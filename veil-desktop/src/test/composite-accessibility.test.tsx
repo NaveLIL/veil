@@ -178,8 +178,8 @@ describe("composite widget accessibility", () => {
       if (command === "get_search_coverage") return null;
       if (command !== "search_messages") return undefined;
       return [
-        { id: "m1", conversationId: "c1", body: "first cipher result", ts: 1, score: 2 },
-        { id: "m2", conversationId: "c2", body: "second cipher result", ts: 2, score: 1 },
+        { id: "m1", conversationId: "c1", conversationType: "dm", conversationName: null, serverId: null, body: "first cipher result", ts: 1, score: 2 },
+        { id: "m2", conversationId: "c2", conversationType: "dm", conversationName: null, serverId: null, body: "second cipher result", ts: 2, score: 1 },
       ];
     });
     const navigate = vi.fn(async () => true);
@@ -284,6 +284,9 @@ describe("composite widget accessibility", () => {
       return [{
         id: "m1",
         conversationId: "c1",
+        conversationType: "dm",
+        conversationName: "Alice",
+        serverId: null,
         body: "exact cipher result",
         ts: 1,
         score: 2,

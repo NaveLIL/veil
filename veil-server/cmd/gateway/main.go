@@ -193,6 +193,7 @@ func main() {
 
 	// Start hub
 	hub := gateway.NewHub(authSvc, chatSvc)
+	chatSvc.SetBroadcaster(hub)
 	if err := gateway.ConfigureFromEnv(); err != nil {
 		log.Fatalf("gateway config: %v", err)
 	}

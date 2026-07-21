@@ -363,6 +363,78 @@ func TestBearerMiddlewareRejectsBadToken(t *testing.T) {
 	}
 }
 
+func TestTusLocationUsesTrustedForwardedOrigin(t *testing.T) {
+	cfg := defaultCfg()
+	cfg.LocalDir = t.TempDir()
+	cfg.RespectForwardedHeaders = true
+	key, _ := keyFromString("0123456789abcdef0123456789abcdef")
+	svc, err := New(cfg, key, newFakeStore(), slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	svc.RegisterRoutes(mux, nil, nil)
+	token, _, err := IssueToken(key, "alice", time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "http://gateway:8080"+cfg.BasePath, nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Tus-Resumable", "1.0.0")
+	req.Header.Set("Upload-Length", "1")
+	req.Header.Set("X-Forwarded-Host", "veil.erez.pro")
+	req.Header.Set("X-Forwarded-Proto", "https")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create status = %d, want 201; body=%q", rec.Code, rec.Body.String())
+	}
+	location := rec.Header().Get("Location")
+	if !strings.HasPrefix(location, "https://veil.erez.pro"+cfg.BasePath) {
+		t.Fatalf("Location = %q, want trusted public HTTPS origin", location)
+	}
+	fileID := strings.TrimPrefix(location, "https://veil.erez.pro"+cfg.BasePath)
+	if len(fileID) != 32 {
+		t.Fatalf("Location file id length = %d, want 32: %q", len(fileID), location)
+	}
+}
+
+func TestTusLocationIgnoresForwardedOriginWithoutProxyTrust(t *testing.T) {
+	cfg := defaultCfg()
+	cfg.LocalDir = t.TempDir()
+	cfg.RespectForwardedHeaders = false
+	key, _ := keyFromString("0123456789abcdef0123456789abcdef")
+	svc, err := New(cfg, key, newFakeStore(), slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	svc.RegisterRoutes(mux, nil, nil)
+	token, _, err := IssueToken(key, "alice", time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "http://gateway:8080"+cfg.BasePath, nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Tus-Resumable", "1.0.0")
+	req.Header.Set("Upload-Length", "1")
+	req.Header.Set("X-Forwarded-Host", "attacker.invalid")
+	req.Header.Set("X-Forwarded-Proto", "https")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create status = %d, want 201; body=%q", rec.Code, rec.Body.String())
+	}
+	location := rec.Header().Get("Location")
+	if !strings.HasPrefix(location, "http://gateway:8080"+cfg.BasePath) {
+		t.Fatalf("Location = %q, want direct request origin", location)
+	}
+}
+
 func TestTusMutationRequiresUploadOwner(t *testing.T) {
 	cfg := defaultCfg()
 	cfg.LocalDir = t.TempDir()

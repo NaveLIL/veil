@@ -2762,6 +2762,7 @@ impl VeilDb {
 
         self.ensure_ratchet_sessions_without_rowid_schema()?;
         self.ensure_conversation_identity_schema()?;
+        self.ensure_conversation_read_state_schema()?;
         self.ensure_network_profile_avatar_schema()?;
         self.ensure_message_author_context_schema()?;
         self.rebuild_interim_sender_key_tables()?;
@@ -3482,6 +3483,41 @@ impl VeilDb {
         );
         tx.execute_batch(&schema)
             .map_err(|error| format!("install ratchet session capacity schema: {error}"))
+    }
+
+    /// Add encrypted device-local read state without retroactively labelling
+    /// all history unread. Existing rows receive the zero-count default; newly
+    /// persisted inbound messages advance it transactionally.
+    fn ensure_conversation_read_state_schema(&self) -> Result<(), String> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| format!("begin conversation read-state schema upgrade: {e}"))?;
+        for (name, definition) in [
+            (
+                "unread_count",
+                "INTEGER NOT NULL DEFAULT 0 CHECK(unread_count BETWEEN 0 AND 2147483647)",
+            ),
+            ("last_read_message_id", "TEXT"),
+        ] {
+            let present: bool = tx
+                .query_row(
+                    "SELECT EXISTS(
+                       SELECT 1 FROM pragma_table_info('conversations') WHERE name=?1
+                     )",
+                    rusqlite::params![name],
+                    |row| row.get(0),
+                )
+                .map_err(|e| format!("inspect conversation {name} column: {e}"))?;
+            if !present {
+                tx.execute_batch(&format!(
+                    "ALTER TABLE conversations ADD COLUMN {name} {definition};"
+                ))
+                .map_err(|e| format!("add conversation {name} column: {e}"))?;
+            }
+        }
+        tx.commit()
+            .map_err(|e| format!("commit conversation read-state schema upgrade: {e}"))
     }
 
     /// Add the nullable origin/account coordinates used by authenticated
@@ -5184,7 +5220,8 @@ impl VeilDb {
             .conn
             .prepare(
                 "SELECT id, conv_type, peer_identity_key, server_id, server_origin,
-                        peer_user_id, name, last_message_at, created_at
+                        peer_user_id, name, last_message_at, unread_count,
+                        last_read_message_id, created_at
                  FROM conversations ORDER BY last_message_at DESC NULLS LAST",
             )
             .map_err(|e| format!("prepare: {e}"))?;
@@ -5204,7 +5241,9 @@ impl VeilDb {
                     peer_user_id: row.get(5)?,
                     name: row.get(6)?,
                     last_message_at: row.get(7)?,
-                    created_at: row.get(8)?,
+                    unread_count: row.get(8)?,
+                    last_read_message_id: row.get(9)?,
+                    created_at: row.get(10)?,
                 })
             })
             .map_err(|e| format!("query: {e}"))?;
@@ -5267,7 +5306,11 @@ impl VeilDb {
         server_timestamp: Option<i64>,
         reply_to_id: Option<&str>,
     ) -> Result<(), String> {
-        self.conn
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| format!("begin message persistence: {e}"))?;
+        let inserted = tx
             .execute(
                 "INSERT OR IGNORE INTO messages (id, conversation_id, sender_key, plaintext, is_outgoing, status, server_timestamp, reply_to_id)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -5284,14 +5327,70 @@ impl VeilDb {
             )
             .map_err(|e| format!("insert message: {e}"))?;
 
-        self.conn
-            .execute(
-                "UPDATE conversations SET last_message_at = datetime('now') WHERE id = ?1",
-                rusqlite::params![conversation_id],
+        if inserted == 1 {
+            tx.execute(
+                "UPDATE conversations
+                     SET last_message_at = datetime('now'),
+                         unread_count = CASE
+                           WHEN ?2 = 0 THEN MIN(unread_count + 1, 2147483647)
+                           ELSE unread_count
+                         END
+                     WHERE id = ?1",
+                rusqlite::params![conversation_id, is_outgoing as u8],
             )
-            .map_err(|e| format!("update last_message_at: {e}"))?;
+            .map_err(|e| format!("update conversation message state: {e}"))?;
+        }
 
-        Ok(())
+        tx.commit()
+            .map_err(|e| format!("commit message persistence: {e}"))
+    }
+
+    /// Mark the complete currently-persisted timeline read for one exact
+    /// authenticated origin. The cursor is device-local and exists only to
+    /// make the zero unread count durable; no network read receipt is implied.
+    pub fn mark_conversation_read(
+        &self,
+        conversation_id: &str,
+        canonical_server_origin: &str,
+    ) -> Result<Option<String>, String> {
+        validate_canonical_uuid("read-state conversation id", conversation_id)?;
+        validate_canonical_server_origin(canonical_server_origin)?;
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| format!("begin mark conversation read: {e}"))?;
+        let latest_message_id = tx
+            .query_row(
+                "SELECT m.id
+                 FROM messages AS m
+                 JOIN conversations AS c ON c.id = m.conversation_id
+                 WHERE m.conversation_id = ?1 AND c.server_origin = ?2
+                 ORDER BY COALESCE(
+                   m.server_timestamp,
+                   CAST(strftime('%s', m.created_at) AS INTEGER) * 1000
+                 ) DESC, m.rowid DESC
+                 LIMIT 1",
+                rusqlite::params![conversation_id, canonical_server_origin],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|e| format!("load latest read-state message: {e}"))?;
+        let changed = tx
+            .execute(
+                "UPDATE conversations
+                 SET unread_count = 0, last_read_message_id = ?3
+                 WHERE id = ?1 AND server_origin = ?2",
+                rusqlite::params![conversation_id, canonical_server_origin, latest_message_id,],
+            )
+            .map_err(|e| format!("mark conversation read: {e}"))?;
+        if changed != 1 {
+            return Err(
+                "read-state conversation is absent from the authenticated origin".to_string(),
+            );
+        }
+        tx.commit()
+            .map_err(|e| format!("commit mark conversation read: {e}"))?;
+        Ok(latest_message_id)
     }
 
     /// Persist private attachment state inside the caller's current
@@ -10599,6 +10698,81 @@ mod tests {
     }
 
     #[test]
+    fn unread_state_is_transactional_duplicate_safe_and_origin_scoped() {
+        const CONVERSATION: &str = "550e8400-e29b-41d4-a716-446655440101";
+        const INCOMING_ONE: &str = "550e8400-e29b-41d4-a716-446655440102";
+        const OUTGOING: &str = "550e8400-e29b-41d4-a716-446655440103";
+        const INCOMING_TWO: &str = "550e8400-e29b-41d4-a716-446655440104";
+        let db = VeilDb::open_memory(&[0x2a; 32]).unwrap();
+        db.upsert_directory_conversation(
+            CONVERSATION,
+            1,
+            ORIGIN_A,
+            Some("Unread Circle"),
+            None,
+            None,
+            None,
+            "2026-07-12T12:00:00Z",
+        )
+        .unwrap();
+
+        db.insert_message(
+            INCOMING_ONE,
+            CONVERSATION,
+            &[0x11; 32],
+            "first",
+            false,
+            Some(10),
+            None,
+        )
+        .unwrap();
+        // A replay/duplicate cannot inflate the durable badge.
+        db.insert_message(
+            INCOMING_ONE,
+            CONVERSATION,
+            &[0x11; 32],
+            "first",
+            false,
+            Some(10),
+            None,
+        )
+        .unwrap();
+        db.insert_message(
+            OUTGOING,
+            CONVERSATION,
+            &[0x22; 32],
+            "mine",
+            true,
+            Some(20),
+            None,
+        )
+        .unwrap();
+        assert_eq!(db.get_conversations().unwrap()[0].unread_count, 1);
+
+        assert!(db.mark_conversation_read(CONVERSATION, ORIGIN_B).is_err());
+        assert_eq!(db.get_conversations().unwrap()[0].unread_count, 1);
+        assert_eq!(
+            db.mark_conversation_read(CONVERSATION, ORIGIN_A).unwrap(),
+            Some(OUTGOING.to_string())
+        );
+        let read = db.get_conversations().unwrap().remove(0);
+        assert_eq!(read.unread_count, 0);
+        assert_eq!(read.last_read_message_id.as_deref(), Some(OUTGOING));
+
+        db.insert_message(
+            INCOMING_TWO,
+            CONVERSATION,
+            &[0x11; 32],
+            "second",
+            false,
+            Some(30),
+            None,
+        )
+        .unwrap();
+        assert_eq!(db.get_conversations().unwrap()[0].unread_count, 1);
+    }
+
+    #[test]
     fn search_rebuild_page_is_origin_scoped_and_keyset_paginated() {
         let db = VeilDb::open_memory(&[42u8; 32]).unwrap();
         const A_1: &str = "550e8400-e29b-41d4-a716-446655440010";
@@ -14246,17 +14420,19 @@ mod tests {
         db.run_migrations().unwrap();
         db.run_migrations().unwrap();
 
-        let columns: (bool, bool) = db
+        let columns: (bool, bool, bool, bool) = db
             .conn
             .query_row(
                 "SELECT
                     EXISTS(SELECT 1 FROM pragma_table_info('conversations') WHERE name='server_origin'),
-                    EXISTS(SELECT 1 FROM pragma_table_info('conversations') WHERE name='peer_user_id')",
+                    EXISTS(SELECT 1 FROM pragma_table_info('conversations') WHERE name='peer_user_id'),
+                    EXISTS(SELECT 1 FROM pragma_table_info('conversations') WHERE name='unread_count'),
+                    EXISTS(SELECT 1 FROM pragma_table_info('conversations') WHERE name='last_read_message_id')",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .unwrap();
-        assert_eq!(columns, (true, true));
+        assert_eq!(columns, (true, true, true, true));
         let legacy = db.get_conversations().unwrap().remove(0);
         assert!(legacy.server_origin.is_none());
         assert!(legacy.peer_user_id.is_none());

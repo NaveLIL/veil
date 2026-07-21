@@ -136,6 +136,7 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	// even when signature verification or rate limiting rejects the request.
 	mux.HandleFunc("GET /v1/messages/{conversationID}", chatNoStore(signed(h.GetMessages)))
 	mux.HandleFunc("GET /v1/conversations", chatNoStore(signed(h.ListConversations)))
+	mux.HandleFunc("GET /v1/conversations/{conversationID}", chatNoStore(signed(h.GetConversation)))
 	mux.HandleFunc("POST /v1/conversations/dm", signed(h.CreateDM))
 	mux.HandleFunc("GET /v1/conversations/{conversationID}/members", chatNoStore(signed(h.GetMembers)))
 	mux.HandleFunc("GET /v1/conversations/{conversationID}/device-directory", chatNoStore(signed(h.GetDeviceDirectory)))
@@ -352,6 +353,89 @@ func (h *Handler) GetMessages(w http.ResponseWriter, r *http.Request) {
 
 // --- Offline conversation discovery ---
 
+type conversationMemberJSON struct {
+	UserID      string `json:"user_id"`
+	Username    string `json:"username"`
+	IdentityKey string `json:"identity_key"`
+	SigningKey  string `json:"signing_key"`
+	Role        int16  `json:"role"`
+	JoinedAt    string `json:"joined_at"`
+}
+
+type conversationJSON struct {
+	ID        string                   `json:"id"`
+	ConvType  int16                    `json:"conv_type"`
+	Name      *string                  `json:"name"`
+	ServerID  *string                  `json:"server_id"`
+	CreatedAt string                   `json:"created_at"`
+	Members   []conversationMemberJSON `json:"members"`
+}
+
+func publicConversation(conversation db.ConversationDiscovery) (conversationJSON, error) {
+	members := make([]conversationMemberJSON, 0, len(conversation.Members))
+	for _, member := range conversation.Members {
+		if len(member.IdentityKey) != 32 || len(member.SigningKey) != ed25519.PublicKeySize {
+			return conversationJSON{}, errors.New("member cryptographic identity is invalid")
+		}
+		members = append(members, conversationMemberJSON{
+			UserID:      member.UserID,
+			Username:    member.Username,
+			IdentityKey: hex.EncodeToString(member.IdentityKey),
+			SigningKey:  hex.EncodeToString(member.SigningKey),
+			Role:        member.Role,
+			JoinedAt:    member.JoinedAt.UTC().Format(time.RFC3339Nano),
+		})
+	}
+	return conversationJSON{
+		ID:        conversation.ID,
+		ConvType:  conversation.ConvType,
+		Name:      conversation.Name,
+		ServerID:  conversation.ServerID,
+		CreatedAt: conversation.CreatedAt.UTC().Format(time.RFC3339Nano),
+		Members:   members,
+	}, nil
+}
+
+// GetConversation is the bounded live-discovery counterpart to paginated
+// offline sync. A bare WS hint never supplies metadata: the signed client must
+// resolve this exact UUID through its current membership and channel ACL.
+func (h *Handler) GetConversation(w http.ResponseWriter, r *http.Request) {
+	userUUID, err := uuid.Parse(r.Header.Get("X-User-ID"))
+	if err != nil {
+		writeJSON(w, http.StatusUnauthorized, errorResp("authenticated user required"))
+		return
+	}
+	conversationUUID, err := uuid.Parse(r.PathValue("conversationID"))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, errorResp("conversation_id required"))
+		return
+	}
+
+	conversation, err := h.svc.db.GetUserConversation(
+		r.Context(), userUUID.String(), conversationUUID.String(),
+	)
+	if errors.Is(err, db.ErrConversationAccessDenied) {
+		// Do not provide an existence oracle for another account's UUID.
+		writeJSON(w, http.StatusNotFound, errorResp("conversation not found"))
+		return
+	}
+	if err != nil {
+		log.Printf("get conversation error: class=%s", logsafe.ErrorClass(err))
+		writeJSON(w, http.StatusInternalServerError, errorResp("failed to fetch conversation"))
+		return
+	}
+	result, err := publicConversation(*conversation)
+	if err != nil {
+		log.Printf(
+			"conversation_ref=%s has invalid public member key material",
+			logsafe.Ref("conversation", conversation.ID),
+		)
+		writeJSON(w, http.StatusInternalServerError, errorResp("failed to serialize conversation"))
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
 func (h *Handler) ListConversations(w http.ResponseWriter, r *http.Request) {
 	userID := r.Header.Get("X-User-ID")
 	userUUID, err := uuid.Parse(userID)
@@ -388,57 +472,22 @@ func (h *Handler) ListConversations(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	type memberJSON struct {
-		UserID      string `json:"user_id"`
-		Username    string `json:"username"`
-		IdentityKey string `json:"identity_key"`
-		SigningKey  string `json:"signing_key"`
-		Role        int16  `json:"role"`
-		JoinedAt    string `json:"joined_at"`
-	}
-	type conversationJSON struct {
-		ID        string       `json:"id"`
-		ConvType  int16        `json:"conv_type"`
-		Name      *string      `json:"name"`
-		ServerID  *string      `json:"server_id"`
-		CreatedAt string       `json:"created_at"`
-		Members   []memberJSON `json:"members"`
-	}
-
 	hasMore := len(conversations) > limit
 	if hasMore {
 		conversations = conversations[:limit]
 	}
 	result := make([]conversationJSON, 0, len(conversations))
 	for _, conversation := range conversations {
-		members := make([]memberJSON, 0, len(conversation.Members))
-		for _, member := range conversation.Members {
-			if len(member.IdentityKey) != 32 || len(member.SigningKey) != ed25519.PublicKeySize {
-				log.Printf(
-					"conversation_ref=%s member_ref=%s has invalid public key material",
-					logsafe.Ref("conversation", conversation.ID),
-					logsafe.Ref("user", member.UserID),
-				)
-				writeJSON(w, http.StatusInternalServerError, errorResp("member cryptographic identity is invalid"))
-				return
-			}
-			members = append(members, memberJSON{
-				UserID:      member.UserID,
-				Username:    member.Username,
-				IdentityKey: hex.EncodeToString(member.IdentityKey),
-				SigningKey:  hex.EncodeToString(member.SigningKey),
-				Role:        member.Role,
-				JoinedAt:    member.JoinedAt.UTC().Format(time.RFC3339Nano),
-			})
+		public, err := publicConversation(conversation)
+		if err != nil {
+			log.Printf(
+				"conversation_ref=%s has invalid public member key material",
+				logsafe.Ref("conversation", conversation.ID),
+			)
+			writeJSON(w, http.StatusInternalServerError, errorResp("failed to serialize conversation"))
+			return
 		}
-		result = append(result, conversationJSON{
-			ID:        conversation.ID,
-			ConvType:  conversation.ConvType,
-			Name:      conversation.Name,
-			ServerID:  conversation.ServerID,
-			CreatedAt: conversation.CreatedAt.UTC().Format(time.RFC3339Nano),
-			Members:   members,
-		})
+		result = append(result, public)
 	}
 
 	response := map[string]any{

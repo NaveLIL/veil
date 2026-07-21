@@ -73,6 +73,11 @@ export interface SearchAuthorDto {
 export interface SearchHitDto {
   id: string;
   conversationId: string;
+  conversationType: "dm" | "group" | "channel";
+  /** Authenticated, origin-scoped presentation text persisted with the conversation. */
+  conversationName: string | null;
+  /** Present only for a channel, where it is required for exact Space navigation. */
+  serverId: string | null;
   body: string;
   ts: number;
   score: number;
@@ -430,6 +435,21 @@ function searchAuthor(value: unknown): SearchAuthorDto | null | undefined {
   };
 }
 
+function searchConversationName(value: unknown): string | null {
+  if (value === null) return null;
+  const name = boundedText(value, "search conversation name", MAX_NAME_UNITS);
+  if (
+    !name.trim()
+    || UNSAFE_PRESENTATION_CHARACTER.test(name)
+    || /\p{Cc}/u.test(name)
+  ) {
+    throw new Error("search conversation name contains unsafe presentation text");
+  }
+  return name;
+}
+
+const UNSAFE_PRESENTATION_CHARACTER = /[\u00ad\u034f\u061c\u180e\u200b\u200e\u200f\u2028\u2029\u202a-\u202e\u2060\u2066-\u206f\ufeff]/u;
+
 export function validatedSearchHits(
   value: unknown,
   expectedServerOrigin: string,
@@ -446,6 +466,21 @@ export function validatedSearchHits(
     if (author && author.canonicalServerOrigin !== expectedServerOrigin) {
       throw new Error("search author escaped the authenticated origin");
     }
+    const conversationType = candidate.conversationType;
+    if (
+      conversationType !== "dm"
+      && conversationType !== "group"
+      && conversationType !== "channel"
+    ) {
+      throw new Error("search hit has an unknown conversation type");
+    }
+    const conversationName = searchConversationName(candidate.conversationName);
+    let serverId: string | null = null;
+    if (conversationType === "channel") {
+      serverId = exactUserId(candidate.serverId, "search hit server id");
+    } else if (candidate.serverId !== null) {
+      throw new Error("non-channel search hit carried server context");
+    }
     return {
       id: boundedString(candidate.id, "search hit id", MAX_ID_UNITS),
       conversationId: boundedString(
@@ -453,6 +488,9 @@ export function validatedSearchHits(
         "search hit conversation id",
         MAX_ID_UNITS,
       ),
+      conversationType,
+      conversationName,
+      serverId,
       body: boundedString(candidate.body, "search hit body", MAX_MESSAGE_TEXT_UNITS),
       ts: safeTimestamp(candidate.ts, "search hit timestamp"),
       score: candidate.score,

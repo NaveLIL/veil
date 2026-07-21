@@ -571,6 +571,9 @@ pub enum ConnectionEvent {
         user_id: String,
         profile_version: u64,
     },
+    /// Presentation-free hint that this authenticated account can now resolve
+    /// an exact conversation through the signed REST directory.
+    ConversationAvailable { conversation_id: String },
     /// A server-level event (created/updated/deleted, member join/leave/kick/ban, role CRUD).
     ServerEvent {
         event_type: i32, // proto::server_event::EventType as i32
@@ -3149,6 +3152,17 @@ fn connection_event_from_envelope(
                 profile_version: update.profile_version,
             }
         }
+        Some(proto::envelope::Payload::ConversationAvailable(available)) => {
+            let parsed_conversation_id = Uuid::parse_str(&available.conversation_id).ok()?;
+            if parsed_conversation_id.is_nil()
+                || parsed_conversation_id.to_string() != available.conversation_id
+            {
+                return None;
+            }
+            ConnectionEvent::ConversationAvailable {
+                conversation_id: available.conversation_id,
+            }
+        }
         Some(proto::envelope::Payload::ServerEvent(se)) => ConnectionEvent::ServerEvent {
             event_type: se.event_type,
             server_id: se.server_id,
@@ -4373,6 +4387,41 @@ mod tests {
             .unwrap_err()
             .contains("invalid client message id"));
         assert!(outbound.try_recv().is_err());
+    }
+
+    #[test]
+    fn conversation_available_accepts_only_a_canonical_non_nil_uuid() {
+        let conversation_id = "70be554c-b5ad-4cdd-b6f4-cc7b79563690";
+        assert!(matches!(
+            connection_event_from_envelope(proto::Envelope {
+                payload: Some(proto::envelope::Payload::ConversationAvailable(
+                    proto::ConversationAvailable {
+                        conversation_id: conversation_id.to_string(),
+                    },
+                )),
+                ..Default::default()
+            }),
+            Some(ConnectionEvent::ConversationAvailable {
+                conversation_id: accepted,
+            }) if accepted == conversation_id
+        ));
+
+        for rejected in [
+            "",
+            "00000000-0000-0000-0000-000000000000",
+            "70BE554C-B5AD-4CDD-B6F4-CC7B79563690",
+            "not-a-uuid",
+        ] {
+            assert!(connection_event_from_envelope(proto::Envelope {
+                payload: Some(proto::envelope::Payload::ConversationAvailable(
+                    proto::ConversationAvailable {
+                        conversation_id: rejected.to_string(),
+                    },
+                )),
+                ..Default::default()
+            })
+            .is_none());
+        }
     }
 
     #[test]

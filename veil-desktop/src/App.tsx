@@ -75,6 +75,61 @@ const formatAttachmentBytes = (bytes: number): string => {
   return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GiB`;
 };
 
+/**
+ * Keep the native WebView context menu disabled without pre-empting Kobalte's
+ * trigger handler. Kobalte stops handled context-menu events before they reach
+ * document, so this bubble listener only sees otherwise unhandled events.
+ */
+export function installUnhandledNativeContextMenuSuppression(
+  target: Document = document,
+): () => void {
+  const suppressUnhandledNativeMenu = (event: Event) => {
+    if (!event.defaultPrevented) event.preventDefault();
+  };
+  target.addEventListener("contextmenu", suppressUnhandledNativeMenu);
+  return () => target.removeEventListener("contextmenu", suppressUnhandledNativeMenu);
+}
+
+export function useUnhandledNativeContextMenuSuppression(
+  target: Document = document,
+): void {
+  onMount(() => {
+    const dispose = installUnhandledNativeContextMenuSuppression(target);
+    onCleanup(dispose);
+  });
+}
+
+export function composerOwnsFocus(input: HTMLTextAreaElement | undefined): boolean {
+  if (!input) return false;
+  const active = input.ownerDocument.activeElement;
+  const composer = input.closest(".veil-message-composer");
+  return active === input || (!!active && !!composer?.contains(active));
+}
+
+/**
+ * Re-focus after Solid has removed the temporary disabled state. A callback
+ * guards the conversation/session boundary, while the active-element check
+ * avoids stealing focus when the user deliberately moved elsewhere.
+ */
+export function scheduleComposerFocusRestore(
+  input: HTMLTextAreaElement | undefined,
+  contextStillCurrent: () => boolean,
+): void {
+  if (!input) return;
+  queueMicrotask(() => {
+    if (!input.isConnected || input.disabled || !contextStillCurrent()) return;
+    const active = input.ownerDocument.activeElement;
+    const composer = input.closest(".veil-message-composer");
+    if (
+      active
+      && active !== input.ownerDocument.body
+      && active !== input
+      && !composer?.contains(active)
+    ) return;
+    input.focus();
+  });
+}
+
 type RightIslandRoute =
   | { kind: "closed" }
   | { kind: "members"; opener: HTMLElement | null }
@@ -359,6 +414,7 @@ const DisclaimerScreen: Component = () => {
    APP
    ═══════════════════════════════════════════════════════ */
 const App: Component = () => {
+  useUnhandledNativeContextMenuSuppression();
   const [inputText, setInputText] = createSignal("");
   const [sendBusy, setSendBusy] = createSignal(false);
   const [attachmentSaving, setAttachmentSaving] = createSignal<string | null>(null);
@@ -417,6 +473,7 @@ const App: Component = () => {
   let newGroupInputRef: HTMLInputElement | undefined;
   let sendTokenCounter = 0;
   let activeSendToken: number | null = null;
+  let composerContextEpoch = 0;
   let rightIslandTransitionEpoch = 0;
   let rightIslandAnimationFrame: number | undefined;
   let identityDmActionToken = 0;
@@ -1204,12 +1261,14 @@ const App: Component = () => {
   });
 
   let previousConversationId = appStore.activeConversationId();
+  let previousComposerScreen = appStore.screen();
   // Load messages when conversation changes. Drafts intentionally do not cross
   // a conversation boundary: carrying text to another recipient is an easy
   // privacy mistake, especially while a send is still awaiting native ACKs.
   createEffect(() => {
     const id = appStore.activeConversationId();
     if (id !== previousConversationId) {
+      composerContextEpoch += 1;
       if (
         previousConversationId
         && appStore.conversationCryptoDiagnostics()[previousConversationId]
@@ -1253,6 +1312,11 @@ const App: Component = () => {
   // Trigger staggered entrance when chat screen appears
   createEffect(() => {
     const screen = appStore.screen();
+
+    if (screen !== previousComposerScreen) {
+      composerContextEpoch += 1;
+      previousComposerScreen = screen;
+    }
 
     if (screen === "locked" || screen === "onboarding") {
       // The root component remains mounted on the lock screen. Scrub every
@@ -1321,6 +1385,9 @@ const App: Component = () => {
     const reply = replyingTo();
     const conversationId = conversation.id;
     const sendSessionEpoch = captureUiSessionEpoch();
+    const sendComposerContextEpoch = composerContextEpoch;
+    const composerInput = inputRef;
+    const restoreComposerFocus = composerOwnsFocus(composerInput);
     const sendToken = ++sendTokenCounter;
     activeSendToken = sendToken;
     // Register before the first await. This covers A → B → A navigation while
@@ -1374,6 +1441,14 @@ const App: Component = () => {
       if (activeSendToken === sendToken) {
         activeSendToken = null;
         setSendBusy(false);
+        if (restoreComposerFocus) {
+          scheduleComposerFocusRestore(composerInput, () => (
+            composerContextEpoch === sendComposerContextEpoch
+            && isUiSessionEpochCurrent(sendSessionEpoch)
+            && appStore.screen() === "chat"
+            && appStore.activeConversationId() === conversationId
+          ));
+        }
       }
     }
   };
@@ -1835,8 +1910,6 @@ const App: Component = () => {
   };
 
   onMount(async () => {
-    // Suppress native WebKitGTK context menu globally — Kobalte handles its own
-    document.addEventListener("contextmenu", (e) => e.preventDefault(), { capture: true });
     await appearanceStore.initialize();
 
     const stopDragState = await listen<{ active: boolean; fileCount: number }>(

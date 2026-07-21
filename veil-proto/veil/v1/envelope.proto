@@ -67,6 +67,10 @@ message Envelope {
     // Presentation-only profile invalidation; never a roster/crypto event.
     ProfileUpdated profile_updated = 52;
 
+    // Membership-scoped discovery hint. The client must hydrate and validate
+    // the exact conversation through signed REST before consuming its traffic.
+    ConversationAvailable conversation_available = 53;
+
     // Shares
     ShareCreate share_create = 60;
     ShareCreated share_created = 61;

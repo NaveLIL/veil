@@ -169,6 +169,10 @@ pub struct Conversation {
     pub peer_user_id: Option<String>,
     pub name: Option<String>,
     pub last_message_at: Option<String>,
+    /// Device-local unread state, encrypted at rest with the conversation.
+    /// This is deliberately not a cross-device read receipt.
+    pub unread_count: u32,
+    pub last_read_message_id: Option<String>,
     pub created_at: String,
 }
 

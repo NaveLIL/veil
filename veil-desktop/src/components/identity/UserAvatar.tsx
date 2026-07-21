@@ -1,6 +1,20 @@
-import { Show, createSignal, type Component, type JSX } from "solid-js";
+import { Show, createEffect, createSignal, type Component, type JSX } from "solid-js";
 import { Phaseprint, type PhaseprintIdentity } from "@/components/identity/Phaseprint";
-import { avatarSourceForIdentity, rejectAvatarSource } from "@/components/identity/avatarRegistry";
+import {
+  avatarSourceForIdentity,
+  rejectAvatarSource,
+  requestNativeAvatar,
+} from "@/components/identity/avatarRegistry";
+import {
+  canonicalIdentityKey,
+  canonicalIdentityOrigin,
+  canonicalIdentityUserId,
+} from "@/components/identity/identityProfile";
+import {
+  appStore,
+  captureUiSessionEpoch,
+  isUiSessionEpochCurrent,
+} from "@/stores/app";
 
 export type UserAvatarStatus = "online" | "idle" | "dnd" | "offline";
 
@@ -39,6 +53,49 @@ export const UserAvatar: Component<UserAvatarProps> = (props) => {
     return !!source && source === loadedImageSource() && source !== failedImageSource();
   };
   let activeImageGeneration: symbol | null = null;
+
+  createEffect(() => {
+    const canonicalServerOrigin = canonicalIdentityOrigin(props.canonicalServerOrigin);
+    const userId = canonicalIdentityUserId(props.userId);
+    const identityKey = canonicalIdentityKey(props.identityKey);
+    const scope = appStore.authenticatedServerScope();
+    const notice = appStore.profileUpdateNotice();
+    if (
+      !canonicalServerOrigin
+      || !userId
+      || !identityKey
+      || canonicalServerOrigin !== props.canonicalServerOrigin
+      || userId !== props.userId
+      || identityKey !== props.identityKey
+      || !scope
+      || scope.canonicalServerOrigin !== canonicalServerOrigin
+      || !appStore.connected()
+      || appStore.bindingTransitioning()
+      || appStore.originTransitioning()
+    ) return;
+
+    const identity = { canonicalServerOrigin, userId, identityKey };
+    const expectedScope = { ...scope };
+    const sessionEpoch = captureUiSessionEpoch();
+    const minimumProfileVersion = notice?.canonicalServerOrigin === canonicalServerOrigin
+      && notice.userId === userId
+      ? notice.profileVersion
+      : null;
+    void requestNativeAvatar(identity, async () => {
+      const profile = await appStore.loadNetworkProfile(userId, identityKey);
+      const currentScope = appStore.authenticatedServerScope();
+      if (
+        !isUiSessionEpochCurrent(sessionEpoch)
+        || !currentScope
+        || currentScope.canonicalServerOrigin !== expectedScope.canonicalServerOrigin
+        || currentScope.userId !== expectedScope.userId
+        || currentScope.bindingGeneration !== expectedScope.bindingGeneration
+      ) {
+        throw new Error("avatar profile belongs to a stale renderer session");
+      }
+      return profile;
+    }, minimumProfileVersion);
+  });
 
   return (
     <div
