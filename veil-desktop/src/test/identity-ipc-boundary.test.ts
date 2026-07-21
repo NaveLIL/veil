@@ -63,6 +63,9 @@ const liveMessage = {
 const searchHit = {
   id: MESSAGE_ID,
   conversationId: CONVERSATION_ID,
+  conversationType: "dm",
+  conversationName: "Quiet Orbit",
+  serverId: null,
   body: "hello",
   ts: 1_789_000_000_000,
   score: 1.25,
@@ -141,6 +144,7 @@ describe("identity IPC renderer boundary", () => {
     const [hit] = validatedSearchHits([searchHit], ORIGIN);
     expect(hit.author?.context).toBe("former_member_at_observation");
     expect(hit.author?.profileVersion).toBe("7");
+    expect(hit.conversationName).toBe("Quiet Orbit");
 
     for (const invalid of [
       { ...searchHit, author: { ...searchHit.author, profileOrigin: "https://other.example.test:443" } },
@@ -148,6 +152,9 @@ describe("identity IPC renderer boundary", () => {
       { ...searchHit, author: { ...searchHit.author, profileVersion: "7.0" } },
       { ...searchHit, author: { ...searchHit.author, context: "authenticated_history" } },
       { ...searchHit, score: Number.POSITIVE_INFINITY },
+      { ...searchHit, conversationType: "forum" },
+      { ...searchHit, conversationType: "group", serverId: SERVER_ID },
+      { ...searchHit, conversationName: "safe\u202espoof" },
     ]) {
       expect(() => validatedSearchHits([invalid], ORIGIN)).toThrow();
     }
@@ -155,6 +162,14 @@ describe("identity IPC renderer boundary", () => {
       [searchHit],
       "https://other.example.test:443",
     )).toThrow();
+
+    const [room] = validatedSearchHits([{
+      ...searchHit,
+      conversationType: "channel",
+      conversationName: null,
+      serverId: SERVER_ID,
+    }], ORIGIN);
+    expect(room.serverId).toBe(SERVER_ID);
   });
 
   it("enforces the local-search response budget", () => {

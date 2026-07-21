@@ -59,11 +59,12 @@ func New(cfg Config, tokenKey []byte, store Store, logger *slog.Logger) (*Servic
 	h := &hooks{store: store, cfg: cfg, logger: logger}
 
 	tusHandle, err := tusd.NewHandler(tusd.Config{
-		BasePath:             cfg.BasePath,
-		StoreComposer:        composer,
-		MaxSize:              cfg.MaxUploadSize,
-		DisableDownload:      true,
-		DisableConcatenation: true,
+		BasePath:                cfg.BasePath,
+		RespectForwardedHeaders: cfg.RespectForwardedHeaders,
+		StoreComposer:           composer,
+		MaxSize:                 cfg.MaxUploadSize,
+		DisableDownload:         true,
+		DisableConcatenation:    true,
 		// tusd's default logger records the raw request path, upload ID,
 		// generated URL and unfiltered storage errors. The gateway access log
 		// already provides bounded route-template observability, while the

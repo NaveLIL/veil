@@ -205,6 +205,50 @@ func TestChat_CreateGroupAndAddMember(t *testing.T) {
 	}
 }
 
+func TestChat_InvitedCircleMemberCanResolveExactLiveDirectory(t *testing.T) {
+	h := New(t)
+	owner := h.CreateUser("live-circle-owner")
+	invitee := h.CreateUser("live-circle-invitee")
+	intruder := h.CreateUser("live-circle-intruder")
+
+	status, _, created := h.Do(owner, http.MethodPost, "/v1/groups", map[string]any{
+		"name": "Immediately visible",
+		"members": []map[string]string{{
+			"user_id": invitee.ID, "identity_key": hex.EncodeToString(invitee.IdentityKey),
+		}},
+	})
+	if status != http.StatusCreated {
+		t.Fatalf("create Circle: status=%d body=%v", status, created)
+	}
+	conversationID := created["conversation_id"].(string)
+
+	status, _, discovered := h.Do(
+		invitee,
+		http.MethodGet,
+		"/v1/conversations/"+conversationID,
+		nil,
+	)
+	if status != http.StatusOK {
+		t.Fatalf("invitee exact discovery: status=%d body=%v", status, discovered)
+	}
+	if discovered["id"] != conversationID || discovered["name"] != "Immediately visible" {
+		t.Fatalf("unexpected exact conversation projection: %v", discovered)
+	}
+	if members, _ := discovered["members"].([]any); len(members) != 2 {
+		t.Fatalf("exact discovery member count=%d, want 2 (%v)", len(members), discovered)
+	}
+
+	status, _, _ = h.Do(
+		intruder,
+		http.MethodGet,
+		"/v1/conversations/"+conversationID,
+		nil,
+	)
+	if status != http.StatusNotFound {
+		t.Fatalf("inaccessible exact UUID leaked membership: status=%d", status)
+	}
+}
+
 func TestChat_RejectsUnsigned(t *testing.T) {
 	h := New(t)
 	status, _ := h.DoUnsigned(http.MethodPost, "/v1/conversations/dm", map[string]string{

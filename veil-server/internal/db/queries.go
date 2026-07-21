@@ -818,6 +818,43 @@ func (db *DB) ListUserConversations(ctx context.Context, userID string, after ti
 	return conversations, nil
 }
 
+// GetUserConversation returns one exact conversation projection only when the
+// requester is still authorized to read it. The membership join deliberately
+// makes a missing UUID and an inaccessible UUID indistinguishable to callers.
+// The complete member directory is filtered through the same channel ACL as
+// list/sync discovery before it crosses the REST boundary.
+func (db *DB) GetUserConversation(ctx context.Context, userID, conversationID string) (*ConversationDiscovery, error) {
+	var conversation ConversationDiscovery
+	err := db.Pool.QueryRow(ctx,
+		`SELECT conversation.id, conversation.conv_type, conversation.name,
+		        conversation.server_id, conversation.created_at
+		 FROM conversations conversation
+		 JOIN conversation_members mine ON mine.conversation_id = conversation.id
+		 WHERE conversation.id = $1::uuid AND mine.user_id = $2::uuid`,
+		conversationID, userID,
+	).Scan(
+		&conversation.ID, &conversation.ConvType, &conversation.Name,
+		&conversation.ServerID, &conversation.CreatedAt,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrConversationAccessDenied
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	conversation.Members, err = db.GetConversationMemberBindingsForRequester(
+		ctx, conversation.ID, userID, ChannelReadPermissions,
+	)
+	if errors.Is(err, ErrConversationAccessDenied) {
+		return nil, ErrConversationAccessDenied
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &conversation, nil
+}
+
 // FindOrCreateDM finds an existing DM conversation between two users, or
 // creates one. A transaction-scoped advisory lock serializes the canonical
 // user pair, including calls with reversed argument order, so concurrent X3DH

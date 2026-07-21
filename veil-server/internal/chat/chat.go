@@ -24,14 +24,37 @@ var (
 	ErrSecureMessageEditUnsupported = errors.New("editing Sender-Key group/channel messages requires an exact device-routed edit protocol")
 )
 
+// Broadcaster delivers non-authoritative conversation discovery hints to
+// online accounts. The exact directory is always resolved again through the
+// signed membership-scoped REST endpoint.
+type Broadcaster interface {
+	BroadcastToUsers(userIDs []string, env *pb.Envelope)
+}
+
 // Service handles message routing and prekey distribution.
 type Service struct {
-	db  *db.DB
-	cfg *config.Config
+	db    *db.DB
+	cfg   *config.Config
+	bcast Broadcaster
 }
 
 func NewService(database *db.DB, cfg *config.Config) *Service {
 	return &Service{db: database, cfg: cfg}
+}
+
+// SetBroadcaster wires the gateway after both mutually-referencing services
+// have been constructed. It is intended for startup use before serving calls.
+func (s *Service) SetBroadcaster(bcast Broadcaster) { s.bcast = bcast }
+
+func (s *Service) notifyConversationAvailable(userIDs []string, conversationID string) {
+	if s.bcast == nil || len(userIDs) == 0 || conversationID == "" {
+		return
+	}
+	s.bcast.BroadcastToUsers(userIDs, &pb.Envelope{
+		Payload: &pb.Envelope_ConversationAvailable{
+			ConversationAvailable: &pb.ConversationAvailable{ConversationId: conversationID},
+		},
+	})
 }
 
 // DB returns the underlying database handle.
@@ -438,7 +461,20 @@ func (s *Service) CreateCircle(ctx context.Context, name, creatorUserID string, 
 		}
 		seen[member.UserID] = struct{}{}
 	}
-	return s.db.CreateGroupWithMembers(ctx, name, creatorUserID, members)
+	conversationID, err := s.db.CreateGroupWithMembers(ctx, name, creatorUserID, members)
+	if err != nil {
+		return "", err
+	}
+	recipients := make([]string, 0, len(members)+1)
+	recipients = append(recipients, creatorUserID)
+	for _, member := range members {
+		recipients = append(recipients, member.UserID)
+	}
+	// The DB transaction is committed before this hint. The creator can now
+	// safely distribute Sender-Key state knowing every online invitee receives
+	// and hydrates the directory hint first on its ordered WS queue.
+	s.notifyConversationAvailable(recipients, conversationID)
+	return conversationID, nil
 }
 
 // AddGroupMember adds a user to a group. Only admins/owners can add.
@@ -462,7 +498,11 @@ func (s *Service) AddGroupMember(ctx context.Context, convID, requesterID, targe
 		return fmt.Errorf("target user not found: %w", err)
 	}
 
-	return s.db.AddGroupMember(ctx, convID, targetUserID, 0) // role=0 member
+	if err := s.db.AddGroupMember(ctx, convID, targetUserID, 0); err != nil {
+		return err
+	}
+	s.notifyConversationAvailable([]string{targetUserID}, convID)
+	return nil
 }
 
 // RemoveGroupMember removes a user from a group.

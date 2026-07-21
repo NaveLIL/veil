@@ -35,7 +35,6 @@ import {
   captureUiSessionEpoch,
   isUiSessionEpochCurrent,
   type AuthenticatedServerScope,
-  type Conversation,
 } from "@/stores/app";
 
 interface Props {
@@ -113,10 +112,23 @@ function highlight(body: string, query: string) {
   );
 }
 
-function convIcon(conv: Conversation | undefined) {
-  if (!conv) return <MessageCircle size={14} />;
-  if (conv.type === "group") return <Users size={14} />;
+function convIcon(conversationType: SearchHit["conversationType"]) {
+  if (conversationType === "group") return <Users size={14} />;
   return <MessageCircle size={14} />;
+}
+
+/** Never falls back to a raw UUID: IDs are navigation authority, not presentation text. */
+export function humanSearchContext(
+  hit: Pick<SearchHit, "conversationType" | "conversationName" | "serverId">,
+  spaceName?: string,
+): string {
+  const name = hit.conversationName?.trim();
+  if (hit.conversationType === "dm") return name || "Direct message";
+  if (hit.conversationType === "group") return name || "Circle";
+  if (spaceName && name) return `${spaceName} / #${name}`;
+  if (name) return `#${name}`;
+  if (spaceName) return `${spaceName} / Room`;
+  return "Room";
 }
 
 function authenticatedScopeMatches(
@@ -366,11 +378,16 @@ export const CommandPalette: Component<Props> = (props) => {
     if (wasOpen) restoreFocus();
   });
 
-  const conversationsById = createMemo(() => {
-    const map = new Map<string, Conversation>();
-    for (const c of appStore.conversations()) map.set(c.id, c);
+  const serversById = createMemo(() => {
+    const map = new Map<string, string>();
+    for (const server of appStore.servers()) map.set(server.id, server.name);
     return map;
   });
+
+  const titleForHit = (hit: SearchHit) => humanSearchContext(
+    hit,
+    hit.serverId ? serversById().get(hit.serverId) : undefined,
+  );
 
   const openHit = async (h: SearchHit) => {
     if (openingHitId()) return;
@@ -488,8 +505,7 @@ export const CommandPalette: Component<Props> = (props) => {
   const activeIdentityProfile = createMemo(() => {
     const hit = hits()[active()];
     if (!hit) return null;
-    const conversation = conversationsById().get(hit.conversationId);
-    return identityProfileForHit(hit, conversation?.name || hit.conversationId.slice(0, 8));
+    return identityProfileForHit(hit, titleForHit(hit));
   });
 
   const rebuild = async () => {
@@ -812,8 +828,7 @@ export const CommandPalette: Component<Props> = (props) => {
               >
                 <For each={hits()}>
                   {(h, i) => {
-                    const conv = () => conversationsById().get(h.conversationId);
-                    const title = () => conv()?.name || h.conversationId.slice(0, 8);
+                    const title = () => titleForHit(h);
                     return (
                       <div
                         role="none"
@@ -847,7 +862,7 @@ export const CommandPalette: Component<Props> = (props) => {
                             display: "flex", "align-items": "center", gap: "8px",
                             "font-size": "12px", color: "var(--veil-text-muted)", "margin-bottom": "4px",
                           }}>
-                            {convIcon(conv())}
+                            {convIcon(h.conversationType)}
                             <span style={{ color: "var(--veil-text)", "font-weight": "500" }}>{title()}</span>
                             <Show when={openingHitId() === h.id}>
                               <RefreshCw

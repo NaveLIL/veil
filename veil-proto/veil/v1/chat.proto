@@ -67,6 +67,14 @@ message MessageRead {
   uint64 timestamp = 3;
 }
 
+// Server -> client: authenticated hint that a conversation has just become
+// available to this account. The UUID is presentation-free and is never
+// trusted as directory metadata; clients fetch the exact membership-scoped
+// REST projection before accepting the conversation or any Sender-Key state.
+message ConversationAvailable {
+  string conversation_id = 1;
+}
+
 // Клиент → сервер: редактирование сообщения
 message EditMessage {
   string message_id = 1;

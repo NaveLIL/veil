@@ -2019,6 +2019,7 @@ fn get_conversations(state: State<'_, AppState>) -> Result<Vec<serde_json::Value
                 "peerUserId": c.peer_user_id,
                 "serverOrigin": c.server_origin,
                 "lastMessageAt": c.last_message_at,
+                "unreadCount": c.unread_count,
             })
         })
         .collect();
@@ -2027,6 +2028,33 @@ fn get_conversations(state: State<'_, AppState>) -> Result<Vec<serde_json::Value
     }
     require_session_still_unlocked(&state)?;
     Ok(result)
+}
+
+/// Persist device-local read state for the exact published origin. The
+/// protobuf MessageRead shape has no implemented server/client contract yet;
+/// this command intentionally emits no cross-device receipt.
+#[tauri::command]
+fn mark_conversation_read(
+    state: State<'_, AppState>,
+    conversation_id: String,
+    expected_server_origin: String,
+    expected_binding_generation: String,
+) -> Result<Option<String>, String> {
+    let live_action_binding = capture_confirmed_live_action_binding(&state)?;
+    validate_expected_live_action_binding(
+        &live_action_binding,
+        &expected_server_origin,
+        &expected_binding_generation,
+    )?;
+    let client = state.client.lock().map_err(|error| error.to_string())?;
+    require_confirmed_live_action_binding_current(&state, &live_action_binding)?;
+    require_authenticated_conversation_origin(&state, &client, &conversation_id)?;
+    let last_read_message_id = client
+        .db()
+        .ok_or("database not initialized")?
+        .mark_conversation_read(&conversation_id, &expected_server_origin)?;
+    require_confirmed_live_action_binding_current(&state, &live_action_binding)?;
+    Ok(last_read_message_id)
 }
 
 /// Return conversation-scoped crypto quarantine without hiding locally stored
@@ -4444,6 +4472,138 @@ fn pin_and_persist_sync_conversation(
     Ok((directory, sender_key_refresh))
 }
 
+fn local_conversation_is_missing(
+    client: &VeilClient,
+    conversation_id: &str,
+) -> Result<bool, String> {
+    Ok(!client
+        .db()
+        .ok_or("database not initialized")?
+        .get_conversations()?
+        .iter()
+        .any(|conversation| conversation.id == conversation_id))
+}
+
+/// Resolve one presentation-free live hint through the exact signed REST
+/// directory. This is intentionally not a mini trust path: it reuses the same
+/// account pins, origin binding, ACL-filtered member directory and device
+/// roster admission as offline sync before any live SKDM/message can consume
+/// cryptographic state.
+fn hydrate_exact_live_conversation(
+    state: &AppState,
+    binding: &RestBinding,
+    event_app: &AuthenticatedEventAppHandle,
+    conversation_id: &str,
+) -> Result<(), String> {
+    decode_canonical_uuid("live conversation discovery id", conversation_id)?;
+    let canonical_server_origin = binding.origin.canonical_server_origin();
+    let authenticated_user_id = {
+        let client = state.client.lock().map_err(|error| error.to_string())?;
+        client.authenticated_user_id()?
+    };
+    let value = state.runtime.block_on(rest_send_json_for_binding(
+        state,
+        reqwest::Method::GET,
+        rest_api_url(
+            &canonical_server_origin,
+            &["v1", "conversations", conversation_id],
+        )?,
+        &authenticated_user_id,
+        None,
+        binding,
+    ))?;
+    let conversation: SyncConversation = serde_json::from_value(value)
+        .map_err(|error| format!("invalid exact conversation discovery response: {error}"))?;
+    if conversation.id != conversation_id {
+        return Err("exact conversation discovery changed its conversation id".to_string());
+    }
+
+    let (directory, sender_key_refresh) = pin_and_persist_sync_conversation(
+        state,
+        &authenticated_user_id,
+        &canonical_server_origin,
+        &conversation,
+        event_app,
+    )?;
+
+    let projection = {
+        let client = state.client.lock().map_err(|error| error.to_string())?;
+        client
+            .db()
+            .ok_or("database not initialized")?
+            .get_conversations()?
+            .into_iter()
+            .find(|candidate| candidate.id == conversation_id)
+            .ok_or("hydrated conversation is absent from the encrypted directory")?
+    };
+
+    // Publish the now-authoritative directory row even when a device roster is
+    // temporarily not ready. The Circle remains visible with its existing
+    // crypto quarantine instead of disappearing until an unrelated reconnect.
+    event_app.emit(
+        "veil://conversation-available",
+        serde_json::json!({
+            "conversationId": projection.id,
+            "conversationType": match projection.conv_type {
+                veil_store::models::ConversationType::DM => "dm",
+                veil_store::models::ConversationType::Group => "group",
+                veil_store::models::ConversationType::Channel => "channel",
+            },
+            "conversationName": projection.name.unwrap_or_default(),
+            "conversationPeerUserId": projection.peer_user_id,
+            "serverOrigin": projection.server_origin,
+        }),
+    )?;
+
+    if sender_key_refresh.is_some() {
+        match fetch_and_install_authenticated_device_directory(
+            state,
+            &binding.origin.canonical_server_origin(),
+            &authenticated_user_id,
+            conversation_id,
+            &directory,
+            Some(binding),
+        )? {
+            DeviceDirectoryInstallOutcome::Ready(_) => {}
+            DeviceDirectoryInstallOutcome::NotReady(reason) => {
+                return Err(format!(
+                    "live conversation device roster is not ready: {reason}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn report_live_conversation_hydration_failure(
+    state: &AppState,
+    event_app: &AuthenticatedEventAppHandle,
+    conversation_id: &str,
+    error: &str,
+) {
+    let detail = format!("live conversation directory refresh failed: {error}");
+    if let Ok(mut client) = state.client.lock() {
+        let sender_key_mode = client.is_channel_conversation(conversation_id);
+        let _ = quarantine_live_conversation(
+            state,
+            event_app,
+            &mut client,
+            conversation_id,
+            sender_key_mode,
+            "live_directory_refresh_required",
+            &detail,
+        );
+    }
+    let _ = event_app.emit(
+        "veil://error",
+        serde_json::json!({ "code": 4003, "message": detail }),
+    );
+    let _ = event_app.emit(
+        "veil://membership-refresh-required",
+        serde_json::json!({ "conversationId": conversation_id }),
+    );
+}
+
 struct OfflineConversationSyncScope<'a> {
     server_http_url: &'a str,
     authenticated_user_id: &'a str,
@@ -5535,6 +5695,40 @@ fn connect_to_server(
                             attachments,
                             security_context,
                         } => {
+                            match local_conversation_is_missing(&client, &conversation_id) {
+                                Ok(true) => {
+                                    drop(client);
+                                    if let Err(error) = hydrate_exact_live_conversation(
+                                        &state_inner,
+                                        &event_binding,
+                                        &app_handle,
+                                        &conversation_id,
+                                    ) {
+                                        report_live_conversation_hydration_failure(
+                                            &state_inner,
+                                            &app_handle,
+                                            &conversation_id,
+                                            &error,
+                                        );
+                                        continue;
+                                    }
+                                    client = match state_inner.client.lock() {
+                                        Ok(client) => client,
+                                        Err(_) => break,
+                                    };
+                                }
+                                Ok(false) => {}
+                                Err(error) => {
+                                    drop(client);
+                                    report_live_conversation_hydration_failure(
+                                        &state_inner,
+                                        &app_handle,
+                                        &conversation_id,
+                                        &error,
+                                    );
+                                    continue;
+                                }
+                            }
                             if !live_conversation_origin_is_current(
                                 &state_inner,
                                 &app_handle,
@@ -6524,6 +6718,22 @@ fn connect_to_server(
                                 }),
                             );
                         }
+                        ConnectionEvent::ConversationAvailable { conversation_id } => {
+                            drop(client);
+                            if let Err(error) = hydrate_exact_live_conversation(
+                                &state_inner,
+                                &event_binding,
+                                &app_handle,
+                                &conversation_id,
+                            ) {
+                                report_live_conversation_hydration_failure(
+                                    &state_inner,
+                                    &app_handle,
+                                    &conversation_id,
+                                    &error,
+                                );
+                            }
+                        }
                         ConnectionEvent::ServerEvent {
                             event_type,
                             server_id,
@@ -6682,6 +6892,40 @@ fn connect_to_server(
                             route,
                         } => {
                             let conversation_id = route.conversation_id.clone();
+                            match local_conversation_is_missing(&client, &conversation_id) {
+                                Ok(true) => {
+                                    drop(client);
+                                    if let Err(error) = hydrate_exact_live_conversation(
+                                        &state_inner,
+                                        &event_binding,
+                                        &app_handle,
+                                        &conversation_id,
+                                    ) {
+                                        report_live_conversation_hydration_failure(
+                                            &state_inner,
+                                            &app_handle,
+                                            &conversation_id,
+                                            &error,
+                                        );
+                                        continue;
+                                    }
+                                    client = match state_inner.client.lock() {
+                                        Ok(client) => client,
+                                        Err(_) => break,
+                                    };
+                                }
+                                Ok(false) => {}
+                                Err(error) => {
+                                    drop(client);
+                                    report_live_conversation_hydration_failure(
+                                        &state_inner,
+                                        &app_handle,
+                                        &conversation_id,
+                                        &error,
+                                    );
+                                    continue;
+                                }
+                            }
                             if !live_conversation_origin_is_current(
                                 &state_inner,
                                 &app_handle,
@@ -11361,10 +11605,23 @@ struct SearchHitDto {
     id: String,
     #[serde(rename = "conversationId")]
     conversation_id: String,
+    #[serde(rename = "conversationType")]
+    conversation_type: &'static str,
+    #[serde(rename = "conversationName")]
+    conversation_name: Option<String>,
+    #[serde(rename = "serverId")]
+    server_id: Option<String>,
     body: String,
     ts: i64,
     score: f32,
     author: Option<SearchAuthorDto>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SearchConversationMetadata {
+    conversation_type: &'static str,
+    conversation_name: Option<String>,
+    server_id: Option<String>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -11473,18 +11730,21 @@ fn get_search_coverage(state: State<'_, AppState>) -> Result<Option<SearchCovera
 fn validated_search_hit_dto(
     hit: SearchHit,
     stored: Message,
+    conversation: &veil_store::models::Conversation,
     canonical_server_origin: &str,
 ) -> Option<SearchHitDto> {
     if decode_canonical_uuid("search hit message id", &hit.id).is_err()
         || decode_canonical_uuid("search hit conversation id", &hit.conversation_id).is_err()
         || stored.id != hit.id
         || stored.conversation_id != hit.conversation_id
+        || conversation.id != hit.conversation_id
         || stored.plaintext != hit.body
         || stored.sender_key.len() != 32
         || hex::encode(&stored.sender_key) != hit.sender
     {
         return None;
     }
+    let metadata = validated_search_conversation_metadata(conversation, canonical_server_origin)?;
     let author_context = stored.author_context.map(MessageAuthorContext::wire_label);
     let author = match stored.author {
         Some(author) => {
@@ -11510,10 +11770,51 @@ fn validated_search_hit_dto(
     Some(SearchHitDto {
         id: hit.id,
         conversation_id: hit.conversation_id,
+        conversation_type: metadata.conversation_type,
+        conversation_name: metadata.conversation_name,
+        server_id: metadata.server_id,
         body: hit.body,
         ts: hit.ts,
         score: hit.score,
         author,
+    })
+}
+
+fn validated_search_conversation_metadata(
+    conversation: &veil_store::models::Conversation,
+    canonical_server_origin: &str,
+) -> Option<SearchConversationMetadata> {
+    if decode_canonical_uuid("search conversation id", &conversation.id).is_err()
+        || conversation.server_origin.as_deref() != Some(canonical_server_origin)
+    {
+        return None;
+    }
+    let (conversation_type, server_id) = match conversation.conv_type {
+        ConversationType::DM if conversation.server_id.is_none() => ("dm", None),
+        ConversationType::Group if conversation.server_id.is_none() => ("group", None),
+        ConversationType::Channel => {
+            let server_id = conversation.server_id.as_ref()?;
+            if decode_canonical_uuid("search channel server id", server_id).is_err() {
+                return None;
+            }
+            ("channel", Some(server_id.clone()))
+        }
+        _ => return None,
+    };
+    let conversation_name = conversation.name.as_ref().and_then(|name| {
+        let trimmed = name.trim();
+        if trimmed.is_empty()
+            || validate_profile_text("search conversation name", name, 512, false).is_err()
+        {
+            None
+        } else {
+            Some(name.clone())
+        }
+    });
+    Some(SearchConversationMetadata {
+        conversation_type,
+        conversation_name,
+        server_id,
     })
 }
 
@@ -11634,16 +11935,6 @@ fn search_messages(
     }
     let search_binding = authenticated_rest_binding(&state)?;
     let canonical_server_origin = search_binding.origin.canonical_server_origin();
-    let allowed_conversations: std::collections::HashSet<String> = client
-        .db()
-        .ok_or("database not initialized")?
-        .get_conversations()?
-        .into_iter()
-        .filter(|conversation| {
-            conversation.server_origin.as_deref() == Some(canonical_server_origin.as_str())
-        })
-        .map(|conversation| conversation.id)
-        .collect();
     drop(client);
     let hits = state
         .indexer
@@ -11654,17 +11945,27 @@ fn search_messages(
     }
     let client = state.client.lock().map_err(|e| e.to_string())?;
     let db = client.db().ok_or("database not initialized")?;
+    let allowed_conversations: std::collections::HashMap<String, veil_store::models::Conversation> =
+        db.get_conversations()?
+            .into_iter()
+            .filter(|conversation| {
+                conversation.server_origin.as_deref() == Some(canonical_server_origin.as_str())
+            })
+            .map(|conversation| (conversation.id.clone(), conversation))
+            .collect();
     let mut result = Vec::with_capacity(hits.len());
     for hit in hits {
-        if !allowed_conversations.contains(&hit.conversation_id) {
+        let Some(conversation) = allowed_conversations.get(&hit.conversation_id) else {
             continue;
-        }
+        };
         let Some(stored) =
             db.get_message_for_search(&hit.id, &hit.conversation_id, &canonical_server_origin)?
         else {
             continue;
         };
-        if let Some(hit) = validated_search_hit_dto(hit, stored, &canonical_server_origin) {
+        if let Some(hit) =
+            validated_search_hit_dto(hit, stored, conversation, &canonical_server_origin)
+        {
             result.push(hit);
         }
     }
@@ -12276,6 +12577,7 @@ pub fn run() {
             set_auto_lock_seconds,
             init_from_seed,
             get_conversations,
+            mark_conversation_read,
             get_conversation_crypto_diagnostics,
             get_messages,
             upload_prekeys,
@@ -12392,7 +12694,8 @@ mod e2ee_rest_tests {
         validate_live_message_security_context, validate_next_cursor,
         validate_persisted_message_conversation, validate_pinned_directory_self,
         validate_profile_avatar_jpeg, validate_rest_url, validate_search_context_session,
-        validate_server_endpoint_pair, validate_utc_rfc3339_nano, validated_search_coverage,
+        validate_server_endpoint_pair, validate_utc_rfc3339_nano,
+        validated_search_conversation_metadata, validated_search_coverage,
         validated_search_hit_dto, verify_device_directory_account_keys, AppState,
         AuthenticatedSessionScope, ConversationSyncIsolation, CurrentTargetAdmissionEvidence,
         ParsedMessageCryptoContext, PinnedDirectoryMember, PublishedSearchBinding, RestBinding,
@@ -12403,8 +12706,9 @@ mod e2ee_rest_tests {
     use ed25519_dalek::SigningKey;
     use veil_search::{SearchCoverageSnapshot, SearchDocument, SearchHit};
     use veil_store::models::{
-        AccountSnapshot, AccountSnapshotSource, Message, MessageAttachment, MessageAuthorContext,
-        MessageStatus, ProfileLocator, SearchIndexDocument,
+        AccountSnapshot, AccountSnapshotSource, Conversation, ConversationType, Message,
+        MessageAttachment, MessageAuthorContext, MessageStatus, ProfileLocator,
+        SearchIndexDocument,
     };
 
     fn authenticated_test_binding(host: &str, generation: u64) -> RestBinding {
@@ -13619,9 +13923,25 @@ mod e2ee_rest_tests {
             ts: 7,
             score: 1.0,
         };
+        let conversation = Conversation {
+            id: stored.conversation_id.clone(),
+            conv_type: ConversationType::DM,
+            peer_identity_key: Some(identity_key.to_vec()),
+            server_id: None,
+            server_origin: Some(origin.to_string()),
+            peer_user_id: Some("550e8400-e29b-41d4-a716-446655440000".to_string()),
+            name: Some("Alice".to_string()),
+            last_message_at: None,
+            unread_count: 0,
+            last_read_message_id: None,
+            created_at: "2026-07-13T12:00:00Z".to_string(),
+        };
 
-        let dto = validated_search_hit_dto(hit.clone(), stored.clone(), origin)
+        let dto = validated_search_hit_dto(hit.clone(), stored.clone(), &conversation, origin)
             .expect("exact search binding must resolve");
+        assert_eq!(dto.conversation_type, "dm");
+        assert_eq!(dto.conversation_name.as_deref(), Some("Alice"));
+        assert_eq!(dto.server_id, None);
         let author = dto.author.expect("author locator must be present");
         assert_eq!(author.canonical_server_origin, origin);
         assert_eq!(author.identity_key, hex::encode(identity_key));
@@ -13633,11 +13953,16 @@ mod e2ee_rest_tests {
 
         let mut stale_sender = hit.clone();
         stale_sender.sender = hex::encode([0x41; 32]);
-        assert!(validated_search_hit_dto(stale_sender, stored.clone(), origin).is_none());
+        assert!(
+            validated_search_hit_dto(stale_sender, stored.clone(), &conversation, origin,)
+                .is_none()
+        );
 
         let mut stale_body = hit;
         stale_body.body = "stale index plaintext".to_string();
-        assert!(validated_search_hit_dto(stale_body, stored.clone(), origin).is_none());
+        assert!(
+            validated_search_hit_dto(stale_body, stored.clone(), &conversation, origin,).is_none()
+        );
 
         let mut cross_origin_author = stored;
         cross_origin_author
@@ -13656,9 +13981,85 @@ mod e2ee_rest_tests {
                 score: 1.0,
             },
             cross_origin_author,
+            &conversation,
             origin,
         )
         .is_none());
+    }
+
+    #[test]
+    fn search_conversation_metadata_is_origin_scoped_and_has_safe_fallbacks() {
+        let origin = "https://chat.example.test:443";
+        let conversation_id = "550e8400-e29b-41d4-a716-446655440112";
+        let server_id = "550e8400-e29b-41d4-a716-446655440113";
+        let base = Conversation {
+            id: conversation_id.to_string(),
+            conv_type: ConversationType::DM,
+            peer_identity_key: Some(vec![0x31; 32]),
+            server_id: None,
+            server_origin: Some(origin.to_string()),
+            peer_user_id: Some("550e8400-e29b-41d4-a716-446655440000".to_string()),
+            name: Some("Alice".to_string()),
+            last_message_at: None,
+            unread_count: 0,
+            last_read_message_id: None,
+            created_at: "2026-07-13T12:00:00Z".to_string(),
+        };
+
+        let dm = validated_search_conversation_metadata(&base, origin).expect("DM metadata");
+        assert_eq!(dm.conversation_type, "dm");
+        assert_eq!(dm.conversation_name.as_deref(), Some("Alice"));
+        assert_eq!(dm.server_id, None);
+
+        let group = Conversation {
+            conv_type: ConversationType::Group,
+            peer_identity_key: None,
+            peer_user_id: None,
+            name: Some("Trusted circle".to_string()),
+            ..base.clone()
+        };
+        assert_eq!(
+            validated_search_conversation_metadata(&group, origin)
+                .expect("Circle metadata")
+                .conversation_type,
+            "group",
+        );
+
+        let channel = Conversation {
+            conv_type: ConversationType::Channel,
+            peer_identity_key: None,
+            peer_user_id: None,
+            server_id: Some(server_id.to_string()),
+            name: Some("general".to_string()),
+            ..base.clone()
+        };
+        let channel_metadata =
+            validated_search_conversation_metadata(&channel, origin).expect("Room metadata");
+        assert_eq!(channel_metadata.conversation_type, "channel");
+        assert_eq!(channel_metadata.server_id.as_deref(), Some(server_id));
+
+        let unsafe_name = Conversation {
+            name: Some("safe\u{202e}spoof".to_string()),
+            ..base.clone()
+        };
+        assert_eq!(
+            validated_search_conversation_metadata(&unsafe_name, origin)
+                .expect("unsafe presentation falls back without losing the hit")
+                .conversation_name,
+            None,
+        );
+        assert!(
+            validated_search_conversation_metadata(&base, "https://other.example.test:443",)
+                .is_none()
+        );
+
+        let invalid_non_channel_server = Conversation {
+            server_id: Some(server_id.to_string()),
+            ..base
+        };
+        assert!(
+            validated_search_conversation_metadata(&invalid_non_channel_server, origin).is_none()
+        );
     }
 
     #[test]

@@ -125,7 +125,7 @@ func (x MessageEvent_EventType) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use MessageEvent_EventType.Descriptor instead.
 func (MessageEvent_EventType) EnumDescriptor() ([]byte, []int) {
-	return file_veil_v1_chat_proto_rawDescGZIP(), []int{7, 0}
+	return file_veil_v1_chat_proto_rawDescGZIP(), []int{8, 0}
 }
 
 // Клиент → сервер: отправка сообщения
@@ -547,6 +547,54 @@ func (x *MessageRead) GetTimestamp() uint64 {
 	return 0
 }
 
+// Server -> client: authenticated hint that a conversation has just become
+// available to this account. The UUID is presentation-free and is never
+// trusted as directory metadata; clients fetch the exact membership-scoped
+// REST projection before accepting the conversation or any Sender-Key state.
+type ConversationAvailable struct {
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	ConversationId string                 `protobuf:"bytes,1,opt,name=conversation_id,json=conversationId,proto3" json:"conversation_id,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
+func (x *ConversationAvailable) Reset() {
+	*x = ConversationAvailable{}
+	mi := &file_veil_v1_chat_proto_msgTypes[5]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ConversationAvailable) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ConversationAvailable) ProtoMessage() {}
+
+func (x *ConversationAvailable) ProtoReflect() protoreflect.Message {
+	mi := &file_veil_v1_chat_proto_msgTypes[5]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ConversationAvailable.ProtoReflect.Descriptor instead.
+func (*ConversationAvailable) Descriptor() ([]byte, []int) {
+	return file_veil_v1_chat_proto_rawDescGZIP(), []int{5}
+}
+
+func (x *ConversationAvailable) GetConversationId() string {
+	if x != nil {
+		return x.ConversationId
+	}
+	return ""
+}
+
 // Клиент → сервер: редактирование сообщения
 type EditMessage struct {
 	state          protoimpl.MessageState `protogen:"open.v1"`
@@ -560,7 +608,7 @@ type EditMessage struct {
 
 func (x *EditMessage) Reset() {
 	*x = EditMessage{}
-	mi := &file_veil_v1_chat_proto_msgTypes[5]
+	mi := &file_veil_v1_chat_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -572,7 +620,7 @@ func (x *EditMessage) String() string {
 func (*EditMessage) ProtoMessage() {}
 
 func (x *EditMessage) ProtoReflect() protoreflect.Message {
-	mi := &file_veil_v1_chat_proto_msgTypes[5]
+	mi := &file_veil_v1_chat_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -585,7 +633,7 @@ func (x *EditMessage) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EditMessage.ProtoReflect.Descriptor instead.
 func (*EditMessage) Descriptor() ([]byte, []int) {
-	return file_veil_v1_chat_proto_rawDescGZIP(), []int{5}
+	return file_veil_v1_chat_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *EditMessage) GetMessageId() string {
@@ -627,7 +675,7 @@ type DeleteMessage struct {
 
 func (x *DeleteMessage) Reset() {
 	*x = DeleteMessage{}
-	mi := &file_veil_v1_chat_proto_msgTypes[6]
+	mi := &file_veil_v1_chat_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -639,7 +687,7 @@ func (x *DeleteMessage) String() string {
 func (*DeleteMessage) ProtoMessage() {}
 
 func (x *DeleteMessage) ProtoReflect() protoreflect.Message {
-	mi := &file_veil_v1_chat_proto_msgTypes[6]
+	mi := &file_veil_v1_chat_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -652,7 +700,7 @@ func (x *DeleteMessage) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteMessage.ProtoReflect.Descriptor instead.
 func (*DeleteMessage) Descriptor() ([]byte, []int) {
-	return file_veil_v1_chat_proto_rawDescGZIP(), []int{6}
+	return file_veil_v1_chat_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *DeleteMessage) GetMessageId() string {
@@ -704,7 +752,7 @@ type MessageEvent struct {
 
 func (x *MessageEvent) Reset() {
 	*x = MessageEvent{}
-	mi := &file_veil_v1_chat_proto_msgTypes[7]
+	mi := &file_veil_v1_chat_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -716,7 +764,7 @@ func (x *MessageEvent) String() string {
 func (*MessageEvent) ProtoMessage() {}
 
 func (x *MessageEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_veil_v1_chat_proto_msgTypes[7]
+	mi := &file_veil_v1_chat_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -729,7 +777,7 @@ func (x *MessageEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MessageEvent.ProtoReflect.Descriptor instead.
 func (*MessageEvent) Descriptor() ([]byte, []int) {
-	return file_veil_v1_chat_proto_rawDescGZIP(), []int{7}
+	return file_veil_v1_chat_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *MessageEvent) GetEventType() MessageEvent_EventType {
@@ -892,7 +940,7 @@ type ReactionUpdate struct {
 
 func (x *ReactionUpdate) Reset() {
 	*x = ReactionUpdate{}
-	mi := &file_veil_v1_chat_proto_msgTypes[8]
+	mi := &file_veil_v1_chat_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -904,7 +952,7 @@ func (x *ReactionUpdate) String() string {
 func (*ReactionUpdate) ProtoMessage() {}
 
 func (x *ReactionUpdate) ProtoReflect() protoreflect.Message {
-	mi := &file_veil_v1_chat_proto_msgTypes[8]
+	mi := &file_veil_v1_chat_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -917,7 +965,7 @@ func (x *ReactionUpdate) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReactionUpdate.ProtoReflect.Descriptor instead.
 func (*ReactionUpdate) Descriptor() ([]byte, []int) {
-	return file_veil_v1_chat_proto_rawDescGZIP(), []int{8}
+	return file_veil_v1_chat_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *ReactionUpdate) GetMessageId() string {
@@ -963,7 +1011,7 @@ type ReactionEvent struct {
 
 func (x *ReactionEvent) Reset() {
 	*x = ReactionEvent{}
-	mi := &file_veil_v1_chat_proto_msgTypes[9]
+	mi := &file_veil_v1_chat_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -975,7 +1023,7 @@ func (x *ReactionEvent) String() string {
 func (*ReactionEvent) ProtoMessage() {}
 
 func (x *ReactionEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_veil_v1_chat_proto_msgTypes[9]
+	mi := &file_veil_v1_chat_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -988,7 +1036,7 @@ func (x *ReactionEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReactionEvent.ProtoReflect.Descriptor instead.
 func (*ReactionEvent) Descriptor() ([]byte, []int) {
-	return file_veil_v1_chat_proto_rawDescGZIP(), []int{9}
+	return file_veil_v1_chat_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *ReactionEvent) GetMessageId() string {
@@ -1048,7 +1096,7 @@ type PreKeyBundle struct {
 
 func (x *PreKeyBundle) Reset() {
 	*x = PreKeyBundle{}
-	mi := &file_veil_v1_chat_proto_msgTypes[10]
+	mi := &file_veil_v1_chat_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1060,7 +1108,7 @@ func (x *PreKeyBundle) String() string {
 func (*PreKeyBundle) ProtoMessage() {}
 
 func (x *PreKeyBundle) ProtoReflect() protoreflect.Message {
-	mi := &file_veil_v1_chat_proto_msgTypes[10]
+	mi := &file_veil_v1_chat_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1073,7 +1121,7 @@ func (x *PreKeyBundle) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PreKeyBundle.ProtoReflect.Descriptor instead.
 func (*PreKeyBundle) Descriptor() ([]byte, []int) {
-	return file_veil_v1_chat_proto_rawDescGZIP(), []int{10}
+	return file_veil_v1_chat_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *PreKeyBundle) GetIdentityKey() []byte {
@@ -1129,7 +1177,7 @@ type PreKeyRequest struct {
 
 func (x *PreKeyRequest) Reset() {
 	*x = PreKeyRequest{}
-	mi := &file_veil_v1_chat_proto_msgTypes[11]
+	mi := &file_veil_v1_chat_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1141,7 +1189,7 @@ func (x *PreKeyRequest) String() string {
 func (*PreKeyRequest) ProtoMessage() {}
 
 func (x *PreKeyRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_veil_v1_chat_proto_msgTypes[11]
+	mi := &file_veil_v1_chat_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1154,7 +1202,7 @@ func (x *PreKeyRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PreKeyRequest.ProtoReflect.Descriptor instead.
 func (*PreKeyRequest) Descriptor() ([]byte, []int) {
-	return file_veil_v1_chat_proto_rawDescGZIP(), []int{11}
+	return file_veil_v1_chat_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *PreKeyRequest) GetTargetIdentityKey() []byte {
@@ -1202,7 +1250,7 @@ type SenderKeyDistribution struct {
 
 func (x *SenderKeyDistribution) Reset() {
 	*x = SenderKeyDistribution{}
-	mi := &file_veil_v1_chat_proto_msgTypes[12]
+	mi := &file_veil_v1_chat_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1214,7 +1262,7 @@ func (x *SenderKeyDistribution) String() string {
 func (*SenderKeyDistribution) ProtoMessage() {}
 
 func (x *SenderKeyDistribution) ProtoReflect() protoreflect.Message {
-	mi := &file_veil_v1_chat_proto_msgTypes[12]
+	mi := &file_veil_v1_chat_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1227,7 +1275,7 @@ func (x *SenderKeyDistribution) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SenderKeyDistribution.ProtoReflect.Descriptor instead.
 func (*SenderKeyDistribution) Descriptor() ([]byte, []int) {
-	return file_veil_v1_chat_proto_rawDescGZIP(), []int{12}
+	return file_veil_v1_chat_proto_rawDescGZIP(), []int{13}
 }
 
 func (x *SenderKeyDistribution) GetConversationId() string {
@@ -1373,7 +1421,7 @@ type SenderKeyReceipt struct {
 
 func (x *SenderKeyReceipt) Reset() {
 	*x = SenderKeyReceipt{}
-	mi := &file_veil_v1_chat_proto_msgTypes[13]
+	mi := &file_veil_v1_chat_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1385,7 +1433,7 @@ func (x *SenderKeyReceipt) String() string {
 func (*SenderKeyReceipt) ProtoMessage() {}
 
 func (x *SenderKeyReceipt) ProtoReflect() protoreflect.Message {
-	mi := &file_veil_v1_chat_proto_msgTypes[13]
+	mi := &file_veil_v1_chat_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1398,7 +1446,7 @@ func (x *SenderKeyReceipt) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SenderKeyReceipt.ProtoReflect.Descriptor instead.
 func (*SenderKeyReceipt) Descriptor() ([]byte, []int) {
-	return file_veil_v1_chat_proto_rawDescGZIP(), []int{13}
+	return file_veil_v1_chat_proto_rawDescGZIP(), []int{14}
 }
 
 func (x *SenderKeyReceipt) GetConversationId() string {
@@ -1495,7 +1543,9 @@ const file_veil_v1_chat_proto_rawDesc = "" +
 	"\x0fconversation_id\x18\x01 \x01(\tR\x0econversationId\x12 \n" +
 	"\flast_read_id\x18\x02 \x01(\tR\n" +
 	"lastReadId\x12\x1c\n" +
-	"\ttimestamp\x18\x03 \x01(\x04R\ttimestamp\"\x9b\x01\n" +
+	"\ttimestamp\x18\x03 \x01(\x04R\ttimestamp\"@\n" +
+	"\x15ConversationAvailable\x12'\n" +
+	"\x0fconversation_id\x18\x01 \x01(\tR\x0econversationId\"\x9b\x01\n" +
 	"\vEditMessage\x12\x1d\n" +
 	"\n" +
 	"message_id\x18\x01 \x01(\tR\tmessageId\x12'\n" +
@@ -1627,7 +1677,7 @@ func file_veil_v1_chat_proto_rawDescGZIP() []byte {
 }
 
 var file_veil_v1_chat_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
-var file_veil_v1_chat_proto_msgTypes = make([]protoimpl.MessageInfo, 14)
+var file_veil_v1_chat_proto_msgTypes = make([]protoimpl.MessageInfo, 15)
 var file_veil_v1_chat_proto_goTypes = []any{
 	(MessageType)(0),              // 0: veil.v1.MessageType
 	(MessageEvent_EventType)(0),   // 1: veil.v1.MessageEvent.EventType
@@ -1636,15 +1686,16 @@ var file_veil_v1_chat_proto_goTypes = []any{
 	(*MessageAck)(nil),            // 4: veil.v1.MessageAck
 	(*MessageDelivered)(nil),      // 5: veil.v1.MessageDelivered
 	(*MessageRead)(nil),           // 6: veil.v1.MessageRead
-	(*EditMessage)(nil),           // 7: veil.v1.EditMessage
-	(*DeleteMessage)(nil),         // 8: veil.v1.DeleteMessage
-	(*MessageEvent)(nil),          // 9: veil.v1.MessageEvent
-	(*ReactionUpdate)(nil),        // 10: veil.v1.ReactionUpdate
-	(*ReactionEvent)(nil),         // 11: veil.v1.ReactionEvent
-	(*PreKeyBundle)(nil),          // 12: veil.v1.PreKeyBundle
-	(*PreKeyRequest)(nil),         // 13: veil.v1.PreKeyRequest
-	(*SenderKeyDistribution)(nil), // 14: veil.v1.SenderKeyDistribution
-	(*SenderKeyReceipt)(nil),      // 15: veil.v1.SenderKeyReceipt
+	(*ConversationAvailable)(nil), // 7: veil.v1.ConversationAvailable
+	(*EditMessage)(nil),           // 8: veil.v1.EditMessage
+	(*DeleteMessage)(nil),         // 9: veil.v1.DeleteMessage
+	(*MessageEvent)(nil),          // 10: veil.v1.MessageEvent
+	(*ReactionUpdate)(nil),        // 11: veil.v1.ReactionUpdate
+	(*ReactionEvent)(nil),         // 12: veil.v1.ReactionEvent
+	(*PreKeyBundle)(nil),          // 13: veil.v1.PreKeyBundle
+	(*PreKeyRequest)(nil),         // 14: veil.v1.PreKeyRequest
+	(*SenderKeyDistribution)(nil), // 15: veil.v1.SenderKeyDistribution
+	(*SenderKeyReceipt)(nil),      // 16: veil.v1.SenderKeyReceipt
 }
 var file_veil_v1_chat_proto_depIdxs = []int32{
 	0, // 0: veil.v1.SendMessage.msg_type:type_name -> veil.v1.MessageType
@@ -1666,16 +1717,16 @@ func file_veil_v1_chat_proto_init() {
 	}
 	file_veil_v1_chat_proto_msgTypes[0].OneofWrappers = []any{}
 	file_veil_v1_chat_proto_msgTypes[2].OneofWrappers = []any{}
-	file_veil_v1_chat_proto_msgTypes[7].OneofWrappers = []any{}
-	file_veil_v1_chat_proto_msgTypes[10].OneofWrappers = []any{}
+	file_veil_v1_chat_proto_msgTypes[8].OneofWrappers = []any{}
 	file_veil_v1_chat_proto_msgTypes[11].OneofWrappers = []any{}
+	file_veil_v1_chat_proto_msgTypes[12].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_veil_v1_chat_proto_rawDesc), len(file_veil_v1_chat_proto_rawDesc)),
 			NumEnums:      2,
-			NumMessages:   14,
+			NumMessages:   15,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

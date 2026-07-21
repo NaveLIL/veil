@@ -219,6 +219,29 @@ interface EmojiEntry {
   category: EmojiCategory;
 }
 
+// Segoe UI Emoji coverage differs across supported Windows releases. Keep the
+// native-text picker on the Emoji 11 baseline and omit later additions that
+// render as tofu on older Windows builds. This list is deliberately explicit:
+// future additions must either ship with a bundled renderer or be reviewed for
+// the supported Windows baseline.
+const WINDOWS_NATIVE_EMOJI_EXCLUSIONS = new Set([
+  "🫡", "🥲", "🫢", "🫣", "🫥", "🥸", "🫤", "🥹", "🥱",
+  "🫱", "🫲", "🫳", "🫴", "🫷", "🫸", "🤌", "🤏", "🫰", "🫵", "🫶",
+  "🦾", "🦿", "🦻", "🫀", "🫁", "🤍", "🤎", "❤️‍🔥", "❤️‍🩹", "🐻‍❄️",
+  "🪱", "🪰", "🪴", "🫐", "🫑", "🫒", "🧄", "🧅", "🫓", "🧇", "🧃",
+  "🪕", "🏳️‍⚧️",
+]);
+
+export function isDesktopEmojiCompatible(emoji: string): boolean {
+  return !WINDOWS_NATIVE_EMOJI_EXCLUSIONS.has(emoji);
+}
+
+function compatibleEntries(category: EmojiCategory): EmojiEntry[] {
+  return (category.emojis as unknown as string[])
+    .filter(isDesktopEmojiCompatible)
+    .map((emoji) => ({ emoji, category }));
+}
+
 const portalHost = () =>
   (typeof document !== "undefined" && document.getElementById("island-portal")) || undefined;
 
@@ -227,10 +250,13 @@ function emojiName(entry: EmojiEntry): string {
 }
 
 const EmojiGrid: Component<{ entries: EmojiEntry[]; onSelect: (emoji: string) => void }> = (props) => (
-  <div style={{
+  <div data-emoji-grid style={{
     display: "grid",
-    "grid-template-columns": "repeat(8, 1fr)",
+    width: "100%",
+    "min-width": "0",
+    "grid-template-columns": "repeat(8, minmax(0, 1fr))",
     gap: "2px",
+    overflow: "hidden",
   }}>
     <For each={props.entries}>
       {(entry) => (
@@ -238,9 +264,10 @@ const EmojiGrid: Component<{ entries: EmojiEntry[]; onSelect: (emoji: string) =>
           type="button"
           aria-label={`Insert ${emojiName(entry)}`}
           title={emojiName(entry)}
+          data-emoji-value={entry.emoji}
           onClick={() => props.onSelect(entry.emoji)}
           style={{
-            width: "100%", "aspect-ratio": "1",
+            width: "100%", "min-width": "0", "aspect-ratio": "1", overflow: "hidden",
             "border-radius": "6px", border: "none",
             background: "transparent", cursor: "pointer",
             "font-size": "22px", display: "flex",
@@ -256,7 +283,10 @@ const EmojiGrid: Component<{ entries: EmojiEntry[]; onSelect: (emoji: string) =>
             event.currentTarget.style.transform = "scale(1)";
           }}
         >
-          <span aria-hidden="true">{entry.emoji}</span>
+          <span aria-hidden="true" style={{
+            display: "block", "max-width": "100%", "line-height": "1",
+            "font-family": "'Segoe UI Emoji', 'Apple Color Emoji', 'Noto Color Emoji', sans-serif",
+          }}>{entry.emoji}</span>
         </button>
       )}
     </For>
@@ -278,7 +308,7 @@ const EmojiPicker: Component<EmojiPickerProps> = (props) => {
     const seen = new Set<string>();
     const entries: EmojiEntry[] = [];
     for (const category of CATEGORIES as unknown as EmojiCategory[]) {
-      for (const emoji of category.emojis as unknown as string[]) {
+      for (const { emoji } of compatibleEntries(category)) {
         if (seen.has(emoji)) continue;
         seen.add(emoji);
         entries.push({ emoji, category });
@@ -446,7 +476,10 @@ const EmojiPicker: Component<EmojiPickerProps> = (props) => {
               </For>
             </KTabs.List>
 
-            <div style={{ flex: "1", "overflow-y": "auto", padding: "8px 10px", "min-height": "0" }}>
+            <div data-emoji-scroll-region style={{
+              flex: "1", "overflow-y": "auto", "overflow-x": "hidden",
+              padding: "8px 10px", "min-height": "0", "min-width": "0",
+            }}>
               <Show when={search().trim()}>
                 <section aria-label="Emoji search results">
                   <Show
@@ -476,7 +509,7 @@ const EmojiPicker: Component<EmojiPickerProps> = (props) => {
                         {cat.label}
                       </div>
                       <EmojiGrid
-                        entries={(cat.emojis as unknown as string[]).map((emoji) => ({ emoji, category: cat }))}
+                        entries={compatibleEntries(cat)}
                         onSelect={selectEmoji}
                       />
                     </KTabs.Content>

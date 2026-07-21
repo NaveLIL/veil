@@ -25,6 +25,13 @@ type Config struct {
 	// it to build Location headers; it must match the route mount.
 	BasePath string
 
+	// RespectForwardedHeaders allows tusd to advertise the public proxy
+	// origin in Location headers. It must only be enabled when every request
+	// reaches the gateway through a trusted reverse proxy (or the gateway is
+	// otherwise unreachable directly). The process-wide
+	// VEIL_TRUST_PROXY_HEADERS switch carries that deployment guarantee.
+	RespectForwardedHeaders bool
+
 	// MaxUploadSize is the per-upload ciphertext byte cap. Zero disables the
 	// cap (tusd will allow any single upload).
 	MaxUploadSize int64
@@ -57,8 +64,12 @@ type Config struct {
 // silently fall back to defaults so a typo can't take the gateway down.
 func LoadConfigFromEnv() Config {
 	cfg := Config{
-		LocalDir:             envOrDefault("UPLOAD_LOCAL_DIR", "/var/veil/uploads"),
-		BasePath:             "/v1/uploads/files/",
+		LocalDir: envOrDefault("UPLOAD_LOCAL_DIR", "/var/veil/uploads"),
+		BasePath: "/v1/uploads/files/",
+		RespectForwardedHeaders: envBoolOrDefault(
+			"VEIL_TRUST_PROXY_HEADERS",
+			false,
+		),
 		MaxUploadSize:        envInt64OrDefault("UPLOAD_MAX_BYTES", defaultMaxUploadSize),
 		QuotaWindow:          envDurationOrDefault("UPLOAD_QUOTA_WINDOW", 24*time.Hour),
 		UserDailyQuota:       envInt64OrDefault("UPLOAD_USER_DAILY_QUOTA_BYTES", 5<<30), // 5 GiB
@@ -68,6 +79,18 @@ func LoadConfigFromEnv() Config {
 		TokenTTL:             envDurationOrDefault("UPLOAD_TOKEN_TTL", DefaultTokenTTL),
 	}
 	return cfg
+}
+
+func envBoolOrDefault(key string, fallback bool) bool {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return fallback
+	}
+	parsed, err := strconv.ParseBool(v)
+	if err != nil {
+		return fallback
+	}
+	return parsed
 }
 
 func envOrDefault(key, fallback string) string {
