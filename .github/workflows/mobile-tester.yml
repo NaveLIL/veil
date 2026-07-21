@@ -38,7 +38,7 @@ jobs:
       VEIL_ANDROID_PRODUCTION_CERT_SHA256: ${{ secrets.VEIL_ANDROID_PRODUCTION_CERT_SHA256 || vars.VEIL_ANDROID_PRODUCTION_CERT_SHA256 }}
     steps:
       - name: Check out requested source commit
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
 
@@ -131,7 +131,7 @@ jobs:
         run: pnpm test:android-tester-apk-verifier
 
       - name: Set up Protocol Buffers compiler
-        uses: arduino/setup-protoc@f4d5893b897028ff5739576ea0409746887fa536 # v3.0.0
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
         with:
           version: "34.1"
           repo-token: ${{ secrets.GITHUB_TOKEN }}

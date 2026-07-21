@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"bytes"
+	"context"
 	"net/http"
 	"testing"
 	"time"
@@ -98,7 +99,7 @@ func TestInvalidSendMessageIDIsRejectedWithoutReflection(t *testing.T) {
 		identityKey:   bytes.Repeat([]byte{0x41}, 32),
 		send:          make(chan outboundBatch, 1),
 	}
-	client.handleSendMessage(nil, 93, &pb.SendMessage{
+	client.handleSendMessage(context.Background(), 93, &pb.SendMessage{
 		ClientMessageId: "ABCDEFAB-CDEF-4ABC-8DEF-ABCDEFABCDEF",
 	})
 	got := decodePublicErrorEnvelope(t, <-client.send).GetError()

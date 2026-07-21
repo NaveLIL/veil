@@ -56,19 +56,20 @@ func TestWebSocketAuthV3DeclarationsAreAppendOnly(t *testing.T) {
 		}
 	}
 
-	// Envelope had 41 fields before this additive contract. Appending the v3
-	// oneof declarations preserves every legacy field's reflection index.
+	// The integrated Envelope has 42 non-v3 fields, including the additive
+	// ConversationAvailable discovery hint. The v3 declarations must remain the
+	// final three fields so later additions cannot silently split their block.
 	envelopeFields := pb.File_veil_v1_envelope_proto.Messages().ByName("Envelope").Fields()
-	if envelopeFields.Len() != 44 {
-		t.Fatalf("Envelope field descriptor count = %d, want 44", envelopeFields.Len())
+	if envelopeFields.Len() != 45 {
+		t.Fatalf("Envelope field descriptor count = %d, want 45", envelopeFields.Len())
 	}
 	for offset, name := range []protoreflect.Name{
 		"auth_challenge_v3",
 		"auth_response_v3",
 		"auth_result_v3",
 	} {
-		if got := envelopeFields.Get(41 + offset).Name(); got != name {
-			t.Fatalf("Envelope descriptor index %d = %s, want %s", 41+offset, got, name)
+		if got := envelopeFields.Get(42 + offset).Name(); got != name {
+			t.Fatalf("Envelope descriptor index %d = %s, want %s", 42+offset, got, name)
 		}
 	}
 }
