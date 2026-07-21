@@ -120,7 +120,7 @@ services:
         hard: 65536
 
   ntfy:
-    image: "${VEIL_NTFY_IMAGE:-binwiederhier/ntfy:v2.23.0}"
+    image: "${VEIL_NTFY_IMAGE:-binwiederhier/ntfy:v2.26.0}"
     profiles: ["push"]
     restart: unless-stopped
     command: serve
