@@ -5306,12 +5306,14 @@ impl VeilDb {
         server_timestamp: Option<i64>,
         reply_to_id: Option<&str>,
     ) -> Result<(), String> {
-        let tx = self
-            .conn
-            .unchecked_transaction()
-            .map_err(|e| format!("begin message persistence: {e}"))?;
-        let inserted = tx
-            .execute(
+        // This helper is used both as a standalone message write and inside
+        // the client's atomic receive savepoint. A nested BEGIN transaction
+        // is rejected by SQLite, while a SAVEPOINT composes in both cases and
+        // still keeps the message row and unread counter all-or-nothing.
+        run_savepoint(&self.conn, "veil_insert_message", || {
+            let inserted = self
+                .conn
+                .execute(
                 "INSERT OR IGNORE INTO messages (id, conversation_id, sender_key, plaintext, is_outgoing, status, server_timestamp, reply_to_id)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 rusqlite::params![
@@ -5327,22 +5329,23 @@ impl VeilDb {
             )
             .map_err(|e| format!("insert message: {e}"))?;
 
-        if inserted == 1 {
-            tx.execute(
-                "UPDATE conversations
+            if inserted == 1 {
+                self.conn
+                    .execute(
+                        "UPDATE conversations
                      SET last_message_at = datetime('now'),
                          unread_count = CASE
                            WHEN ?2 = 0 THEN MIN(unread_count + 1, 2147483647)
                            ELSE unread_count
                          END
                      WHERE id = ?1",
-                rusqlite::params![conversation_id, is_outgoing as u8],
-            )
-            .map_err(|e| format!("update conversation message state: {e}"))?;
-        }
+                        rusqlite::params![conversation_id, is_outgoing as u8],
+                    )
+                    .map_err(|e| format!("update conversation message state: {e}"))?;
+            }
 
-        tx.commit()
-            .map_err(|e| format!("commit message persistence: {e}"))
+            Ok(())
+        })
     }
 
     /// Mark the complete currently-persisted timeline read for one exact
@@ -10758,6 +10761,26 @@ mod tests {
         let read = db.get_conversations().unwrap().remove(0);
         assert_eq!(read.unread_count, 0);
         assert_eq!(read.last_read_message_id.as_deref(), Some(OUTGOING));
+
+        // Atomic inbound receive owns an outer savepoint. Message persistence
+        // must nest beneath it without publishing either the row or unread
+        // increment when the enclosing cryptographic operation rolls back.
+        db.begin_receive_savepoint().unwrap();
+        db.insert_message(
+            INCOMING_TWO,
+            CONVERSATION,
+            &[0x11; 32],
+            "second",
+            false,
+            Some(30),
+            None,
+        )
+        .unwrap();
+        assert!(db.message_exists(INCOMING_TWO).unwrap());
+        assert_eq!(db.get_conversations().unwrap()[0].unread_count, 1);
+        db.rollback_receive_savepoint().unwrap();
+        assert!(!db.message_exists(INCOMING_TWO).unwrap());
+        assert_eq!(db.get_conversations().unwrap()[0].unread_count, 0);
 
         db.insert_message(
             INCOMING_TWO,
