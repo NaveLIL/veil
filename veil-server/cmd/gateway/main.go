@@ -204,6 +204,9 @@ func main() {
 	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
 		gateway.HandleWebSocket(hub, w, r)
 	})
+	mux.HandleFunc("/v3/events", func(w http.ResponseWriter, r *http.Request) {
+		gateway.HandleWebSocketV3(hub, w, r)
+	})
 
 	// Servers / Channels / Roles / Invites REST endpoints
 	serversSvc := servers.NewService(database, hub)

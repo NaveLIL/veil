@@ -30,9 +30,9 @@ use crate::device_identity::{
 };
 use crate::protocol::proto;
 
-const MAX_RETAINED_SKDM_EVENTS: usize = 2_048;
-const MAX_RETAINED_SKDM_WIRE_TOTAL_BYTES: usize = 4 * 1024 * 1024;
-const MAX_RETAINED_SKDM_METADATA_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_RETAINED_SKDM_EVENTS: usize = 2_048;
+pub(crate) const MAX_RETAINED_SKDM_WIRE_TOTAL_BYTES: usize = 4 * 1024 * 1024;
+pub(crate) const MAX_RETAINED_SKDM_METADATA_BYTES: usize = 1024 * 1024;
 const MAX_RETAINED_SKDM_WIRE_BYTES: usize = 4_096;
 const AUTH_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 const OUTBOUND_QUEUE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -90,21 +90,21 @@ pub struct ConnectionConnectErrorV1 {
 }
 
 impl ConnectionConnectErrorV1 {
-    fn retryable_transport(detail: impl Into<String>) -> Self {
+    pub(crate) fn retryable_transport(detail: impl Into<String>) -> Self {
         Self {
             stop: ConnectionConnectStopV1::RetryableTransport,
             detail: detail.into(),
         }
     }
 
-    fn authentication_rejected() -> Self {
+    pub(crate) fn authentication_rejected() -> Self {
         Self {
             stop: ConnectionConnectStopV1::AuthenticationRejected,
             detail: "authentication failed".to_string(),
         }
     }
 
-    fn registration_closed() -> Self {
+    pub(crate) fn registration_closed() -> Self {
         Self {
             stop: ConnectionConnectStopV1::RegistrationClosed,
             detail: "node access registration is closed; a valid access pass is required"
@@ -112,14 +112,14 @@ impl ConnectionConnectErrorV1 {
         }
     }
 
-    fn invite_invalid() -> Self {
+    pub(crate) fn invite_invalid() -> Self {
         Self {
             stop: ConnectionConnectStopV1::InviteInvalid,
             detail: "node access pass is invalid, expired, or already used".to_string(),
         }
     }
 
-    fn epoch_invalid(detail: impl Into<String>) -> Self {
+    pub(crate) fn epoch_invalid(detail: impl Into<String>) -> Self {
         Self {
             stop: ConnectionConnectStopV1::EpochInvalid,
             detail: detail.into(),
@@ -211,7 +211,7 @@ fn websocket_close_detail_v1(context: &'static str, code: Option<CloseCode>) -> 
     }
 }
 
-fn classify_websocket_handshake_error_v1(
+pub(crate) fn classify_websocket_handshake_error_v1(
     context: &'static str,
     error: tokio_tungstenite::tungstenite::Error,
 ) -> ConnectionConnectErrorV1 {
@@ -230,7 +230,7 @@ fn classify_websocket_handshake_error_v1(
     }
 }
 
-fn classify_websocket_handshake_close_v1(
+pub(crate) fn classify_websocket_handshake_close_v1(
     context: &'static str,
     code: Option<CloseCode>,
 ) -> ConnectionConnectErrorV1 {
@@ -343,7 +343,7 @@ fn websocket_tls_connector_v1() -> Result<Connector, ConnectionConnectErrorV1> {
     Ok(Connector::Rustls(Arc::new(config)))
 }
 
-fn websocket_connector_for_validated_url_v1(
+pub(crate) fn websocket_connector_for_validated_url_v1(
     url: &url::Url,
 ) -> Result<Connector, ConnectionConnectErrorV1> {
     match url.scheme() {
@@ -685,6 +685,12 @@ pub enum ConnectionEventBufferErrorV1 {
     },
 }
 
+impl ConnectionEventBufferErrorV1 {
+    pub fn is_retryable_transport(&self) -> bool {
+        matches!(self, Self::TransportEpochEnded)
+    }
+}
+
 impl fmt::Display for ConnectionEventBufferErrorV1 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -1007,7 +1013,7 @@ pub(crate) struct ConnectionEventBudgetV1 {
 }
 
 impl ConnectionEventBudgetV1 {
-    fn production() -> Self {
+    pub(crate) fn production() -> Self {
         Self::with_limits(LIVE_EVENT_QUEUE_CAPACITY, LIVE_EVENT_RETAINED_BYTES)
     }
 
@@ -1129,7 +1135,7 @@ enum ConnectionTerminalCauseV1 {
 }
 
 #[derive(Default)]
-struct ConnectionTerminalStateV1 {
+pub(crate) struct ConnectionTerminalStateV1 {
     inner: StdMutex<ConnectionTerminalInnerV1>,
     notify: Notify,
 }
@@ -1237,13 +1243,13 @@ impl ConnectionTerminalStateV1 {
 }
 
 #[derive(Clone)]
-struct ConnectionEventSenderV1 {
-    sender: mpsc::Sender<BudgetedConnectionEventV1>,
-    budget: ConnectionEventBudgetV1,
+pub(crate) struct ConnectionEventSenderV1 {
+    pub(crate) sender: mpsc::Sender<BudgetedConnectionEventV1>,
+    pub(crate) budget: ConnectionEventBudgetV1,
 }
 
 impl ConnectionEventSenderV1 {
-    async fn send(&self, event: ConnectionEvent) -> Result<(), ConnectionEventBufferErrorV1> {
+    pub(crate) async fn send(&self, event: ConnectionEvent) -> Result<(), ConnectionEventBufferErrorV1> {
         let event = self.budget.try_wrap(event)?;
         self.sender
             .send(event)
@@ -1253,8 +1259,8 @@ impl ConnectionEventSenderV1 {
 }
 
 pub struct ConnectionEventReceiverV1 {
-    receiver: mpsc::Receiver<BudgetedConnectionEventV1>,
-    terminal: Arc<ConnectionTerminalStateV1>,
+    pub(crate) receiver: mpsc::Receiver<BudgetedConnectionEventV1>,
+    pub(crate) terminal: Arc<ConnectionTerminalStateV1>,
 }
 
 impl ConnectionEventReceiverV1 {
@@ -1402,7 +1408,7 @@ impl TestOnlyAuthenticatedQueuedConnectionV1 {
     }
 }
 
-fn signal_disconnected(
+pub(crate) fn signal_disconnected(
     terminal: &ConnectionTerminalStateV1,
     shutdown: &watch::Sender<bool>,
     reason: String,
@@ -1416,7 +1422,7 @@ fn signal_disconnected(
     let _ = shutdown.send(true);
 }
 
-fn signal_websocket_error_v1(
+pub(crate) fn signal_websocket_error_v1(
     terminal: &ConnectionTerminalStateV1,
     shutdown: &watch::Sender<bool>,
     context: &'static str,
@@ -1439,7 +1445,7 @@ fn signal_websocket_error_v1(
     let _ = shutdown.send(true);
 }
 
-fn signal_websocket_close_v1(
+pub(crate) fn signal_websocket_close_v1(
     terminal: &ConnectionTerminalStateV1,
     shutdown: &watch::Sender<bool>,
     context: &'static str,
@@ -1461,7 +1467,7 @@ fn signal_websocket_close_v1(
     let _ = shutdown.send(true);
 }
 
-fn signal_event_buffer_failure(
+pub(crate) fn signal_event_buffer_failure(
     terminal: &ConnectionTerminalStateV1,
     shutdown: &watch::Sender<bool>,
     error: ConnectionEventBufferErrorV1,
@@ -2658,7 +2664,7 @@ fn exact_bytes<const N: usize>(value: &[u8]) -> Option<[u8; N]> {
     value.try_into().ok()
 }
 
-fn sender_key_route_from_proto(
+pub(crate) fn sender_key_route_from_proto(
     skd: &proto::SenderKeyDistribution,
 ) -> Option<crate::api::SenderKeyRouteV1> {
     if skd.conversation_id.is_empty()
@@ -2909,7 +2915,7 @@ fn validate_friend_list_response(
 /// explicit `Ok(None)` for protocol forward compatibility. A malformed payload
 /// that *is* handled here is different: dropping it could hide an encrypted
 /// chat or acknowledgement step, so it terminates the authenticated epoch.
-fn connection_event_from_envelope(
+pub(crate) fn connection_event_from_envelope(
     env: proto::Envelope,
 ) -> Result<Option<ConnectionEvent>, ConnectionEventBufferErrorV1> {
     let event = match env.payload {
@@ -3254,12 +3260,12 @@ async fn dispatch_authenticated_binary_frame(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AuthenticatedWsMessageOutcomeV1 {
+pub(crate) enum AuthenticatedWsMessageOutcomeV1 {
     Continue,
     Closed(Option<CloseCode>),
 }
 
-async fn dispatch_authenticated_ws_message(
+pub(crate) async fn dispatch_authenticated_ws_message(
     tx: &ConnectionEventSenderV1,
     message: WsMessage,
 ) -> Result<AuthenticatedWsMessageOutcomeV1, ConnectionEventBufferErrorV1> {

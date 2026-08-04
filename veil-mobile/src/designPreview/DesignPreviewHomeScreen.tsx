@@ -12,16 +12,39 @@ import { ChannelsIsland } from "../components/layout/ChannelsIsland";
 import { MobileHeader } from "../components/navigation/MobileHeader";
 import { RootDock, type RootDestination } from "../components/navigation/RootDock";
 import { Island } from "../components/ui/Island";
+import { InlineContactSearch } from "../components/search/InlineContactSearch";
 import { useReducedMotionPreference } from "../hooks/useReducedMotionPreference";
 import { colors, radii, spacing } from "../lib/theme";
 import type { DesignPreviewStackParamList } from "./navigation";
+import Reanimated, {
+  useSharedValue,
+  useAnimatedStyle,
+  withTiming,
+  withDelay,
+  Easing,
+  interpolateColor,
+  interpolate,
+  Extrapolation,
+} from "react-native-reanimated";
+import { BackHandler } from "react-native";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 type Props = NativeStackScreenProps<DesignPreviewStackParamList, "Home">;
 
 export default function DesignPreviewHomeScreen({ navigation }: Props) {
   const [destination, setDestination] = useState<RootDestination>("home");
+  const [activeTab, setActiveTab] = useState<RootDestination>("home");
+  const [isSearching, setIsSearching] = useState(false);
+  const insets = useSafeAreaInsets();
   const reducedMotion = useReducedMotionPreference();
-  const contentProgress = useRef(new Animated.Value(1)).current;
+  const contentProgress = useRef(new Animated.Value(1)).current; // For Tab switching
+
+  // Reanimated values for Search Transition
+  const searchProgress = useSharedValue(0);
+  const headerOpacity = useSharedValue(1);
+  const headerY = useSharedValue(0);
+  const panelOpacity = useSharedValue(0);
+
   const header = destination === "home"
     ? { title: "Home", subtitle: "Direct Preview" }
     : destination === "spaces"
@@ -42,58 +65,139 @@ export default function DesignPreviewHomeScreen({ navigation }: Props) {
     return () => animation.stop();
   }, [contentProgress, destination, reducedMotion]);
 
-  const selectDestination = useCallback((next: RootDestination) => {
-    if (next === destination) return;
-    contentProgress.stopAnimation();
-    contentProgress.setValue(reducedMotion ? 1 : 0);
-    setDestination(next);
-  }, [contentProgress, destination, reducedMotion]);
+  useEffect(() => {
+    if (reducedMotion) {
+      searchProgress.value = withTiming(isSearching ? 1 : 0, { duration: 120 });
+      headerOpacity.value = withTiming(isSearching ? 0 : 1, { duration: 120 });
+      panelOpacity.value = withTiming(isSearching ? 1 : 0, { duration: 120 });
+      headerY.value = 0;
+    } else {
+      if (isSearching) {
+        headerOpacity.value = withTiming(0, { duration: 160, easing: Easing.out(Easing.ease) });
+        headerY.value = withTiming(-8, { duration: 160, easing: Easing.out(Easing.ease) });
+        searchProgress.value = withTiming(1, { duration: 220, easing: Easing.linear });
+        panelOpacity.value = withDelay(100, withTiming(1, { duration: 200, easing: Easing.out(Easing.ease) }));
+      } else {
+        panelOpacity.value = withTiming(0, { duration: 120, easing: Easing.out(Easing.ease) });
+        searchProgress.value = withTiming(0, { duration: 180, easing: Easing.linear });
+        headerOpacity.value = withDelay(60, withTiming(1, { duration: 120, easing: Easing.out(Easing.ease) }));
+        headerY.value = withDelay(60, withTiming(0, { duration: 120, easing: Easing.out(Easing.ease) }));
+      }
+    }
+  }, [isSearching, reducedMotion]);
+
+  useEffect(() => {
+    const backAction = () => {
+      if (isSearching) {
+        setIsSearching(false);
+        return true;
+      }
+      return false;
+    };
+    const backHandler = BackHandler.addEventListener("hardwareBackPress", backAction);
+    return () => backHandler.remove();
+  }, [isSearching]);
+
+  const selectDestination = (newDest: RootDestination) => {
+    if (newDest === activeTab) return;
+    if (isSearching) setIsSearching(false);
+    setActiveTab(newDest);
+    Animated.timing(contentProgress, {
+      toValue: 0,
+      duration: 100,
+      useNativeDriver: true,
+    }).start(() => {
+      setDestination(newDest);
+      Animated.timing(contentProgress, {
+        toValue: 1,
+        duration: 150,
+        useNativeDriver: true,
+      }).start();
+    });
+  };
+
+  const bgStyle = useAnimatedStyle(() => ({
+    backgroundColor: interpolateColor(
+      searchProgress.value,
+      [0, 1],
+      [colors.background, "#000000"]
+    ),
+  }));
+
+  const mainContentStyle = useAnimatedStyle(() => ({
+    opacity: headerOpacity.value,
+    transform: [{ translateY: headerY.value }],
+  }));
+
+  const searchOverlayStyle = useAnimatedStyle(() => ({
+    opacity: panelOpacity.value,
+  }));
 
   return (
-    <View testID="home-screen" style={styles.root}>
-      <MobileHeader
-        showBrand
-        title={header.title}
-        subtitle={header.subtitle}
-        action={{
-          label: "Settings",
-          accessibilityLabel: "Open Settings",
-          icon: Settings2,
-          onPress: () => navigation.navigate("Settings"),
-        }}
-      />
-      <Animated.View
-        style={[
-          styles.body,
-          reducedMotion ? null : {
-            opacity: contentProgress,
-            transform: [{
-              translateY: contentProgress.interpolate({
-                inputRange: [0, 1],
-                outputRange: [5, 0],
-              }),
-            }],
-          },
-        ]}
+    <Reanimated.View testID="home-screen" style={[styles.root, bgStyle]}>
+      {/* Main Content */}
+      <Reanimated.View style={[{ flex: 1 }, mainContentStyle]} pointerEvents={isSearching ? "none" : "auto"}>
+        <MobileHeader
+          showBrand
+          title={header.title}
+          subtitle={header.subtitle}
+          action={{
+            label: "Settings",
+            accessibilityLabel: "Open Settings",
+            icon: Settings2,
+            onPress: () => navigation.navigate("Settings"),
+          }}
+        />
+        <Animated.View
+          style={[
+            styles.body,
+            reducedMotion ? null : {
+              opacity: contentProgress,
+              transform: [{
+                translateY: contentProgress.interpolate({
+                  inputRange: [0, 1],
+                  outputRange: [5, 0],
+                }),
+              }],
+            },
+          ]}
+        >
+          {destination === "home" ? (
+            <ChannelsIsland
+              onSelect={(conversationId) => navigation.navigate("Direct", { conversationId })}
+              onSearchContacts={() => setIsSearching(true)}
+            />
+          ) : destination === "spaces" ? (
+            <SpacesPreview
+              onOpenCircle={() => navigation.navigate("DesignCircle")}
+              onOpenSpace={() => navigation.navigate("DesignSpace")}
+            />
+          ) : (
+            <UpdatesPreview
+              onOpenCircle={() => navigation.navigate("DesignCircle")}
+              onOpenRoom={() => navigation.navigate("DesignRoom", { roomId: "mobile-design" })}
+            />
+          )}
+        </Animated.View>
+      </Reanimated.View>
+
+      {/* Inline Search Overlay */}
+      <Reanimated.View 
+        style={[StyleSheet.absoluteFill, searchOverlayStyle]} 
+        pointerEvents={isSearching ? "box-none" : "none"}
       >
-        {destination === "home" ? (
-          <ChannelsIsland
-            onSelect={(conversationId) => navigation.navigate("Direct", { conversationId })}
-          />
-        ) : destination === "spaces" ? (
-          <SpacesPreview
-            onOpenCircle={() => navigation.navigate("DesignCircle")}
-            onOpenSpace={() => navigation.navigate("DesignSpace")}
-          />
-        ) : (
-          <UpdatesPreview
-            onOpenCircle={() => navigation.navigate("DesignCircle")}
-            onOpenRoom={() => navigation.navigate("DesignRoom", { roomId: "mobile-design" })}
-          />
-        )}
-      </Animated.View>
-      <RootDock active={destination} onSelect={selectDestination} />
-    </View>
+        <View style={{ paddingTop: insets.top + spacing.md, paddingHorizontal: spacing.lg }}>
+          <InlineContactSearch onExit={() => setIsSearching(false)} />
+        </View>
+      </Reanimated.View>
+
+      <Reanimated.View 
+        style={mainContentStyle} 
+        pointerEvents={isSearching ? "none" : "auto"}
+      >
+        <RootDock active={activeTab} onSelect={selectDestination} />
+      </Reanimated.View>
+    </Reanimated.View>
   );
 }
 

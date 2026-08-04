@@ -15,6 +15,13 @@ class VeilPushService : PushService() {
     // The authenticated native sync runtime will consume this wake signal once its
     // account/origin-bound session is ready. Until then, fail closed and discard it.
     VeilPushWakeCoordinator.requestBoundedSync(applicationContext, instance)
+    
+    androidx.core.content.ContextCompat.startForegroundService(
+      applicationContext,
+      android.content.Intent(applicationContext, io.veil.mobile.runtime.VeilEventsService::class.java).apply {
+        action = "io.veil.mobile.ACTION_FORCE_RECONNECT"
+      }
+    )
   }
 
   override fun onNewEndpoint(endpoint: PushEndpoint, instance: String) {

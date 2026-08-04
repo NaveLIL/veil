@@ -1,6 +1,9 @@
 packages:
   - .
 
+allowBuilds:
+  unrs-resolver: set this to true or false
+
 overrides:
   "shell-quote@>=1.1.0 <=1.8.4": 1.9.0
   "form-data@>=4.0.0 <4.0.6": 4.0.6

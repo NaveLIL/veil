@@ -76,6 +76,27 @@ impl IdentityKeyPair {
         })
     }
 
+    /// Clone the keypair for background tasks.
+    /// This bypasses ZeroizeOnDrop cloning restrictions for when a distinct
+    /// background task requires its own copy of the keys.
+    pub fn clone_for_background(&self) -> Self {
+        let x_bytes = self.x25519_secret.to_bytes();
+        let e_bytes = self.ed25519_signing.to_bytes();
+        
+        let x25519_secret = X25519StaticSecret::from(x_bytes);
+        let x25519_public = X25519PublicKey::from(&x25519_secret);
+        
+        let ed25519_signing = Ed25519SigningKey::from_bytes(&e_bytes);
+        let ed25519_verifying = ed25519_signing.verifying_key();
+        
+        Self {
+            x25519_secret,
+            x25519_public,
+            ed25519_signing,
+            ed25519_verifying,
+        }
+    }
+
     /// X25519 public key bytes (32 bytes). Safe to share.
     pub fn x25519_public_bytes(&self) -> [u8; 32] {
         *self.x25519_public.as_bytes()

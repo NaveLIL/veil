@@ -239,6 +239,20 @@ impl DeviceIdentityV1 {
         })
     }
 
+    pub fn clone_for_background(&self) -> Self {
+        let x_bytes = self.x25519_secret.to_bytes();
+        let e_bytes = self.ed25519_signing.to_bytes();
+        
+        let x25519_secret = X25519StaticSecret::from(x_bytes);
+        let ed25519_signing = SigningKey::from_bytes(&e_bytes);
+        
+        Self {
+            x25519_secret,
+            ed25519_signing,
+            binding: self.binding.clone(),
+        }
+    }
+
     pub fn binding(&self) -> &DeviceBindingPublicV1 {
         &self.binding
     }

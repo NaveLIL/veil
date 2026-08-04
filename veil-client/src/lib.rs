@@ -20,6 +20,7 @@ pub mod prekeys;
 pub mod protocol;
 mod rest_auth_v2;
 mod ws_auth_v3;
+pub mod ws_events_v3;
 
 #[cfg(test)]
 mod auth_contract_fixture_tests;

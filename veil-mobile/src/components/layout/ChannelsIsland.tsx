@@ -1,6 +1,7 @@
 import React, { useMemo } from "react";
 import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
-import { Hash, UsersRound, Volume2 } from "lucide-react-native";
+import { ChevronRight, Hash, Search, UsersRound, Volume2 } from "lucide-react-native";
+import { useIsFocused } from "@react-navigation/native";
 import { Island } from "../ui/Island";
 import { colors, radii, spacing } from "../../lib/theme";
 import { DM_HOME_ID, useChatStore } from "../../stores/chat";
@@ -8,6 +9,7 @@ import { UserAvatar } from "../identity/UserAvatar";
 
 interface Props {
   onSelect: (targetId: string) => void;
+  onSearchContacts?: () => void;
   bottomInset?: number;
   leftInset?: number;
   rightInset?: number;
@@ -15,10 +17,12 @@ interface Props {
 
 export const ChannelsIsland: React.FC<Props> = ({
   onSelect,
+  onSearchContacts,
   bottomInset = 0,
   leftInset = 0,
   rightInset = 0,
 }) => {
+  const isFocused = useIsFocused();
   const serverId = useChatStore((s) => s.selectedServerId);
   const servers = useChatStore((s) => s.servers);
   const allChannels = useChatStore((s) => s.channels);
@@ -59,6 +63,33 @@ export const ChannelsIsland: React.FC<Props> = ({
                 Conversations appear here only after the authenticated native directory is ready.
               </Text>
             </View>
+          ) : null}
+          {isDmHome && onSearchContacts && isFocused ? (
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel="Find contacts"
+              onPress={onSearchContacts}
+              style={({ pressed }) => [
+                styles.dmRow,
+                {
+                  backgroundColor: colors.surfaceLow,
+                  borderRadius: radii.md,
+                  paddingHorizontal: spacing.md,
+                  paddingVertical: spacing.md,
+                  marginTop: spacing.sm,
+                  marginBottom: spacing.xs,
+                },
+                pressed && { opacity: 0.7 }
+              ]}
+            >
+              <Search size={18} strokeWidth={2.2} color={colors.primary} />
+              <View style={[styles.dmMeta, { marginLeft: spacing.md }]}>
+                <Text numberOfLines={1} style={[styles.dmName, { color: colors.primary }]}>
+                  Find contacts
+                </Text>
+              </View>
+              <ChevronRight size={18} strokeWidth={2.2} color={colors.primary} style={{ opacity: 0.5 }} />
+            </Pressable>
           ) : null}
           {isDmHome
             ? dms.map((dm) => {

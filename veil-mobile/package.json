@@ -63,5 +63,10 @@
     "transformIgnorePatterns": [
       "node_modules[\\\\/](?!(?:\\.pnpm[\\\\/][^\\\\/]+[\\\\/]node_modules[\\\\/])?(?:(?:jest-)?react-native(?:[\\\\/]|$)|@react-native(?:[\\\\/]|$)|expo[^\\\\/]*(?:[\\\\/]|$)|@expo(?:nent)?(?:[\\\\/]|$)|react-navigation(?:[\\\\/]|$)|@react-navigation(?:[\\\\/]|$)|react-native-svg(?:[\\\\/]|$)|lucide-react-native(?:[\\\\/]|$)))"
     ]
+  },
+  "pnpm": {
+    "approvedBuilds": {
+      "unrs-resolver": true
+    }
   }
 }

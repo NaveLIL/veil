@@ -108,6 +108,26 @@ export class DirectTextSendError extends Error {
   }
 }
 
+export interface NativeRestSignatureData {
+  userId: string;
+  timestampMs: string;
+  signatureBase64: string;
+}
+
+export interface NativeContactRequest {
+  method: string;
+  target: string;
+  bodyBase64?: string;
+  signature: NativeRestSignatureData;
+}
+
+export interface NativeContactSearchResult {
+  userId: string;
+  username: string;
+  identityKeyBase64: string;
+  signingKeyBase64: string;
+}
+
 interface VeilMobileRuntimeNative {
   getRuntimeSnapshot(): Promise<unknown>;
   verifyIdentityPresence(): Promise<unknown>;
@@ -123,6 +143,12 @@ interface VeilMobileRuntimeNative {
     expectedDirectGeneration: number,
     text: string,
   ): Promise<unknown>;
+  prepareContactSearch(username: string): Promise<NativeContactRequest>;
+  prepareFriendRequest(peerUserId: string): Promise<NativeContactRequest>;
+  prepareCreateDirect(peerUserId: string): Promise<NativeContactRequest>;
+  parseContactSearchResponse(responseBase64: string): Promise<NativeContactSearchResult>;
+  parseCreateDirectResponse(responseBase64: string): Promise<{ conversationId: string, createdAt: string }>;
+  installDirectConversation(peerUserId: string, conversationId: string, createdAt: string): Promise<"installed" | "already_exists">;
   addListener(eventName: string): void;
   removeListeners(count: number): void;
 }
@@ -645,6 +671,25 @@ const VeilRuntime = {
     runtimeSnapshot(await requireRuntime().disconnect()),
   lock: async (): Promise<VeilMobileRuntimeSnapshot> =>
     runtimeSnapshot(await requireRuntime().lockSession()),
+  
+  prepareContactSearch: async (username: string): Promise<NativeContactRequest> =>
+    requireRuntime().prepareContactSearch(username),
+
+  prepareFriendRequest: async (peerUserId: string): Promise<NativeContactRequest> =>
+    requireRuntime().prepareFriendRequest(peerUserId),
+
+  prepareCreateDirect: async (peerUserId: string): Promise<NativeContactRequest> =>
+    requireRuntime().prepareCreateDirect(peerUserId),
+
+  parseContactSearchResponse: async (responseBase64: string): Promise<NativeContactSearchResult> =>
+    requireRuntime().parseContactSearchResponse(responseBase64),
+
+  parseCreateDirectResponse: async (responseBase64: string): Promise<{ conversationId: string, createdAt: string }> =>
+    requireRuntime().parseCreateDirectResponse(responseBase64),
+
+  installDirectConversation: async (peerUserId: string, conversationId: string, createdAt: string): Promise<"installed" | "already_exists"> =>
+    requireRuntime().installDirectConversation(peerUserId, conversationId, createdAt),
+
   cancelPendingAccessPass: async (flowId: string): Promise<boolean> =>
     await requireRuntime().cancelPendingAccessPass(flowId) === true,
   getDirectMessages: async (conversationId: string): Promise<DirectMessageProjection> => {

@@ -28,9 +28,9 @@ const DESIGN_PREVIEW_DESTINATIONS: readonly RootDestinationDefinition[] = [
 ];
 
 export function rootDestinations(
-  designPreviewEnabled: boolean,
+  _designPreviewEnabled?: boolean,
 ): readonly RootDestinationDefinition[] {
-  return designPreviewEnabled ? DESIGN_PREVIEW_DESTINATIONS : [HOME_DESTINATION];
+  return DESIGN_PREVIEW_DESTINATIONS;
 }
 
 export function RootDock({
@@ -43,8 +43,6 @@ export function RootDock({
   const insets = useSafeAreaInsets();
   const destinations = rootDestinations(__DEV__);
 
-  // Until native Spaces/Updates projections exist, release builds expose only
-  // Home and therefore do not render a misleading one-item navigation dock.
   if (destinations.length < 2) return null;
 
   return (
@@ -53,9 +51,7 @@ export function RootDock({
       style={[
         styles.wrap,
         {
-          paddingBottom: Math.max(insets.bottom, spacing.md),
-          paddingLeft: Math.max(insets.left, spacing.md),
-          paddingRight: Math.max(insets.right, spacing.md),
+          paddingBottom: Math.max(insets.bottom, DOCK_INSET),
         },
       ]}
     >
@@ -77,7 +73,7 @@ export function RootDock({
               ]}
             >
               <Icon
-                size={16}
+                size={20}
                 strokeWidth={2}
                 color={selected ? colors.primaryHi : colors.textLo}
               />
@@ -98,30 +94,26 @@ export function RootDock({
 const styles = StyleSheet.create({
   wrap: {
     paddingTop: 0,
-    backgroundColor: colors.background,
+    backgroundColor: colors.surfaceSolid,
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderTopColor: colors.border,
   },
   island: {
-    minHeight: 54,
+    height: 54,
     flexDirection: "row",
     alignItems: "stretch",
-    padding: DOCK_INSET,
-    borderRadius: radii.xl,
-    borderWidth: StyleSheet.hairlineWidth,
-    borderColor: colors.border,
-    backgroundColor: colors.surfaceSolid,
+    paddingHorizontal: spacing.md,
   },
   item: {
     flex: 1,
     minWidth: 0,
-    flexDirection: "row",
+    flexDirection: "column",
     alignItems: "center",
     justifyContent: "center",
-    // Keep the selected surface concentric with the dock island.
-    borderRadius: radii.xl - DOCK_INSET,
-    gap: 5,
+    gap: 4,
   },
-  itemSelected: { backgroundColor: "rgba(124,107,245,0.13)" },
+  itemSelected: {},
   itemPressed: { opacity: 0.68 },
-  label: { flexShrink: 1, color: colors.textLo, fontSize: 10, fontWeight: "700", textAlign: "center" },
-  labelSelected: { color: colors.textHi },
+  label: { flexShrink: 1, color: colors.textLo, fontSize: 10, fontWeight: "600", textAlign: "center" },
+  labelSelected: { color: colors.primaryHi },
 });

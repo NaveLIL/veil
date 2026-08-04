@@ -5,7 +5,7 @@
 //! frozen account and device proofs, and validates a future v3 result. The
 //! legacy live `/ws` authentication path remains unchanged.
 
-#![cfg_attr(not(test), allow(dead_code))]
+
 
 use std::fmt;
 

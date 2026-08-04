@@ -209,6 +209,44 @@ pub struct MobileDirectRestRequest {
     pub response_limit_bytes: u32,
 }
 
+#[derive(Debug, uniffi::Record)]
+pub struct MobileContactRequest {
+    pub token: String,
+    pub method: String,
+    pub target: String,
+    pub body: Vec<u8>,
+    pub signature_data: RestSignatureData,
+}
+
+#[derive(Debug, uniffi::Record)]
+pub struct MobileContactSearchResult {
+    pub user_id: String,
+    pub username: String,
+    pub identity_key: Vec<u8>,
+    pub signing_key: Vec<u8>,
+}
+
+/// Server-controlled create-DM responses stay tiny; anything larger is
+/// treated as hostile, mirroring the bounded-response rule used by every
+/// other mobile Direct route.
+const MOBILE_DIRECT_CREATE_RESPONSE_LIMIT: usize = 4 * 1024;
+
+/// Parsed result of one POST /v1/dms response. Only the canonical
+/// conversation ID crosses the FFI boundary; the raw body is wiped.
+#[derive(Debug, uniffi::Record)]
+pub struct MobileDirectCreatedConversation {
+    pub conversation_id: String,
+}
+
+/// Terminal outcome of registering one created Direct conversation under
+/// the current lease. `AlreadyInstalled` is a safe idempotent replay of the
+/// exact same peer binding; a key conflict is an error, never a variant.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, uniffi::Enum)]
+pub enum MobileDirectConversationInstallOutcome {
+    Installed,
+    AlreadyInstalled,
+}
+
 fn mobile_direct_rest_request_data(
     request: &MobileDirectOutstandingRequest,
 ) -> MobileDirectRestRequest {
@@ -681,7 +719,7 @@ fn mobile_direct_live_buffer_error(error: veil_client::api::DirectLiveBufferErro
     mobile_direct_live_stop_error(error.stop)
 }
 
-#[derive(uniffi::Record)]
+#[derive(Debug, uniffi::Record)]
 pub struct RestSignatureData {
     pub user_id: String,
     pub timestamp_ms: String,
@@ -1106,6 +1144,64 @@ fn recovery_unavailable() -> VeilError {
     }
 }
 
+// ============================================================================
+// Background WebSocket v3 Controller
+// ============================================================================
+
+/// Why the background controller stopped. Mirrors WsEventsV3SupervisorExit.
+#[derive(uniffi::Enum)]
+pub enum MobileWsEventsExit {
+    /// Host asked (stop()/logout/service destroy). Silent, restartable.
+    Cancelled,
+    /// Fail-closed terminal (auth denial, protocol violation, bounded-buffer
+    /// failure). Kotlin MUST surface this and MUST NOT auto-restart; only an
+    /// explicit user/host intent may start a new controller.
+    FailClosed,
+}
+
+/// Callbacks into the Kotlin Foreground Service. All methods are invoked from
+/// the native runtime with NO Rust locks held; implementations must be cheap
+/// and non-blocking (post to a Handler/Channel, return immediately).
+#[uniffi::export(with_foreign)]
+pub trait MobileWsEventsCallback: Send + Sync {
+    /// AuthResultV3 barrier passed; retained SKDM buffer already ingested.
+    fn on_authenticated(&self);
+    /// One or more events were ingested into the buffered live queue.
+    /// Coalesced hint: schedule ONE pump turn (replayDirectLiveEventsV1)
+    /// via the existing turn-based JNI - never decrypt here.
+    fn on_events_ready(&self);
+    /// Supervisor finished. Fires exactly once per controller.
+    fn on_terminal(&self, exit: MobileWsEventsExit);
+}
+
+/// Host handle for one running background controller. Thread-safe; both
+/// methods are designed for Android lifecycle threads (like
+/// MobileConnectCancellation) and never touch the VeilClient mutex.
+#[derive(uniffi::Object)]
+pub struct MobileWsEventsController {
+    cancel: tokio::sync::watch::Sender<bool>,
+    network_hint: Arc<Notify>,
+}
+
+#[uniffi::export]
+impl MobileWsEventsController {
+    /// Sticky, idempotent stop. The supervisor exits Cancelled; a session in
+    /// flight is dropped, which aborts its socket I/O immediately.
+    pub fn stop(&self) {
+        let _ = self.cancel.send(true);
+        // A backoff sleep also selects on the watch; no extra wake needed,
+        // but nudge the hint so a sleeping select cannot miss a lost send.
+        self.network_hint.notify_one();
+    }
+
+    /// ConnectivityManager.onAvailable hook: wakes a backoff sleep early.
+    /// Policy is NOT bypassed - fail-closed stays stopped, the zero-delay
+    /// budget still applies.
+    pub fn network_changed(&self) {
+        self.network_hint.notify_one();
+    }
+}
+
 // ── MobileConnectCancellation (thread-safe cooperative cancellation) ──
 
 /// One-shot cancellation capability for a single mobile connection attempt.
@@ -1177,7 +1273,7 @@ impl MobileConnectCancellation {
 /// exist until that publication has completed.
 #[derive(uniffi::Object)]
 pub struct VeilMobileSession {
-    client: Mutex<veil_client::api::VeilClient>,
+    client: Arc<Mutex<veil_client::api::VeilClient>>,
     runtime: tokio::runtime::Runtime,
     binding: Mutex<Option<MobileAuthenticatedEpoch>>,
     direct_sync: Mutex<Option<MobileDirectSyncState>>,
@@ -1231,7 +1327,7 @@ impl VeilMobileSession {
                 msg: format!("create mobile native runtime: {error}"),
             })?;
         Ok(Arc::new(Self {
-            client: Mutex::new(client),
+            client: Arc::new(Mutex::new(client)),
             runtime,
             binding: Mutex::new(None),
             direct_sync: Mutex::new(None),
@@ -1345,6 +1441,175 @@ impl VeilMobileSession {
                 })
             })
             .transpose()
+    }
+
+    /// Start the background /v3/events controller on the native runtime.
+    ///
+    /// Preconditions (mirrors the Kotlin host contract in ws_events_v3.rs):
+    ///   - mobile_reconnect_target() returned Some(target); its canonical
+    ///     origin selects the endpoint. Absent target => do not call this.
+    ///   - Exactly one controller per session at a time. Callers stop() the
+    ///     previous controller and wait for on_terminal before starting a
+    ///     new one. [VERIFY] add a guard field if double-start must be a
+    ///     hard error rather than a documented contract.
+    ///
+    /// The returned controller owns no client lock; all waits happen off the
+    /// mutex, so lifecycle calls can never deadlock the serialized runtime.
+    pub fn start_background_events(
+        &self,
+        device_name: String,
+        client_version: String,
+        callback: Arc<dyn MobileWsEventsCallback>,
+    ) -> Result<Arc<MobileWsEventsController>, VeilError> {
+        // Metadata bounds mirror the wire contract (128 bytes, checked again
+        // fail-closed inside prepare_ws_auth_response_v3).
+        if device_name.is_empty() || device_name.len() > 128 {
+            return Err(VeilError::InvalidInput {
+                msg: "device name is empty or oversized".to_string(),
+            });
+        }
+        if client_version.is_empty() || client_version.len() > 128 {
+            return Err(VeilError::InvalidInput {
+                msg: "client version is empty or oversized".to_string(),
+            });
+        }
+
+        // Credential-free target from SQLCipher; the same source the Kotlin
+        // service already consults via mobileReconnectTarget().
+        let target = self
+            .mobile_reconnect_target()?
+            .ok_or_else(|| VeilError::Session {
+                msg: "no persisted reconnect target; authenticate first".to_string(),
+            })?;
+
+        // Exact endpoint spelling: origin is canonical (scheme https),
+        // the events transport is wss on the same authority.
+        // [VERIFY] against WsAuthV3Target::parse - it validates the ORIGINAL
+        // spelling before Url normalization, so build, never normalize.
+        let canonical_origin = target.canonical_server_origin.clone();
+        let websocket_url = format!(
+            "wss://{}/v3/events",
+            canonical_origin
+                .strip_prefix("https://")
+                .ok_or_else(|| VeilError::Session {
+                    msg: "reconnect target origin is not https".to_string(),
+                })?
+        );
+
+        // Clone signing material under a short client lock. Private keys
+        // stay inside this process; only the clone crosses into the task.
+        let (account, device_identity) = {
+            let client = self.client.lock().map_err(|error| VeilError::Session {
+                msg: format!("lock mobile client: {error}"),
+            })?;
+            client
+                .background_events_v3_material()
+                .map_err(|msg| VeilError::Session { msg })?
+        };
+
+        let config = veil_client::ws_events_v3::WsEventsV3Config {
+            websocket_url,
+            canonical_origin,
+            device_name,
+            client_id: client_version,
+        };
+
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let network_hint = Arc::new(Notify::new());
+        let controller = Arc::new(MobileWsEventsController {
+            cancel: cancel_tx,
+            network_hint: Arc::clone(&network_hint),
+        });
+
+        // The session handler drains one authenticated connection into the
+        // existing pipeline. It takes the client mutex only per event batch,
+        // never across an await on network I/O.
+        let session_client = self.client.clone();
+        let session_callback = Arc::clone(&callback);
+        let session_cancel = cancel_rx.clone();
+        let handle_session = move |mut session: veil_client::ws_events_v3::WsEventsV3Connection| {
+            let client = session_client.clone();
+            let callback = Arc::clone(&session_callback);
+            let mut cancel = session_cancel.clone();
+            async move {
+                // Retained SKDM buffer first - it precedes the AuthResultV3
+                // barrier on the wire and must precede live events in the DB.
+                let mut has_retained = false;
+                for event in session.drain_retained() {
+                    has_retained = true;
+                    if let Err(msg) = ingest_one(&client, event) {
+                        eprintln!("background retained ingest failed: {msg}");
+                        return veil_client::ws_events_v3::WsSessionStopV3::FailClosed;
+                    }
+                }
+                callback.on_authenticated();
+                if has_retained {
+                    callback.on_events_ready();
+                }
+
+                loop {
+                    tokio::select! {
+                        changed = cancel.changed() => {
+                            if changed.is_err() || *cancel.borrow() {
+                                // Dropping the session aborts socket I/O.
+                                drop(session);
+                                // Cancelled sessions are not transport
+                                // failures, but the supervisor checks the
+                                // watch first and exits Cancelled before
+                                // consulting the decider.
+                                return veil_client::ws_events_v3::WsSessionStopV3::RetryableTransport;
+                            }
+                        }
+                        event = session.events.recv() => {
+                            match event {
+                                Some(event) => {
+                                    if let Err(msg) = ingest_one(&client, event) {
+                                        eprintln!("background ingest failed: {msg}");
+                                        return veil_client::ws_events_v3::WsSessionStopV3::FailClosed;
+                                    }
+                                    callback.on_events_ready();
+                                }
+                                None => {
+                                    // terminal classification: map the
+                                    // connection's ConnectionTerminalStateV1 via
+                                    // the same rule as the supervisor - ONLY
+                                    // RetryableTransport retries.
+                                    return match session.terminal_error() {
+                                        Some(t) if t.is_retryable_transport() =>
+                                            veil_client::ws_events_v3::WsSessionStopV3::RetryableTransport,
+                                        _ =>
+                                            veil_client::ws_events_v3::WsSessionStopV3::FailClosed,
+                                    };
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        };
+
+        let exit_callback = Arc::clone(&callback);
+        self.runtime.spawn(async move {
+            let exit = veil_client::ws_events_v3::run_ws_events_v3(
+                &config,
+                &account,
+                &device_identity,
+                handle_session,
+                cancel_rx,
+                network_hint,
+            )
+            .await;
+            exit_callback.on_terminal(match exit {
+                veil_client::ws_events_v3::WsEventsV3SupervisorExit::Cancelled => {
+                    MobileWsEventsExit::Cancelled
+                }
+                veil_client::ws_events_v3::WsEventsV3SupervisorExit::FailClosed => {
+                    MobileWsEventsExit::FailClosed
+                }
+            });
+        });
+
+        Ok(controller)
     }
 
     /// Start an object-bound Direct directory sync for the exact current
@@ -2934,6 +3199,218 @@ impl VeilMobileSession {
         Ok(signature)
     }
 
+    pub fn prepare_contact_search_request(&self, username: String) -> Result<MobileContactRequest, VeilError> {
+        let epoch = self.authenticated_epoch()?;
+        let target = format!("/v1/users/search?username={}", url::form_urlencoded::byte_serialize(username.as_bytes()).collect::<String>());
+        let body = Vec::new();
+        let sig = self.sign_rest_request_internal(&epoch, "GET", &target, &body)?;
+        Ok(MobileContactRequest {
+            token: "contact-search".to_string(),
+            method: "GET".to_string(),
+            target,
+            body,
+            signature_data: sig,
+        })
+    }
+
+    pub fn prepare_friend_request(&self, peer_user_id: String) -> Result<MobileContactRequest, VeilError> {
+        let epoch = self.authenticated_epoch()?;
+        let target = format!("/v1/users/{}/friends", url::form_urlencoded::byte_serialize(peer_user_id.as_bytes()).collect::<String>());
+        let body = Vec::new();
+        let sig = self.sign_rest_request_internal(&epoch, "PUT", &target, &body)?;
+        Ok(MobileContactRequest {
+            token: "friend-request".to_string(),
+            method: "PUT".to_string(),
+            target,
+            body,
+            signature_data: sig,
+        })
+    }
+
+    pub fn prepare_create_direct_request(&self, peer_user_id: String) -> Result<MobileContactRequest, VeilError> {
+        let epoch = self.authenticated_epoch()?;
+        let target = "/v1/dms".to_string();
+        let body = serde_json::json!({
+            "peer_user_id": peer_user_id
+        }).to_string().into_bytes();
+        let sig = self.sign_rest_request_internal(&epoch, "POST", &target, &body)?;
+        Ok(MobileContactRequest {
+            token: "create-direct".to_string(),
+            method: "POST".to_string(),
+            target,
+            body,
+            signature_data: sig,
+        })
+    }
+
+    pub fn parse_contact_search_response(&self, response: Vec<u8>) -> Result<MobileContactSearchResult, VeilError> {
+        let _epoch = self.authenticated_epoch()?;
+        let parsed: serde_json::Value = serde_json::from_slice(&response).map_err(|e| VeilError::InvalidInput {
+            msg: format!("Invalid JSON response: {}", e),
+        })?;
+        
+        let user_id = parsed["id"].as_str().unwrap_or_default().to_string();
+        let username = parsed["username"].as_str().unwrap_or_default().to_string();
+        let identity_key_hex = parsed["identity_key"].as_str().unwrap_or_default();
+        let signing_key_hex = parsed["signing_key"].as_str().unwrap_or_default();
+        
+        if user_id.is_empty() || username.is_empty() || identity_key_hex.is_empty() || signing_key_hex.is_empty() {
+            return Err(VeilError::InvalidInput { msg: "Missing fields in search response".to_string() });
+        }
+        
+        let identity_key = hex::decode(identity_key_hex).map_err(|_| VeilError::InvalidInput { msg: "Invalid hex for identity_key".to_string() })?;
+        let signing_key = hex::decode(signing_key_hex).map_err(|_| VeilError::InvalidInput { msg: "Invalid hex for signing_key".to_string() })?;
+        
+        Ok(MobileContactSearchResult {
+            user_id,
+            username,
+            identity_key,
+            signing_key,
+        })
+    }
+
+    /// Parse one bounded POST /v1/dms response. Accepts either
+    /// `conversation_id` or `id` as the canonical UUID field and rejects
+    /// everything else. The server-controlled body is wiped on every path.
+    pub fn parse_create_direct_response(
+        &self,
+        response: Vec<u8>,
+    ) -> Result<MobileDirectCreatedConversation, VeilError> {
+        // Refuse to parse anything for an unauthenticated session so this
+        // route cannot become an offline JSON oracle.
+        let _epoch = self.authenticated_epoch()?;
+        let response = Zeroizing::new(response);
+        if response.is_empty() || response.len() > MOBILE_DIRECT_CREATE_RESPONSE_LIMIT {
+            return Err(VeilError::Session {
+                msg: "mobile Direct create response exceeds the native limit".to_string(),
+            });
+        }
+        let parsed: serde_json::Value =
+            serde_json::from_slice(response.as_slice()).map_err(|error| {
+                VeilError::InvalidInput {
+                    msg: format!("invalid create-DM JSON response: {error}"),
+                }
+            })?;
+        let raw_id = parsed
+            .get("conversation_id")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| parsed.get("id").and_then(serde_json::Value::as_str))
+            .ok_or_else(|| VeilError::InvalidInput {
+                msg: "create-DM response is missing a conversation ID".to_string(),
+            })?;
+        let conversation_id = require_canonical_user_id("Direct conversation ID", raw_id)?;
+        Ok(MobileDirectCreatedConversation { conversation_id })
+    }
+
+    /// Register one freshly created Direct conversation under the exact
+    /// current Ready lease so the existing peer-prekey flow
+    /// (`prepare_direct_prekey_request` → `sign_direct_rest_request` →
+    /// `install_direct_prekey_bundle`) can establish the X3DH session.
+    ///
+    /// Peer identity comes from the authenticated contact-search response,
+    /// not from the create-DM response, so the server cannot swap keys
+    /// between the two calls. Guards repeat the module-wide order
+    /// `direct_sync -> binding -> client` and every authority check is done
+    /// under the held locks.
+    ///
+    /// Idempotent for the exact same peer binding. A conversation already
+    /// bound to different keys is terminal: no overwrite, no retry hint.
+    pub fn install_direct_conversation(
+        &self,
+        lease_token: String,
+        conversation_id: String,
+        peer_user_id: String,
+        peer_identity_key: Vec<u8>,
+        peer_signing_key: Vec<u8>,
+    ) -> Result<MobileDirectConversationInstallOutcome, VeilError> {
+        require_mobile_sync_token(&lease_token)?;
+        require_canonical_user_id("Direct conversation ID", &conversation_id)?;
+        require_canonical_user_id("Direct peer user ID", &peer_user_id)?;
+        let identity_key = to_32(&peer_identity_key)?;
+        let signing_key = to_32(&peer_signing_key)?;
+
+        let mut sync = self
+            .direct_sync
+            .lock()
+            .map_err(|error| VeilError::Session {
+                msg: format!("lock mobile Direct sync: {error}"),
+            })?;
+        let state = sync.as_mut().ok_or_else(|| VeilError::Session {
+            msg: "mobile Direct sync is unavailable".to_string(),
+        })?;
+        // Only the current Ready lease may grow its own peer set. A stale
+        // generation must never install a route into its successor.
+        if state.token != lease_token || state.phase != MobileDirectSyncPhase::Ready {
+            return Err(VeilError::Session {
+                msg: "mobile Direct sync lease is stale or not ready".to_string(),
+            });
+        }
+        let binding = self.binding.lock().map_err(|error| VeilError::Session {
+            msg: format!("lock mobile binding: {error}"),
+        })?;
+        if binding.as_ref() != Some(&state.epoch) {
+            return Err(VeilError::Session {
+                msg: "mobile Direct sync lease is stale".to_string(),
+            });
+        }
+        // A conversation with self can never need X3DH and would poison the
+        // readiness scope checks later; refuse it here with a typed error.
+        if peer_user_id == state.epoch.binding.user_id {
+            return Err(VeilError::InvalidInput {
+                msg: "Direct conversation peer must not be the authenticated user".to_string(),
+            });
+        }
+        // A conversation this lease has already classified as blocked stays
+        // blocked; registration must not resurrect it.
+        if state.blocked_conversations.contains_key(&conversation_id) {
+            return Err(VeilError::Session {
+                msg: "mobile Direct conversation is unavailable".to_string(),
+            });
+        }
+        if let Some(existing) = state.peers.get(&conversation_id) {
+            let same_binding = existing.user_id == peer_user_id
+                && existing.identity_key == identity_key
+                && existing.signing_key == signing_key;
+            if same_binding {
+                return Ok(MobileDirectConversationInstallOutcome::AlreadyInstalled);
+            }
+            // Never rebind an existing conversation to new keys through this
+            // route: that is exactly the shape of a server-side key swap.
+            return Err(VeilError::Session {
+                msg: "mobile Direct conversation is already bound to different peer keys"
+                    .to_string(),
+            });
+        }
+        let mut client = self.client.lock().map_err(|error| VeilError::Session {
+            msg: format!("lock mobile client: {error}"),
+        })?;
+        // Durable half first: pin the peer identity/signing keys and the
+        // DM binding in SQLCipher exactly like the directory-page install
+        // does, so `mobile_direct_projection_scope` and the readiness
+        // preflight accept this conversation. Only after the durable write
+        // succeeds does the in-memory lease learn the peer; a failure leaves
+        // the lease untouched (fail-closed, no partial route).
+        Self::install_direct_conversation_durable(
+            &mut client,
+            &state.epoch.binding.canonical_server_origin,
+            &state.epoch.binding.user_id,
+            &conversation_id,
+            &peer_user_id,
+            &identity_key,
+            &signing_key,
+        )
+        .map_err(|msg| VeilError::Session { msg })?;
+        state.peers.insert(
+            conversation_id,
+            MobileDirectPeer {
+                user_id: peer_user_id,
+                identity_key,
+                signing_key,
+            },
+        );
+        Ok(MobileDirectConversationInstallOutcome::Installed)
+    }
+
     pub fn disconnect(&self) -> Result<(), VeilError> {
         clear_mobile_direct_sync_fail_closed(&self.direct_sync);
         let _client = invalidate_mobile_session(&self.binding, &self.client)?;
@@ -2954,26 +3431,53 @@ impl VeilMobileSession {
         }
     }
 
-    fn sign_mobile_direct_request(
+    /// ЕДИНСТВЕННАЯ ТОЧКА ИНТЕГРАЦИИ, требующая сверки с veil_client.
+    ///
+    /// Должна выполнить для ОДНОГО диалога то же, что
+    /// `install_authenticated_direct_directory_page_tracked` делает для
+    /// страницы каталога: durable-запись known_user_identity, пин
+    /// signing key и совместимую привязку conversation_id ↔ identity_key
+    /// (`ensure_dm_conversation_binding_compatible`).
+    ///
+    /// Если в veil_client уже есть одиночный инсталлятор — вызвать его.
+    /// Если нет — добавить в veil_client::direct функцию с этой сигнатурой,
+    /// собранную из тех же примитивов, что использует установка страницы
+    /// каталога. Реализация обязана быть идемпотентной для идентичной
+    /// привязки и возвращать Err на конфликт ключей.
+    fn install_direct_conversation_durable(
+        client: &mut veil_client::api::VeilClient,
+        canonical_server_origin: &str,
+        self_user_id: &str,
+        conversation_id: &str,
+        peer_user_id: &str,
+        peer_identity_key: &[u8; 32],
+        peer_signing_key: &[u8; 32],
+    ) -> Result<(), String> {
+        veil_client::direct::install_authenticated_direct_conversation_v1(
+            client,
+            canonical_server_origin,
+            self_user_id,
+            conversation_id,
+            peer_user_id,
+            *peer_identity_key,
+            *peer_signing_key,
+        )
+    }
+
+    fn sign_rest_request_internal(
         &self,
         expected_epoch: &MobileAuthenticatedEpoch,
-        request: &MobileDirectOutstandingRequest,
+        method: &str,
+        target: &str,
+        body: &[u8],
     ) -> Result<RestSignatureData, VeilError> {
         use base64::Engine;
         use sha2::{Digest, Sha256};
 
-        let origin =
-            require_canonical_server_origin(&expected_epoch.binding.canonical_server_origin)?;
+        let origin = require_canonical_server_origin(&expected_epoch.binding.canonical_server_origin)?;
         if self.authenticated_epoch()? != *expected_epoch {
             return Err(VeilError::Session {
-                msg: "mobile binding changed before signing Direct request".to_string(),
-            });
-        }
-        let method = require_rest_method(request.method)?;
-        require_rest_target(&request.target)?;
-        if request.body.len() > 64 * 1024 {
-            return Err(VeilError::InvalidInput {
-                msg: "REST request body exceeds the mobile signing limit".to_string(),
+                msg: "mobile binding changed before signing request".to_string(),
             });
         }
         let timestamp_ms = self.next_rest_timestamp_ms()?;
@@ -2984,9 +3488,8 @@ impl VeilMobileSession {
                 msg: "canonical origin has no supported scheme".to_string(),
             })?;
         let canonical = format!(
-            "veil-rest-v1\n{method}\n{authority}\n{}\n{timestamp_ms}\n{}",
-            request.target,
-            hex::encode(Sha256::digest(request.body.as_slice())),
+            "veil-rest-v1\n{method}\n{authority}\n{target}\n{timestamp_ms}\n{}",
+            hex::encode(Sha256::digest(body)),
         );
         let signature = self
             .client
@@ -2998,7 +3501,7 @@ impl VeilMobileSession {
             .map_err(|msg| VeilError::Session { msg })?;
         if self.authenticated_epoch()? != *expected_epoch {
             return Err(VeilError::Session {
-                msg: "mobile binding changed while signing Direct request".to_string(),
+                msg: "mobile binding changed while signing request".to_string(),
             });
         }
         Ok(RestSignatureData {
@@ -3006,6 +3509,21 @@ impl VeilMobileSession {
             timestamp_ms: timestamp_ms.to_string(),
             signature_base64: base64::engine::general_purpose::STANDARD.encode(signature),
         })
+    }
+
+    fn sign_mobile_direct_request(
+        &self,
+        expected_epoch: &MobileAuthenticatedEpoch,
+        request: &MobileDirectOutstandingRequest,
+    ) -> Result<RestSignatureData, VeilError> {
+        let method = require_rest_method(request.method)?;
+        require_rest_target(&request.target)?;
+        if request.body.len() > 64 * 1024 {
+            return Err(VeilError::InvalidInput {
+                msg: "REST request body exceeds the mobile signing limit".to_string(),
+            });
+        }
+        self.sign_rest_request_internal(expected_epoch, method, &request.target, request.body.as_slice())
     }
 
     fn connect_inner(
@@ -3831,10 +4349,46 @@ fn require_rest_target(target: &str) -> Result<(), VeilError> {
     }
     Ok(())
 }
+// ============================================================================
+// Free helper (top level, not exported over FFI)
+// ============================================================================
+
+/// Push one ConnectionEvent into the client's buffered live queue under a
+/// short lock. No decryption, no ratchet, no DB writes here - those remain
+/// exclusively in the turn-based pump (replay_direct_live_events_v1), exactly
+/// like the legacy /ws path.
+fn ingest_one(
+    client: &Arc<Mutex<veil_client::api::VeilClient>>,
+    event: veil_client::connection::ConnectionEvent,
+) -> Result<(), String> {
+    let mut client = client
+        .lock()
+        .map_err(|error| format!("lock mobile client: {error}"))?;
+    client.ingest_background_connection_event_v1(event)
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_create_direct_response_accepts_canonical_id_and_rejects_noise() {
+        let session = mobile_test_authenticated_session(); // существующий хелпер
+        let id = "6f9619ff-8b86-d011-b42d-00cf4fc964ff";
+        let ok = session
+            .parse_create_direct_response(
+                format!("{{\"conversation_id\":\"{id}\"}}").into_bytes(),
+            )
+            .expect("canonical create response parses");
+        assert_eq!(ok.conversation_id, id);
+        assert!(session.parse_create_direct_response(b"{}".to_vec()).is_err());
+        assert!(session
+            .parse_create_direct_response(b"{\"conversation_id\":\"nope\"}".to_vec())
+            .is_err());
+        assert!(session
+            .parse_create_direct_response(vec![b'x'; 5 * 1024])
+            .is_err());
+    }
     use bip39::Language;
     use prost::Message as ProstMessage;
     use sha2::{Digest, Sha256};

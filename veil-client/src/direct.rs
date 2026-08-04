@@ -129,7 +129,7 @@ struct ValidatedDirectoryMember {
     signing_key: [u8; 32],
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct ValidatedDirectConversation {
     id: String,
     name: String,
@@ -360,6 +360,75 @@ fn install_authenticated_direct_directory_page_inner(
         skipped_non_direct,
         validated_conversation_ids,
     })
+}
+
+pub fn install_authenticated_direct_conversation_v1(
+    client: &mut VeilClient,
+    canonical_server_origin: &str,
+    self_user_id: &str,
+    conversation_id: &str,
+    peer_user_id: &str,
+    peer_identity_key: [u8; 32],
+    peer_signing_key: [u8; 32],
+) -> Result<(), String> {
+    let local_identity_key = client.identity_key()?;
+    let local_signing_key = client.signing_key()?;
+
+    let self_member = ValidatedDirectoryMember {
+        user_id: self_user_id.to_string(),
+        username: "".to_string(),
+        identity_key: local_identity_key,
+        signing_key: local_signing_key,
+    };
+    let peer_member = ValidatedDirectoryMember {
+        user_id: peer_user_id.to_string(),
+        username: "".to_string(),
+        identity_key: peer_identity_key,
+        signing_key: peer_signing_key,
+    };
+
+    let conversation = ValidatedDirectConversation {
+        id: conversation_id.to_string(),
+        name: "".to_string(),
+        created_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        members: vec![self_member, peer_member.clone()],
+        peer: peer_member,
+    };
+
+    // 1. Ensure keys are compatible with any previously pinned keys for this user/identity
+    for member in &conversation.members {
+        client.ensure_user_identity_binding_compatible(&member.user_id, member.identity_key)?;
+        client.ensure_peer_signing_key_compatible(member.identity_key, member.signing_key)?;
+    }
+
+    // 2. Prepare snapshots for SQLCipher
+    let observed_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let snapshots = direct_page_account_snapshots(
+        &[Box::new(conversation.clone())],
+        canonical_server_origin,
+        &observed_at,
+    );
+
+    let stored_conversation = AuthenticatedDirectDirectoryEntry {
+        conversation_id: conversation.id.clone(),
+        name: conversation.name.clone(),
+        peer_user_id: conversation.peer.user_id.clone(),
+        peer_identity_key: conversation.peer.identity_key,
+        created_at: conversation.created_at.clone(),
+    };
+
+    // 3. Durable write to SQLCipher
+    let db = client.db().ok_or("database not initialized")?;
+    db.upsert_identity_directory(&snapshots)?;
+    db.upsert_directory_directs(canonical_server_origin, &[stored_conversation])?;
+
+    // 4. Preflight and register the DM binding locally
+    client.ensure_dm_conversation_binding_compatible(&conversation.id, conversation.peer.identity_key)?;
+    
+    // 5. Publish to runtime memory
+    publish_direct_conversation(client, conversation)?;
+    
+    Ok(())
 }
 
 /// Install one peer X3DH bundle obtained for an authenticated Direct member.

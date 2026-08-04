@@ -4109,6 +4109,22 @@ internal class VeilMobileRuntime internal constructor(
   private fun genericPublicConnectFailure() =
     VeilMobileRuntimeException("E_VEIL_CONNECT", "Unable to authenticate with the Veil Node")
 
+  fun mobileReconnectTarget(): NativeMobileReconnectTarget? {
+    return synchronized(stateLock) {
+      session?.mobileReconnectTarget()
+    }
+  }
+
+  fun startBackgroundEvents(
+    deviceName: String,
+    clientVersion: String,
+    callback: io.veil.mobile.MobileWsEventsCallback,
+  ): io.veil.mobile.MobileWsEventsController? {
+    return synchronized(stateLock) {
+      session?.startBackgroundEvents(deviceName, clientVersion, callback)
+    }
+  }
+
   companion object {
     private const val HTTP_GET_METHOD = "GET"
     private const val HTTP_POST_METHOD = "POST"

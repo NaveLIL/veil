@@ -1405,6 +1405,33 @@ impl VeilClient {
             .ok_or_else(|| "not authenticated".to_string())
     }
 
+    /// Cloned signing material for the background events controller.
+    /// Never exposed over FFI; consumed inside this process only.
+    pub fn background_events_v3_material(
+        &self,
+    ) -> Result<(veil_crypto::IdentityKeyPair, crate::device_identity::DeviceIdentityV1), String> {
+        let account = self.identity.as_ref().map(|k| k.clone_for_background()).ok_or_else(|| "not initialized".to_string())?;
+        let device = self.device_identity.as_ref().map(|d| d.clone_for_background()).ok_or_else(|| "not initialized".to_string())?;
+        Ok((account, device))
+    }
+
+    /// Feed one background ConnectionEvent into the SAME buffered
+    /// live-event queue that replay_direct_live_events_v1 consumes.
+    /// [VERIFY] implement as a thin push into the existing queue the
+    /// legacy /ws connection fills; do NOT build a second decrypt or
+    /// persist path - ratchet advancement stays in the pump turns.
+    pub fn ingest_background_connection_event_v1(
+        &mut self,
+        event: crate::connection::ConnectionEvent,
+    ) -> Result<(), String> {
+        let budget = crate::connection::ConnectionEventBudgetV1::production();
+        let budgeted = budget.try_wrap(event).map_err(|error| format!("budget wrap failed: {:?}", error))?;
+        self.deferred_connection_events
+            .try_extend(vec![budgeted])
+            .map_err(|error| format!("buffer event failed: {:?}", error))?;
+        Ok(())
+    }
+
     /// Test-only bridge for native integration fixtures that cannot perform a
     /// real WebSocket handshake. The feature is disabled in production.
     /// Durable origin/user/account continuity is checked before process state

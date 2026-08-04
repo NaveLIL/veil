@@ -123,7 +123,7 @@ internal data class CanonicalServerOrigin(
     }
 
     private fun isLoopback(host: String): Boolean =
-      host == "localhost" || host == "127.0.0.1" || host == "::1"
+      host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "10.0.2.2"
 
     private const val MAX_ORIGIN_CHARS = 512
   }
