@@ -399,7 +399,7 @@ export const OnboardingScreen: Component = () => {
     }),
     btnCol: {
       "flex-shrink": "0", display: "flex",
-      "flex-direction": "column" as const, gap: "10px", "min-width": "200px",
+      "flex-direction": "column" as const, gap: "10px", width: "320px",
     },
     btnPrimary: {
       display: "flex", "align-items": "center", "justify-content": "center",

@@ -28,9 +28,9 @@ const DESIGN_PREVIEW_DESTINATIONS: readonly RootDestinationDefinition[] = [
 ];
 
 export function rootDestinations(
-  _designPreviewEnabled?: boolean,
+  designPreviewEnabled: boolean,
 ): readonly RootDestinationDefinition[] {
-  return DESIGN_PREVIEW_DESTINATIONS;
+  return designPreviewEnabled ? DESIGN_PREVIEW_DESTINATIONS : [HOME_DESTINATION];
 }
 
 export function RootDock({
@@ -43,6 +43,8 @@ export function RootDock({
   const insets = useSafeAreaInsets();
   const destinations = rootDestinations(__DEV__);
 
+  // Until native Spaces/Updates projections exist, release builds expose only
+  // Home and therefore do not render a misleading one-item navigation dock.
   if (destinations.length < 2) return null;
 
   return (
@@ -51,7 +53,9 @@ export function RootDock({
       style={[
         styles.wrap,
         {
-          paddingBottom: Math.max(insets.bottom, DOCK_INSET),
+          paddingBottom: Math.max(insets.bottom, spacing.md),
+          paddingLeft: Math.max(insets.left, spacing.md),
+          paddingRight: Math.max(insets.right, spacing.md),
         },
       ]}
     >
@@ -94,15 +98,17 @@ export function RootDock({
 const styles = StyleSheet.create({
   wrap: {
     paddingTop: 0,
-    backgroundColor: colors.surfaceSolid,
-    borderTopWidth: StyleSheet.hairlineWidth,
-    borderTopColor: colors.border,
+    backgroundColor: "transparent",
   },
   island: {
-    height: 54,
+    minHeight: 64,
     flexDirection: "row",
     alignItems: "stretch",
-    paddingHorizontal: spacing.md,
+    padding: DOCK_INSET,
+    borderRadius: radii.xl,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: colors.border,
+    backgroundColor: colors.surfaceSolid,
   },
   item: {
     flex: 1,
@@ -110,9 +116,12 @@ const styles = StyleSheet.create({
     flexDirection: "column",
     alignItems: "center",
     justifyContent: "center",
+    // Keep the selected surface concentric with the dock island.
+    borderRadius: radii.xl - DOCK_INSET,
     gap: 4,
+    paddingVertical: 6,
   },
-  itemSelected: {},
+  itemSelected: { backgroundColor: "rgba(124,107,245,0.13)" },
   itemPressed: { opacity: 0.68 },
   label: { flexShrink: 1, color: colors.textLo, fontSize: 10, fontWeight: "600", textAlign: "center" },
   labelSelected: { color: colors.primaryHi },

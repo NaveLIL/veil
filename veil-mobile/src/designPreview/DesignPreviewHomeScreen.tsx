@@ -15,6 +15,7 @@ import { Island } from "../components/ui/Island";
 import { InlineContactSearch } from "../components/search/InlineContactSearch";
 import { useReducedMotionPreference } from "../hooks/useReducedMotionPreference";
 import { colors, radii, spacing } from "../lib/theme";
+import { useChatStore } from "../stores/chat";
 import type { DesignPreviewStackParamList } from "./navigation";
 import Reanimated, {
   useSharedValue,
@@ -45,8 +46,11 @@ export default function DesignPreviewHomeScreen({ navigation }: Props) {
   const headerY = useSharedValue(0);
   const panelOpacity = useSharedValue(0);
 
+  const runtimeBinding = useChatStore((state) => state.runtimeBinding);
+  const shortId = runtimeBinding?.userId ? runtimeBinding.userId.slice(0, 8) : "---";
+
   const header = destination === "home"
-    ? { title: "Home", subtitle: "Direct Preview" }
+    ? { title: "Home", subtitle: `Your private center • ${shortId}` }
     : destination === "spaces"
       ? { title: "Spaces", subtitle: "Circles and Rooms" }
       : { title: "Updates", subtitle: "Mentions, replies and invitations" };
