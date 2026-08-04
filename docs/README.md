@@ -45,6 +45,7 @@ ADR фиксирует принятое решение и причины. Изм
 
 ## Reviews и completion gates
 
+- [Beta integration and macOS checkpoint — 2026-08-04](reviews/beta-integration-macos-2026-08-04.md)
 - [Phase 1–4C completion gate](reviews/phase-1-4c-completion-gate.md)
 - [Phase 2 search product gate](reviews/phase-2-search-product-gate.md)
 - [Phase 3B attachment security review](reviews/phase-3b-attachment-security-review.md)

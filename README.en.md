@@ -40,7 +40,9 @@ Substantial Preview implementations exist for:
 - origin-scoped SQLCipher storage and a process-memory-only local search index;
 - signed REST/WebSocket transport with Protobuf contracts; the managed Preview
   ingress has an exact transitional REST-v1 authority allowlist, while full
-  cryptographic origin/user binding remains a Phase 5S gate;
+  cryptographic origin/user binding remains a Phase 5S gate. A separate
+  experimental `/v3/events` endpoint and mobile background controller now
+  exist, but they have not replaced the legacy `/ws` path;
 - Direct, Circle, and structured Space/Room product surfaces and ACLs;
 - a Tauri v2 desktop client with a SolidJS interface;
 - a Go Veil Node gateway with PostgreSQL, uploads, push wake-ups, profiles,
@@ -56,6 +58,9 @@ Implemented code is not the same as release evidence. The authoritative phase
 status and remaining physical/device matrices are tracked in
 [INTEGRATION_ROADMAP.md](INTEGRATION_ROADMAP.md) and the
 [completion reviews](docs/README.md#reviews-и-completion-gates).
+The exact 2026-08-04 beta handoff, current red checks, and local unsigned macOS
+x86_64 build evidence are recorded in the
+[beta integration and macOS checkpoint](docs/reviews/beta-integration-macos-2026-08-04.md).
 
 ## What is not complete
 
@@ -63,11 +68,11 @@ status and remaining physical/device matrices are tracked in
 - Android still lacks the full Desktop ↔ Android send/outbox/reconnect/airplane/
   process-death device matrix, connected recovery/capture instrumentation,
   app-wide public failure codes, and signed standalone tester distribution.
-  Its native Direct runtime currently opens and services only the authenticated
-  existing Direct directory: Android does not yet provide native user search,
-  friend-request handling, or creation of a new Direct. Those are required for
-  functional desktop parity and must not be represented as a completed mobile
-  contact flow.
+  Its native Direct runtime reliably opens and services only the authenticated
+  existing Direct directory. Baseline `f6dbf5a` adds screens and FFI/Kotlin/
+  request scaffolding for user search, friend requests, and Direct creation,
+  but the generated Kotlin bindings and route/header/transport contracts do not
+  yet match the gateway. This is not a completed mobile contact flow.
   `PublicFailureCodeV1` currently covers Android identity setup and the secure
   runtime gate; Direct session/send/delivery and desktop/Go consumers remain
   open. Calls and the MLS runtime are not enabled as complete user features.
@@ -99,14 +104,13 @@ The Veil Node stores and routes ciphertext, but it still sees unavoidable
 routing metadata such as network addresses, timing, sizes, account and
 conversation membership, and delivery state. E2EE does not hide that metadata.
 The canonical HTTPS origin is part of the account model. The Preview validates
-URL/TLS and managed legacy REST authority strictly. Isolated WS v3 protobuf and
-native proof helpers, a server verifier with atomic admission, and a private
-REST v2 native preparer, HTTP boundary, version dispatcher, and PostgreSQL
-replay boundary now exist. None is wired into live transport, FFI, or gateway
-routes. WS v2/REST v1 therefore still do not bind the full origin/user context
-end to end; live WS raw-protobuf/subprotocol dispatch, REST route/media/ServeMux
-cutover, the two-Node relay matrix, and independent review remain Phase 5S
-security gates.
+URL/TLS and managed legacy REST authority strictly. A separate experimental
+`/v3/events` endpoint, Rust supervisor, FFI controller, and Android background
+service now exist, while the primary `/ws` path remains WS v2. The new slice is
+not integration-green: the full workspace currently fails in `veil-ffi`, the
+generated Kotlin bindings lag behind, and cross-client/two-Node evidence is
+missing. REST v2 remains disconnected from live routes. The complete cutover,
+two-Node relay matrix, and independent review remain Phase 5S security gates.
 
 Files are encrypted before upload. Push payloads are restricted to generic
 wake-up signals without sender, message, conversation, or plaintext preview.

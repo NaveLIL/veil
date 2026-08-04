@@ -46,9 +46,11 @@ missing or non-canonical. The application must never infer this trust scope from
 incoming `Host`, `X-Forwarded-Host`, redirects, or DNS.
 
 This configuration is the non-deployed Phase 5S.3B-1 foundation only. It does
-not activate the frozen transport-auth builders: `/ws` and signed REST still use
-legacy Preview WS auth v2 and REST auth v1 until the separately reviewed live
-cutover. Do not describe this setting as closing the hostile-Node P1, enabling
+not cut the primary transport over: `/ws` and signed REST still use legacy
+Preview WS auth v2 and REST auth v1. The gateway also registers a separate
+experimental `/v3/events` integration endpoint, but its FFI/Android bindings,
+cross-client behavior, and two-Node evidence are incomplete. Do not describe
+this setting or the side endpoint as closing the hostile-Node P1, enabling
 production cryptography, or satisfying the two-Node relay gate.
 
 Keep `VEIL_ALLOW_REGISTRATION=false` while the managed Node is in closed

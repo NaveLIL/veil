@@ -90,11 +90,14 @@ Access Pass и preview Veil Link. Узкий Secure Share Viewer заплани�
   локальном checkpoint. A04/A05 и cross-client
   E2EE/airplane matrix, connected recovery/capture instrumentation, app-wide
   публичные коды ошибок и подписанный standalone APK ещё входят в Phase 5A/5B.
-  Нативный Android Direct пока открывает и обслуживает только уже
-  аутентифицированный каталог существующих Direct: поиска человека, обработки
-  заявок в друзья и создания нового Direct на Android ещё нет. Эти возможности
-  обязательны для функционального паритета с desktop и не выдаются за готовый
-  mobile contact flow.
+  Нативный Android Direct надёжно открывает и обслуживает только уже
+  аутентифицированный каталог существующих Direct. В beta baseline `f6dbf5a`
+  появились экраны и FFI/Kotlin/request scaffolding для поиска человека,
+  заявки в друзья и создания Direct, но flow ещё не работоспособен: generated
+  Kotlin bindings отстают, route/header расходятся с Go, а подготовленный
+  friend-request REST route отсутствует. Эти возможности обязательны для
+  функционального паритета с desktop и не выдаются за готовый mobile contact
+  flow.
   `PublicFailureCodeV1` покрывает Android identity setup и secure runtime gate,
   включая сохранение точной terminal-причины при React recreation, но Direct
   send/delivery и desktop/Go consumer parity открыты; MLS runtime и звонки не
@@ -104,6 +107,10 @@ Access Pass и preview Veil Link. Узкий Secure Share Viewer заплани�
 `SHA256SUMS`. До появления доверенного Authenticode-сертификата он явно
 помечается как неподписанный и может вызвать SmartScreen/Smart App Control;
 локальный development bundle официальным релизом не является.
+
+Переносимый beta-checkpoint от 2026-08-04 с точными test results, известными
+integration blockers и локальной macOS x86_64 сборкой опубликован в
+[`docs/reviews/beta-integration-macos-2026-08-04.md`](docs/reviews/beta-integration-macos-2026-08-04.md).
 
 ## Архитектура
 
@@ -183,15 +190,15 @@ Gateway разработки публикуется только на `127.0.0.1
 публичного proxy значение нужно явно заменить на его exact HTTPS origin.
 Отсутствующее или неканоническое значение блокирует gateway fail closed.
 
-Это configured-origin и изолированный transport-auth foundation, а не активация
-нового протокола. Отдельные WS v3 protobuf/native proof helpers, server
-verifier/atomic admission и REST v2 private native preparer, HTTP boundary,
-version dispatcher и PostgreSQL replay boundary существуют, но намеренно не
-подключены к transport, FFI или gateway routes: текущие `/ws` и signed REST
-остаются legacy Preview WS auth v2/REST auth v1. До live WS raw-protobuf/
-subprotocol dispatch, REST route/media/ServeMux cutover, двухнодовой
-relay-матрицы и независимого review эти компоненты не являются
-production-готовностью или новой live криптографической гарантией.
+Это configured-origin foundation, а не завершённый protocol cutover. Gateway
+теперь регистрирует отдельный экспериментальный `/v3/events`, а Rust/FFI/Android
+содержат первый background-events consumer; основной `/ws` остаётся legacy
+Preview WS auth v2. Новый endpoint ещё не проходит полный workspace build и не
+имеет законченного generated-Kotlin/cross-client/two-Node evidence. REST v2
+private preparer, HTTP boundary, version dispatcher и PostgreSQL replay boundary
+по-прежнему не подключены к live routes, а signed REST остаётся v1. До полного
+route/media/ServeMux cutover, relay-матрицы и независимого review эти компоненты
+не являются production-готовностью или новой live криптографической гарантией.
 
 Uploads и push намеренно fail closed, пока не заданы их ключи:
 
@@ -248,7 +255,7 @@ Windows job всегда обязан создать и проверить `.exe
 unsigned Preview после приобретения доверенного сертификата. macOS и Android
 остаются недоступными до platform signing/notarization и отдельного gate.
 
-## Desktop development и локальный Windows bundle
+## Desktop development и локальные bundles
 
 На Windows путь Rust target обязан быть ASCII. Кириллица в обычном workspace
 target ломает upstream OpenSSL/nmake:
@@ -278,6 +285,21 @@ NSIS появляется в
 `D:\veil-release-target\release\bundle\nsis\`. Локальный bundle без явно
 настроенной Authenticode-подписи — development artifact, а не опубликованный
 CI Preview.
+
+На macOS локальный app/DMG собирается так:
+
+```sh
+cargo install cargo-about --version 0.9.1 --locked --features cli
+cd veil-desktop
+pnpm install --frozen-lockfile
+pnpm tauri build --bundles app,dmg
+```
+
+2026-08-04 эта команда успешно создала `Veil.app` и
+`Veil_0.1.4_x64.dmg`; DMG прошёл `hdiutil verify`. Это x86_64-only development
+artifact без Apple signature/notarization, поэтому он не публикуется и не
+меняет release status macOS. Хеши и окружение записаны в
+[`beta integration and macOS checkpoint`](docs/reviews/beta-integration-macos-2026-08-04.md).
 
 ## Проверки перед checkpoint
 

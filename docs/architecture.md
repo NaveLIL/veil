@@ -81,10 +81,13 @@ Node не означает одну identity. Wildcard origin, HTTP downgrade и
 автоматическое доверие self-signed сертификату нарушают эту границу. Текущий
 Preview строго проверяет URL/TLS и exact legacy REST authority на managed
 ingress, но WS v2/REST v1 ещё не связывают полный canonical origin/user context
-end to end. Изолированные WS v3 verifier/atomic admission и REST v2 HTTP/version
-dispatcher существуют, но не подключены к gateway. Live raw-protobuf/
-subprotocol и route/ServeMux cutover, hostile two-Node matrix и client
-consumption остаются blocking gate Phase 5S.
+end to end. Gateway регистрирует отдельный экспериментальный `/v3/events`, а
+Rust/FFI/Android содержат первый background-events consumer; основной `/ws`
+остаётся legacy v2. Этот срез пока не проходит полный workspace build,
+generated Kotlin bindings отстают, а cross-client и hostile two-Node evidence
+отсутствуют. REST v2 HTTP/version dispatcher не подключён к live routes.
+Полный protocol/route cutover, two-Node matrix и проверенное client consumption
+остаются blocking gate Phase 5S.
 
 ### Локальные данные и поиск
 
