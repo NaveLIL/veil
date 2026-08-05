@@ -9,6 +9,10 @@ on:
     # Run weekly on Monday at 06:00 UTC
     - cron: "0 6 * * 1"
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.head.ref || github.ref_name }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 

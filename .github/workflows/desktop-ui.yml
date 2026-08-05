@@ -34,6 +34,10 @@ on:
       - "veil-server/cmd/gateway/web/index.html"
       - ".github/workflows/desktop-ui.yml"
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.head.ref || github.ref_name }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 

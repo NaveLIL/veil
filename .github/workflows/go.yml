@@ -44,6 +44,10 @@ on:
       - ".github/workflows/go.yml"
       - ".github/workflows/server-image.yml"
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.head.ref || github.ref_name }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 

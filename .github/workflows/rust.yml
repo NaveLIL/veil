@@ -38,6 +38,10 @@ on:
       - "Cargo.lock"
       - ".github/workflows/rust.yml"
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.head.ref || github.ref_name }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
