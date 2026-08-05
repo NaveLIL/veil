@@ -1884,7 +1884,7 @@ func TestMigrationUpgradePreflights(t *testing.T) {
 			    LIMIT 1`,
 			conversationID, ownerDeviceID, targetDeviceID, wire,
 		)
-		requireMigrationError(t, err, "23514", "sender_keys_membership_context_shape")
+		requireMigrationError(t, err, "23514", "legacy Sender-Key distribution cannot claim a membership epoch")
 	})
 
 	t.Run("fresh migration chain includes and applies 001 through 036", func(t *testing.T) {
