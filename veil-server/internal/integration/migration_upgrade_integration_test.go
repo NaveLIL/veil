@@ -1827,18 +1827,78 @@ func TestMigrationUpgradePreflights(t *testing.T) {
 		requireMigrationError(t, err, "23514", "does not extend the current head")
 	})
 
-	t.Run("fresh migration chain includes and applies 001 through 035", func(t *testing.T) {
+	t.Run("036 closes nullable security-context CHECK expressions", func(t *testing.T) {
+		pool := newMigrationDatabase(t, admin, baseDSN, "veil_migration_036")
+		applyMigrationsBefore(t, pool, migrations, 36)
+		ownerUserID, _, ownerDeviceID, targetDeviceID, conversationID :=
+			seedMigrationSenderKeyHistory(t, pool, true)
+		if err := execMigration(t, pool, migrations, 36); err != nil {
+			t.Fatalf("migration 036: %v", err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		for _, expected := range []struct {
+			table      string
+			constraint string
+			fragment   string
+		}{
+			{"conversation_membership_epochs_v1", "membership_epoch_bootstrap_owner_shape", "bootstrap_owner_signing_key IS NOT NULL"},
+			{"messages", "messages_security_context_all_or_none", "crypto_profile IS NOT NULL"},
+			{"sender_keys", "sender_keys_membership_context_shape", "membership_epoch_hash IS NOT NULL"},
+			{"message_send_idempotency", "message_send_ack_membership_shape", "ack_membership_epoch_hash IS NOT NULL"},
+		} {
+			var definition string
+			if err := pool.QueryRow(ctx,
+				`SELECT pg_get_constraintdef(oid)
+				   FROM pg_constraint
+				  WHERE conrelid=$1::regclass AND conname=$2`,
+				expected.table, expected.constraint,
+			).Scan(&definition); err != nil || !strings.Contains(definition, expected.fragment) {
+				t.Fatalf("constraint %s definition=%q err=%v, missing %q",
+					expected.constraint, definition, err, expected.fragment)
+			}
+		}
+
+		wire := []byte("partial-membership-coordinate-after-036")
+		_, err := pool.Exec(ctx,
+			`INSERT INTO identity_transparency_log_leaves (
+			   leaf_index, event_kind, subject_user_id, subject_device_id,
+			   binding_version, canonical_event, leaf_hash
+			 ) VALUES (0, 3, $1::uuid, NULL, 1, $2, $3)`,
+			ownerUserID, []byte("partial-transparency-coordinate"), bytes.Repeat([]byte{0xf1}, 32),
+		)
+		requireMigrationError(t, err, "23514", "identity_transparency_event_shape")
+
+		_, err = pool.Exec(ctx,
+			`INSERT INTO sender_keys (
+			   conversation_id, owner_device_id, target_device_id,
+			   encrypted_key, generation, envelope_commitment,
+			   roster_version, roster_commitment,
+			   owner_binding_version, target_binding_version,
+			   membership_epoch
+			 ) SELECT $1::uuid, $2::uuid, $3::uuid, $4::bytea, 2, digest($4::bytea, 'sha256'),
+			          roster_version, roster_commitment,
+			          owner_binding_version, target_binding_version, 1
+			     FROM sender_keys
+			    WHERE conversation_id=$1::uuid
+			    LIMIT 1`,
+			conversationID, ownerDeviceID, targetDeviceID, wire,
+		)
+		requireMigrationError(t, err, "23514", "sender_keys_membership_context_shape")
+	})
+
+	t.Run("fresh migration chain includes and applies 001 through 036", func(t *testing.T) {
 		pool := newMigrationDatabase(t, admin, baseDSN, "veil_migration_fresh")
 		seen := make(map[int]bool)
 		for _, item := range migrations {
 			seen[migrationNumber(t, item.name)] = true
 		}
-		for number := 1; number <= 35; number++ {
+		for number := 1; number <= 36; number++ {
 			if !seen[number] {
 				t.Fatalf("migration chain is missing %03d", number)
 			}
 		}
-		applyMigrationsBefore(t, pool, migrations, 36)
+		applyMigrationsBefore(t, pool, migrations, 37)
 	})
 }
 

@@ -249,6 +249,42 @@ func TestRESTAuthV2AllowedBodyPolicyOwnsExactBoundedMediaTypes(t *testing.T) {
 	}
 }
 
+func TestRESTAuthV2OptionalJSONPolicyKeepsAbsentAndJSONBodiesUnambiguous(t *testing.T) {
+	policy, err := NewRESTAuthV2OptionalJSONHTTPPolicy(64)
+	if err != nil || !policy.valid() {
+		t.Fatalf("valid optional JSON policy rejected: policy=%+v err=%v", policy, err)
+	}
+
+	testCases := []struct {
+		name        string
+		body        string
+		contentType string
+		wantErr     bool
+	}{
+		{name: "absent"},
+		{name: "exact JSON", body: `{}`, contentType: "application/json"},
+		{name: "unlabelled body", body: `{}`, wantErr: true},
+		{name: "wrong media", body: `{}`, contentType: "text/plain", wantErr: true},
+		{name: "metadata without body", contentType: "application/json", wantErr: true},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			var body io.Reader
+			if testCase.body != "" {
+				body = strings.NewReader(testCase.body)
+			}
+			request := httptest.NewRequest(http.MethodDelete, "/v1/servers/s/members/u", body)
+			if testCase.contentType != "" {
+				request.Header.Set("Content-Type", testCase.contentType)
+			}
+			err := validateRESTAuthV2HTTPMetadata(request, policy)
+			if (err != nil) != testCase.wantErr {
+				t.Fatalf("metadata error=%v, want error=%v", err, testCase.wantErr)
+			}
+		})
+	}
+}
+
 func TestRESTAuthV2HTTPBoundaryNeverReconstructsTargetFromURLOrHost(t *testing.T) {
 	harness := newRESTV2HTTPHarness(t, nil)
 	policy := RESTAuthV2BodylessHTTPPolicy()

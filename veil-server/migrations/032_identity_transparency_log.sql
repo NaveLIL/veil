@@ -41,7 +41,9 @@ CREATE TABLE identity_transparency_log_leaves (
         OR
         (event_kind = 2 AND subject_device_id IS NOT NULL AND binding_version IS NOT NULL)
         OR
-        (event_kind IN (3, 4) AND subject_device_id IS NULL)
+        (event_kind IN (3, 4)
+         AND subject_device_id IS NULL
+         AND binding_version IS NULL)
     )
 );
 

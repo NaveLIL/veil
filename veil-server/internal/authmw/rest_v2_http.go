@@ -22,6 +22,7 @@ const (
 	restAuthV2HTTPBodyInvalid restAuthV2HTTPBodyMode = iota
 	restAuthV2HTTPBodyForbidden
 	restAuthV2HTTPBodyRequired
+	restAuthV2HTTPBodyOptional
 )
 
 // RESTAuthV2HTTPPolicy fixes the body and parser boundary for one signed route.
@@ -80,11 +81,24 @@ func NewRESTAuthV2JSONHTTPPolicy(maxBodyBytes int64) (RESTAuthV2HTTPPolicy, erro
 	return NewRESTAuthV2FixedBodyHTTPPolicy("application/json", maxBodyBytes)
 }
 
+// NewRESTAuthV2OptionalJSONHTTPPolicy permits an absent body with no media
+// metadata, or a non-empty body with the exact application/json media type.
+// It is for routes such as moderation actions whose JSON reason is optional;
+// it never treats a body with missing or ambiguous Content-Type as bodyless.
+func NewRESTAuthV2OptionalJSONHTTPPolicy(maxBodyBytes int64) (RESTAuthV2HTTPPolicy, error) {
+	policy, err := NewRESTAuthV2JSONHTTPPolicy(maxBodyBytes)
+	if err != nil {
+		return RESTAuthV2HTTPPolicy{}, err
+	}
+	policy.bodyMode = restAuthV2HTTPBodyOptional
+	return policy, nil
+}
+
 func (policy RESTAuthV2HTTPPolicy) valid() bool {
 	switch policy.bodyMode {
 	case restAuthV2HTTPBodyForbidden:
 		return len(policy.mediaTypes) == 0 && policy.maxBodyBytes == 0
-	case restAuthV2HTTPBodyRequired:
+	case restAuthV2HTTPBodyRequired, restAuthV2HTTPBodyOptional:
 		if len(policy.mediaTypes) == 0 || len(policy.mediaTypes) > 8 ||
 			policy.maxBodyBytes < 1 || policy.maxBodyBytes > RESTAuthV2MaxBodyBytes {
 			return false
@@ -115,9 +129,9 @@ func canonicalRESTAuthV2MediaType(value string) bool {
 }
 
 // RESTAuthV2HTTPBoundary owns only request adaptation. It deliberately does
-// not choose an authentication version or register a route. Body admission is
-// borrowed from the existing v1 Middleware so a future Preview dual stack
-// cannot double the global or per-client retained-body capacity.
+// not choose an authentication version or register a route. Body admission
+// reuses the shared bounded request-capacity component owned by Middleware;
+// the legacy verifier itself is not reachable through this boundary.
 type RESTAuthV2HTTPBoundary struct {
 	verifier  *RESTAuthV2Verifier
 	admission *Middleware
@@ -254,6 +268,21 @@ func validateRESTAuthV2HTTPMetadata(request *http.Request, policy RESTAuthV2HTTP
 		}
 		if request.Body == nil || request.Body == http.NoBody {
 			return restAuthV2HTTPInvalid
+		}
+	case restAuthV2HTTPBodyOptional:
+		bodyDeclared := request.ContentLength > 0 || len(request.TransferEncoding) != 0 ||
+			(request.Body != nil && request.Body != http.NoBody)
+		if !bodyDeclared {
+			if contentTypePresent {
+				return restAuthV2HTTPUnsupportedRepresentation
+			}
+			break
+		}
+		if !contentTypePresent || len(contentTypes) != 1 || !policy.allowsMediaType(contentTypes[0]) {
+			return restAuthV2HTTPUnsupportedRepresentation
+		}
+		if request.ContentLength > policy.maxBodyBytes {
+			return restAuthV2HTTPTooLarge
 		}
 	default:
 		return restAuthV2HTTPInvalid

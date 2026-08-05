@@ -1,10 +1,44 @@
--- Bind every post-activation Sender-Key distribution and message to the
--- exact client-authorized membership epoch. Historical Sender-Key v5 rows
--- remain readable and are never relabelled.
+-- PostgreSQL CHECK constraints accept an UNKNOWN result. Earlier shape checks
+-- used length/range expressions without first proving every required column
+-- non-NULL, so a deliberately partial security context could evaluate to
+-- UNKNOWN and pass. Rebuild the live constraints with explicit NULL presence
+-- predicates. Historical all-NULL rows remain valid.
 
-ALTER TABLE messages
-    ADD COLUMN membership_epoch BIGINT,
-    ADD COLUMN membership_epoch_hash BYTEA;
+ALTER TABLE identity_transparency_log_leaves
+    DROP CONSTRAINT identity_transparency_event_shape;
+
+ALTER TABLE identity_transparency_log_leaves
+    ADD CONSTRAINT identity_transparency_event_shape CHECK (
+        (event_kind = 1 AND subject_device_id IS NULL AND binding_version IS NULL)
+        OR
+        (event_kind = 2 AND subject_device_id IS NOT NULL AND binding_version IS NOT NULL)
+        OR
+        (event_kind IN (3, 4)
+         AND subject_device_id IS NULL
+         AND binding_version IS NULL)
+    ) NOT VALID;
+
+ALTER TABLE identity_transparency_log_leaves
+    VALIDATE CONSTRAINT identity_transparency_event_shape;
+
+ALTER TABLE conversation_membership_epochs_v1
+    DROP CONSTRAINT membership_epoch_bootstrap_owner_shape;
+
+ALTER TABLE conversation_membership_epochs_v1
+    ADD CONSTRAINT membership_epoch_bootstrap_owner_shape
+    CHECK (
+        (epoch_number = 1
+         AND bootstrap_owner_id IS NOT NULL
+         AND bootstrap_owner_signing_key IS NOT NULL
+         AND octet_length(bootstrap_owner_signing_key) = 32)
+        OR
+        (epoch_number > 1
+         AND bootstrap_owner_id IS NULL
+         AND bootstrap_owner_signing_key IS NULL)
+    ) NOT VALID;
+
+ALTER TABLE conversation_membership_epochs_v1
+    VALIDATE CONSTRAINT membership_epoch_bootstrap_owner_shape;
 
 ALTER TABLE messages DROP CONSTRAINT messages_security_context_all_or_none;
 
@@ -105,76 +139,7 @@ ALTER TABLE messages ADD CONSTRAINT messages_security_context_all_or_none
 
 ALTER TABLE messages VALIDATE CONSTRAINT messages_security_context_all_or_none;
 
-CREATE OR REPLACE FUNCTION veil_validate_message_security_context()
-RETURNS trigger
-LANGUAGE plpgsql
-SET search_path = pg_catalog, public
-AS $$
-DECLARE
-    conversation_type SMALLINT;
-    active_membership_epoch BIGINT;
-    active_membership_hash BYTEA;
-BEGIN
-    SELECT conv_type INTO STRICT conversation_type
-    FROM public.conversations
-    WHERE id = NEW.conversation_id;
-
-    IF conversation_type IN (1, 2) THEN
-        SELECT epoch_number, epoch_hash
-          INTO active_membership_epoch, active_membership_hash
-          FROM public.conversation_membership_epoch_heads_v1
-         WHERE conversation_id = NEW.conversation_id;
-        IF active_membership_epoch IS NULL THEN
-            IF NEW.crypto_profile IS DISTINCT FROM 'sender_key_v5'
-               OR NEW.membership_epoch IS NOT NULL
-               OR NEW.membership_epoch_hash IS NOT NULL THEN
-                RAISE EXCEPTION 'legacy group/channel requires Sender-Key v5 without membership coordinates'
-                    USING ERRCODE = '23514';
-            END IF;
-        ELSIF NEW.crypto_profile IS DISTINCT FROM 'sender_key_v6'
-           OR NEW.membership_epoch IS DISTINCT FROM active_membership_epoch
-           OR NEW.membership_epoch_hash IS DISTINCT FROM active_membership_hash THEN
-            RAISE EXCEPTION 'activated group/channel requires exact current membership epoch'
-                USING ERRCODE = '23514';
-        END IF;
-    ELSIF conversation_type = 0 THEN
-        IF NEW.crypto_profile IS NOT NULL
-           AND NEW.crypto_profile IS DISTINCT FROM 'direct_v2' THEN
-            RAISE EXCEPTION 'direct-message row has an invalid crypto profile'
-                USING ERRCODE = '23514';
-        END IF;
-    ELSE
-        RAISE EXCEPTION 'message conversation type is unsupported'
-            USING ERRCODE = '23514';
-    END IF;
-    RETURN NEW;
-END;
-$$;
-
-DROP TRIGGER IF EXISTS messages_validate_security_context_insert ON messages;
-CREATE TRIGGER messages_validate_security_context_insert
-BEFORE INSERT ON messages
-FOR EACH ROW EXECUTE FUNCTION veil_validate_message_security_context();
-
-DROP TRIGGER IF EXISTS messages_validate_security_context_scope_update ON messages;
-CREATE TRIGGER messages_validate_security_context_scope_update
-BEFORE UPDATE OF conversation_id, crypto_profile, crypto_era, roster_version,
-                 roster_commitment, sender_device_id, sender_binding_version,
-                 target_device_id, target_binding_version, direct_session_id,
-                 sender_device_identity_key, sender_device_signing_key,
-                 sender_device_capabilities, sender_device_binding_status,
-                 sender_account_signature, membership_epoch,
-                 membership_epoch_hash
-ON messages
-FOR EACH ROW EXECUTE FUNCTION veil_validate_message_security_context();
-
-CREATE INDEX idx_messages_sender_key_v6_epoch
-    ON messages (conversation_id, membership_epoch, sender_device_id, created_at)
-    WHERE crypto_profile = 'sender_key_v6';
-
-ALTER TABLE sender_keys
-    ADD COLUMN membership_epoch BIGINT,
-    ADD COLUMN membership_epoch_hash BYTEA;
+ALTER TABLE sender_keys DROP CONSTRAINT sender_keys_membership_context_shape;
 
 ALTER TABLE sender_keys ADD CONSTRAINT sender_keys_membership_context_shape
     CHECK (
@@ -188,21 +153,11 @@ ALTER TABLE sender_keys ADD CONSTRAINT sender_keys_membership_context_shape
 
 ALTER TABLE sender_keys VALIDATE CONSTRAINT sender_keys_membership_context_shape;
 
-ALTER TABLE sender_keys ADD CONSTRAINT sender_keys_membership_epoch_fk
-    FOREIGN KEY (conversation_id, membership_epoch, membership_epoch_hash)
-    REFERENCES conversation_membership_epochs_v1
-        (conversation_id, epoch_number, epoch_hash)
-    NOT VALID;
-
-CREATE INDEX idx_sender_keys_membership_epoch
-    ON sender_keys (conversation_id, membership_epoch, target_device_id)
-    WHERE membership_epoch IS NOT NULL;
+ALTER TABLE message_send_idempotency
+    DROP CONSTRAINT message_send_ack_membership_shape;
 
 ALTER TABLE message_send_idempotency
-    ADD COLUMN ack_membership_epoch BIGINT,
-    ADD COLUMN ack_membership_epoch_hash BYTEA;
-
-ALTER TABLE message_send_idempotency ADD CONSTRAINT message_send_ack_membership_shape
+    ADD CONSTRAINT message_send_ack_membership_shape
     CHECK (
         (ack_membership_epoch IS NULL AND ack_membership_epoch_hash IS NULL)
         OR
@@ -212,4 +167,7 @@ ALTER TABLE message_send_idempotency ADD CONSTRAINT message_send_ack_membership_
          AND ack_membership_epoch BETWEEN 1 AND 9223372036854775807
          AND octet_length(ack_membership_epoch_hash) = 32
          AND ack_membership_epoch_hash <> decode(repeat('00', 32), 'hex'))
-    );
+    ) NOT VALID;
+
+ALTER TABLE message_send_idempotency
+    VALIDATE CONSTRAINT message_send_ack_membership_shape;

@@ -17,19 +17,27 @@
 | `17108c3` | Go fuzz smoke for Node-origin, REST v2, membership-epoch, and transparency parsers |
 | `bc987d0` | Integration harness moved from legacy REST v1 to production v2-only; hostile two-Node relay/downgrade matrix added |
 | `155ecd1` | Superseded push/PR workflow runs cancel by source branch instead of consuming the CI queue |
-| current hardening commit | Permanently retired WS v2 and standalone REST v1 binaries; removed the WS rollback switch, post-auth re-verification, and REST `PreviewDual` dispatch; corrected the SQLCipher restart fixture |
+| `1a46787` | Permanently retired WS v2 and standalone REST v1 binaries; removed the WS rollback switch, post-auth re-verification, and REST `PreviewDual` dispatch; corrected the SQLCipher restart fixture |
+| current follow-up commit | Preserved optional no-reason moderation requests under REST v2 while keeping their signed-body boundary unambiguous; closed nullable PostgreSQL security-context checks for both fresh and already-upgraded databases; made Android foreground-service registration unambiguous to variant-aware lint |
 
 Schema migrations introduced by this security range are:
 
 - `031_direct_v2_message_context.sql`;
-- `032_identity_transparency_v1.sql`;
+- `032_identity_transparency_log.sql`;
 - `033_membership_epochs_v1.sql`;
-- `034_sender_key_v6_membership_epochs.sql`;
-- `035_membership_epoch_database_invariants.sql`.
+- `034_sender_key_v6_membership_binding.sql`;
+- `035_membership_epoch_database_invariants.sql`;
+- `036_close_nullable_security_context_checks.sql`.
 
-The fresh `001`–`035` chain and upgrades through `032`–`035` are exercised by
+The fresh `001`–`036` chain and upgrades through `032`–`036` are exercised by
 the Docker/PostgreSQL integration suite. Historical Direct v1 and Sender-Key v5
 rows remain readable; only newly activated secure-era traffic is fail-closed.
+Migration `036` replaces checks whose nullable expressions could evaluate to
+PostgreSQL `UNKNOWN`, which a `CHECK` accepts, with explicit all-present or
+all-absent predicates. This covers transparency events, membership bootstrap
+owners, message contexts, Sender-Key membership coordinates, and idempotent
+send acknowledgements. A database containing a partial security context fails
+validation instead of silently relabelling or deleting the row.
 
 ## Security properties to review
 
@@ -73,6 +81,9 @@ rows remain readable; only newly activated secure-era traffic is fail-closed.
 - Roster changes rotate and distribute group keys automatically. A user is
   blocked only when the authorized new epoch or exact key distribution is not
   yet available.
+- Moderators may still remove a member without entering a reason. The absent
+  body and an exact `application/json` body are both supported, but ambiguous,
+  mislabeled, or oversized bodies are rejected before signature verification.
 
 ## Reproducible local evidence
 
@@ -86,9 +97,9 @@ go test -tags=integration ./internal/integration ./internal/db -run '^$'
 ```
 
 All pass on the 2026-08-05 Windows host after live legacy authentication was
-removed. The last command compiles the Docker
-suite; the actual disposable PostgreSQL run belongs to GitHub Actions because
-Docker is unavailable on this host.
+removed and the optional-body/database constraints were hardened. The last
+command compiles the Docker suite; the actual disposable PostgreSQL run belongs
+to GitHub Actions because Docker is unavailable on this host.
 
 Fuzz smoke completed locally without a finding for all four targets. Approximate
 two-second execution counts were 68,549 Node-origin, 14,143 REST-auth, 42,976
@@ -159,7 +170,7 @@ not substituted for a green current-head run.
   `veil-client/src/transparency.rs`, `veil-server/internal/transparency`, and
   migration `032`.
 - Membership/Sender-Key: `veil-crypto/src/membership.rs`, client/store
-  Sender-Key code, server membership/database code, and migrations `033`–`035`.
+  Sender-Key code, server membership/database code, and migrations `033`–`036`.
 - Mobile boundary: `veil-ffi`, Android runtime/transport Kotlin, and the UniFFI
   symbol audit in `.github/workflows/security.yml`.
 

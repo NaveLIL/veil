@@ -60,7 +60,7 @@
       </intent-filter>
     </service>
     <service
-      android:name=".runtime.VeilEventsService"
+      android:name="io.veil.mobile.runtime.VeilEventsService"
       android:exported="false"
       android:foregroundServiceType="dataSync" />
   </application>

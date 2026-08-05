@@ -88,6 +88,10 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	if err != nil {
 		panic("invalid servers REST v2 JSON policy")
 	}
+	optionalJSONPolicy, err := authmw.NewRESTAuthV2OptionalJSONHTTPPolicy(64 * 1024)
+	if err != nil {
+		panic("invalid servers optional REST v2 JSON policy")
+	}
 	bodylessPolicy := authmw.RESTAuthV2BodylessHTTPPolicy()
 
 	// Servers
@@ -100,7 +104,7 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 
 	// Members
 	mux.HandleFunc("GET /v1/servers/{serverID}/members", signed(bodylessPolicy, h.ListMembers))
-	mux.HandleFunc("DELETE /v1/servers/{serverID}/members/{userID}", signed(jsonPolicy, h.KickMember))
+	mux.HandleFunc("DELETE /v1/servers/{serverID}/members/{userID}", signed(optionalJSONPolicy, h.KickMember))
 	mux.HandleFunc("GET /v1/servers/{serverID}/bans", signed(bodylessPolicy, h.ListBans))
 	mux.HandleFunc("PUT /v1/servers/{serverID}/bans/{userID}", signed(jsonPolicy, h.BanMember))
 	mux.HandleFunc("DELETE /v1/servers/{serverID}/bans/{userID}", signed(bodylessPolicy, h.UnbanMember))

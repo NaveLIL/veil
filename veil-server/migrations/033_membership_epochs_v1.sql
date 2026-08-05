@@ -52,6 +52,7 @@ CREATE TABLE conversation_membership_epochs_v1 (
         CHECK (
             (epoch_number = 1
              AND bootstrap_owner_id IS NOT NULL
+             AND bootstrap_owner_signing_key IS NOT NULL
              AND octet_length(bootstrap_owner_signing_key) = 32)
             OR
             (epoch_number > 1
