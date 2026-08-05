@@ -57,10 +57,10 @@ the `.proto` source and regenerated Go diff in the same change.
 
 `AuthChallengeV3`, `AuthResponseV3`, and `AuthResultV3` are the active native
 authentication exchange on exact `/v3/events`. Their Envelope tags are 14, 15,
-and 16; legacy auth keeps tags 10, 11, and 12 solely for the server-operated
-emergency compatibility endpoint. `/ws` is disabled by default, requires the
-explicit `VEIL_ALLOW_LEGACY_WS_V2=true` operator flag, and is never selected by
-an automatic client downgrade. WS v3 binds canonical Node origin, account,
+and 16. The frozen legacy tags 10, 11, and 12 remain decodable only so a
+post-handshake downgrade attempt can be identified, its bearer cleared, and
+the socket closed; no v2 verifier or compatibility endpoint exists. `/ws`
+permanently returns HTTP 410. WS v3 binds canonical Node origin, account,
 device, client metadata, registration intent, challenge, and optional Node
 Access Pass into one signed attempt. Commands, ACKs, and events then share the
 same authenticated socket and sequence epoch.

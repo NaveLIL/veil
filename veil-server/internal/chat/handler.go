@@ -106,14 +106,14 @@ type Handler struct {
 	rl             *authmw.RateLimit
 }
 
-// NewHandler builds the chat REST handler. mw and rl may be nil to disable
-// signature checks / rate limiting (used in tests and the all-in-one binary).
+// NewHandler builds the chat REST handler. A nil middleware is reserved for
+// direct-handler unit tests; every server entry point installs REST v2.
 func NewHandler(svc *Service, mw *authmw.Middleware, rl *authmw.RateLimit) *Handler {
 	return &Handler{svc: svc, mw: mw, rl: rl}
 }
 
-// SetRESTAuthVersionDispatcher activates explicit v1/v2 selection for every
-// signed chat route while preserving v1-only isolated service fixtures.
+// SetRESTAuthVersionDispatcher activates mandatory REST v2 authentication for
+// every signed chat route. A configured middleware without it fails closed.
 func (h *Handler) SetRESTAuthVersionDispatcher(dispatcher *authmw.RESTAuthVersionDispatcher) {
 	h.restDispatcher = dispatcher
 }
@@ -145,8 +145,8 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 		if h.restDispatcher != nil {
 			f = h.restDispatcher.RequireSigned(policy, f)
 		} else if h.mw != nil {
-			// Verify first; the limiter keys from verified principal context.
-			f = h.mw.RequireSigned(f)
+			var unavailable *authmw.RESTAuthVersionDispatcher
+			f = unavailable.RequireSigned(policy, f)
 		}
 		return f
 	}

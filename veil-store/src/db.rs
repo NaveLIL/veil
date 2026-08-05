@@ -13074,13 +13074,15 @@ mod tests {
             std::env::temp_dir().join(format!("veil-device-identity-{}.db", uuid::Uuid::new_v4()));
         let db_key = [0x83u8; 32];
         let identity = sample_device_identity([0x30; 16]);
+        let mut advanced_account_signature = identity.account_signature;
+        advanced_account_signature[0] ^= 1;
         {
             let db = VeilDb::open(&path, &db_key).unwrap();
             db.create_device_identity_v1(&identity).unwrap();
             let mut candidate = db.load_device_identity_v1().unwrap().unwrap();
             candidate.version += 1;
             candidate.capabilities |= 4;
-            candidate.account_signature[0] ^= 1;
+            candidate.account_signature = advanced_account_signature;
             db.advance_device_identity_binding_v1(&candidate).unwrap();
         }
         {
@@ -13091,7 +13093,11 @@ mod tests {
             assert_eq!(loaded.capabilities, identity.capabilities | 4);
             assert_eq!(loaded.x25519_secret, identity.x25519_secret);
             assert_eq!(loaded.ed25519_secret, identity.ed25519_secret);
-            assert_eq!(loaded.account_signature, identity.account_signature);
+            // The private device identity is immutable, while an account-
+            // authorized capability advance necessarily carries the new
+            // binding signature. Reopen must preserve that exact candidate,
+            // not the signature from the previous binding version.
+            assert_eq!(loaded.account_signature, advanced_account_signature);
         }
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("db-wal"));

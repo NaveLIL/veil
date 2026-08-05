@@ -13,7 +13,7 @@ import (
 )
 
 func wsURL(s *httptest.Server) string {
-	return "ws" + strings.TrimPrefix(s.URL, "http") + "/ws"
+	return "ws" + strings.TrimPrefix(s.URL, "http") + "/v3/events"
 }
 
 func TestWS_OriginAllowList_Reject(t *testing.T) {

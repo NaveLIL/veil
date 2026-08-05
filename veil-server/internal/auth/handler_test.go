@@ -14,7 +14,6 @@ import (
 func newTestHandler() *auth.Handler {
 	cfg := &config.Config{
 		AuthChallengeTTL: 5 * time.Second,
-		AuthMaxAttempts:  3,
 		PreKeyLowWarning: 10,
 	}
 	svc := auth.NewService(nil, cfg)

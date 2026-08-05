@@ -137,8 +137,7 @@ func NewRESTAuthV2HTTPBoundary(
 }
 
 // RequireSigned adapts one exact HTTP request into the transport-neutral v2
-// verifier. Live routes reach this boundary through the explicit version
-// dispatcher, which owns the temporary compatibility policy.
+// verifier. Live routes reach this boundary through the v2-only dispatcher.
 func (boundary *RESTAuthV2HTTPBoundary) RequireSigned(
 	policy RESTAuthV2HTTPPolicy,
 	next http.HandlerFunc,

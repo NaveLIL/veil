@@ -43,7 +43,7 @@ func NewHandlerWithEndpointPolicy(database *db.DB, mw *authmw.Middleware, rl *au
 	return &Handler{db: database, mw: mw, rl: rl, policy: policy}
 }
 
-// SetRESTAuthVersionDispatcher activates explicit REST authentication version
+// SetRESTAuthVersionDispatcher activates mandatory REST v2 authentication
 // selection for every signed push route.
 func (h *Handler) SetRESTAuthVersionDispatcher(dispatcher *authmw.RESTAuthVersionDispatcher) {
 	h.restAuthDispatcher = dispatcher
@@ -58,7 +58,8 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 		if h.restAuthDispatcher != nil {
 			f = h.restAuthDispatcher.RequireSigned(policy, f)
 		} else if h.mw != nil {
-			f = h.mw.RequireSigned(f)
+			var unavailable *authmw.RESTAuthVersionDispatcher
+			f = unavailable.RequireSigned(policy, f)
 		}
 		return f
 	}

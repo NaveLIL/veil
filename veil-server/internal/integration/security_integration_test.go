@@ -18,12 +18,10 @@ import (
 
 	"github.com/NaveLIL/veil/veil-server/internal/auth"
 	"github.com/NaveLIL/veil/veil-server/internal/chat"
-	"github.com/NaveLIL/veil/veil-server/internal/config"
 	"github.com/NaveLIL/veil/veil-server/internal/db"
 	"github.com/NaveLIL/veil/veil-server/internal/servers"
 	pb "github.com/NaveLIL/veil/veil-server/pkg/proto/v1"
 	"github.com/google/uuid"
-	"golang.org/x/crypto/curve25519"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -49,117 +47,6 @@ func TestSecurityPrincipalBinding(t *testing.T) {
 	alice := h.CreateUser("security-alice")
 	bob := h.CreateUser("security-bob")
 	mallory := h.CreateUser("security-mallory")
-
-	t.Run("websocket auth registers only with a valid X25519 proof", func(t *testing.T) {
-		cfg := &config.Config{AuthChallengeTTL: 5 * time.Second, AuthMaxAttempts: 3, AllowRegistration: true}
-		svc := auth.NewService(h.DB, cfg)
-		serverPublic, err := svc.CreateChallenge("valid-registration")
-		if err != nil {
-			t.Fatal(err)
-		}
-		identityPublic, identityPrivate := randomX25519KeyPair(t)
-		signingPublic, signingPrivate, err := ed25519.GenerateKey(rand.Reader)
-		if err != nil {
-			t.Fatal(err)
-		}
-		shared, err := curve25519.X25519(identityPrivate, serverPublic[:])
-		if err != nil {
-			t.Fatal(err)
-		}
-		message, err := auth.WSAuthSigningMessage(serverPublic[:], shared)
-		if err != nil {
-			t.Fatal(err)
-		}
-		result, err := svc.VerifyResponse(context.Background(), "valid-registration",
-			identityPublic, signingPublic, ed25519.Sign(signingPrivate, message),
-			randomBytes(t, 16), "valid-device")
-		if err != nil {
-			t.Fatalf("valid registration rejected: %v", err)
-		}
-		if !result.IsNew {
-			t.Fatal("valid registration was not marked new")
-		}
-	})
-
-	t.Run("websocket auth keeps first-time registration closed by default", func(t *testing.T) {
-		cfg := &config.Config{AuthChallengeTTL: 5 * time.Second, AuthMaxAttempts: 3}
-		svc := auth.NewService(h.DB, cfg)
-		serverPublic, err := svc.CreateChallenge("closed-registration")
-		if err != nil {
-			t.Fatal(err)
-		}
-		identityPublic, identityPrivate := randomX25519KeyPair(t)
-		signingPublic, signingPrivate, err := ed25519.GenerateKey(rand.Reader)
-		if err != nil {
-			t.Fatal(err)
-		}
-		shared, err := curve25519.X25519(identityPrivate, serverPublic[:])
-		if err != nil {
-			t.Fatal(err)
-		}
-		message, err := auth.WSAuthSigningMessage(serverPublic[:], shared)
-		if err != nil {
-			t.Fatal(err)
-		}
-		_, err = svc.VerifyResponse(context.Background(), "closed-registration",
-			identityPublic, signingPublic, ed25519.Sign(signingPrivate, message),
-			randomBytes(t, 16), "closed-device")
-		if !errors.Is(err, auth.ErrRegistrationClosed) {
-			t.Fatalf("closed registration error = %v, want ErrRegistrationClosed", err)
-		}
-	})
-
-	t.Run("websocket auth rejects a replacement signing key", func(t *testing.T) {
-		cfg := &config.Config{AuthChallengeTTL: 5 * time.Second, AuthMaxAttempts: 3}
-		svc := auth.NewService(h.DB, cfg)
-		serverPublic, err := svc.CreateChallenge("takeover-attempt")
-		if err != nil {
-			t.Fatal(err)
-		}
-		attackerPublic, attackerPrivate, err := ed25519.GenerateKey(rand.Reader)
-		if err != nil {
-			t.Fatal(err)
-		}
-		deviceKey := randomBytes(t, 16)
-		shared, err := curve25519.X25519(alice.IdentityPrivate, serverPublic[:])
-		if err != nil {
-			t.Fatal(err)
-		}
-		signingMessage, err := auth.WSAuthSigningMessage(serverPublic[:], shared)
-		if err != nil {
-			t.Fatal(err)
-		}
-		_, err = svc.VerifyResponse(context.Background(), "takeover-attempt",
-			alice.IdentityKey, attackerPublic, ed25519.Sign(attackerPrivate, signingMessage),
-			deviceKey, "attacker-device")
-		if !errors.Is(err, auth.ErrSigningKeyMismatch) {
-			t.Fatalf("takeover error = %v, want ErrSigningKeyMismatch", err)
-		}
-	})
-
-	t.Run("websocket auth requires X25519 private key possession", func(t *testing.T) {
-		cfg := &config.Config{AuthChallengeTTL: 5 * time.Second, AuthMaxAttempts: 3}
-		svc := auth.NewService(h.DB, cfg)
-		serverPublic, err := svc.CreateChallenge("no-x25519-private")
-		if err != nil {
-			t.Fatal(err)
-		}
-		_, wrongIdentityPrivate := randomX25519KeyPair(t)
-		wrongShared, err := curve25519.X25519(wrongIdentityPrivate, serverPublic[:])
-		if err != nil {
-			t.Fatal(err)
-		}
-		message, err := auth.WSAuthSigningMessage(serverPublic[:], wrongShared)
-		if err != nil {
-			t.Fatal(err)
-		}
-		_, err = svc.VerifyResponse(context.Background(), "no-x25519-private",
-			alice.IdentityKey, alice.SigningPublic, ed25519.Sign(alice.SigningKey, message),
-			randomBytes(t, 16), "forged-device")
-		if !errors.Is(err, auth.ErrBadSignature) {
-			t.Fatalf("missing X25519 private proof error = %v, want ErrBadSignature", err)
-		}
-	})
 
 	aliceDeviceKey := randomBytes(t, 16)
 	aliceDevice, err := h.DB.CreateDevice(context.Background(), alice.ID, aliceDeviceKey, "alice-device")
@@ -1662,14 +1549,4 @@ func randomBytes(t *testing.T, size int) []byte {
 		t.Fatal(err)
 	}
 	return b
-}
-
-func randomX25519KeyPair(t *testing.T) ([]byte, []byte) {
-	t.Helper()
-	private := randomBytes(t, 32)
-	public, err := curve25519.X25519(private, curve25519.Basepoint)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return public, private
 }

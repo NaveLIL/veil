@@ -123,7 +123,6 @@ func New(t *testing.T) *Harness {
 	cfg := &config.Config{
 		PublicOrigin:          mustIntegrationNodeOrigin(t, integrationNodeOrigin),
 		AuthChallengeTTL:      30 * time.Second,
-		AuthMaxAttempts:       3,
 		PreKeyLowWarning:      10,
 		AllowRegistration:     true,
 		MaxMessageSize:        64 * 1024,
@@ -149,12 +148,7 @@ func New(t *testing.T) *Harness {
 	if err != nil {
 		t.Fatalf("create REST auth v2 HTTP boundary: %v", err)
 	}
-	restDispatcher, err := authmw.NewRESTAuthVersionDispatcher(
-		authmw.RESTAuthDispatchV2Only,
-		nil,
-		restV2Boundary,
-		authmw.RESTAuthPreviewCompatibility{},
-	)
+	restDispatcher, err := authmw.NewRESTAuthVersionDispatcher(restV2Boundary)
 	if err != nil {
 		t.Fatalf("create REST auth v2 dispatcher: %v", err)
 	}

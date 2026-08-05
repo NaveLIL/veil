@@ -246,8 +246,8 @@ func TestRegisteredChatReadsSetNoStoreBeforeSignatureMiddleware(t *testing.T) {
 			response := httptest.NewRecorder()
 			mux.ServeHTTP(response, request)
 
-			if response.Code != http.StatusUnauthorized {
-				t.Fatalf("status=%d body=%s, want 401", response.Code, response.Body.String())
+			if response.Code != http.StatusServiceUnavailable {
+				t.Fatalf("status=%d body=%s, want 503", response.Code, response.Body.String())
 			}
 			if got := response.Header().Get("Cache-Control"); got != "no-store" {
 				t.Fatalf("Cache-Control=%q, want no-store", got)

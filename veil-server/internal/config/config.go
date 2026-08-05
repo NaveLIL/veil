@@ -25,10 +25,8 @@ type Config struct {
 
 	// Auth
 	AuthChallengeTTL     time.Duration // How long a challenge is valid
-	AuthMaxAttempts      int           // Max auth attempts per connection before disconnect
 	PreKeyLowWarning     int           // Warn when OPKs drop below this count
 	AllowRegistration    bool          // Whether first-time identities may create accounts
-	AllowLegacyWSV2      bool          // Emergency opt-in for the origin-unbound legacy /ws transport
 	IdentityTransparency *IdentityTransparencyConfig
 
 	// Chat
@@ -186,6 +184,9 @@ func allZeroConfigBytes(value []byte) bool {
 const ed25519SeedSize = 32
 
 func Load() (*Config, error) {
+	if _, configured := os.LookupEnv("VEIL_ALLOW_LEGACY_WS_V2"); configured {
+		return nil, errors.New("VEIL_ALLOW_LEGACY_WS_V2 was removed; legacy WebSocket v2 cannot be enabled")
+	}
 	databaseURL, err := loadDatabaseURL()
 	if err != nil {
 		return nil, err
@@ -194,18 +195,12 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	allowLegacyWSV2, err := envBoolOrDefault("VEIL_ALLOW_LEGACY_WS_V2", false)
-	if err != nil {
-		return nil, err
-	}
 	return &Config{
 		Port:                  envOrDefault("PORT", "8080"),
 		DatabaseURL:           databaseURL,
 		AuthChallengeTTL:      envDurationOrDefault("AUTH_CHALLENGE_TTL", 30*time.Second),
-		AuthMaxAttempts:       envIntOrDefault("AUTH_MAX_ATTEMPTS", 3),
 		PreKeyLowWarning:      envIntOrDefault("PREKEY_LOW_WARNING", 10),
 		AllowRegistration:     allowRegistration,
-		AllowLegacyWSV2:       allowLegacyWSV2,
 		MaxMessageSize:        envIntOrDefault("MAX_MESSAGE_SIZE", 64*1024),
 		MessageBatchLimit:     envIntOrDefault("MESSAGE_BATCH_LIMIT", 100),
 		MaxConversationFanout: envIntOrDefault("MAX_CONVERSATION_FANOUT", 2),

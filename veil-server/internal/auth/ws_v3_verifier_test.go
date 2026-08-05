@@ -244,7 +244,6 @@ func newWSAuthV3VerifierService(t *testing.T, store wsAuthV3AdmissionStore) *Ser
 	service := NewService(nil, &config.Config{
 		PublicOrigin:      origin,
 		AuthChallengeTTL:  5 * time.Second,
-		AuthMaxAttempts:   3,
 		AllowRegistration: false,
 	})
 	service.wsAuthV3Store = store

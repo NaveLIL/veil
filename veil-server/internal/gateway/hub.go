@@ -187,9 +187,6 @@ type Client struct {
 	perDeviceSecure      bool
 	deviceBindingVersion uint64
 	deviceBindingStatus  db.DeviceBindingStatus
-
-	// Rate limiting
-	authAttempts int
 }
 
 type authenticatedSenderSnapshot struct {
@@ -608,64 +605,6 @@ func (h *Hub) BroadcastToUsers(userIDs []string, env *pb.Envelope) {
 	}
 }
 
-// HandleWebSocket upgrades HTTP to WebSocket, sends auth challenge, starts pumps.
-func HandleWebSocket(hub *Hub, w http.ResponseWriter, r *http.Request) {
-	ip := wsClientIP(r)
-
-	// Per-IP connection cap. Reject BEFORE upgrade so we don't waste a
-	// goroutine + websocket buffer on an attacker flooding from one IP.
-	if !hub.tryAcquireIP(ip) {
-		metrics.WSRefusedTotal.WithLabelValues("ip_cap").Inc()
-		http.Error(w, "too many connections from this address", http.StatusTooManyRequests)
-		return
-	}
-
-	conn, err := upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		// Upgrade may fail because of CheckOrigin too — count it.
-		metrics.WSRefusedTotal.WithLabelValues("upgrade_error").Inc()
-		hub.releaseIP(ip)
-		log.Printf("upgrade error: class=%s", logsafe.ErrorClass(err))
-		return
-	}
-
-	connID := fmt.Sprintf("%p-%d", conn, time.Now().UnixNano())
-	client := &Client{
-		hub:        hub,
-		conn:       conn,
-		send:       make(chan outboundBatch, 256),
-		connID:     connID,
-		ip:         ip,
-		registered: make(chan struct{}),
-	}
-
-	hub.register <- client
-	<-client.registered
-
-	// Send auth challenge immediately
-	nonce, err := hub.authSvc.CreateChallenge(connID)
-	if err != nil {
-		log.Printf("failed to create challenge: class=%s", logsafe.ErrorClass(err))
-		client.failClosed()
-		// Pumps have not started yet, so no readPump defer exists to return the
-		// registered client, IP slot and send channel to Hub.Run.
-		hub.unregister <- client
-		return
-	}
-
-	env := &pb.Envelope{
-		Timestamp: uint64(time.Now().UnixNano()),
-		Payload: &pb.Envelope_AuthChallenge{
-			AuthChallenge: &pb.AuthChallenge{Challenge: nonce[:]},
-		},
-	}
-	data, _ := proto.Marshal(env)
-	client.send <- singleOutbound(data)
-
-	go client.writePump()
-	go client.readPump()
-}
-
 func (c *Client) readPump() {
 	defer func() {
 		c.hub.unregister <- c
@@ -738,77 +677,76 @@ func envelopeKind(env *pb.Envelope) string {
 }
 
 func (c *Client) handleEnvelope(env *pb.Envelope) {
-	// AuthResponseV3 remains deliberately unactivated, but the generated oneof
-	// now decodes its raw Pass field. Clear that unavoidable decoded bearer copy
-	// on every legacy/default dispatch path instead of leaving it until GC.
+	// Authentication completes synchronously before readPump starts. A later
+	// auth frame is therefore a terminal protocol violation. In particular, a
+	// legacy v2 response must never re-authenticate an origin-bound v3 socket.
 	if response := env.GetAuthResponseV3(); response != nil {
 		defer clear(response.NodeAccessPass)
+	}
+	if response := env.GetAuthResponse(); response != nil {
+		defer clear(response.NodeAccessInvite)
+	}
+	if env.GetAuthResponseV3() != nil || env.GetAuthResponse() != nil {
+		metrics.WSAuthFailuresTotal.Inc()
+		c.failClosed()
+		return
 	}
 	ctx := context.Background()
 	clientMessageID, sendMessageReason := sendMessageEnvelopeContext(env)
 
-	switch payload := env.Payload.(type) {
+	if !c.authenticated {
+		if clientMessageID != "" {
+			sendMessageReason = sendMessageReasonNotAuthenticated
+		}
+		c.sendErrorWithSendMessageContext(
+			env.Seq, 401, "not authenticated", clientMessageID, sendMessageReason,
+		)
+		return
+	}
 
-	// === Auth Response ===
-	case *pb.Envelope_AuthResponse:
-		c.handleAuth(ctx, env.Seq, payload.AuthResponse)
+	// W10 — per-(user, kind) rate limit. Drop with a 429-equivalent
+	// error so the client knows to back off, and increment the
+	// rejected-total metric so ops can see the offender.
+	kind := kindForUserBucket(envelopeKind(env))
+	if !allowEnvelope(c.userID, kind) {
+		if clientMessageID != "" {
+			sendMessageReason = sendMessageReasonRateLimited
+		}
+		c.sendErrorWithSendMessageContext(
+			env.Seq, 429, "ws rate limit exceeded for "+kind, clientMessageID, sendMessageReason,
+		)
+		return
+	}
 
-	// === All other messages require authentication ===
+	switch p := env.Payload.(type) {
+	case *pb.Envelope_SendMessage:
+		c.handleSendMessage(ctx, env.Seq, p.SendMessage)
+	case *pb.Envelope_EditMessage:
+		c.handleEditMessage(ctx, env.Seq, p.EditMessage)
+	case *pb.Envelope_DeleteMessage:
+		c.handleDeleteMessage(ctx, env.Seq, p.DeleteMessage)
+	case *pb.Envelope_ReactionUpdate:
+		c.handleReaction(ctx, env.Seq, p.ReactionUpdate)
+	case *pb.Envelope_PrekeyRequest:
+		c.handlePreKeyRequest(ctx, env.Seq, p.PrekeyRequest)
+	case *pb.Envelope_TypingEvent:
+		c.handleTyping(ctx, env.Seq, p.TypingEvent)
+	case *pb.Envelope_PresenceUpdate:
+		c.handlePresence(ctx, p.PresenceUpdate)
+	case *pb.Envelope_SenderKeyDist:
+		c.handleSenderKeyDist(ctx, env.Seq, p.SenderKeyDist)
+	case *pb.Envelope_SenderKeyReceipt:
+		c.handleSenderKeyReceipt(ctx, env.Seq, p.SenderKeyReceipt)
+	case *pb.Envelope_FriendRequest:
+		c.handleFriendRequest(ctx, env.Seq, p.FriendRequest)
+	case *pb.Envelope_FriendRespond:
+		c.handleFriendRespond(ctx, env.Seq, p.FriendRespond)
+	case *pb.Envelope_FriendRemove:
+		c.handleFriendRemove(ctx, env.Seq, p.FriendRemove)
+	case *pb.Envelope_FriendListRequest:
+		c.handleFriendListRequest(ctx, env.Seq)
 	default:
-		if !c.authenticated {
-			if clientMessageID != "" {
-				sendMessageReason = sendMessageReasonNotAuthenticated
-			}
-			c.sendErrorWithSendMessageContext(
-				env.Seq, 401, "not authenticated", clientMessageID, sendMessageReason,
-			)
-			return
-		}
-
-		// W10 — per-(user, kind) rate limit. Drop with a 429-equivalent
-		// error so the client knows to back off, and increment the
-		// rejected-total metric so ops can see the offender.
-		kind := kindForUserBucket(envelopeKind(env))
-		if !allowEnvelope(c.userID, kind) {
-			if clientMessageID != "" {
-				sendMessageReason = sendMessageReasonRateLimited
-			}
-			c.sendErrorWithSendMessageContext(
-				env.Seq, 429, "ws rate limit exceeded for "+kind, clientMessageID, sendMessageReason,
-			)
-			return
-		}
-
-		switch p := env.Payload.(type) {
-		case *pb.Envelope_SendMessage:
-			c.handleSendMessage(ctx, env.Seq, p.SendMessage)
-		case *pb.Envelope_EditMessage:
-			c.handleEditMessage(ctx, env.Seq, p.EditMessage)
-		case *pb.Envelope_DeleteMessage:
-			c.handleDeleteMessage(ctx, env.Seq, p.DeleteMessage)
-		case *pb.Envelope_ReactionUpdate:
-			c.handleReaction(ctx, env.Seq, p.ReactionUpdate)
-		case *pb.Envelope_PrekeyRequest:
-			c.handlePreKeyRequest(ctx, env.Seq, p.PrekeyRequest)
-		case *pb.Envelope_TypingEvent:
-			c.handleTyping(ctx, env.Seq, p.TypingEvent)
-		case *pb.Envelope_PresenceUpdate:
-			c.handlePresence(ctx, p.PresenceUpdate)
-		case *pb.Envelope_SenderKeyDist:
-			c.handleSenderKeyDist(ctx, env.Seq, p.SenderKeyDist)
-		case *pb.Envelope_SenderKeyReceipt:
-			c.handleSenderKeyReceipt(ctx, env.Seq, p.SenderKeyReceipt)
-		case *pb.Envelope_FriendRequest:
-			c.handleFriendRequest(ctx, env.Seq, p.FriendRequest)
-		case *pb.Envelope_FriendRespond:
-			c.handleFriendRespond(ctx, env.Seq, p.FriendRespond)
-		case *pb.Envelope_FriendRemove:
-			c.handleFriendRemove(ctx, env.Seq, p.FriendRemove)
-		case *pb.Envelope_FriendListRequest:
-			c.handleFriendListRequest(ctx, env.Seq)
-		default:
-			c.sendError(env.Seq, 501, "unsupported message type")
-		}
+		c.sendError(env.Seq, 501, "unsupported message type")
 	}
 }
 
@@ -856,102 +794,6 @@ func deviceBindingFromProto(binding *pb.DeviceBindingV1) (*auth.DeviceBindingInp
 		Status:            db.DeviceBindingStatus(status),
 		AccountSignature:  append([]byte(nil), binding.GetAccountSignature()...),
 	}, nil
-}
-
-func (c *Client) handleAuth(ctx context.Context, seq uint64, resp *pb.AuthResponse) {
-	c.authAttempts++
-	if c.authAttempts > 3 {
-		c.sendError(seq, 429, "too many auth attempts")
-		c.failClosed()
-		return
-	}
-
-	if resp == nil {
-		metrics.WSAuthFailuresTotal.Inc()
-		_ = c.sendPublicAuthFailure(seq, publicerr.New(
-			http.StatusUnauthorized, "authentication_failed", "authentication failed", errors.New("missing authentication response"),
-		))
-		return
-	}
-	// The access pass is a short-lived bearer. Protobuf and WebSocket/TLS
-	// decoding necessarily create transient wire copies, but this avoidable
-	// decoded field must not remain in the heap until the envelope is collected.
-	defer clear(resp.NodeAccessInvite)
-	deviceBinding, err := deviceBindingFromProto(resp.GetDeviceBinding())
-	if err != nil {
-		metrics.WSAuthFailuresTotal.Inc()
-		_ = c.sendPublicAuthFailure(seq, publicerr.New(
-			http.StatusUnauthorized, "authentication_failed", "authentication failed", err,
-		))
-		return
-	}
-	result, err := c.hub.authSvc.VerifyResponseV2(
-		ctx, c.connID,
-		resp.IdentityKey, resp.SigningKey, resp.Signature,
-		resp.DeviceId, resp.DeviceName, deviceBinding, resp.GetDeviceSignature(),
-		resp.GetNodeAccessInvite(),
-	)
-	if err != nil {
-		log.Printf("auth failed [%s]: class=%s", c.connID, logsafe.ErrorClass(err))
-		metrics.WSAuthFailuresTotal.Inc()
-		_ = c.sendMappedAuthFailure(seq, err)
-		return
-	}
-
-	c.userID = result.UserID
-	c.deviceID = result.DeviceID
-	c.deviceKey = append([]byte(nil), resp.DeviceId...)
-	c.username = result.Username
-	c.identityKey = resp.IdentityKey
-	c.perDeviceSecure = result.PerDeviceSecure
-	c.deviceBindingVersion = result.DeviceBindingVersion
-	c.deviceBindingStatus = result.DeviceBindingStatus
-
-	// Restore durable sender-key state before declaring the session ready. A
-	// database failure forces a reconnect so the client cannot start sending
-	// group messages without the latest retained generation.
-	pendingSenderKeys, err := c.pendingSenderKeyEnvelopes(ctx)
-	if err != nil {
-		log.Printf("auth state restore failed [%s]: reason=%s", c.connID, senderKeyRestoreErrorLabel(err))
-		message := "failed to restore encrypted session state"
-		switch {
-		case errors.Is(err, db.ErrSenderKeyRetentionExpired):
-			message = "encrypted history unavailable: sender-key receipt deadline expired"
-		case errors.Is(err, db.ErrSenderKeyRestoreBacklogExceeded):
-			message = "encrypted session backlog exceeds the safe restore limit"
-		case errors.Is(err, db.ErrSenderKeyLegacyState):
-			message = "encrypted session contains unsupported legacy sender-key state"
-		}
-		_ = c.sendAuthResult(seq, false, "", message)
-		c.failClosed()
-		return
-	}
-	// Retained device controls and the successful AuthResult are one gated FIFO
-	// batch. writePump may dequeue it, but cannot expose any frame until the Hub
-	// has atomically published this connection in both authenticated indexes.
-	// Once released, live fan-out can only enqueue behind the complete batch.
-	authData, err := marshalEnvelope(authResultEnvelope(seq, true, result.UserID, "", result))
-	if err != nil {
-		log.Printf("auth result encode failed [%s]: class=%s", c.connID, logsafe.ErrorClass(err))
-		c.failClosed()
-		return
-	}
-	frames := make([][]byte, 0, len(pendingSenderKeys)+1)
-	frames = append(frames, pendingSenderKeys...)
-	frames = append(frames, authData)
-	gate := newPublicationGate()
-	if err := c.enqueueBatch(outboundBatch{frames: frames, publication: gate}); err != nil {
-		gate.resolve(false)
-		log.Printf("auth result queue failed [%s]: class=%s", c.connID, logsafe.ErrorClass(err))
-		c.failClosed()
-		return
-	}
-	if !c.hub.publishAuthenticatedClient(c, gate) {
-		log.Printf("auth publication failed [%s]", c.connID)
-		c.failClosed()
-		return
-	}
-	log.Printf("auth success [%s]: user_ref=%s device_ref=%s", c.connID, logsafe.Ref("user", c.userID), logsafe.Ref("device", c.deviceID))
 }
 
 // --- Chat ---
@@ -2033,18 +1875,6 @@ func (c *Client) enqueueBatch(batch outboundBatch) error {
 	}
 }
 
-func (c *Client) enqueueData(data []byte) error {
-	return c.enqueueBatch(singleOutbound(data))
-}
-
-func (c *Client) enqueueEnvelope(env *pb.Envelope) error {
-	data, err := marshalEnvelope(env)
-	if err != nil {
-		return fmt.Errorf("marshal envelope: %w", err)
-	}
-	return c.enqueueData(data)
-}
-
 func (c *Client) sendError(refSeq uint64, code uint32, message string) {
 	c.sendErrorWithSendMessageContext(refSeq, code, message, "", "")
 }
@@ -2089,77 +1919,6 @@ func (c *Client) sendMessagePublicError(refSeq uint64, status int, err error, cl
 	c.sendErrorWithSendMessageContext(
 		refSeq, uint32(status), publicerr.Message(status, err), clientMessageID, reason,
 	)
-}
-
-func (c *Client) sendPublicAuthFailure(seq uint64, err error) error {
-	return c.sendAuthFailure(
-		seq,
-		pb.AuthFailureReason_AUTH_FAILURE_REASON_AUTHENTICATION_FAILED,
-		publicerr.Message(http.StatusUnauthorized, err),
-	)
-}
-
-// sendMappedAuthFailure exposes the two enrollment outcomes only after the
-// auth service has completed account-key proof. Every earlier failure remains
-// the same generic authentication result.
-func (c *Client) sendMappedAuthFailure(seq uint64, err error) error {
-	switch {
-	case errors.Is(err, auth.ErrRegistrationClosed):
-		return c.sendAuthFailure(
-			seq,
-			pb.AuthFailureReason_AUTH_FAILURE_REASON_REGISTRATION_CLOSED,
-			"registration is closed",
-		)
-	case errors.Is(err, auth.ErrInviteInvalid):
-		return c.sendAuthFailure(
-			seq,
-			pb.AuthFailureReason_AUTH_FAILURE_REASON_INVITE_INVALID,
-			"invite is invalid, expired, or already used",
-		)
-	default:
-		return c.sendPublicAuthFailure(seq, publicerr.New(
-			http.StatusUnauthorized, "authentication_failed", "authentication failed", err,
-		))
-	}
-}
-
-func (c *Client) sendAuthFailure(seq uint64, reason pb.AuthFailureReason, message string) error {
-	result := &pb.AuthResult{
-		Success:       false,
-		FailureReason: reason,
-		ErrorMessage:  &message,
-	}
-	return c.enqueueEnvelope(&pb.Envelope{
-		Seq: seq,
-		Payload: &pb.Envelope_AuthResult{
-			AuthResult: result,
-		},
-	})
-}
-
-func authResultEnvelope(seq uint64, success bool, userID, errMsg string, authDetails ...*auth.AuthResult) *pb.Envelope {
-	result := &pb.AuthResult{Success: success}
-	if success {
-		result.UserId = &userID
-		if len(authDetails) == 1 && authDetails[0] != nil {
-			result.PerDeviceSecure = authDetails[0].PerDeviceSecure
-			result.DeviceBindingVersion = authDetails[0].DeviceBindingVersion
-			result.DeviceBindingStatus = pb.DeviceBindingStatus(authDetails[0].DeviceBindingStatus)
-		}
-	}
-	if errMsg != "" {
-		result.ErrorMessage = &errMsg
-	}
-	return &pb.Envelope{
-		Seq: seq,
-		Payload: &pb.Envelope_AuthResult{
-			AuthResult: result,
-		},
-	}
-}
-
-func (c *Client) sendAuthResult(seq uint64, success bool, userID, errMsg string, authDetails ...*auth.AuthResult) error {
-	return c.enqueueEnvelope(authResultEnvelope(seq, success, userID, errMsg, authDetails...))
 }
 
 func (c *Client) writePump() {

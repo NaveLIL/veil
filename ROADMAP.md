@@ -191,9 +191,10 @@ below prevent completed April work from being mistaken for the next sprint.
    gone; signed middleware is mandatory. Mobile must implement the same signed
    contract before it can connect to production.
 
-3. **Wire `httpmw` into `cmd/auth/main.go` and `cmd/chat/main.go`** for
-   parity with `cmd/gateway`. These standalone binaries are not in the
-   compose deploy today, so it's purely consistency / future-proofing.
+3. **Retired (2026-08-05): `cmd/auth` and `cmd/chat` were removed**; the
+   origin-bound all-in-one gateway is the sole server entry point. The earlier
+   parity task was superseded because keeping dormant REST v1 binaries would
+   preserve a future downgrade path.
 
 4. **Grafana dashboard + Prometheus scrape config** to actually consume
    the metrics we now expose. Suggested panels: req rate by status,

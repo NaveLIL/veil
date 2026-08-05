@@ -44,12 +44,7 @@ func TestRESTAuthV2HostileTwoNodeRelayMatrix(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	dispatcherB, err := authmw.NewRESTAuthVersionDispatcher(
-		authmw.RESTAuthDispatchV2Only,
-		nil,
-		boundaryB,
-		authmw.RESTAuthPreviewCompatibility{},
-	)
+	dispatcherB, err := authmw.NewRESTAuthVersionDispatcher(boundaryB)
 	if err != nil {
 		t.Fatal(err)
 	}

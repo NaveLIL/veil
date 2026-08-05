@@ -108,22 +108,22 @@ func (s *Service) SetRESTAuthVersionDispatcher(dispatcher *authmw.RESTAuthVersio
 //	GET    /v1/uploads/blob/{id}          — bearer (download)
 //	*      /v1/uploads/files/...          — bearer (POST/PATCH/HEAD/DELETE)
 //
-// The signedMw wraps only the token endpoint; tusd's traffic uses the
-// bearer middleware to keep PATCH chunks from needing per-request
-// Ed25519 sigs.
+// The REST v2 dispatcher wraps only the token endpoint; tusd's traffic uses
+// bearer authorization so PATCH chunks do not need account signatures.
 func (s *Service) RegisterRoutes(mux *http.ServeMux, signedMw *authmw.Middleware, rl *authmw.RateLimit) {
 	signed := func(f http.HandlerFunc) http.HandlerFunc {
 		if rl != nil {
 			f = rl.Wrap(f)
 		}
+		jsonPolicy, err := authmw.NewRESTAuthV2JSONHTTPPolicy(4 << 10)
+		if err != nil {
+			panic("invalid uploads REST v2 JSON policy")
+		}
 		if s.restAuthDispatcher != nil {
-			jsonPolicy, err := authmw.NewRESTAuthV2JSONHTTPPolicy(4 << 10)
-			if err != nil {
-				panic("invalid uploads REST v2 JSON policy")
-			}
 			f = s.restAuthDispatcher.RequireSigned(jsonPolicy, f)
 		} else if signedMw != nil {
-			f = signedMw.RequireSigned(f)
+			var unavailable *authmw.RESTAuthVersionDispatcher
+			f = unavailable.RequireSigned(jsonPolicy, f)
 		}
 		return f
 	}

@@ -10,16 +10,16 @@ import (
 	"testing"
 )
 
-func TestLegacyWebSocketRouteIsFailClosedByDefault(t *testing.T) {
+func TestLegacyWebSocketRouteIsPermanentlyRetired(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	request := httptest.NewRequest(http.MethodGet, "http://gateway.test/ws", nil)
 	request.Header.Set("Connection", "Upgrade")
 	request.Header.Set("Upgrade", "websocket")
 
-	legacyWebSocketHandler(nil, false).ServeHTTP(recorder, request)
+	retiredWebSocketHandler().ServeHTTP(recorder, request)
 
-	if recorder.Code != http.StatusUpgradeRequired {
-		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusUpgradeRequired)
+	if recorder.Code != http.StatusGone {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusGone)
 	}
 	if recorder.Header().Get("Cache-Control") != "no-store" {
 		t.Fatalf("Cache-Control = %q, want no-store", recorder.Header().Get("Cache-Control"))

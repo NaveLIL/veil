@@ -17,8 +17,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/NaveLIL/veil/veil-server/internal/auth"
-	"github.com/NaveLIL/veil/veil-server/internal/config"
 	"github.com/NaveLIL/veil/veil-server/internal/db"
 	"github.com/testcontainers/testcontainers-go"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
@@ -52,39 +50,22 @@ func TestNodeAccessInviteLifecycle(t *testing.T) {
 		t.Fatal("database did not retain only the invite digest")
 	}
 
-	service := auth.NewService(database, &config.Config{
-		AuthChallengeTTL:  30 * time.Second,
-		AuthMaxAttempts:   3,
-		AllowRegistration: false,
-	})
 	account := newAuthIdentity(t)
-	result, err := verifyInvitedIdentity(t, service, "valid-invite", account, invites[0].Token)
-	if err != nil || !result.IsNew {
-		t.Fatalf("valid invited registration result=%#v err=%v", result, err)
+	if _, err := database.CreateUserWithNodeAccessInvite(
+		ctx, invites[0].Token, account.identityPublic, account.signingPublic, "invited",
+	); err != nil {
+		t.Fatalf("valid invited registration: %v", err)
 	}
-
-	// An established identity authenticates without retaining or presenting
-	// its original invite.
-	result, err = verifyInvitedIdentity(t, service, "existing-no-invite", account, nil)
-	if err != nil || result.IsNew {
-		t.Fatalf("existing account without invite result=%#v err=%v", result, err)
-	}
-	result, err = verifyInvitedIdentity(t, service, "existing-with-unused-invite", account, invites[2].Token)
-	if err != nil || result.IsNew {
-		t.Fatalf("existing account with unused invite result=%#v err=%v", result, err)
-	}
-	if _, err := verifyInvitedIdentity(t, service, "unused-invite-after-existing", newAuthIdentity(t), invites[2].Token); err != nil {
-		t.Fatalf("existing account consumed a supplied unused invite: %v", err)
-	}
-
-	if _, err := verifyInvitedIdentity(t, service, "closed-no-invite", newAuthIdentity(t), nil); !errors.Is(err, auth.ErrRegistrationClosed) {
-		t.Fatalf("missing invite error=%v, want ErrRegistrationClosed", err)
-	}
-	if _, err := verifyInvitedIdentity(t, service, "reused-invite", newAuthIdentity(t), invites[0].Token); !errors.Is(err, auth.ErrInviteInvalid) {
-		t.Fatalf("reused invite error=%v, want ErrInviteInvalid", err)
-	}
-	if _, err := verifyInvitedIdentity(t, service, "malformed-invite", newAuthIdentity(t), []byte("short")); !errors.Is(err, auth.ErrInviteInvalid) {
-		t.Fatalf("malformed invite error=%v, want ErrInviteInvalid", err)
+	for name, token := range map[string][]byte{
+		"reused":    invites[0].Token,
+		"malformed": []byte("short"),
+	} {
+		identity := newAuthIdentity(t)
+		if _, err := database.CreateUserWithNodeAccessInvite(
+			ctx, token, identity.identityPublic, identity.signingPublic, name,
+		); !errors.Is(err, db.ErrNodeAccessInviteInvalid) {
+			t.Fatalf("%s invite error=%v, want ErrNodeAccessInviteInvalid", name, err)
+		}
 	}
 
 	// An expired digest is indistinguishable from malformed and reused tokens.
@@ -97,8 +78,11 @@ func TestNodeAccessInviteLifecycle(t *testing.T) {
 	); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := verifyInvitedIdentity(t, service, "expired-invite", newAuthIdentity(t), expiredToken); !errors.Is(err, auth.ErrInviteInvalid) {
-		t.Fatalf("expired invite error=%v, want ErrInviteInvalid", err)
+	expiredIdentity := newAuthIdentity(t)
+	if _, err := database.CreateUserWithNodeAccessInvite(
+		ctx, expiredToken, expiredIdentity.identityPublic, expiredIdentity.signingPublic, "expired",
+	); !errors.Is(err, db.ErrNodeAccessInviteInvalid) {
+		t.Fatalf("expired invite error=%v, want ErrNodeAccessInviteInvalid", err)
 	}
 
 	// Use the second invite in a deliberate account-insert failure. The token
@@ -194,28 +178,6 @@ func newAuthIdentity(t *testing.T) authIdentity {
 		t.Fatal(err)
 	}
 	return authIdentity{identityPrivate, identityPublic, signingPublic, signingPrivate, deviceID}
-}
-
-func verifyInvitedIdentity(t *testing.T, service *auth.Service, connID string, identity authIdentity, invite []byte) (*auth.AuthResult, error) {
-	t.Helper()
-	serverPublic, err := service.CreateChallenge(connID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	sharedSecret, err := curve25519.X25519(identity.identityPrivate, serverPublic[:])
-	if err != nil {
-		t.Fatal(err)
-	}
-	message, err := auth.WSAuthSigningMessage(serverPublic[:], sharedSecret)
-	if err != nil {
-		t.Fatal(err)
-	}
-	signature := ed25519.Sign(identity.signingPrivate, message)
-	return service.VerifyResponseV2(
-		context.Background(), connID,
-		identity.identityPublic, identity.signingPublic, signature,
-		identity.deviceID, "integration test", nil, nil, invite,
-	)
 }
 
 func newInviteIntegrationDB(t *testing.T) *db.DB {

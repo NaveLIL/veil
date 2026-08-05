@@ -24,7 +24,7 @@ const (
 )
 
 // ErrInvalidWSAuthV3 is returned for every malformed, non-canonical, or
-// cryptographically invalid input to the non-activated WebSocket auth v3
+// cryptographically invalid input to the WebSocket auth v3
 // contract. Callers must not expose the wrapped diagnostic as a public auth
 // oracle.
 var ErrInvalidWSAuthV3 = errors.New("invalid WebSocket auth v3 input")

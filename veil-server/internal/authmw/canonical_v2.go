@@ -25,7 +25,7 @@ const (
 	RESTAuthV2MaxTargetBytes = 16 * 1024
 )
 
-// RESTAuthV2Input is the transport-neutral input to the non-activated REST v2
+// RESTAuthV2Input is the transport-neutral input to the mandatory REST v2
 // signing contract. CanonicalOrigin must come from trusted Node configuration,
 // never from the request Host header.
 type RESTAuthV2Input struct {

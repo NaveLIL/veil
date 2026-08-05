@@ -32,15 +32,14 @@ type Handler struct {
 	identityTransparencySigner *IdentityTransparencySigner
 }
 
-// NewHandler builds the auth REST handler. mw and rl may be nil to disable
-// signature checks / rate limiting (used in tests and the all-in-one binary).
+// NewHandler builds the auth REST handler. A nil middleware is reserved for
+// direct-handler unit tests; every server entry point installs REST v2.
 func NewHandler(svc *Service, mw *authmw.Middleware, rl *authmw.RateLimit) *Handler {
 	return &Handler{svc: svc, mw: mw, rl: rl}
 }
 
-// SetRESTAuthVersionDispatcher activates explicit v1/v2 selection for every
-// signed auth route. A nil dispatcher leaves the existing v1-only behavior in
-// place for isolated service binaries and legacy integration fixtures.
+// SetRESTAuthVersionDispatcher activates mandatory REST v2 authentication for
+// every signed auth route. A nil dispatcher fails closed with 503.
 func (h *Handler) SetRESTAuthVersionDispatcher(dispatcher *authmw.RESTAuthVersionDispatcher) {
 	h.restDispatcher = dispatcher
 }
@@ -69,12 +68,13 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 		if h.rl != nil {
 			f = h.rl.Wrap(f)
 		}
+		// A nil middleware is an existing direct-handler unit-test seam. Any
+		// configured authentication stack without v2 dispatch fails closed.
 		if h.restDispatcher != nil {
 			f = h.restDispatcher.RequireSigned(policy, f)
 		} else if h.mw != nil {
-			// Signature verification must be the outermost middleware so the
-			// limiter sees only an authenticated principal context.
-			f = h.mw.RequireSigned(f)
+			var unavailable *authmw.RESTAuthVersionDispatcher
+			f = unavailable.RequireSigned(policy, f)
 		}
 		return f
 	}

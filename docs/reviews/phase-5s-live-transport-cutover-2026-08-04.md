@@ -19,14 +19,15 @@
 - Every signed gateway handler uses REST v2-only selection with exact route
   media policy and the durable PostgreSQL replay boundary. No missing-field or
   parse failure falls back to REST v1.
-- `/ws` is fail-closed by default with HTTP 426. The server-only emergency flag
-  `VEIL_ALLOW_LEGACY_WS_V2=true` may restore old Preview interoperability for a
-  controlled rollback; no client performs an automatic downgrade.
+- `/ws` is permanently retired with HTTP 410. The old server-only emergency
+  switch is rejected during startup and cannot restore origin-unbound WS v2.
+- Post-handshake v2 or v3 auth frames close an authenticated socket; the shared
+  message pump cannot enter a second, weaker verifier.
 
 ## Evidence in this checkpoint
 
 - Go gateway and package tests pass with the v2-only routes and default-disabled
-  legacy endpoint.
+  retired endpoint and no compiled legacy dispatch branch.
 - Rust workspace checks pass for client, FFI, and desktop after the unified v3
   connection refactor.
 - Generated Kotlin types compile, and the Android Direct/runtime/origin unit
@@ -38,3 +39,7 @@
 This checkpoint supersedes the activation status in earlier Phase 5S
 foundation reviews. Those dated documents remain historical evidence of what
 was not yet live at their respective checkpoints.
+
+Update (2026-08-05): the temporary rollback allowance described in the
+original checkpoint was removed before release. REST dispatch is now a thin
+v2-only boundary with no `PreviewDual` mode or v1 middleware dependency.

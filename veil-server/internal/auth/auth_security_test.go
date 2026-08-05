@@ -17,48 +17,6 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-// Regression test for account takeover via a public X25519 identity key.
-// An attacker may sign the challenge with a key they own, but that key must
-// never replace the Ed25519 key pinned to an existing account.
-func TestVerifyRegisteredSigningKeyRejectsAttackerKey(t *testing.T) {
-	victimPublic, _, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	attackerPublic, attackerPrivate, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	challenge := make([]byte, 32)
-	if _, err := rand.Read(challenge); err != nil {
-		t.Fatal(err)
-	}
-	attackerSignature := ed25519.Sign(attackerPrivate, challenge)
-	registered := &db.User{SigningKey: victimPublic}
-
-	err = verifyRegisteredSigningKey(registered, attackerPublic, challenge, attackerSignature)
-	if !errors.Is(err, ErrSigningKeyMismatch) {
-		t.Fatalf("expected ErrSigningKeyMismatch, got %v", err)
-	}
-}
-
-func TestVerifyRegisteredSigningKeyAcceptsPinnedKey(t *testing.T) {
-	public, private, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	challenge := make([]byte, 32)
-	if _, err := rand.Read(challenge); err != nil {
-		t.Fatal(err)
-	}
-	registered := &db.User{SigningKey: public}
-
-	if err := verifyRegisteredSigningKey(registered, public, challenge, ed25519.Sign(private, challenge)); err != nil {
-		t.Fatalf("valid pinned key rejected: %v", err)
-	}
-}
-
 func TestWSAuthSigningMessageIsDomainSeparated(t *testing.T) {
 	serverPublic := make([]byte, 32)
 	sharedSecret := make([]byte, 32)
@@ -409,8 +367,8 @@ func TestRegisteredPreKeyRoutesSetNoStoreBeforeSignatureMiddleware(t *testing.T)
 
 	mux.ServeHTTP(response, request)
 
-	if response.Code != http.StatusUnauthorized {
-		t.Fatalf("status=%d body=%s, want 401", response.Code, response.Body.String())
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d body=%s, want 503", response.Code, response.Body.String())
 	}
 	if got := response.Header().Get("Cache-Control"); got != "no-store" {
 		t.Fatalf("Cache-Control=%q, want no-store", got)
@@ -473,27 +431,5 @@ func TestLoadDevicePreKeyCountsPropagatesDatabaseErrors(t *testing.T) {
 	)
 	if !errors.Is(err, databaseError) {
 		t.Fatalf("signed prekey error=%v, want database error", err)
-	}
-}
-
-func TestNormalizeDeviceNameBoundsAndControls(t *testing.T) {
-	name, err := normalizeDeviceName("  Windows laptop  ")
-	if err != nil || name != "Windows laptop" {
-		t.Fatalf("normalized device name=%q err=%v", name, err)
-	}
-	for label, input := range map[string]string{
-		"empty":          "   ",
-		"oversize":       strings.Repeat("x", 129),
-		"newline":        "laptop\nforged log",
-		"tab":            "laptop\tname",
-		"c1 control":     "laptop\u0085name",
-		"line separator": "laptop\u2028name",
-		"invalid utf8":   string([]byte{0xff}),
-	} {
-		t.Run(label, func(t *testing.T) {
-			if _, err := normalizeDeviceName(input); !errors.Is(err, ErrBadDeviceName) {
-				t.Fatalf("invalid name error=%v, want ErrBadDeviceName", err)
-			}
-		})
 	}
 }

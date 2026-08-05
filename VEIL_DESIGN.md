@@ -436,7 +436,14 @@ message SealedEnvelope {
 }
 ```
 
-### 3.7 Бэкенд: Go Микросервисы
+### 3.7 Бэкенд: Go-сервисы (исторический эскиз)
+
+> **Актуализация 2026-08-05.** Отдельные `cmd/auth` и `cmd/chat` удалены до
+> релиза: они сохраняли возможность запуска origin-unbound WS v2 / REST v1.
+> Рабочая серверная точка входа — `veil-server/cmd/gateway`, а логические
+> модули `internal/auth`, `internal/chat` и остальные работают внутри неё через
+> обязательные WS v3 и REST v2 boundaries. Таблица и дерево ниже сохранены как
+> исторический архитектурный эскиз, а не инструкция по развёртыванию.
 
 **Почему Go**: goroutines для WebSocket (1M+ соединений), простой деплой, отличная stdlib.
 
@@ -908,8 +915,8 @@ veil/
 - [x] `veil-client`: WebSocket + системная TLS-валидация + Protobuf codec
 - [ ] `veil-client`: полноценная durable offline queue и автоматический reconnect/resend
 - [x] `server/cmd/gateway`: Go WebSocket server
-- [x] `server/cmd/auth`: Ed25519 challenge-response
-- [x] `server/cmd/chat`: store-and-forward DM delivery
+- [x] Historical `server/cmd/auth` challenge-response service (retired before release; WS v3 lives in the gateway)
+- [x] Historical `server/cmd/chat` store-and-forward service (retired before release; REST v2 lives in the gateway)
 - [x] PostgreSQL migrations, Docker compose
 - [x] UniFFI: `.udl` definition, Kotlin/Swift/TS bindings generation
 
@@ -940,7 +947,7 @@ veil/
 ### Phase 4: Groups & Servers (3 недели) ⚠️ IN PROGRESS
 - [x] `veil-crypto`: Sender Keys for groups (SenderKeyState, distribution, wire format)
 - [x] `veil-store`: group_members + sender_keys_local tables, CRUD
-- [x] `server/cmd/chat`: group REST endpoints, fan-out, sender key distribution WS
+- [x] Historical `server/cmd/chat` group endpoints (consolidated into the origin-bound gateway)
 - [x] Tauri commands: create_group, add/remove/get group members
 - [x] Desktop UI: sidebar tabs (All/DMs/Groups), new group dialog, group avatars
 - [x] Desktop UI: group member panel (Island 4) with slide animation

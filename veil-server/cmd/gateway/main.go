@@ -60,15 +60,11 @@ var sitemapXML []byte
 
 const projectRepositoryURL = "https://github.com/NaveLIL/veil"
 
-func legacyWebSocketHandler(hub *gateway.Hub, enabled bool) http.HandlerFunc {
+func retiredWebSocketHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !enabled {
-			w.Header().Set("Connection", "close")
-			w.Header().Set("Cache-Control", "no-store")
-			http.Error(w, "legacy WebSocket transport is disabled; use /v3/events", http.StatusUpgradeRequired)
-			return
-		}
-		gateway.HandleWebSocket(hub, w, r)
+		w.Header().Set("Connection", "close")
+		w.Header().Set("Cache-Control", "no-store")
+		http.Error(w, "legacy WebSocket transport was removed; use /v3/events", http.StatusGone)
 	}
 }
 
@@ -260,7 +256,7 @@ func main() {
 
 	// HTTP routes
 	mux := http.NewServeMux()
-	mux.HandleFunc("/ws", legacyWebSocketHandler(hub, cfg.AllowLegacyWSV2))
+	mux.HandleFunc("/ws", retiredWebSocketHandler())
 	mux.HandleFunc("/v3/events", func(w http.ResponseWriter, r *http.Request) {
 		gateway.HandleWebSocketV3(hub, w, r)
 	})
@@ -286,12 +282,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("REST auth v2 HTTP boundary configuration: %v", err)
 	}
-	restDispatcher, err := authmw.NewRESTAuthVersionDispatcher(
-		authmw.RESTAuthDispatchV2Only,
-		nil,
-		restV2Boundary,
-		authmw.RESTAuthPreviewCompatibility{},
-	)
+	restDispatcher, err := authmw.NewRESTAuthVersionDispatcher(restV2Boundary)
 	if err != nil {
 		log.Fatalf("REST auth version dispatcher configuration: %v", err)
 	}

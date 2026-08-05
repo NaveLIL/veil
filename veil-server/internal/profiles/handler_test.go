@@ -3,17 +3,12 @@ package profiles
 import (
 	"bytes"
 	"context"
-	"crypto/ed25519"
-	"crypto/rand"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"strconv"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -23,8 +18,6 @@ import (
 )
 
 const testUserID = "5a636f65-3ab4-48b9-84b8-f4996ab73c88"
-
-var testTimestampOffset atomic.Int64
 
 type fakeStore struct {
 	profile        *Profile
@@ -86,38 +79,22 @@ func (s *fakeStore) UpdateProfile(_ context.Context, userID string, version int6
 	return s.profile, s.updateErr
 }
 
-func requestWithPrincipal(t *testing.T, privateKey ed25519.PrivateKey, method, target, body string) *http.Request {
+func requestWithPrincipal(t *testing.T, _ []byte, method, target, body string) *http.Request {
 	t.Helper()
 	request := httptest.NewRequest(method, target, strings.NewReader(body))
-	timestamp := strconv.FormatInt(time.Now().UnixMilli()+testTimestampOffset.Add(1), 10)
-	canonical, err := authmw.CanonicalRequest(method, request.Host, request.URL.RequestURI(), timestamp, []byte(body))
-	if err != nil {
-		t.Fatal(err)
-	}
-	request.Header.Set("X-Veil-User", testUserID)
-	request.Header.Set("X-Veil-Timestamp", timestamp)
-	request.Header.Set("X-Veil-Signature", base64.StdEncoding.EncodeToString(ed25519.Sign(privateKey, canonical)))
-	return request
+	return request.WithContext(authmw.ContextWithVerifiedUserIDForTesting(request.Context(), testUserID))
 }
 
-func newSignedMux(t *testing.T, store Store, broadcasters ...Broadcaster) (*http.ServeMux, ed25519.PrivateKey) {
+func newSignedMux(t *testing.T, store Store, broadcasters ...Broadcaster) (*http.ServeMux, []byte) {
 	t.Helper()
-	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	middleware := authmw.New(authmw.LookupFunc(func(context.Context, string) (ed25519.PublicKey, error) {
-		return publicKey, nil
-	}))
-	t.Cleanup(middleware.Close)
 	var broadcaster Broadcaster
 	if len(broadcasters) > 0 {
 		broadcaster = broadcasters[0]
 	}
-	handler := NewHandler(store, middleware, nil, nil, broadcaster)
+	handler := NewHandler(store, nil, nil, nil, broadcaster)
 	mux := http.NewServeMux()
 	handler.RegisterRoutes(mux)
-	return mux, privateKey
+	return mux, nil
 }
 
 func TestRoutesRequireVerifiedPrincipalEvenWithoutMiddleware(t *testing.T) {
@@ -206,21 +183,14 @@ func TestUpdateAudienceFailureDoesNotRewriteCommittedSuccess(t *testing.T) {
 }
 
 func TestProfileMutationLimiterRunsAfterVerifiedPrincipal(t *testing.T) {
-	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	middleware := authmw.New(authmw.LookupFunc(func(context.Context, string) (ed25519.PublicKey, error) {
-		return publicKey, nil
-	}))
-	t.Cleanup(middleware.Close)
+	var privateKey []byte
 	mutationLimiter := authmw.NewRateLimit(1, time.Hour)
 	t.Cleanup(mutationLimiter.Close)
 	store := &fakeStore{profile: &Profile{
 		UserID: testUserID, Username: "alice", ProfileVersion: 1,
 		ProfileUpdatedAt: time.Unix(1, 0).UTC(),
 	}}
-	handler := NewHandler(store, middleware, nil, mutationLimiter, nil)
+	handler := NewHandler(store, nil, nil, mutationLimiter, nil)
 	mux := http.NewServeMux()
 	handler.RegisterRoutes(mux)
 

@@ -50,7 +50,8 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 		if h.restDispatcher != nil {
 			f = h.restDispatcher.RequireSigned(policy, f)
 		} else if h.mw != nil {
-			f = h.mw.RequireSigned(f)
+			var unavailable *authmw.RESTAuthVersionDispatcher
+			f = unavailable.RequireSigned(policy, f)
 		}
 		return f
 	}

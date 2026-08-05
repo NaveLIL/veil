@@ -42,19 +42,13 @@ for commands and events, and all signed REST handlers use the REST v2 profile
 with the durable PostgreSQL replay store. Missing, legacy, mixed, duplicate, or
 unknown REST authentication fields fail closed.
 
-The legacy `/ws` route is disabled by default and returns HTTP 426 without
-upgrading. An operator may temporarily restore it only through the explicit
-emergency compatibility flag:
-
-```text
-VEIL_ALLOW_LEGACY_WS_V2=true
-```
-
-That flag re-enables origin-unbound WS v2 and therefore must not be used for a
-normal or production deployment. It exists for controlled rollback while old
-Preview clients are retired; clients never downgrade automatically. Hostile
-two-Node and independent-review evidence are still release gates, so this
-runtime cutover is not by itself a production-readiness claim.
+The legacy `/ws` route is permanently retired and returns HTTP 410 without
+upgrading. There is no runtime switch that can re-enable origin-unbound WS v2;
+setting the removed `VEIL_ALLOW_LEGACY_WS_V2` variable fails startup so stale
+deployment configuration cannot silently weaken the Node. Post-handshake auth
+frames also close the v3 socket instead of entering a second verifier. Hostile
+two-Node and independent-review evidence remain release gates, so this runtime
+cutover is not by itself a production-readiness claim.
 
 ## Identity transparency rollout
 

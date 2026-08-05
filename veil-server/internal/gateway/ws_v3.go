@@ -34,7 +34,7 @@ package gateway
 //     refresh the server read deadline (readPump otherwise refreshes it only
 //     on Pongs to the server's own pings).
 //
-// Registration in cmd/gateway/main.go, next to the legacy /ws route:
+// Registration in cmd/gateway/main.go:
 //
 //	mux.HandleFunc("/v3/events", func(w http.ResponseWriter, r *http.Request) {
 //		gateway.HandleWebSocketV3(hub, w, r)
@@ -76,9 +76,9 @@ import (
 // parking a goroutine here.
 const wsV3AuthReadTimeout = 8 * time.Second
 
-// HandleWebSocketV3 serves one /v3/events connection. It reuses the /ws
-// building blocks (per-IP cap, upgrader, Client, Hub registration, pumps,
-// gated retained-batch publication) and replaces only the handshake.
+// HandleWebSocketV3 serves one /v3/events connection using the shared
+// connection primitives (per-IP cap, upgrader, Client, Hub registration,
+// pumps, gated retained-batch publication) and the mandatory v3 handshake.
 func HandleWebSocketV3(hub *Hub, w http.ResponseWriter, r *http.Request) {
 	ip := wsClientIP(r)
 
@@ -141,10 +141,9 @@ func HandleWebSocketV3(hub *Hub, w http.ResponseWriter, r *http.Request) {
 	go client.readPump()
 }
 
-// runWSAuthV3 performs the single-attempt v3 handshake. Unlike the legacy
-// 3-attempt path, takeChallenge burns the pending challenge on first use, so
-// there is deliberately no retry loop: a retry is a fresh connection with a
-// fresh server ephemeral.
+// runWSAuthV3 performs the single-attempt v3 handshake. takeChallenge burns
+// the pending challenge on first use, so a retry requires a fresh connection
+// with a fresh server ephemeral.
 func (c *Client) runWSAuthV3(ctx context.Context) bool {
 	challenge, err := c.hub.authSvc.CreateChallengeV3(c.connID)
 	if err != nil {
@@ -196,8 +195,7 @@ func (c *Client) runWSAuthV3(ctx context.Context) bool {
 
 	binding, err := deviceBindingFromProto(resp.GetDeviceBinding())
 	if err != nil || binding == nil {
-		// v3 requires an explicit, well-formed device binding; the legacy
-		// nil-binding escape hatch does not exist on this endpoint.
+		// v3 requires an explicit, well-formed device binding.
 		metrics.WSAuthFailuresTotal.Inc()
 		c.rejectWSAuthV3(env.Seq, challenge.CanonicalOrigin,
 			pb.WsAuthFailureReasonV3_WS_AUTH_FAILURE_REASON_V3_AUTHENTICATION_FAILED,
@@ -254,8 +252,8 @@ func (c *Client) runWSAuthV3(ctx context.Context) bool {
 	c.deviceBindingVersion = principal.DeviceBindingVersion
 	c.deviceBindingStatus = principal.DeviceBindingStatus
 
-	// Same durable-restore rule as v2: a database failure forces a reconnect
-	// so the client cannot run without the latest retained generation. Close
+	// A database failure forces a reconnect so the client cannot run without
+	// the latest retained generation. Close
 	// without a result => retryable on the client.
 	pendingSenderKeys, err := c.pendingSenderKeyEnvelopes(ctx)
 	if err != nil {

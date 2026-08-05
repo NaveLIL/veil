@@ -1,7 +1,7 @@
 # Security hardening audit handoff — 2026-08-05
 
 - Branch: `ds/beta-all-2026-07-21`
-- Implementation range: `b8ed439..155ecd1`
+- Implementation range: `b8ed439..HEAD` on the named beta branch
 - Current status: internal implementation and regression hardening complete;
   final CI evidence for the current head is being collected
 - Security claim: pre-release engineering evidence, not an independent audit
@@ -17,6 +17,7 @@
 | `17108c3` | Go fuzz smoke for Node-origin, REST v2, membership-epoch, and transparency parsers |
 | `bc987d0` | Integration harness moved from legacy REST v1 to production v2-only; hostile two-Node relay/downgrade matrix added |
 | `155ecd1` | Superseded push/PR workflow runs cancel by source branch instead of consuming the CI queue |
+| current hardening commit | Permanently retired WS v2 and standalone REST v1 binaries; removed the WS rollback switch, post-auth re-verification, and REST `PreviewDual` dispatch; corrected the SQLCipher restart fixture |
 
 Schema migrations introduced by this security range are:
 
@@ -33,8 +34,9 @@ rows remain readable; only newly activated secure-era traffic is fail-closed.
 ## Security properties to review
 
 1. Transport credentials bind the exact canonical Node origin, account,
-   device, method/target/body, freshness, and nonce. Production is v2/v3 only;
-   the server-only WS v2 emergency flag cannot be negotiated by a client.
+   device, method/target/body, freshness, and nonce. Production is v2/v3 only.
+   WS v2 has no handler or verifier, `/ws` returns 410, the removed rollback
+   variable blocks startup, and post-handshake auth frames close the socket.
 2. Direct v2 binds both account identities, both device bindings, X3DH
    coordinates, canonical origin, and a durable session commitment. Once
    installed, missing or conflicting v2 context cannot fall back to v1.
@@ -56,6 +58,9 @@ rows remain readable; only newly activated secure-era traffic is fail-closed.
 
 - Normal messaging, reconnect, offline replay, and historical ciphertext need
   no additional user action.
+- Pre-release clients that still use `/ws`, REST v1, or the retired standalone
+  auth/chat services must update; there is intentionally no network downgrade
+  path. This does not affect ciphertext history stored by current clients.
 - Direct-message directory responses intentionally omit group-only membership
   bootstrap fields. Complete group scope is still mandatory; partial scope is
   rejected.
@@ -77,10 +82,11 @@ From `veil-server`:
 go test ./...
 go vet ./...
 go run honnef.co/go/tools/cmd/staticcheck@v0.6.1 ./...
-go test -tags=integration ./internal/integration -run '^$'
+go test -tags=integration ./internal/integration ./internal/db -run '^$'
 ```
 
-All pass on the 2026-08-05 Windows host. The last command compiles the Docker
+All pass on the 2026-08-05 Windows host after live legacy authentication was
+removed. The last command compiles the Docker
 suite; the actual disposable PostgreSQL run belongs to GitHub Actions because
 Docker is unavailable on this host.
 
@@ -96,15 +102,22 @@ Additional local evidence:
   startup; GitHub runs the complete JS and native Android suites;
 - `cargo fmt --all -- --check`, desktop `cargo check`, and strict desktop
   Clippy pass;
-- the pre-fix full Rust workspace compiled and ran 225 passing tests, with one
-  corrected capability-bit fixture failure and 11 explicitly ignored tests;
+- before the local GNU cache was invalidated, the full Rust workspace compiled
+  and ran 225 passing tests with 11 explicitly ignored tests; its sole failure
+  was the capability-bit restart fixture corrected in this range, and the
+  corrected focused SQLCipher restart test passes;
+- the post-cutover full-workspace retry is blocked before Veil code is linked by
+  the local Windows GNU vendored-OpenSSL build (`ar.exe` truncates long archive
+  member paths). This is recorded as a host-toolchain limitation, not a passing
+  project result; the current-head Rust CI matrix is authoritative;
 - linked Tauri tests cannot be produced by the local MinGW linker because its
   export ordinal exceeds the toolchain limit. Linux/macOS/Windows CI and
   packaging jobs are the authoritative linked-build evidence.
 
 ## CI and artifact evidence
 
-The authoritative target is commit `155ecd1` or a documentation-only descendant.
+The authoritative target is the commit containing this handoff; evidence from
+an earlier checkpoint must not be substituted for a current-head result.
 The final handoff must record successful current-head runs for:
 
 - Go CI, including Docker integration and security fuzz smoke;

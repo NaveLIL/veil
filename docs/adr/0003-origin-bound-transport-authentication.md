@@ -9,8 +9,8 @@
 
 > Activation update (2026-08-04): desktop and Android select exact
 > `/v3/events`; the gateway's signed handlers select REST v2 only; `/ws` is
-> fail-closed by default and may be restored solely by the explicit emergency
-> `VEIL_ALLOW_LEGACY_WS_V2=true` operator flag. Clients never auto-downgrade.
+> permanently retired with HTTP 410. The rollback flag and REST `PreviewDual`
+> dispatcher were removed before release. Clients never auto-downgrade.
 > A disposable PostgreSQL two-Node relay/downgrade matrix is now in CI;
 > cross-client/physical evidence and independent audit remain release gates.
 
@@ -199,10 +199,8 @@ substitute for transcript versioning. The selected verifier always uses the
 v2 signature valid as REST v1. A request carrying mixed legacy and v2
 authentication material is rejected; verification failure never triggers a
 second verifier. In the v2-only activation profile, a missing selector is also
-rejected. A separately reviewed Preview compatibility dispatcher MAY select
-legacy v1 directly from an absent selector before verification, but only under
-the explicit flag, owner, telemetry, and expiry rules below; unknown or mixed
-selectors are never a legacy alias.
+rejected. There is no compatibility dispatcher: an absent, unknown, or mixed
+selector is never a legacy alias and is rejected by the v2 verifier.
 
 #### Raw HTTP boundary and media types
 
@@ -300,13 +298,11 @@ runtime: dedicated transport dispatch, mandatory configured public origin,
 exact client comparison, a shared durable replay store, route media policies,
 fail-closed negotiation, and a two-Node relay harness are implemented. Missing
 or unknown version never means "try the other version".
-A Preview-only compatibility dispatcher, if required, MUST select v1 or v2 once
-before verification under an explicit flag with no-secret telemetry, an owner,
-and a finite expiry no more than 30 days after process start. The process MUST
-reattach that bounded interval to a monotonic deadline when available and MUST
-keep legacy selection disabled after any request observes expiry or an invalid
-clock; a later wall-clock rollback cannot re-enable it. Production MUST reject
-origin-unbound WS v2 and ingress-dependent REST v1.
+Production rejects origin-unbound WS v2 and ingress-dependent REST v1. Legacy
+auth frames received after a successful v3 handshake close the transport; they
+cannot trigger a second verifier. The removed compatibility environment
+variable is rejected at startup so stale deployment state is visible and
+fail-closed.
 
 ## Executable evidence
 
@@ -329,9 +325,9 @@ evidence remain separate release gates.
 - Registration policy and Pass presence become explicit authenticated intent.
 - REST identity, target, freshness, and body commitment share one bounded binary
   grammar across native clients and the server.
-- The deliberate Preview cutover is active. Legacy WS compatibility is an
-  explicit, server-only emergency rollback switch; it is never negotiated or
-  selected by a client after a v3 endpoint has been configured.
+- The deliberate Preview cutover is complete. Legacy WS and REST dispatch
+  branches have no runtime activation path; historical ciphertext readers are
+  retained separately and do not participate in authentication negotiation.
 - Any future field with authorization or parser semantics requires explicit
   contract review instead of relying on an unsigned header or protobuf field.
 

@@ -24,9 +24,11 @@ func TestLoadDefaultsWithExplicitDevOptIn(t *testing.T) {
 	t.Setenv("DATABASE_URL", "")
 	t.Setenv("VEIL_ALLOW_INSECURE_DEV_DATABASE", "1")
 	t.Setenv("AUTH_CHALLENGE_TTL", "")
-	t.Setenv("AUTH_MAX_ATTEMPTS", "")
 	t.Setenv("VEIL_ALLOW_REGISTRATION", "")
-	t.Setenv("VEIL_ALLOW_LEGACY_WS_V2", "")
+	t.Setenv("VEIL_ALLOW_LEGACY_WS_V2", "temporary")
+	if err := os.Unsetenv("VEIL_ALLOW_LEGACY_WS_V2"); err != nil {
+		t.Fatal(err)
+	}
 
 	cfg, err := config.Load()
 	if err != nil {
@@ -39,14 +41,8 @@ func TestLoadDefaultsWithExplicitDevOptIn(t *testing.T) {
 	if cfg.AuthChallengeTTL != 30*time.Second {
 		t.Errorf("default AuthChallengeTTL = %v, want 30s", cfg.AuthChallengeTTL)
 	}
-	if cfg.AuthMaxAttempts != 3 {
-		t.Errorf("default AuthMaxAttempts = %d, want 3", cfg.AuthMaxAttempts)
-	}
 	if cfg.AllowRegistration {
 		t.Error("default AllowRegistration = true, want fail-closed false")
-	}
-	if cfg.AllowLegacyWSV2 {
-		t.Error("default AllowLegacyWSV2 = true, want fail-closed false")
 	}
 	if cfg.MaxMessageSize != 64*1024 {
 		t.Errorf("default MaxMessageSize = %d, want %d", cfg.MaxMessageSize, 64*1024)
@@ -62,9 +58,7 @@ func TestLoadFromEnv(t *testing.T) {
 	t.Setenv("VEIL_PUBLIC_ORIGIN", "not-a-canonical-origin")
 	t.Setenv("PORT", "9090")
 	t.Setenv("AUTH_CHALLENGE_TTL", "1m")
-	t.Setenv("AUTH_MAX_ATTEMPTS", "5")
 	t.Setenv("VEIL_ALLOW_REGISTRATION", "true")
-	t.Setenv("VEIL_ALLOW_LEGACY_WS_V2", "true")
 
 	cfg, err := config.Load()
 	if err != nil {
@@ -77,17 +71,18 @@ func TestLoadFromEnv(t *testing.T) {
 	if cfg.AuthChallengeTTL != time.Minute {
 		t.Errorf("AuthChallengeTTL = %v, want 1m", cfg.AuthChallengeTTL)
 	}
-	if cfg.AuthMaxAttempts != 5 {
-		t.Errorf("AuthMaxAttempts = %d, want 5", cfg.AuthMaxAttempts)
-	}
 	if !cfg.AllowRegistration {
 		t.Error("AllowRegistration = false, want true")
 	}
-	if !cfg.AllowLegacyWSV2 {
-		t.Error("AllowLegacyWSV2 = false, want true")
-	}
 	if !cfg.PublicOrigin.IsZero() {
 		t.Errorf("PublicOrigin = %q, want empty for shared Load", cfg.PublicOrigin.String())
+	}
+}
+
+func TestLoadRejectsRemovedLegacyWebSocketSwitch(t *testing.T) {
+	t.Setenv("VEIL_ALLOW_LEGACY_WS_V2", "false")
+	if _, err := config.Load(); err == nil {
+		t.Fatal("Load accepted removed VEIL_ALLOW_LEGACY_WS_V2 setting")
 	}
 }
 

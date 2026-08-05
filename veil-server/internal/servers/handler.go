@@ -47,7 +47,7 @@ func (h *Handler) SetVeilLinkRateLimits(preview, join *authmw.RateLimit) {
 	h.veilJoinRL = join
 }
 
-// SetRESTAuthVersionDispatcher activates explicit REST authentication version
+// SetRESTAuthVersionDispatcher activates mandatory REST v2 authentication
 // selection for every signed Space, Room, role, and Veil Link route.
 func (h *Handler) SetRESTAuthVersionDispatcher(dispatcher *authmw.RESTAuthVersionDispatcher) {
 	h.restDispatcher = dispatcher
@@ -61,8 +61,8 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 		if h.restDispatcher != nil {
 			f = h.restDispatcher.RequireSigned(policy, f)
 		} else if h.mw != nil {
-			// Verify first; the limiter keys from verified principal context.
-			f = h.mw.RequireSigned(f)
+			var unavailable *authmw.RESTAuthVersionDispatcher
+			f = unavailable.RequireSigned(policy, f)
 		}
 		return f
 	}
@@ -73,7 +73,8 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 		if h.restDispatcher != nil {
 			f = h.restDispatcher.RequireSigned(policy, f)
 		} else if h.mw != nil {
-			f = h.mw.RequireSigned(f)
+			var unavailable *authmw.RESTAuthVersionDispatcher
+			f = unavailable.RequireSigned(policy, f)
 		}
 		return f
 	}

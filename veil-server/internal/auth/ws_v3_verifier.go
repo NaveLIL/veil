@@ -148,7 +148,7 @@ func (s *Service) VerifyResponseV3(ctx context.Context, connID string, response 
 	// A selected v3 response gets exactly one use of the challenge, including
 	// malformed or wrong-version responses. A retry starts a fresh connection
 	// and receives a fresh server ephemeral.
-	challenge, err := s.takeChallenge(connID, challengeProtocolV3)
+	challenge, err := s.takeChallenge(connID)
 	if err != nil {
 		return nil, rejectWSAuthV3(WSAuthV3AuthenticationFailed, err)
 	}
@@ -299,8 +299,7 @@ func parseWSAuthV3Response(response WSAuthV3ResponseInput, challenge *pendingCha
 			parsed.clear()
 		}
 	}()
-	if challenge == nil || challenge.protocol != challengeProtocolV3 ||
-		challenge.canonicalOrigin == "" || allZeroWSAuthV3(challenge.public[:]) {
+	if challenge == nil || challenge.canonicalOrigin == "" || allZeroWSAuthV3(challenge.public[:]) {
 		return parsed, ErrInvalidWSAuthV3
 	}
 	if len(response.IdentityKey) != 32 || len(response.SigningKey) != ed25519.PublicKeySize ||
