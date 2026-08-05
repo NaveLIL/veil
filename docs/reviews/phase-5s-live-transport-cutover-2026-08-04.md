@@ -2,7 +2,8 @@
 
 - Date: 2026-08-04
 - Scope: live WS v3 and signed REST v2 activation
-- Status: implemented; hostile two-Node and independent-audit gates remain open
+- Status: implemented; disposable PostgreSQL two-Node relay/downgrade evidence
+  is in CI; cross-client/physical evidence and independent audit remain open
 
 ## Activated boundary
 

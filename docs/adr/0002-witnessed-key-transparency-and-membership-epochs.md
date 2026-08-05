@@ -1,7 +1,7 @@
 # ADR 0002: witnessed key transparency and authorized membership epochs
 
-- Status: accepted for staged implementation; no security claim until the exit
-  gates below pass
+- Status: implemented and internally tested; independently operated witnesses,
+  physical release evidence, and external audit remain exit gates
 - Date: 2026-08-04
 - Scope: first-contact account/device identity and Circle/Space membership
   authorization under a malicious or compromised Node

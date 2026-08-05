@@ -84,8 +84,9 @@ canonical origin, account, device и registration intent, а один socket н�
 commands, ACK и events. Signed HTTP routes принимают REST v2, где transcript
 связывает origin, account, method, raw target, nonce и body hash; replay state
 хранится в PostgreSQL. Legacy `/ws` выключен по умолчанию и доступен только по
-явному аварийному operator flag без client-side downgrade. Hostile two-Node,
-cross-client и независимый audit evidence остаются blocking release gate.
+явному аварийному operator flag без client-side downgrade. Disposable
+PostgreSQL two-Node relay/downgrade matrix теперь входит в CI; cross-client,
+physical-device и независимый audit evidence остаются blocking release gate.
 
 ### Локальные данные и поиск
 
@@ -106,11 +107,15 @@ release matrices ещё входят в открытые Preview gates.
   canonical origin, account identities, точные device bindings и X3DH
   transcript в session commitment и запрещает sticky downgrade после первого
   durable v2 состояния.
-- Circle и text Room используют authenticated Sender Keys v5.
+- Circle и text Room используют membership-bound Sender Keys v6 после
+  авторизованной активации; Sender Keys v5 сохраняется только для явной
+  исторической совместимости.
 - Space/Room access задаётся server-side ACL, но presentation metadata не
   участвует в crypto trust.
 - Изменение roster/access требует корректной key rotation/distribution.
-- Key transparency пока отсутствует; текущая модель service-mediated TOFU.
+- Identity Transparency v1 проверяет Node-signed Merkle inclusion/consistency,
+  SQLCipher/desktop OS anchor и опциональный независимый witness quorum/gossip.
+  Never-pinned legacy Node остаётся доступным без transparency claim.
   Account-v2 safety number можно независимо сравнить и явно отметить как
   `Verified on this device`; замена identity снимает этот статус.
 - Production UniFFI не экспортирует raw ratchet, AEAD, X3DH, signing, KDF,
@@ -147,7 +152,8 @@ reverse proxy. Конкретная схема и rollback gate описаны �
   Android identity setup/secure runtime gate и host-tested Direct send/delivery
   action split, но Direct-session-specific outcome, desktop/Go consumers и
   cross-client conformance открыты; calls и MLS runtime не включены;
-- key transparency отсутствует;
+- независимое развёртывание witness-сервисов, Android OS-backed rollback anchor
+  и внешний криптографический аудит остаются release gates;
 - attachment, multi-device и platform signing matrices требуют дальнейшего
   release evidence;
 - доступность публичного Preview не является SLA.

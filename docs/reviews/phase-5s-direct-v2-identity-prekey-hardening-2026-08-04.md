@@ -3,8 +3,8 @@
 - Date: 2026-08-04
 - Scope: Direct cryptographic binding, first-contact verification, mobile FFI,
   and X3DH local-key lifecycle
-- Status: implemented and host-tested; independent audit, physical-device, and
-  disposable two-Node gates remain open
+- Status: implemented and host/CI-tested; independent audit, physical-device,
+  cross-client, and independently deployed witness gates remain open
 
 ## Security properties implemented
 
@@ -103,8 +103,10 @@
   session establishment. Once an origin has a pin, proof omission is a sticky
   downgrade failure. A never-pinned legacy/disabled Node remains usable without
   receiving a transparency or verified claim, preserving existing deployments.
-- Independent witnesses/gossip and an OS-backed whole-file rollback anchor are
-  not implemented by this foundation and remain explicit release gates.
+- External witness quorum, public checkpoint gossip, and the desktop OS-backed
+  whole-file rollback anchor are implemented. Android still lacks a separate
+  OS-backed anchor; compiled mandatory witness policy is its available
+  whole-file rollback mitigation.
 
 ## Host evidence in this checkpoint
 
@@ -154,19 +156,14 @@ not in this implementation checkpoint.
 
 ## Explicitly open release/security gates
 
-1. **Independent transparency witnesses and gossip.** The Node log, exact
-   account/device proofs, SQLCipher pinning, consistency verification, sticky
-   downgrade handling, and immutable local alarm evidence are implemented. A
-   malicious Node can still present separate append-only first-contact views
-   until independently operated witnesses or client gossip compare the exact
-   signed head. Manual fingerprint/QR comparison remains the immediate
-   out-of-band defense.
-2. **Whole-file rollback anchor.** Live stale-writer CAS, ratchet revisions,
-   roster versions, and monotonic allocators reject rollback inside the current
-   database lineage. Restoring an older complete SQLCipher file is not yet
-   compared with an OS-backed monotonic anchor. A correct implementation needs
-   a crash-safe Keychain/Android Keystore protocol; a sidecar file would not be
-   a security boundary.
+1. **Independent witness deployment.** The strict quorum client/protocol and
+   gossip comparison are implemented, but this repository does not ship or
+   operate an independent persistent witness service. Manual fingerprint/QR
+   comparison remains the immediate out-of-band defense without one.
+2. **Android whole-file rollback anchor.** Desktop compares SQLCipher state
+   with a crash-safe OS credential-store anchor. Android currently relies on a
+   compiled mandatory witness policy and still needs a separately reviewed
+   Keystore-backed monotonic protocol.
 3. **Full Direct multi-device fanout.** Direct v2 authenticates one exact target
    device. Sending one user intent to every active peer device and keying every
    ratchet by account plus device require a versioned fanout/receipt migration.
@@ -179,10 +176,10 @@ not in this implementation checkpoint.
 5. **Protocol feature parity.** Direct v2 text is fail-closed. Secure encrypted
    Direct edit/delete semantics are rejected rather than silently emitted with
    an incomplete profile and need a separate versioned design.
-6. **External evidence.** Docker/PostgreSQL two-Node relay tests, Android device
-   process-death/airplane/recovery tests, cross-client Direct v2 vectors,
-   signed artifacts, fuzz campaigns, and independent cryptographic review are
-   still mandatory before a stable security claim.
+6. **External evidence.** The Docker/PostgreSQL two-Node relay matrix and four
+   Go fuzz targets are now in CI. Android device process-death/airplane/recovery
+   tests, cross-client Direct v2 vectors, signed artifacts, and independent
+   cryptographic review are still mandatory before a stable security claim.
 7. **Tauri Linux GTK lineage.** Current Tauri/WebKitGTK dependencies retain the
    unmaintained GTK3 bindings and `glib` 0.18.5. RustSec's unsound method family
    is not called by Veil, and the exact advisory is the only explicit CI

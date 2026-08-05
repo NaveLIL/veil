@@ -1,7 +1,8 @@
 # Security hardening checkpoint — 2026-08-04
 
 - Branch: `ds/beta-all-2026-07-21`
-- Status: implementation checkpoint; final release matrix and external review remain in progress
+- Status: implementation hardened; current-head CI, physical release evidence,
+  independent witness deployment, and external review remain in progress
 - Purpose: make the current security work available to every contributor before the final gate
 
 ## What is implemented at this checkpoint
@@ -35,12 +36,22 @@
 - `veil-store` and `veil-client` compile with their test targets; `veil-ffi` and the desktop check are being rerun for this checkpoint.
 - The local MinGW toolchain cannot link the oversized Tauri test `cdylib` (`export ordinal too large`). This is a toolchain/export-table limitation; desktop is instead gated by `cargo check`, frontend production build, TypeScript, and Vitest. It is not counted as a passing linked desktop test.
 
-## Work still required before the final commit/release claim
+## Remaining release gates
 
-1. Complete the full Rust, Go, desktop, mobile, Gradle, lint, audit, and workflow validation matrix from a clean invocation.
-2. Exercise database-backed migration/upgrade paths and adversarial concurrency matrices that are available on the host.
-3. Update the architecture, server operations, ADR status, README, and audit handoff with exact commands/results and honest residual limits.
-4. Build reproducible container and APK candidates. A signed APK and physical-device/process-death matrix require the configured tester/release signing material and a device.
-5. Obtain an independent cryptographic review before making a stable-security claim. This repository can prepare the evidence package but cannot self-certify independence.
+1. Record a green current-head Rust, Go, desktop, mobile, Gradle, audit,
+   protocol, coverage, and Beta Artifacts matrix in the audit handoff.
+2. Independently deploy and exercise the persistent witness service described
+   by the protocol; the repository contains the strict client but no witness
+   daemon.
+3. Produce signed candidates and complete the physical-device/process-death,
+   recovery, airplane-mode, cross-client, and QR interoperability matrices.
+4. Obtain an independent cryptographic review before making a stable-security
+   claim. This repository can prepare evidence but cannot self-certify
+   independence.
+
+Database-backed upgrades through migration `035`, production REST v2-only
+integration, hostile two-Node relay/downgrade, and four parser/state-machine
+fuzz targets have been added since the initial checkpoint. The complete handoff
+is [security-hardening-audit-handoff-2026-08-05.md](security-hardening-audit-handoff-2026-08-05.md).
 
 No tag or stable release claim is attached to this checkpoint.

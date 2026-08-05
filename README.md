@@ -38,7 +38,7 @@ Preview-сборки, но ещё не достиг стабильного ре�
 |---|---|
 | **Home** | личный центр: поиск, друзья, запросы и Direct |
 | **Direct** | защищённый разговор один на один на X3DH + Double Ratchet |
-| **Circle** | небольшая приватная группа с одной беседой на Sender Keys v5 |
+| **Circle** | небольшая приватная группа с membership-bound Sender Keys v6; v5 читается как history |
 | **Space** | совместное пространство с участниками, ролями и Rooms |
 | **Room** | отдельный функциональный и криптографический контекст внутри Space |
 | **Veil Node** | self-hosted инфраструктура и exact canonical origin аккаунта |
@@ -63,7 +63,7 @@ Access Pass и preview Veil Link. Узкий Secure Share Viewer заплани�
 [INTEGRATION_ROADMAP.md](INTEGRATION_ROADMAP.md), а не выводятся из наличия
 отдельного API или экрана.
 
-- Baseline identity, X3DH/Double Ratchet, authenticated Sender Keys v5,
+- Baseline identity, X3DH/Double Ratchet, membership-bound Sender Keys v6,
   SQLCipher, signed REST/WS, группы, Space/Room ACL и desktop Identity Island
   реализованы и покрыты соответствующими completion gates.
 - Phase 2 local search закрыт финальным product/security gate. Реализация
@@ -110,6 +110,9 @@ Access Pass и preview Veil Link. Узкий Secure Share Viewer заплани�
 Переносимый beta-checkpoint от 2026-08-04 с точными test results, известными
 integration blockers и локальной macOS x86_64 сборкой опубликован в
 [`docs/reviews/beta-integration-macos-2026-08-04.md`](docs/reviews/beta-integration-macos-2026-08-04.md).
+Текущий security scope, воспроизводимые проверки и честные остаточные gates
+зафиксированы в
+[`docs/reviews/security-hardening-audit-handoff-2026-08-05.md`](docs/reviews/security-hardening-audit-handoff-2026-08-05.md).
 
 ## Архитектура
 
@@ -133,9 +136,9 @@ integration blockers и локальной macOS x86_64 сборкой опуб�
 - DM используют X3DH + Double Ratchet. Direct v2 дополнительно связывает
   canonical Node origin, оба account UUID/identity, оба device binding и X3DH
   transcript; после durable v2 commitment downgrade к Direct v1 запрещён.
-  Группы и text Rooms используют
-  authenticated Sender Keys v5; изменение roster/access требует ротации, а
-  незавершённая раздача блокирует отправку.
+  После авторизованной membership-активации группы и text Rooms используют
+  Sender Keys v6 с точным epoch/hash; v5 сохраняется для history. Изменение
+  roster/access требует ротации, а незавершённая раздача блокирует отправку.
 - Локальный поиск не создаёт persistent plaintext index: Tantivy живёт только
   в памяти процесса, перестраивается из SQLCipher для exact authenticated
   origin и очищается при lock/account/origin transition.
@@ -145,9 +148,11 @@ integration blockers и локальной macOS x86_64 сборкой опуб�
   conversation metadata и plaintext preview.
 - Профильные имя/avatar/roles являются presentation metadata и никогда не
   участвуют в crypto trust, ACL или Sender-Key rotation.
-- Текущий TOFU service-mediated: key transparency ещё отсутствует. Статус
-  `Verified on this device` появляется только после явного независимого
-  сравнения fingerprint и не наследуется новым identity key.
+- Identity Transparency v1 проверяет Node-signed Merkle inclusion/consistency,
+  закрепляет принятую историю и поддерживает независимых witnesses/gossip.
+  Никогда не наблюдавший лог legacy Node остаётся совместимым без security
+  claim. Статус `Verified on this device` всё равно появляется только после
+  явного независимого сравнения fingerprint и не наследуется новым identity key.
 - Пополнение X3DH-инвентаря повторно публикует точный текущий signed prekey и
   создаёт только новые монотонные OPK. Локальные SPK не удаляются без
   подтверждённого grace/receive-протокола, поэтому отложенные initial messages

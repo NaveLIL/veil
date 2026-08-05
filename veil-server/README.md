@@ -97,11 +97,16 @@ After a pin exists, omission of the proofs is a sticky downgrade error. A Node
 that has never enabled transparency remains usable on first contact to preserve
 existing deployments, but it receives no transparency/verified security claim.
 
-Independent witnesses and client gossip are still an open release gate. Until
-they are active, the Node-signed append-only log protects against rollback in a
-client's observed history but cannot alone prevent a malicious Node from giving
-different first-time clients consistent-looking split views. Fingerprint/QR
-comparison remains the immediate out-of-band verification path.
+External witness quorum and public client-checkpoint gossip are implemented.
+Configure `VEIL_IDENTITY_TRANSPARENCY_WITNESSES` as comma-separated
+`canonical-https-url|lowercase-32-byte-public-key-hex` entries together with
+`VEIL_IDENTITY_TRANSPARENCY_WITNESS_QUORUM`. The Node requests signatures
+concurrently, rejects redirects and malformed responses, locally verifies every
+signature, and can retry a lagging witness with an exact consistency proof.
+The repository does not ship an independently operated witness service; see
+[`docs/operations/transparency-witness-rollout.md`](../docs/operations/transparency-witness-rollout.md).
+Until such witnesses or gossip are actually operated, fingerprint/QR comparison
+remains the immediate out-of-band verification path.
 
 ## Account registration
 

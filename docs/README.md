@@ -21,6 +21,7 @@ evidence для completion gates. Veil остаётся pre-release проект
 - [ADR-0001: Authenticated Sender Keys v5 for server channels](adr/0001-authenticated-sender-keys-v5-for-server-channels.md)
 - [ADR-0002: Origin-bound one-time Node Access Passes](adr/0002-origin-bound-node-access-passes.md)
 - [ADR-0003: Origin-bound transport authentication](adr/0003-origin-bound-transport-authentication.md)
+- [ADR: Witnessed key transparency and authorized membership epochs](adr/0002-witnessed-key-transparency-and-membership-epochs.md)
 
 ADR фиксирует принятое решение и причины. Изменение такого решения должно
 добавлять новый ADR, а не незаметно переписывать исторический документ.
@@ -29,6 +30,7 @@ ADR фиксирует принятое решение и причины. Изм
 
 - [Cryptographic identity rotation](operations/cryptographic-identity-rotation.md)
 - [Sender-Key device-routing cutover](operations/sender-key-device-routing-cutover.md)
+- [Identity transparency witness rollout](operations/transparency-witness-rollout.md)
 - [Production deployment](../deploy/README.md)
 
 Операционные инструкции не заменяют backup, rollback и smoke gate конкретного
@@ -45,6 +47,8 @@ ADR фиксирует принятое решение и причины. Изм
 
 ## Reviews и completion gates
 
+- [Security hardening audit handoff — 2026-08-05](reviews/security-hardening-audit-handoff-2026-08-05.md)
+- [Security hardening checkpoint — 2026-08-04](reviews/security-hardening-checkpoint-2026-08-04.md)
 - [Beta integration and macOS checkpoint — 2026-08-04](reviews/beta-integration-macos-2026-08-04.md)
 - [Phase 1–4C completion gate](reviews/phase-1-4c-completion-gate.md)
 - [Phase 2 search product gate](reviews/phase-2-search-product-gate.md)

@@ -11,7 +11,8 @@
 > `/v3/events`; the gateway's signed handlers select REST v2 only; `/ws` is
 > fail-closed by default and may be restored solely by the explicit emergency
 > `VEIL_ALLOW_LEGACY_WS_V2=true` operator flag. Clients never auto-downgrade.
-> Hostile two-Node and independent-audit evidence remain release gates.
+> A disposable PostgreSQL two-Node relay/downgrade matrix is now in CI;
+> cross-client/physical evidence and independent audit remain release gates.
 
 The deployed Preview authentication paths are versioned, but their signed
 transcripts do not cryptographically identify the exact Veil Node origin.
@@ -294,11 +295,11 @@ WebSocket v2 bytes are not valid v3 proof bytes, and REST v1 bytes are not valid
 v2 proof bytes. Unknown fields or semantic changes require a new version; no
 implementation silently appends, omits, or normalizes them.
 
-The pure transcript and isolated foundation checkpoints are deliberately
-non-activated. Runtime activation still requires dedicated transport dispatch,
-mandatory configured public origin, exact client comparison, a shared durable
-replay store, route media policies, fail-closed negotiation, and a two-Node
-relay harness. Missing or unknown version never means "try the other version".
+The pure transcript and isolated foundation checkpoints led to the active
+runtime: dedicated transport dispatch, mandatory configured public origin,
+exact client comparison, a shared durable replay store, route media policies,
+fail-closed negotiation, and a two-Node relay harness are implemented. Missing
+or unknown version never means "try the other version".
 A Preview-only compatibility dispatcher, if required, MUST select v1 or v2 once
 before verification under an explicit flag with no-secret telemetry, an owner,
 and a finite expiry no more than 30 days after process start. The process MUST
@@ -316,9 +317,10 @@ and deterministic Ed25519 signatures. Mutation tests cover every security field,
 origin aliases, registration-intent substitution, cross-domain substitution,
 other-origin relay, v1/v2 downgrade bytes, bounds, and malformed encodings.
 
-This evidence proves agreement on bytes and local validation only. It does not
-close the hostile-Node P1 until configured-origin runtime integration,
-production downgrade removal, and the two-Node relay matrix pass.
+This evidence is now paired with configured-origin runtime integration,
+production downgrade removal, durable replay tests, and a disposable
+PostgreSQL two-Node relay matrix. Independent review and cross-client/physical
+evidence remain separate release gates.
 
 ## Consequences
 

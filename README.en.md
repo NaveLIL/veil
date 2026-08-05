@@ -35,14 +35,14 @@ only invites an existing account into a Space.
 
 Substantial Preview implementations exist for:
 
-- native Rust identity, X3DH, Double Ratchet, authenticated Sender Keys v5,
+- native Rust identity, X3DH, Double Ratchet, membership-bound Sender Keys v6
+  with explicit v5 history compatibility,
   encrypted attachment primitives, and recovery foundations;
 - origin-scoped SQLCipher storage and a process-memory-only local search index;
-- signed REST/WebSocket transport with Protobuf contracts; the managed Preview
-  ingress has an exact transitional REST-v1 authority allowlist, while full
-  cryptographic origin/user binding remains a Phase 5S gate. A separate
-  experimental `/v3/events` endpoint and mobile background controller now
-  exist, but they have not replaced the legacy `/ws` path;
+- origin/account/device-bound REST v2 and WebSocket v3 transport with durable
+  replay protection and Protobuf contracts. `/v3/events` is the live client
+  endpoint; legacy `/ws` is disabled unless an explicit server-only emergency
+  rollback flag is set, and clients never auto-downgrade;
 - Direct, Circle, and structured Space/Room product surfaces and ACLs;
 - a Tauri v2 desktop client with a SolidJS interface;
 - a Go Veil Node gateway with PostgreSQL, uploads, push wake-ups, profiles,
@@ -76,8 +76,10 @@ x86_64 build evidence are recorded in the
   `PublicFailureCodeV1` currently covers Android identity setup and the secure
   runtime gate; Direct session/send/delivery and desktop/Go consumers remain
   open. Calls and the MLS runtime are not enabled as complete user features.
-- Key transparency is not implemented; the current model is service-mediated
-  TOFU with explicit local fingerprint verification.
+- Identity Transparency v1 verifies Node-signed Merkle inclusion/consistency,
+  pins accepted history, and supports independent witness quorum and public
+  checkpoint gossip. The repository does not operate the independent witness
+  service; explicit local fingerprint/QR verification remains authoritative.
 - Platform signing, multi-device, attachment, and distributor matrices still
   require release evidence.
 - There is no full browser client. Web surfaces are deliberately limited to
@@ -103,14 +105,13 @@ discarded based on a failed or unsettled check.
 The Veil Node stores and routes ciphertext, but it still sees unavoidable
 routing metadata such as network addresses, timing, sizes, account and
 conversation membership, and delivery state. E2EE does not hide that metadata.
-The canonical HTTPS origin is part of the account model. The Preview validates
-URL/TLS and managed legacy REST authority strictly. A separate experimental
-`/v3/events` endpoint, Rust supervisor, FFI controller, and Android background
-service now exist, while the primary `/ws` path remains WS v2. The new slice is
-not integration-green: the full workspace currently fails in `veil-ffi`, the
-generated Kotlin bindings lag behind, and cross-client/two-Node evidence is
-missing. REST v2 remains disconnected from live routes. The complete cutover,
-two-Node relay matrix, and independent review remain Phase 5S security gates.
+The canonical HTTPS origin is part of the account model. Desktop and Android
+use exact REST v2 and `/v3/events` WS v3 contracts through the Rust/FFI/native
+boundaries. Production rejects missing/legacy proofs without fallback. A
+disposable PostgreSQL hostile two-Node relay/downgrade matrix and parser fuzz
+smoke are in CI. Cross-client/physical evidence, independently operated
+witnesses, signed release candidates, and independent review remain release
+gates.
 
 Files are encrypted before upload. Push payloads are restricted to generic
 wake-up signals without sender, message, conversation, or plaintext preview.
