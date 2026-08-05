@@ -179,9 +179,12 @@ jobs:
 
           # Files that handle secrets must import zeroize
           # signature/chunked_aead/x25519 only borrow keys owned by zeroizing
-          # types; public_key validates public material only. None retain raw
-          # private material themselves.
-          CRYPTO_FILES=$(find veil-crypto/src -name "*.rs" ! -name "lib.rs" ! -name "fingerprint.rs" ! -name "signature.rs" ! -name "chunked_aead.rs" ! -name "x25519.rs" ! -name "public_key.rs")
+          # types; public_key validates public material only. Membership and
+          # transparency production code encode/verify public keys, hashes,
+          # signatures, and public commitments only; their fixed test-vector
+          # seeds are synthetic fixtures, never runtime secret ownership.
+          # None of these reviewed modules retain raw private material.
+          CRYPTO_FILES=$(find veil-crypto/src -name "*.rs" ! -name "lib.rs" ! -name "fingerprint.rs" ! -name "signature.rs" ! -name "chunked_aead.rs" ! -name "x25519.rs" ! -name "public_key.rs" ! -name "membership.rs" ! -name "transparency.rs")
           FAIL=0
 
           for f in $CRYPTO_FILES; do

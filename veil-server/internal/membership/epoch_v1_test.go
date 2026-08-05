@@ -83,13 +83,13 @@ func TestBootstrapAndThresholdTransitionArePredecessorAuthorized(t *testing.T) {
 }
 
 func TestPolicyAndSignatureCanonicalizationFailClosed(t *testing.T) {
-	first, owner, ownerKey, admin, adminKey := testEpochOne()
+	first, _, _, _, _ := testEpochOne()
 	first.SuccessorPolicy.Signers[0], first.SuccessorPolicy.Signers[1] =
 		first.SuccessorPolicy.Signers[1], first.SuccessorPolicy.Signers[0]
 	if err := first.Validate(); err == nil {
 		t.Fatal("accepted a reordered policy")
 	}
-	first, owner, ownerKey, admin, adminKey = testEpochOne()
+	first, owner, ownerKey, admin, adminKey := testEpochOne()
 	second := first
 	second.Number = 2
 	second.PredecessorHash, _ = first.Hash()

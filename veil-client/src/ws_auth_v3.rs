@@ -896,7 +896,7 @@ mod tests {
         );
 
         changed = binding.clone();
-        changed.capabilities |= 4;
+        changed.capabilities ^= crate::device_identity::DEVICE_CAPABILITY_MEMBERSHIP_EPOCH_V1;
         assert_eq!(
             verify_local_binding(&fixture.account, &fixture.device, &changed),
             Err(WsAuthV3Error::InvalidLocalBinding)
