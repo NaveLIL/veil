@@ -197,6 +197,31 @@ jobs:
           DATABASE_URL: postgres://veil:veiltest@localhost:5432/veil_test?sslmode=disable
         run: go test -v -race -timeout 60s ./...
 
+  fuzz:
+    name: Security fuzz smoke
+    runs-on: ubuntu-latest
+    needs: [build]
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: "1.26.5"
+          cache-dependency-path: veil-server/go.sum
+
+      - name: Fuzz canonical origin
+        run: go test ./internal/nodeorigin -run='^$' -fuzz='^FuzzCanonicalOriginRoundTrip$' -fuzztime=5s
+
+      - name: Fuzz REST auth v2 transcript
+        run: go test ./internal/authmw -run='^$' -fuzz='^FuzzRESTAuthV2SigningTranscript$' -fuzztime=5s
+
+      - name: Fuzz membership epoch canonicalization
+        run: go test ./internal/membership -run='^$' -fuzz='^FuzzMembershipEpochCanonicalization$' -fuzztime=5s
+
+      - name: Fuzz transparency proofs
+        run: go test ./internal/transparency -run='^$' -fuzz='^FuzzTransparencyProofRoundTrip$' -fuzztime=5s
+
   # Integration-tagged REST and database tests against ephemeral Postgres
   # containers spun up via testcontainers-go. Gated by the `integration`
   # build tag so that the default `go test ./...` job above stays Docker-free.
