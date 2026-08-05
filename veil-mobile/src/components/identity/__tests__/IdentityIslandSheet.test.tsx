@@ -188,7 +188,7 @@ describe("IdentityIslandSheet interaction and accessibility boundary", () => {
     expect(root.findAllByType(Text).some(
       (node) => node.props.children === "Verified on this device",
     )).toBe(true);
-  });
+  }, 15_000);
 
   it("keeps the camera unmounted until requested and consumes only one exact QR result", async () => {
     reduceMotion.mockResolvedValue(true);

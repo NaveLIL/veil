@@ -1580,18 +1580,265 @@ func TestMigrationUpgradePreflights(t *testing.T) {
 		}
 	})
 
-	t.Run("fresh migration chain includes and applies 001 through 031", func(t *testing.T) {
+	t.Run("032 makes transparency history append-only and head advances exact", func(t *testing.T) {
+		pool := newMigrationDatabase(t, admin, baseDSN, "veil_migration_032")
+		applyMigrationsBefore(t, pool, migrations, 32)
+		ownerID, _ := seedMigrationMembershipScope(t, pool, "transparency")
+		if err := execMigration(t, pool, migrations, 32); err != nil {
+			t.Fatalf("migration 032: %v", err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		if _, err := pool.Exec(ctx,
+			`INSERT INTO identity_transparency_log_state
+			   (singleton, log_id, node_signing_key, tree_size, root_hash)
+			 VALUES (TRUE, $1, $2, 0, $3)`,
+			bytes.Repeat([]byte{0x31}, 32), bytes.Repeat([]byte{0x32}, 32),
+			bytes.Repeat([]byte{0x33}, 32),
+		); err != nil {
+			t.Fatalf("insert transparency head: %v", err)
+		}
+		if _, err := pool.Exec(ctx,
+			`INSERT INTO identity_transparency_log_leaves
+			   (leaf_index, event_kind, subject_user_id, canonical_event, leaf_hash)
+			 VALUES (0, 1, $1::uuid, $2, $3)`,
+			ownerID, []byte("account-registration"), bytes.Repeat([]byte{0x34}, 32),
+		); err != nil {
+			t.Fatalf("insert transparency leaf: %v", err)
+		}
+		if _, err := pool.Exec(ctx,
+			`INSERT INTO identity_transparency_log_nodes(node_level, node_index, node_hash)
+			 VALUES (0, 0, $1)`, bytes.Repeat([]byte{0x34}, 32),
+		); err != nil {
+			t.Fatalf("insert transparency node: %v", err)
+		}
+		_, err := pool.Exec(ctx,
+			`UPDATE identity_transparency_log_leaves
+			 SET canonical_event=$1 WHERE leaf_index=0`, []byte("rewritten"),
+		)
+		requireMigrationError(t, err, "23514", "identity transparency history is append-only")
+		_, err = pool.Exec(ctx,
+			`DELETE FROM identity_transparency_log_nodes WHERE node_level=0 AND node_index=0`,
+		)
+		requireMigrationError(t, err, "23514", "identity transparency history is append-only")
+		_, err = pool.Exec(ctx,
+			`UPDATE identity_transparency_log_state
+			 SET tree_size=2, root_hash=$1 WHERE singleton=TRUE`,
+			bytes.Repeat([]byte{0x35}, 32),
+		)
+		requireMigrationError(t, err, "23514", "identity transparency head transition is invalid")
+	})
+
+	t.Run("033 requires complete immutable membership epochs", func(t *testing.T) {
+		pool := newMigrationDatabase(t, admin, baseDSN, "veil_migration_033")
+		applyMigrationsBefore(t, pool, migrations, 33)
+		ownerID, conversationID := seedMigrationMembershipScope(t, pool, "membership")
+		if err := execMigration(t, pool, migrations, 33); err != nil {
+			t.Fatalf("migration 033: %v", err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		epochOneHash := bytes.Repeat([]byte{0x41}, 32)
+		rosterCommitment := bytes.Repeat([]byte{0x42}, 32)
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		insertMigrationMembershipEpoch(t, ctx, tx, conversationID, ownerID, 1,
+			make([]byte, 32), 1, rosterCommitment, epochOneHash)
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO conversation_membership_epoch_heads_v1
+			   (conversation_id, epoch_number, epoch_hash, roster_version, roster_commitment)
+			 VALUES ($1::uuid, 1, $2, 1, $3)`,
+			conversationID, epochOneHash, rosterCommitment,
+		); err != nil {
+			t.Fatalf("insert membership head: %v", err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			t.Fatalf("commit complete membership epoch: %v", err)
+		}
+		_, err = pool.Exec(ctx,
+			`UPDATE conversation_membership_epochs_v1
+			 SET canonical_unsigned=$1 WHERE conversation_id=$2::uuid AND epoch_number=1`,
+			[]byte("rewritten"), conversationID,
+		)
+		requireMigrationError(t, err, "55000", "membership epoch history is immutable")
+
+		tx, err = pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO conversation_membership_epochs_v1 (
+			   conversation_id, epoch_number, canonical_origin, conversation_kind,
+			   predecessor_hash, roster_version, roster_commitment,
+			   policy_threshold, policy_signer_count, crypto_profile, crypto_era,
+			   mutation_nonce, epoch_hash, canonical_unsigned, submitted_by
+			 ) VALUES ($1::uuid, 2, 'https://veil.example:443', 1, $2, 2, $3,
+			           1, 1, 1, 1, $4, $5, $6, $7::uuid)`,
+			conversationID, epochOneHash, bytes.Repeat([]byte{0x43}, 32),
+			bytes.Repeat([]byte{0x44}, 32), bytes.Repeat([]byte{0x45}, 32),
+			[]byte("incomplete-epoch"), ownerID,
+		); err != nil {
+			t.Fatalf("insert incomplete membership epoch: %v", err)
+		}
+		err = tx.Commit(ctx)
+		requireMigrationError(t, err, "23514", "membership epoch child rows are incomplete")
+	})
+
+	t.Run("034 preserves legacy Sender-Key rows and rejects partial epoch coordinates", func(t *testing.T) {
+		pool := newMigrationDatabase(t, admin, baseDSN, "veil_migration_034")
+		applyMigrationsBefore(t, pool, migrations, 34)
+		_, _, ownerDeviceID, targetDeviceID, conversationID :=
+			seedMigrationSenderKeyHistory(t, pool, true)
+		if err := execMigration(t, pool, migrations, 34); err != nil {
+			t.Fatalf("migration 034: %v", err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		var legacyRows int
+		if err := pool.QueryRow(ctx,
+			`SELECT count(*) FROM sender_keys
+			 WHERE conversation_id=$1::uuid AND membership_epoch IS NULL
+			   AND membership_epoch_hash IS NULL`, conversationID,
+		).Scan(&legacyRows); err != nil || legacyRows != 1 {
+			t.Fatalf("legacy Sender-Key rows=%d err=%v, want 1", legacyRows, err)
+		}
+		wire := []byte("partial-membership-coordinate")
+		_, err := pool.Exec(ctx,
+			`INSERT INTO sender_keys (
+			   conversation_id, owner_device_id, target_device_id,
+			   encrypted_key, generation, envelope_commitment,
+			   roster_version, roster_commitment,
+			   owner_binding_version, target_binding_version,
+			   membership_epoch
+			 ) SELECT $1::uuid, $2::uuid, $3::uuid, $4, 2, digest($4, 'sha256'),
+			          roster_version, roster_commitment,
+			          owner_binding_version, target_binding_version, 1
+			     FROM sender_keys
+			    WHERE conversation_id=$1::uuid
+			    LIMIT 1`,
+			conversationID, ownerDeviceID, targetDeviceID, wire,
+		)
+		requireMigrationError(t, err, "23514", "sender_keys_membership_context_shape")
+	})
+
+	t.Run("035 makes membership topology and Sender-Key activation fail closed in SQL", func(t *testing.T) {
+		pool := newMigrationDatabase(t, admin, baseDSN, "veil_migration_035")
+		applyMigrationsBefore(t, pool, migrations, 35)
+		ownerID, _, ownerDeviceID, targetDeviceID, conversationID :=
+			seedMigrationSenderKeyHistory(t, pool, true)
+		if err := execMigration(t, pool, migrations, 35); err != nil {
+			t.Fatalf("migration 035: %v", err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		epochOneHash := bytes.Repeat([]byte{0x51}, 32)
+		rosterOne := bytes.Repeat([]byte{0x52}, 32)
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		insertMigrationMembershipEpoch(t, ctx, tx, conversationID, ownerID, 1,
+			make([]byte, 32), 1, rosterOne, epochOneHash)
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO conversation_membership_epoch_heads_v1
+			   (conversation_id, epoch_number, epoch_hash, roster_version, roster_commitment)
+			 VALUES ($1::uuid, 1, $2, 1, $3)`,
+			conversationID, epochOneHash, rosterOne,
+		); err != nil {
+			t.Fatalf("insert exact membership head: %v", err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			t.Fatalf("commit epoch one: %v", err)
+		}
+
+		legacyWire := []byte("post-activation-legacy")
+		_, err = pool.Exec(ctx,
+			`INSERT INTO sender_keys (
+			   conversation_id, owner_device_id, target_device_id,
+			   encrypted_key, generation, envelope_commitment,
+			   roster_version, roster_commitment,
+			   owner_binding_version, target_binding_version
+			 ) SELECT $1::uuid, $2::uuid, $3::uuid, $4, 2, digest($4, 'sha256'),
+			          roster_version, roster_commitment,
+			          owner_binding_version, target_binding_version
+			     FROM sender_keys WHERE conversation_id=$1::uuid LIMIT 1`,
+			conversationID, ownerDeviceID, targetDeviceID, legacyWire,
+		)
+		requireMigrationError(t, err, "23514", "requires the exact active membership epoch")
+
+		boundWire := []byte("post-activation-v6")
+		if _, err := pool.Exec(ctx,
+			`INSERT INTO sender_keys (
+			   conversation_id, owner_device_id, target_device_id,
+			   encrypted_key, generation, envelope_commitment,
+			   roster_version, roster_commitment,
+			   owner_binding_version, target_binding_version,
+			   membership_epoch, membership_epoch_hash
+			 ) SELECT $1::uuid, $2::uuid, $3::uuid, $4, 2, digest($4, 'sha256'),
+			          roster_version, roster_commitment,
+			          owner_binding_version, target_binding_version, 1, $5
+			     FROM sender_keys WHERE conversation_id=$1::uuid LIMIT 1`,
+			conversationID, ownerDeviceID, targetDeviceID, boundWire, epochOneHash,
+		); err != nil {
+			t.Fatalf("insert exact membership-bound Sender-Key: %v", err)
+		}
+
+		epochTwoHash := bytes.Repeat([]byte{0x53}, 32)
+		rosterTwo := bytes.Repeat([]byte{0x54}, 32)
+		tx, err = pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		insertMigrationMembershipEpoch(t, ctx, tx, conversationID, ownerID, 2,
+			epochOneHash, 2, rosterTwo, epochTwoHash)
+		if err := tx.Commit(ctx); err != nil {
+			t.Fatalf("commit epoch two history: %v", err)
+		}
+		_, err = pool.Exec(ctx,
+			`UPDATE conversation_membership_epoch_heads_v1
+			 SET epoch_number=2, epoch_hash=$1, roster_version=999, roster_commitment=$2
+			 WHERE conversation_id=$3::uuid`,
+			epochTwoHash, rosterTwo, conversationID,
+		)
+		requireMigrationError(t, err, "23503", "membership_epoch_head_exact_coordinates_v1")
+		if _, err := pool.Exec(ctx,
+			`UPDATE conversation_membership_epoch_heads_v1
+			 SET epoch_number=2, epoch_hash=$1, roster_version=2, roster_commitment=$2
+			 WHERE conversation_id=$3::uuid`,
+			epochTwoHash, rosterTwo, conversationID,
+		); err != nil {
+			t.Fatalf("advance exact membership head: %v", err)
+		}
+
+		_, err = pool.Exec(ctx,
+			`INSERT INTO conversation_membership_epochs_v1 (
+			   conversation_id, epoch_number, canonical_origin, conversation_kind,
+			   predecessor_hash, roster_version, roster_commitment,
+			   policy_threshold, policy_signer_count, crypto_profile, crypto_era,
+			   mutation_nonce, epoch_hash, canonical_unsigned, submitted_by
+			 ) VALUES ($1::uuid, 4, 'https://veil.example:443', 1, $2, 3, $3,
+			           1, 1, 1, 1, $4, $5, $6, $7::uuid)`,
+			conversationID, epochTwoHash, bytes.Repeat([]byte{0x55}, 32),
+			bytes.Repeat([]byte{0x56}, 32), bytes.Repeat([]byte{0x57}, 32),
+			[]byte("forked-epoch"), ownerID,
+		)
+		requireMigrationError(t, err, "23514", "does not extend the current head")
+	})
+
+	t.Run("fresh migration chain includes and applies 001 through 035", func(t *testing.T) {
 		pool := newMigrationDatabase(t, admin, baseDSN, "veil_migration_fresh")
 		seen := make(map[int]bool)
 		for _, item := range migrations {
 			seen[migrationNumber(t, item.name)] = true
 		}
-		for number := 1; number <= 31; number++ {
+		for number := 1; number <= 35; number++ {
 			if !seen[number] {
 				t.Fatalf("migration chain is missing %03d", number)
 			}
 		}
-		applyMigrationsBefore(t, pool, migrations, 32)
+		applyMigrationsBefore(t, pool, migrations, 36)
 	})
 }
 
@@ -1694,6 +1941,84 @@ func seedMigrationSenderKeyHistory(t *testing.T, pool *pgxpool.Pool, completeBin
 		t.Fatalf("insert 019 sender-key head: %v", err)
 	}
 	return ownerUserID, targetUserID, ownerDeviceID, targetDeviceID, conversationID
+}
+
+func seedMigrationMembershipScope(t *testing.T, pool *pgxpool.Pool, suffix string) (string, string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	marker := byte(len(suffix) + 0x61)
+	var ownerID, conversationID string
+	if err := pool.QueryRow(ctx,
+		`INSERT INTO users(identity_key, signing_key, username)
+		 VALUES ($1, $2, $3) RETURNING id::text`,
+		bytes.Repeat([]byte{marker}, 32), bytes.Repeat([]byte{marker + 1}, 32),
+		"membership-"+suffix,
+	).Scan(&ownerID); err != nil {
+		t.Fatalf("insert membership migration owner: %v", err)
+	}
+	if err := pool.QueryRow(ctx,
+		`INSERT INTO conversations(conv_type, name)
+		 VALUES (1, $1) RETURNING id::text`,
+		"membership-"+suffix,
+	).Scan(&conversationID); err != nil {
+		t.Fatalf("insert membership migration conversation: %v", err)
+	}
+	return ownerID, conversationID
+}
+
+func insertMigrationMembershipEpoch(
+	t *testing.T,
+	ctx context.Context,
+	tx pgx.Tx,
+	conversationID string,
+	ownerID string,
+	number int64,
+	predecessorHash []byte,
+	rosterVersion int64,
+	rosterCommitment []byte,
+	epochHash []byte,
+) {
+	t.Helper()
+	var bootstrapOwner, bootstrapSigningKey any
+	if number == 1 {
+		bootstrapOwner = ownerID
+		bootstrapSigningKey = bytes.Repeat([]byte{0x62}, 32)
+	}
+	marker := byte(0x70 + number)
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO conversation_membership_epochs_v1 (
+		   conversation_id, epoch_number, canonical_origin, conversation_kind,
+		   predecessor_hash, roster_version, roster_commitment,
+		   policy_threshold, policy_signer_count, crypto_profile, crypto_era,
+		   mutation_nonce, epoch_hash, canonical_unsigned,
+		   bootstrap_owner_id, bootstrap_owner_signing_key, submitted_by
+		 ) VALUES (
+		   $1::uuid, $2, 'https://veil.example:443', 1, $3, $4, $5,
+		   1, 1, 1, 1, $6, $7, $8, $9::uuid, $10, $11::uuid
+		 )`,
+		conversationID, number, predecessorHash, rosterVersion, rosterCommitment,
+		bytes.Repeat([]byte{marker}, 32), epochHash, []byte{marker},
+		bootstrapOwner, bootstrapSigningKey, ownerID,
+	); err != nil {
+		t.Fatalf("insert membership epoch %d: %v", number, err)
+	}
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO conversation_membership_policy_signers_v1
+		   (conversation_id, epoch_number, signer_index, account_id, account_signing_key)
+		 VALUES ($1::uuid, $2, 0, $3::uuid, $4)`,
+		conversationID, number, ownerID, bytes.Repeat([]byte{0x62}, 32),
+	); err != nil {
+		t.Fatalf("insert membership epoch %d signer: %v", number, err)
+	}
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO conversation_membership_signatures_v1
+		   (conversation_id, epoch_number, signature_index, signer_account_id, signature)
+		 VALUES ($1::uuid, $2, 0, $3::uuid, $4)`,
+		conversationID, number, ownerID, bytes.Repeat([]byte{marker + 1}, 64),
+	); err != nil {
+		t.Fatalf("insert membership epoch %d signature: %v", number, err)
+	}
 }
 
 func startMigrationPostgres(t *testing.T) (string, *pgxpool.Pool) {
