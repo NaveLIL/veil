@@ -18,7 +18,7 @@
 | `bc987d0` | Integration harness moved from legacy REST v1 to production v2-only; hostile two-Node relay/downgrade matrix added |
 | `155ecd1` | Superseded push/PR workflow runs cancel by source branch instead of consuming the CI queue |
 | `1a46787` | Permanently retired WS v2 and standalone REST v1 binaries; removed the WS rollback switch, post-auth re-verification, and REST `PreviewDual` dispatch; corrected the SQLCipher restart fixture |
-| current follow-up commit | Preserved optional no-reason moderation requests under REST v2 while keeping their signed-body boundary unambiguous; closed nullable PostgreSQL security-context checks for both fresh and already-upgraded databases; made Android foreground-service registration unambiguous to variant-aware lint |
+| current follow-up commit | Preserved optional no-reason moderation requests under REST v2 while keeping their signed-body boundary unambiguous; closed nullable PostgreSQL security-context checks for both fresh and already-upgraded databases; made Android foreground-service registration unambiguous to variant-aware lint; declared camera hardware optional so QR verification remains available without excluding camera-less devices from installation |
 | current CI reliability commits | Verify the exported multi-architecture OCI layout directly with runner-provided `tar` and `jq`, so no post-build `apt` repository can invalidate an already successful image build; keep the background-cancellation race test strict about fail-closed state while accepting either legal observation, `CLOSING` or an already completed `LOCKED` |
 
 Schema migrations introduced by this security range are:
