@@ -2,7 +2,7 @@ services:
   postgres:
     # PostgreSQL 18 activation is gated on the reviewed dump/restore procedure
     # documented in docs/operations/postgresql-18-upgrade-gate.md.
-    image: postgres:16-alpine
+    image: postgres:18-alpine
     restart: unless-stopped
     environment:
       POSTGRES_DB: veil
@@ -17,7 +17,7 @@ services:
       retries: 5
 
   migrate:
-    image: postgres:16-alpine
+    image: postgres:18-alpine
     restart: "no"
     environment:
       DATABASE_URL: "postgres://veil:${VEIL_DB_PASSWORD:?set VEIL_DB_PASSWORD in .env}@postgres:5432/veil?sslmode=disable"
