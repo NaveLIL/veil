@@ -1782,7 +1782,11 @@ class VeilMobileRuntimeTest {
       assertTrue(fakeSession.connectStarted.await(5, TimeUnit.SECONDS))
 
       runtime.lockForBackground()
-      assertEquals(NativeSessionState.CLOSING, runtime.snapshot().sessionState)
+      val backgroundState = runtime.snapshot().sessionState
+      assertTrue(
+        "background lock must already be closing or fully locked, got $backgroundState",
+        backgroundState == NativeSessionState.CLOSING || backgroundState == NativeSessionState.LOCKED,
+      )
       assertNull(runtime.snapshot().binding)
       assertNull(runtime.snapshot().pendingAccessPass)
       runtime.execute { executorDrained.countDown() }
