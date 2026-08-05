@@ -70,6 +70,7 @@ ADR фиксирует принятое решение и причины. Изм
 - [Phase 5S WebSocket auth v3 foundation checkpoint](reviews/phase-5s-ws-auth-v3-foundation-checkpoint.md)
 - [Phase 5S REST auth v2 foundation checkpoint](reviews/phase-5s-rest-auth-v2-foundation-checkpoint.md)
 - [Phase 5S WebSocket auth v3 verifier/admission checkpoint](reviews/phase-5s-ws-auth-v3-verifier-admission-checkpoint.md)
+- [Phase 5S live transport cutover checkpoint](reviews/phase-5s-live-transport-cutover-2026-08-04.md)
 - [Phase 5S REST auth v2 HTTP boundary checkpoint](reviews/phase-5s-rest-auth-v2-http-boundary-checkpoint.md)
 - [Phase 5S 2026-07-20 end-of-day report](reviews/phase-5s-2026-07-20-end-of-day-report.md)
 

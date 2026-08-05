@@ -462,6 +462,8 @@ pub struct SenderKeyAckMetadataV1 {
     pub conversation_id: String,
     pub generation: u32,
     pub roster_version: u64,
+    pub membership_epoch: u64,
+    pub membership_epoch_hash: [u8; 32],
     pub envelope_commitment: [u8; 32],
 }
 
@@ -1249,7 +1251,10 @@ pub(crate) struct ConnectionEventSenderV1 {
 }
 
 impl ConnectionEventSenderV1 {
-    pub(crate) async fn send(&self, event: ConnectionEvent) -> Result<(), ConnectionEventBufferErrorV1> {
+    pub(crate) async fn send(
+        &self,
+        event: ConnectionEvent,
+    ) -> Result<(), ConnectionEventBufferErrorV1> {
         let event = self.budget.try_wrap(event)?;
         self.sender
             .send(event)
@@ -1478,6 +1483,28 @@ pub(crate) fn signal_event_buffer_failure(
 }
 
 impl Connection {
+    /// Build the ordinary command/event connection from an already
+    /// authenticated transport. WebSocket auth v3 uses this after its
+    /// origin/account/device-bound barrier so every post-auth command, ACK,
+    /// retained control and live event continues through the same Connection
+    /// implementation as the legacy transport.
+    pub(crate) fn from_authenticated_transport_v1(
+        sender: WsSender,
+        events: ConnectionEventReceiverV1,
+        retained_events: VecDeque<BudgetedConnectionEventV1>,
+        write_task: tokio::task::AbortHandle,
+        read_task: tokio::task::AbortHandle,
+    ) -> Self {
+        Self {
+            sender,
+            events,
+            retained_events,
+            seq: Arc::new(Mutex::new(1)),
+            write_task,
+            read_task,
+        }
+    }
+
     /// Connect to the server, perform auth challenge-response, and start
     /// background read/write loops. Returns immediately after auth completes.
     pub async fn connect(
@@ -2695,6 +2722,21 @@ pub(crate) fn sender_key_route_from_proto(
     let sender_device_signing_key = exact_bytes(&skd.sender_device_signing_key)?;
     let sender_account_signature = exact_bytes(&skd.sender_account_signature)?;
     let roster_commitment = exact_bytes(&skd.roster_commitment)?;
+    let (membership_epoch, membership_epoch_hash) = if skd.membership_epoch == 0 {
+        if !skd.membership_epoch_hash.is_empty() {
+            return None;
+        }
+        (0, [0u8; 32])
+    } else {
+        if skd.membership_epoch > i64::MAX as u64 {
+            return None;
+        }
+        let hash = exact_bytes(&skd.membership_epoch_hash)?;
+        if hash == [0u8; 32] {
+            return None;
+        }
+        (skd.membership_epoch, hash)
+    };
     if target_account_identity_key == [0u8; 32]
         || target_device_id == [0u8; 16]
         || target_device_identity_key == [0u8; 32]
@@ -2755,6 +2797,8 @@ pub(crate) fn sender_key_route_from_proto(
         sender_account_signature,
         roster_version: skd.roster_version,
         roster_commitment,
+        membership_epoch,
+        membership_epoch_hash,
         sender_binding_version: skd.sender_binding_version,
         target_binding_version: skd.target_binding_version,
         envelope_commitment: Sha256::digest(&skd.sender_key_message).into(),
@@ -2770,33 +2814,148 @@ fn message_security_context_from_proto(
         && message.roster_commitment.is_empty()
         && message.sender_device_id.is_empty()
         && message.target_device_id.is_empty()
-        && message.sender_binding_version == 0;
+        && message.sender_binding_version == 0
+        && message.target_binding_version == 0
+        && message.direct_session_id.is_empty()
+        && message.sender_user_id.is_empty()
+        && message.sender_device_identity_key.is_empty()
+        && message.sender_device_signing_key.is_empty()
+        && message.sender_device_capabilities == 0
+        && message.sender_device_binding_status == 0
+        && message.sender_account_signature.is_empty()
+        && message.membership_epoch == 0
+        && message.membership_epoch_hash.is_empty();
     if absent {
         return Some(None);
     }
-    if message.crypto_profile != "sender_key_v5"
-        || message.crypto_era != 1
-        || message.roster_version == 0
-        || message.roster_version > i64::MAX as u64
-        || message.sender_binding_version == 0
-        || message.sender_binding_version > i64::MAX as u64
-    {
-        return None;
+    match message.crypto_profile.as_str() {
+        "sender_key_v5" => {
+            if message.crypto_era != 1
+                || message.roster_version == 0
+                || message.roster_version > i64::MAX as u64
+                || message.sender_binding_version == 0
+                || message.sender_binding_version > i64::MAX as u64
+                || message.target_binding_version != 0
+                || !message.direct_session_id.is_empty()
+                || !message.sender_user_id.is_empty()
+                || !message.sender_device_identity_key.is_empty()
+                || !message.sender_device_signing_key.is_empty()
+                || message.sender_device_capabilities != 0
+                || message.sender_device_binding_status != 0
+                || !message.sender_account_signature.is_empty()
+                || message.membership_epoch != 0
+                || !message.membership_epoch_hash.is_empty()
+            {
+                return None;
+            }
+            let sender_device_id = exact_bytes(&message.sender_device_id)?;
+            let target_device_id = exact_bytes(&message.target_device_id)?;
+            if sender_device_id == [0u8; 16] || target_device_id == [0u8; 16] {
+                return None;
+            }
+            Some(Some(crate::api::MessageSecurityContextV1::SenderKeyV5(
+                crate::api::SenderKeyMessageSecurityContextV1 {
+                    roster_version: message.roster_version,
+                    roster_commitment: exact_bytes(&message.roster_commitment)?,
+                    sender_device_id,
+                    target_device_id,
+                    sender_binding_version: message.sender_binding_version,
+                },
+            )))
+        }
+        "sender_key_v6" => {
+            if message.crypto_era != 1
+                || message.roster_version == 0
+                || message.roster_version > i64::MAX as u64
+                || message.sender_binding_version == 0
+                || message.sender_binding_version > i64::MAX as u64
+                || message.target_binding_version != 0
+                || !message.direct_session_id.is_empty()
+                || !message.sender_user_id.is_empty()
+                || !message.sender_device_identity_key.is_empty()
+                || !message.sender_device_signing_key.is_empty()
+                || message.sender_device_capabilities != 0
+                || message.sender_device_binding_status != 0
+                || !message.sender_account_signature.is_empty()
+                || message.membership_epoch == 0
+                || message.membership_epoch > i64::MAX as u64
+            {
+                return None;
+            }
+            let sender_device_id = exact_bytes(&message.sender_device_id)?;
+            let target_device_id = exact_bytes(&message.target_device_id)?;
+            let membership_epoch_hash = exact_bytes(&message.membership_epoch_hash)?;
+            if sender_device_id == [0u8; 16]
+                || target_device_id == [0u8; 16]
+                || membership_epoch_hash == [0u8; 32]
+            {
+                return None;
+            }
+            Some(Some(crate::api::MessageSecurityContextV1::SenderKeyV6(
+                crate::api::SenderKeyMessageSecurityContextV6 {
+                    roster_version: message.roster_version,
+                    roster_commitment: exact_bytes(&message.roster_commitment)?,
+                    sender_device_id,
+                    target_device_id,
+                    sender_binding_version: message.sender_binding_version,
+                    membership_epoch: message.membership_epoch,
+                    membership_epoch_hash,
+                },
+            )))
+        }
+        "direct_v2" => {
+            if message.crypto_era != 1
+                || message.roster_version != 0
+                || !message.roster_commitment.is_empty()
+                || message.sender_binding_version == 0
+                || message.sender_binding_version > i64::MAX as u64
+                || message.target_binding_version == 0
+                || message.target_binding_version > i64::MAX as u64
+                || message.sender_device_capabilities == 0
+                || message.sender_device_capabilities > i64::MAX as u64
+                || message.sender_device_binding_status
+                    != crate::device_identity::DEVICE_BINDING_STATUS_ACTIVE as u32
+                || !is_canonical_lowercase_uuid(&message.sender_user_id)
+                || message.membership_epoch != 0
+                || !message.membership_epoch_hash.is_empty()
+            {
+                return None;
+            }
+            let sender_device_id = exact_bytes(&message.sender_device_id)?;
+            let target_device_id = exact_bytes(&message.target_device_id)?;
+            let sender_device_identity_key = exact_bytes(&message.sender_device_identity_key)?;
+            let sender_device_signing_key = exact_bytes(&message.sender_device_signing_key)?;
+            let sender_account_signature = exact_bytes(&message.sender_account_signature)?;
+            let direct_session_id = exact_bytes(&message.direct_session_id)?;
+            if sender_device_id == [0u8; 16]
+                || target_device_id == [0u8; 16]
+                || sender_device_id == target_device_id
+                || sender_device_identity_key == [0u8; 32]
+                || sender_device_signing_key == [0u8; 32]
+                || sender_device_identity_key == sender_device_signing_key
+                || sender_account_signature == [0u8; 64]
+                || direct_session_id == [0u8; 32]
+            {
+                return None;
+            }
+            Some(Some(crate::api::MessageSecurityContextV1::DirectV2(
+                crate::api::DirectMessageSecurityContextV2 {
+                    sender_user_id: message.sender_user_id.clone(),
+                    sender_device_id,
+                    sender_binding_version: message.sender_binding_version,
+                    sender_device_identity_key,
+                    sender_device_signing_key,
+                    sender_device_capabilities: message.sender_device_capabilities,
+                    sender_device_binding_status: message.sender_device_binding_status as u8,
+                    sender_account_signature,
+                    target_device_id,
+                    target_binding_version: message.target_binding_version,
+                    direct_session_id,
+                },
+            )))
+        }
+        _ => None,
     }
-    let sender_device_id = exact_bytes(&message.sender_device_id)?;
-    let target_device_id = exact_bytes(&message.target_device_id)?;
-    if sender_device_id == [0u8; 16] || target_device_id == [0u8; 16] {
-        return None;
-    }
-    Some(Some(crate::api::MessageSecurityContextV1::SenderKeyV5(
-        crate::api::SenderKeyMessageSecurityContextV1 {
-            roster_version: message.roster_version,
-            roster_commitment: exact_bytes(&message.roster_commitment)?,
-            sender_device_id,
-            target_device_id,
-            sender_binding_version: message.sender_binding_version,
-        },
-    )))
 }
 
 fn sender_key_ack_from_proto(ack: &proto::MessageAck) -> Option<Option<SenderKeyAckMetadataV1>> {
@@ -2816,6 +2975,18 @@ fn sender_key_ack_from_proto(ack: &proto::MessageAck) -> Option<Option<SenderKey
     let generation = ack.sender_key_generation?;
     let roster_version = ack.roster_version?;
     let envelope = ack.envelope_commitment.as_deref()?;
+    let (membership_epoch, membership_epoch_hash) =
+        match (ack.membership_epoch, ack.membership_epoch_hash.as_deref()) {
+            (None, None) => (0, [0u8; 32]),
+            (Some(epoch), Some(encoded_hash)) if epoch != 0 && epoch <= i64::MAX as u64 => {
+                let hash = exact_bytes(encoded_hash)?;
+                if hash == [0u8; 32] {
+                    return None;
+                }
+                (epoch, hash)
+            }
+            _ => return None,
+        };
     if conversation_id.is_empty()
         || conversation_id.len() > MAX_EVENT_ID_BYTES
         || generation == 0
@@ -2829,6 +3000,8 @@ fn sender_key_ack_from_proto(ack: &proto::MessageAck) -> Option<Option<SenderKey
         conversation_id,
         generation,
         roster_version,
+        membership_epoch,
+        membership_epoch_hash,
         envelope_commitment: exact_bytes(envelope)?,
     }))
 }
@@ -3011,17 +3184,31 @@ pub(crate) fn connection_event_from_envelope(
             }
             let sender_key =
                 sender_key_ack_from_proto(&ack).ok_or_else(|| protocol_violation("MessageAck"))?;
+            let chat_membership_valid =
+                match (ack.membership_epoch, ack.membership_epoch_hash.as_deref()) {
+                    (None, None) => true,
+                    (Some(epoch), Some(hash)) => {
+                        epoch != 0
+                            && epoch <= i64::MAX as u64
+                            && exact_bytes::<32>(hash).is_some_and(|value| value != [0u8; 32])
+                    }
+                    _ => false,
+                };
             let valid_shape = match (chat_ack, sender_key.as_ref()) {
                 // Chat ACKs may carry the accepted roster version, but never
                 // the Sender-Key distribution route tuple.
-                (true, None) => true,
+                (true, None) => chat_membership_valid,
                 // Distribution/receipt ACKs use the complete route tuple and
                 // intentionally have no chat message result.
                 (false, Some(_)) => true,
                 // A generic command ACK is only a sequence correlation. A
                 // roster version without either chat or exact route metadata
                 // is ambiguous and must not reach the mutation finalizers.
-                (false, None) => ack.roster_version.is_none(),
+                (false, None) => {
+                    ack.roster_version.is_none()
+                        && ack.membership_epoch.is_none()
+                        && ack.membership_epoch_hash.is_none()
+                }
                 (true, Some(_)) => false,
             };
             if !valid_shape {
@@ -3765,6 +3952,8 @@ mod tests {
             roster_version: Some(4),
             envelope_commitment: Some(vec![0x33; 32]),
             client_message_id: TEST_CLIENT_MESSAGE_ID.to_string(),
+            membership_epoch: None,
+            membership_epoch_hash: None,
         };
         let generic_with_orphan_roster = proto::MessageAck {
             ref_seq: 2,
@@ -4114,6 +4303,70 @@ mod tests {
                 ..
             }))
         ));
+
+        let mut v6 = base_message_event();
+        v6.crypto_profile = "sender_key_v6".to_string();
+        v6.crypto_era = 1;
+        v6.roster_version = 8;
+        v6.roster_commitment = vec![0x63; 32];
+        v6.sender_device_id = vec![0x64; 16];
+        v6.target_device_id = vec![0x65; 16];
+        v6.sender_binding_version = 3;
+        v6.membership_epoch = 9;
+        v6.membership_epoch_hash = vec![0x66; 32];
+        assert!(matches!(
+            connection_event_from_envelope(proto::Envelope {
+                payload: Some(proto::envelope::Payload::MessageEvent(v6.clone())),
+                ..Default::default()
+            }),
+            Ok(Some(ConnectionEvent::MessageReceived {
+                security_context: Some(crate::api::MessageSecurityContextV1::SenderKeyV6(
+                    crate::api::SenderKeyMessageSecurityContextV6 {
+                        membership_epoch: 9,
+                        membership_epoch_hash,
+                        ..
+                    }
+                )),
+                ..
+            })) if membership_epoch_hash == [0x66; 32]
+        ));
+        v6.membership_epoch_hash.clear();
+        assert!(connection_event_from_envelope(proto::Envelope {
+            payload: Some(proto::envelope::Payload::MessageEvent(v6)),
+            ..Default::default()
+        })
+        .is_err());
+
+        let mut direct = base_message_event();
+        direct.crypto_profile = "direct_v2".to_string();
+        direct.crypto_era = 1;
+        direct.sender_user_id = "550e8400-e29b-41d4-a716-446655440201".to_string();
+        direct.sender_device_id = vec![0x61; 16];
+        direct.sender_binding_version = 3;
+        direct.sender_device_identity_key = vec![0x62; 32];
+        direct.sender_device_signing_key = vec![0x63; 32];
+        direct.sender_device_capabilities = 3;
+        direct.sender_device_binding_status = 1;
+        direct.sender_account_signature = vec![0x64; 64];
+        direct.target_device_id = vec![0x65; 16];
+        direct.target_binding_version = 4;
+        direct.direct_session_id = vec![0x66; 32];
+        assert!(matches!(
+            connection_event_from_envelope(proto::Envelope {
+                payload: Some(proto::envelope::Payload::MessageEvent(direct.clone())),
+                ..Default::default()
+            }),
+            Ok(Some(ConnectionEvent::MessageReceived {
+                security_context: Some(crate::api::MessageSecurityContextV1::DirectV2(_)),
+                ..
+            }))
+        ));
+        direct.direct_session_id.pop();
+        assert!(connection_event_from_envelope(proto::Envelope {
+            payload: Some(proto::envelope::Payload::MessageEvent(direct)),
+            ..Default::default()
+        })
+        .is_err());
     }
 
     #[test]
@@ -4537,8 +4790,19 @@ mod tests {
             sender_device_capabilities: sender.binding().capabilities,
             sender_device_binding_status: u32::from(sender.binding().status),
             sender_account_signature: sender.binding().account_signature.to_vec(),
+            membership_epoch: 0,
+            membership_epoch_hash: Vec::new(),
         };
         assert!(sender_key_route_from_proto(&skdm).is_some());
+        let mut v6_skdm = skdm.clone();
+        v6_skdm.membership_epoch = 9;
+        v6_skdm.membership_epoch_hash = vec![0x45; 32];
+        let v6_route = sender_key_route_from_proto(&v6_skdm).unwrap();
+        assert_eq!(v6_route.membership_epoch, 9);
+        assert_eq!(v6_route.membership_epoch_hash, [0x45; 32]);
+        let mut partial_v6_skdm = v6_skdm;
+        partial_v6_skdm.membership_epoch_hash.clear();
+        assert!(sender_key_route_from_proto(&partial_v6_skdm).is_none());
         let mut oversized = skdm.clone();
         oversized.sender_key_message = vec![0x55; MAX_RETAINED_SKDM_WIRE_BYTES + 1];
         assert!(sender_key_route_from_proto(&oversized).is_none());
@@ -4611,5 +4875,27 @@ mod tests {
                 ..
             }))
         ));
+        let v6_ack = proto::MessageAck {
+            ref_seq: 3,
+            target_device_id: vec![0x22; 16],
+            conversation_id: Some("conversation-1".to_string()),
+            sender_key_generation: Some(1),
+            roster_version: Some(4),
+            membership_epoch: Some(9),
+            membership_epoch_hash: Some(vec![0x45; 32]),
+            envelope_commitment: Some(vec![0x66; 32]),
+            ..Default::default()
+        };
+        assert!(matches!(
+            sender_key_ack_from_proto(&v6_ack),
+            Some(Some(SenderKeyAckMetadataV1 {
+                membership_epoch: 9,
+                membership_epoch_hash,
+                ..
+            })) if membership_epoch_hash == [0x45; 32]
+        ));
+        let mut partial_v6_ack = v6_ack;
+        partial_v6_ack.membership_epoch_hash = None;
+        assert!(sender_key_ack_from_proto(&partial_v6_ack).is_none());
     }
 }

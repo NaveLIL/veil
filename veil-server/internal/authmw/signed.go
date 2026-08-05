@@ -52,6 +52,13 @@ func VerifiedUserID(ctx context.Context) (string, bool) {
 	return userID, ok && userID != ""
 }
 
+// ContextWithVerifiedUserIDForTesting publishes a principal only for isolated
+// handler tests that intentionally omit authentication middleware. Production
+// request paths must obtain this context exclusively from a verifier.
+func ContextWithVerifiedUserIDForTesting(ctx context.Context, userID string) context.Context {
+	return context.WithValue(ctx, verifiedPrincipalContextKey{}, userID)
+}
+
 // keyCacheTTL controls how long we cache a user's signing public key in
 // memory. Short enough that a rotated key takes effect quickly, long enough
 // to avoid hitting the DB on every request.

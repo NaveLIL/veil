@@ -1,6 +1,9 @@
 package config
 
 import (
+	"bytes"
+	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/url"
@@ -21,15 +24,32 @@ type Config struct {
 	PublicOrigin nodeorigin.Canonical
 
 	// Auth
-	AuthChallengeTTL  time.Duration // How long a challenge is valid
-	AuthMaxAttempts   int           // Max auth attempts per connection before disconnect
-	PreKeyLowWarning  int           // Warn when OPKs drop below this count
-	AllowRegistration bool          // Whether first-time identities may create accounts
+	AuthChallengeTTL     time.Duration // How long a challenge is valid
+	AuthMaxAttempts      int           // Max auth attempts per connection before disconnect
+	PreKeyLowWarning     int           // Warn when OPKs drop below this count
+	AllowRegistration    bool          // Whether first-time identities may create accounts
+	AllowLegacyWSV2      bool          // Emergency opt-in for the origin-unbound legacy /ws transport
+	IdentityTransparency *IdentityTransparencyConfig
 
 	// Chat
 	MaxMessageSize        int // Max ciphertext size (bytes)
 	MessageBatchLimit     int // Max messages per sync request
 	MaxConversationFanout int // Max recipients in a DM fan-out
+}
+
+// IdentityTransparencyConfig contains the Node-local seed used only to sign
+// witnessed transparency tree heads. It is opt-in and intentionally has no
+// text/String representation, so ordinary configuration logging cannot expose
+// the secret.
+type IdentityTransparencyConfig struct {
+	SigningSeed      [32]byte
+	Witnesses        []IdentityTransparencyWitnessConfig
+	WitnessThreshold uint16
+}
+
+type IdentityTransparencyWitnessConfig struct {
+	URL        string
+	SigningKey [32]byte
 }
 
 // LoadGateway loads the shared server configuration and the gateway's
@@ -54,8 +74,116 @@ func LoadGateway() (*Config, error) {
 	}
 
 	cfg.PublicOrigin = canonicalOrigin
+	transparencyConfig, err := loadIdentityTransparencyConfig()
+	if err != nil {
+		return nil, err
+	}
+	cfg.IdentityTransparency = transparencyConfig
 	return cfg, nil
 }
+
+func loadIdentityTransparencyConfig() (*IdentityTransparencyConfig, error) {
+	enabled, err := envBoolOrDefault("VEIL_IDENTITY_TRANSPARENCY_ENABLED", false)
+	if err != nil {
+		return nil, err
+	}
+	rawSeed, seedConfigured := os.LookupEnv("VEIL_IDENTITY_TRANSPARENCY_SIGNING_SEED")
+	rawWitnesses, witnessesConfigured := os.LookupEnv("VEIL_IDENTITY_TRANSPARENCY_WITNESSES")
+	rawThreshold, thresholdConfigured := os.LookupEnv("VEIL_IDENTITY_TRANSPARENCY_WITNESS_QUORUM")
+	if !enabled {
+		if seedConfigured && rawSeed != "" || witnessesConfigured && rawWitnesses != "" ||
+			thresholdConfigured && rawThreshold != "" {
+			return nil, errors.New("identity transparency secrets or witnesses are set while identity transparency is disabled")
+		}
+		return nil, nil
+	}
+	if !seedConfigured || rawSeed == "" {
+		return nil, errors.New("VEIL_IDENTITY_TRANSPARENCY_SIGNING_SEED is required when identity transparency is enabled")
+	}
+	if strings.TrimSpace(rawSeed) != rawSeed || strings.Contains(rawSeed, "=") {
+		return nil, errors.New("VEIL_IDENTITY_TRANSPARENCY_SIGNING_SEED must be canonical unpadded base64url")
+	}
+	decoded, err := base64.RawURLEncoding.Strict().DecodeString(rawSeed)
+	if err != nil || len(decoded) != ed25519SeedSize || base64.RawURLEncoding.EncodeToString(decoded) != rawSeed {
+		return nil, errors.New("VEIL_IDENTITY_TRANSPARENCY_SIGNING_SEED must encode exactly 32 bytes as canonical unpadded base64url")
+	}
+	var seed [ed25519SeedSize]byte
+	copy(seed[:], decoded)
+	witnesses, threshold, err := parseIdentityTransparencyWitnesses(
+		rawWitnesses, witnessesConfigured, rawThreshold, thresholdConfigured,
+	)
+	if err != nil {
+		clear(seed[:])
+		return nil, err
+	}
+	return &IdentityTransparencyConfig{
+		SigningSeed: seed, Witnesses: witnesses, WitnessThreshold: threshold,
+	}, nil
+}
+
+func parseIdentityTransparencyWitnesses(
+	rawWitnesses string,
+	witnessesConfigured bool,
+	rawThreshold string,
+	thresholdConfigured bool,
+) ([]IdentityTransparencyWitnessConfig, uint16, error) {
+	if (!witnessesConfigured || rawWitnesses == "") && (!thresholdConfigured || rawThreshold == "") {
+		return nil, 0, nil
+	}
+	if !witnessesConfigured || rawWitnesses == "" || !thresholdConfigured || rawThreshold == "" ||
+		strings.TrimSpace(rawWitnesses) != rawWitnesses || strings.TrimSpace(rawThreshold) != rawThreshold {
+		return nil, 0, errors.New("identity transparency witnesses and quorum must be configured together without whitespace")
+	}
+	parsedThreshold, err := strconv.ParseUint(rawThreshold, 10, 16)
+	if err != nil || parsedThreshold == 0 || strconv.FormatUint(parsedThreshold, 10) != rawThreshold {
+		return nil, 0, errors.New("VEIL_IDENTITY_TRANSPARENCY_WITNESS_QUORUM must be a canonical positive decimal integer")
+	}
+	items := strings.Split(rawWitnesses, ",")
+	if len(items) == 0 || len(items) > 32 || int(parsedThreshold) > len(items) {
+		return nil, 0, errors.New("identity transparency witness quorum is invalid")
+	}
+	witnesses := make([]IdentityTransparencyWitnessConfig, len(items))
+	for index, item := range items {
+		parts := strings.Split(item, "|")
+		if len(parts) != 2 || parts[0] == "" || len(parts[1]) != 64 {
+			return nil, 0, errors.New("VEIL_IDENTITY_TRANSPARENCY_WITNESSES entry is invalid")
+		}
+		endpoint, err := url.Parse(parts[0])
+		if err != nil || endpoint.String() != parts[0] || endpoint.User != nil || endpoint.RawQuery != "" ||
+			endpoint.Fragment != "" || endpoint.Hostname() == "" || endpoint.Port() == "" ||
+			endpoint.Path == "" || (endpoint.Scheme != "https" &&
+			!(endpoint.Scheme == "http" && isLoopbackHostname(endpoint.Hostname()))) {
+			return nil, 0, errors.New("transparency witness URL must be canonical HTTPS with an explicit port (HTTP is loopback-only)")
+		}
+		key, err := hex.DecodeString(parts[1])
+		if err != nil || hex.EncodeToString(key) != parts[1] || allZeroConfigBytes(key) {
+			return nil, 0, errors.New("transparency witness signing key must be canonical lowercase 32-byte hex")
+		}
+		witnesses[index].URL = parts[0]
+		copy(witnesses[index].SigningKey[:], key)
+		for previous := 0; previous < index; previous++ {
+			if witnesses[previous].URL == witnesses[index].URL ||
+				bytes.Equal(witnesses[previous].SigningKey[:], witnesses[index].SigningKey[:]) {
+				return nil, 0, errors.New("transparency witness endpoints and signing keys must be unique")
+			}
+		}
+	}
+	return witnesses, uint16(parsedThreshold), nil
+}
+
+func isLoopbackHostname(hostname string) bool {
+	return hostname == "localhost" || hostname == "127.0.0.1" || hostname == "::1"
+}
+
+func allZeroConfigBytes(value []byte) bool {
+	var combined byte
+	for _, item := range value {
+		combined |= item
+	}
+	return combined == 0
+}
+
+const ed25519SeedSize = 32
 
 func Load() (*Config, error) {
 	databaseURL, err := loadDatabaseURL()
@@ -66,6 +194,10 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	allowLegacyWSV2, err := envBoolOrDefault("VEIL_ALLOW_LEGACY_WS_V2", false)
+	if err != nil {
+		return nil, err
+	}
 	return &Config{
 		Port:                  envOrDefault("PORT", "8080"),
 		DatabaseURL:           databaseURL,
@@ -73,6 +205,7 @@ func Load() (*Config, error) {
 		AuthMaxAttempts:       envIntOrDefault("AUTH_MAX_ATTEMPTS", 3),
 		PreKeyLowWarning:      envIntOrDefault("PREKEY_LOW_WARNING", 10),
 		AllowRegistration:     allowRegistration,
+		AllowLegacyWSV2:       allowLegacyWSV2,
 		MaxMessageSize:        envIntOrDefault("MAX_MESSAGE_SIZE", 64*1024),
 		MessageBatchLimit:     envIntOrDefault("MESSAGE_BATCH_LIMIT", 100),
 		MaxConversationFanout: envIntOrDefault("MAX_CONVERSATION_FANOUT", 2),

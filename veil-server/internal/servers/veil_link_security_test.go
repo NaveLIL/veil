@@ -46,7 +46,10 @@ func TestVeilLinkPreviewAndJoinHaveIndependentRateLimits(t *testing.T) {
 	call := func(method, path, body string) int {
 		req := httptest.NewRequest(method, path, strings.NewReader(body))
 		req.RemoteAddr = "192.0.2.10:42500"
-		req.Header.Set("X-User-ID", "00000000-0000-0000-0000-000000000001")
+		req = req.WithContext(authmw.ContextWithVerifiedUserIDForTesting(
+			req.Context(),
+			"00000000-0000-0000-0000-000000000001",
+		))
 		recorder := httptest.NewRecorder()
 		mux.ServeHTTP(recorder, req)
 		return recorder.Code

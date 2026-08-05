@@ -77,7 +77,7 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use prost::Message as ProstMessage;
-use tokio::sync::{mpsc, watch, Mutex, Notify};
+use tokio::sync::{mpsc, watch, Notify};
 use tokio::time::{Instant, MissedTickBehavior};
 use tokio_tungstenite::{
     connect_async_tls_with_config,
@@ -89,27 +89,24 @@ use veil_crypto::IdentityKeyPair;
 
 use crate::connection::{
     classify_websocket_handshake_close_v1, classify_websocket_handshake_error_v1,
-    connection_event_from_envelope, dispatch_authenticated_ws_message,
-    sender_key_route_from_proto, signal_disconnected, signal_event_buffer_failure,
-    signal_websocket_close_v1, signal_websocket_error_v1,
-    websocket_connector_for_validated_url_v1, AuthenticatedWsMessageOutcomeV1,
-    BudgetedConnectionEventV1, ConnectionConnectErrorV1, ConnectionConnectStopV1,
-    ConnectionEvent, ConnectionEventBudgetV1, ConnectionEventReceiverV1,
-    ConnectionEventSenderV1, ConnectionTerminalStateV1, LIVE_EVENT_QUEUE_CAPACITY,
-    MAX_RETAINED_SKDM_EVENTS, MAX_RETAINED_SKDM_METADATA_BYTES,
+    connection_event_from_envelope, dispatch_authenticated_ws_message, sender_key_route_from_proto,
+    signal_disconnected, signal_event_buffer_failure, signal_websocket_close_v1,
+    signal_websocket_error_v1, websocket_connector_for_validated_url_v1,
+    AuthenticatedWsMessageOutcomeV1, BudgetedConnectionEventV1, Connection,
+    ConnectionConnectErrorV1, ConnectionConnectStopV1, ConnectionEvent, ConnectionEventBudgetV1,
+    ConnectionEventReceiverV1, ConnectionEventSenderV1, ConnectionTerminalStateV1,
+    LIVE_EVENT_QUEUE_CAPACITY, MAX_RETAINED_SKDM_EVENTS, MAX_RETAINED_SKDM_METADATA_BYTES,
     MAX_RETAINED_SKDM_WIRE_TOTAL_BYTES,
 };
 use crate::device_identity::DeviceIdentityV1;
 use crate::protocol::proto;
 use crate::ws_auth_v3::{
     prepare_ws_auth_response_v3, validate_ws_auth_result_v3, WsAuthV3Error, WsAuthV3Target,
-    WsRegistrationModeV3,
+    WsRegistrationModeV3, WS_AUTH_V3_PATH,
 };
 
-/// Exact required path of the v3 events endpoint. Never derived from server
-/// input; the configured URL must already spell it exactly.
-const WS_EVENTS_V3_PATH: &str = "/v3/events";
-
+// Bound both network establishment and the authenticated FIFO barrier so a
+// hostile or stalled peer cannot pin the background supervisor indefinitely.
 const WS_EVENTS_CONNECT_TIMEOUT_V1: Duration = Duration::from_secs(8);
 const WS_EVENTS_AUTH_TIMEOUT_V1: Duration = Duration::from_secs(8);
 
@@ -215,7 +212,10 @@ impl ReconnectDeciderV3 {
 /// extra zero-delay reconnects and defeat the ordinal-0 contract.
 fn backoff_delay_v1(ordinal: u32, jitter_unit: f64) -> Duration {
     let shift = ordinal.saturating_sub(1).min(BACKOFF_MAX_SHIFT_V1);
-    let ceiling = std::cmp::min(BACKOFF_BASE_V1.saturating_mul(1u32 << shift), BACKOFF_CAP_V1);
+    let ceiling = std::cmp::min(
+        BACKOFF_BASE_V1.saturating_mul(1u32 << shift),
+        BACKOFF_CAP_V1,
+    );
     let unit = if jitter_unit.is_finite() {
         jitter_unit.clamp(0.0, 1.0)
     } else {
@@ -250,39 +250,41 @@ fn classify_ws_auth_v3_error(error: WsAuthV3Error) -> ConnectionConnectErrorV1 {
 /// One authenticated background v3 connection. Mirrors `Connection` but is
 /// owned by this module so heartbeat lives inside the I/O loops.
 pub struct WsEventsV3Connection {
-    /// Send raw protobuf bytes to the WS write loop.
-    pub sender: mpsc::Sender<Vec<u8>>,
-    /// Receive application-level events; drains into the existing engine.
-    pub events: ConnectionEventReceiverV1,
-    /// Retained controls observed before the AuthResultV3 FIFO barrier.
-    pub(crate) retained_events: VecDeque<BudgetedConnectionEventV1>,
-    seq: Arc<Mutex<u64>>,
-    write_task: tokio::task::AbortHandle,
-    read_task: tokio::task::AbortHandle,
+    inner: Connection,
+    authenticated_user_id: String,
 }
 
 impl WsEventsV3Connection {
-    pub(crate) async fn next_seq(&self) -> u64 {
-        let mut seq = self.seq.lock().await;
-        let value = *seq;
-        *seq += 1;
-        value
-    }
-
     /// Stop background I/O immediately. Dropping the handle calls this too.
     pub(crate) fn disconnect(&self) {
-        self.write_task.abort();
-        self.read_task.abort();
+        self.inner.disconnect();
     }
 
     /// Extract retained events for background controller injection.
     pub fn drain_retained(&mut self) -> Vec<crate::connection::ConnectionEvent> {
-        self.retained_events.drain(..).map(|e| e.into_event()).collect()
+        self.inner
+            .retained_events
+            .drain(..)
+            .map(|e| e.into_event())
+            .collect()
+    }
+
+    /// Receive the next application event from the same bounded authenticated
+    /// FIFO used by the primary command connection.
+    pub async fn recv_event(&mut self) -> Option<crate::connection::ConnectionEvent> {
+        self.inner.events.recv().await
+    }
+
+    /// Exact account UUID returned by the authenticated v3 barrier. The
+    /// background host must compare it with its durable reconnect selection
+    /// before accepting retained or live events.
+    pub fn authenticated_user_id(&self) -> &str {
+        &self.authenticated_user_id
     }
 
     /// Read the terminal buffer error from the connection events channel.
     pub fn terminal_error(&self) -> Option<crate::connection::ConnectionEventBufferErrorV1> {
-        self.events.terminal_buffer_error_v1()
+        self.inner.events.terminal_buffer_error_v1()
     }
 }
 
@@ -301,12 +303,43 @@ pub(crate) async fn connect_events_v3_classified(
     account: &IdentityKeyPair,
     device_identity: &DeviceIdentityV1,
 ) -> Result<WsEventsV3Connection, ConnectionConnectErrorV1> {
+    let mut inner = connect_primary_v3_classified(
+        config,
+        account,
+        device_identity,
+        WsRegistrationModeV3::Existing,
+    )
+    .await?;
+    let authenticated_user_id = match inner.events.try_recv() {
+        Ok(ConnectionEvent::Authenticated { user_id }) if !user_id.is_empty() => user_id,
+        _ => {
+            return Err(ConnectionConnectErrorV1::epoch_invalid(
+                "v3 background transport omitted its authenticated account barrier",
+            ))
+        }
+    };
+    Ok(WsEventsV3Connection {
+        inner,
+        authenticated_user_id,
+    })
+}
+
+/// Connect the live command/event transport through the v3 authentication
+/// barrier. The caller chooses an explicit signed registration intent; an
+/// existing exact account remains idempotently admissible for Open/Pass, while
+/// background reconnects use Existing and can never create an account.
+pub(crate) async fn connect_primary_v3_classified(
+    config: &WsEventsV3Config,
+    account: &IdentityKeyPair,
+    device_identity: &DeviceIdentityV1,
+    registration: WsRegistrationModeV3<'_>,
+) -> Result<Connection, ConnectionConnectErrorV1> {
     // ASSUMPTION: WsAuthV3Target::parse(websocket_url, canonical_origin).
     // It validates the original spelling before Url normalization; keep it
     // as the only trust gate for both values.
     let target = WsAuthV3Target::parse(&config.websocket_url, &config.canonical_origin)
         .map_err(|error| ConnectionConnectErrorV1::epoch_invalid(error.to_string()))?;
-    if target.websocket_url().path() != WS_EVENTS_V3_PATH {
+    if target.websocket_url().path() != WS_AUTH_V3_PATH {
         return Err(ConnectionConnectErrorV1::epoch_invalid(
             "v3 events endpoint path must be exactly /v3/events",
         ));
@@ -398,7 +431,7 @@ pub(crate) async fn connect_events_v3_classified(
         device_identity,
         &config.device_name,
         &client_version,
-        WsRegistrationModeV3::Existing,
+        registration,
     )
     .map_err(classify_ws_auth_v3_error)?;
     let (encoded, expectation) = prepared.into_envelope_bytes(2);
@@ -667,14 +700,13 @@ pub(crate) async fn connect_events_v3_classified(
     });
     let read_task = read_task.abort_handle();
 
-    Ok(WsEventsV3Connection {
-        sender: send_tx,
-        events: event_rx,
+    Ok(Connection::from_authenticated_transport_v1(
+        send_tx,
+        event_rx,
         retained_events,
-        seq: Arc::new(Mutex::new(3u64)),
         write_task,
         read_task,
-    })
+    ))
 }
 
 /// Why the supervisor exited. There is no "retrying" exit: the loop only

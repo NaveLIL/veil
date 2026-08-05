@@ -11,12 +11,15 @@ import android.os.IBinder
 import android.os.PowerManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import uniffi.veil_ffi.MobileWsEventsCallback
+import uniffi.veil_ffi.MobileWsEventsController
+import uniffi.veil_ffi.MobileWsEventsExit
 
 
 class VeilEventsService : Service() {
 
     private var wakeLock: PowerManager.WakeLock? = null
-    private var eventsController: io.veil.mobile.MobileWsEventsController? = null
+    private var eventsController: MobileWsEventsController? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -52,28 +55,28 @@ class VeilEventsService : Service() {
         // Only start the loop if it's not already running
         if (eventsController == null) {
             try {
-                val callback = object : io.veil.mobile.MobileWsEventsCallback {
+                val callback = object : MobileWsEventsCallback {
                     override fun onAuthenticated() {
                         Log.i(TAG, "Background WebSocket authenticated")
                     }
 
                     override fun onEventsReady() {
                         Log.i(TAG, "Background events ready, notifying sync engine")
-                        // In Android, we schedule a pump turn via the standard mechanism
-                        // which would normally be the DirectSyncHost waking up. For now,
-                        // we can broadcast an intent, or rely on the UI/sync engine listening.
-                        // Wait, VeilMobileRuntime has a schedule method if we had access to it.
-                        // Let's broadcast so the host can decide.
-                        val pumpIntent = Intent("io.veil.mobile.ACTION_PUMP_EVENTS")
-                        sendBroadcast(pumpIntent)
+                        runtime.onBackgroundEventsReady()
                     }
 
-                    override fun onTerminal(exit: io.veil.mobile.MobileWsEventsExit) {
-                        Log.w(TAG, "Background WebSocket terminal: \$exit")
+                    override fun onTerminal(exit: MobileWsEventsExit) {
+                        Log.w(TAG, "Background WebSocket terminal: $exit")
                         stopSelf()
                     }
                 }
-                eventsController = runtime.startBackgroundEvents(Build.MODEL, "Android", callback)
+                val controller = runtime.startBackgroundEvents(Build.MODEL, "Android", callback)
+                if (controller == null) {
+                    Log.i(TAG, "Background events not started: native session is locked")
+                    stopSelf()
+                    return START_NOT_STICKY
+                }
+                eventsController = controller
                 Log.i(TAG, "Rust supervisor loop started (runWsEventsV3)")
             } catch (e: Exception) {
                 Log.e(TAG, "Rust supervisor loop failed", e)

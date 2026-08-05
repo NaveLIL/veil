@@ -6,6 +6,10 @@ import { StyleSheet } from "react-native";
 import { ChannelsIsland } from "../ChannelsIsland";
 import { DM_HOME_ID, resetChatStoreForTests, useChatStore } from "../../../stores/chat";
 
+jest.mock("@react-navigation/native", () => ({
+  useIsFocused: () => true,
+}));
+
 jest.mock("../../../native/runtime", () => ({
   __esModule: true,
   isExactAuthenticatedBinding: (binding: unknown) => Boolean(binding),

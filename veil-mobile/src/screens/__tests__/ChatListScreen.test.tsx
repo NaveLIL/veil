@@ -92,10 +92,18 @@ describe("ChatListScreen authenticated navigation scope", () => {
     expect(mountId()).not.toBe(initialMount);
   });
 
-  it("registers only native-backed production routes", () => {
+  it("registers the native-backed routes and explicitly labelled preview routes", () => {
     expect([...new Set(renderer.root.findAllByProps({ testID: "authenticated-stack-screen" })
       .map((screen) => screen.props.accessibilityLabel))])
-      .toEqual(["Home", "Direct", "Settings", "SettingsDetail"]);
+      .toEqual([
+        "Home",
+        "Direct",
+        "Settings",
+        "SettingsDetail",
+        "DesignCircle",
+        "DesignSpace",
+        "DesignRoom",
+      ]);
   });
 
   it("resets navigation when the exact authenticated account binding changes", () => {

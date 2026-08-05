@@ -1,9 +1,9 @@
 //! Native client-side REST authentication v2 preparation.
 //!
-//! This module deliberately has no transport, API, FFI, or UI integration.
-//! It validates the frozen v2 inputs, obtains native freshness, signs the
-//! exact versioned transcript, and emits the five canonical header values.
-//! The live REST v1 path remains unchanged.
+//! This module validates the frozen v2 inputs, obtains native freshness, signs
+//! the exact versioned transcript, and emits the five canonical header values.
+//! The only live call site is the authenticated `VeilClient` boundary, which
+//! selects origin and account from the current WebSocket epoch.
 
 #![cfg_attr(not(test), allow(dead_code))]
 
@@ -81,7 +81,7 @@ pub(crate) struct RestAuthV2HeaderValues {
 }
 
 impl RestAuthV2HeaderValues {
-    pub(crate) fn version(&self) -> &str {
+    pub(crate) fn version(&self) -> &'static str {
         self.version
     }
 
@@ -122,8 +122,8 @@ impl PreparedRestAuthV2 {
 
 /// Prepare one REST v2 proof using the native system clock and OS CSPRNG.
 ///
-/// This remains private to `veil-client`; no live transport calls it in this
-/// checkpoint.
+/// This remains private to `veil-client`; the authenticated API wrapper is the
+/// only reviewed live call site.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn prepare_rest_auth_v2(
     account: &IdentityKeyPair,
@@ -604,38 +604,19 @@ mod tests {
     }
 
     #[test]
-    fn preparer_remains_private_and_has_no_live_client_call_site() {
+    fn preparer_remains_private_and_has_one_authenticated_client_call_site() {
         let crate_root = include_str!("lib.rs");
 
         assert_eq!(crate_root.matches("mod rest_auth_v2;").count(), 1);
         assert!(!crate_root.contains("pub mod rest_auth_v2;"));
 
-        let source_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        assert_no_rest_auth_v2_call_site(&source_root);
-    }
-
-    fn assert_no_rest_auth_v2_call_site(directory: &std::path::Path) {
-        for entry in std::fs::read_dir(directory).expect("client source directory must be readable")
-        {
-            let path = entry.expect("client source entry must be readable").path();
-            if path.is_dir() {
-                assert_no_rest_auth_v2_call_site(&path);
-                continue;
-            }
-            if path.extension().and_then(std::ffi::OsStr::to_str) != Some("rs")
-                || path.file_name().and_then(std::ffi::OsStr::to_str) == Some("rest_auth_v2.rs")
-            {
-                continue;
-            }
-
-            let source =
-                std::fs::read_to_string(&path).expect("client source file must be readable");
-            assert!(
-                !source.contains("prepare_rest_auth_v2"),
-                "REST auth v2 preparer must remain non-activated; unexpected reference in {}",
-                path.display()
-            );
-        }
+        let api = include_str!("api.rs");
+        assert_eq!(
+            api.matches("crate::rest_auth_v2::prepare_rest_auth_v2(")
+                .count(),
+            1
+        );
+        assert!(api.contains("pub fn prepare_authenticated_rest_headers_v2("));
     }
 
     fn signing_bytes(

@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -11,6 +12,9 @@ import (
 // DB wraps pgxpool for all database operations.
 type DB struct {
 	Pool *pgxpool.Pool
+
+	identityTransparencyMu sync.RWMutex
+	identityTransparency   *identityTransparencyRuntime
 }
 
 // Connect creates a connection pool to PostgreSQL.

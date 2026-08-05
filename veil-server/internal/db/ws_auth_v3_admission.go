@@ -145,6 +145,9 @@ func (db *DB) AdmitWSAuthV3(ctx context.Context, request WSAuthV3AdmissionReques
 		if err != nil {
 			return nil, err
 		}
+		if err := db.appendIdentityTransparencyAccountTx(ctx, tx, user); err != nil {
+			return nil, fmt.Errorf("append WebSocket auth v3 account transparency event: %w", err)
+		}
 		isNew = true
 	default:
 		return nil, fmt.Errorf("find WebSocket auth v3 user: %w", err)
@@ -167,7 +170,7 @@ func (db *DB) AdmitWSAuthV3(ctx context.Context, request WSAuthV3AdmissionReques
 		}
 	}
 
-	binding, err := storeDeviceBindingTx(ctx, tx, &DeviceBinding{
+	binding, bindingAppended, err := storeDeviceBindingTx(ctx, tx, &DeviceBinding{
 		DeviceID:          device.ID,
 		UserID:            user.ID,
 		DeviceKey:         request.DeviceKey[:],
@@ -184,6 +187,11 @@ func (db *DB) AdmitWSAuthV3(ctx context.Context, request WSAuthV3AdmissionReques
 			return nil, ErrWSAuthV3AdmissionRejected
 		}
 		return nil, fmt.Errorf("store WebSocket auth v3 binding: %w", err)
+	}
+	if bindingAppended {
+		if err := db.appendIdentityTransparencyDeviceBindingTx(ctx, tx, binding); err != nil {
+			return nil, fmt.Errorf("append WebSocket auth v3 device-binding transparency event: %w", err)
+		}
 	}
 
 	if isNew && request.Intent == WSAuthV3AdmissionPass {

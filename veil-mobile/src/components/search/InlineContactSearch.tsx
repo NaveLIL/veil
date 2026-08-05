@@ -1,13 +1,11 @@
-import React, { useState, useEffect, useMemo, useRef } from "react";
+import React, { useState, useEffect, useMemo } from "react";
 import {
-  ActivityIndicator,
   Pressable,
   StyleSheet,
   Text,
   TextInput,
   View,
   Image,
-  Dimensions,
 } from "react-native";
 import { MessageCircle, Search, X } from "lucide-react-native";
 import Svg, { Rect, RadialGradient, Stop, Defs } from "react-native-svg";
@@ -22,8 +20,6 @@ import { noiseBase64 } from "../ui/noiseBase64";
 interface Props {
   onExit: () => void;
 }
-
-const WINDOW = Dimensions.get("window");
 
 export function InlineContactSearch({ onExit }: Props) {
   const [query, setQuery] = useState("");
@@ -65,9 +61,11 @@ export function InlineContactSearch({ onExit }: Props) {
           method: req.method,
           headers: {
             "Accept": "application/json",
-            "X-Veil-User-Id": req.signature.userId,
+            "X-Veil-REST-Auth-Version": req.signature.version,
+            "X-Veil-User": req.signature.userId,
             "X-Veil-Timestamp": req.signature.timestampMs,
-            "X-Veil-Signature": req.signature.signatureBase64,
+            "X-Veil-Nonce": req.signature.nonceBase64url,
+            "X-Veil-Signature": req.signature.signatureBase64url,
           },
         });
 
@@ -115,11 +113,13 @@ export function InlineContactSearch({ onExit }: Props) {
       const response = await fetch(url, {
         method: req.method,
         headers: {
-          "Content-Type": "application/x-protobuf",
-          "Accept": "application/x-protobuf",
-          "X-Veil-User-Id": req.signature.userId,
+          "Content-Type": "application/json",
+          "Accept": "application/json",
+          "X-Veil-REST-Auth-Version": req.signature.version,
+          "X-Veil-User": req.signature.userId,
           "X-Veil-Timestamp": req.signature.timestampMs,
-          "X-Veil-Signature": req.signature.signatureBase64,
+          "X-Veil-Nonce": req.signature.nonceBase64url,
+          "X-Veil-Signature": req.signature.signatureBase64url,
         },
         body: bodyBytes,
       });
@@ -134,13 +134,6 @@ export function InlineContactSearch({ onExit }: Props) {
       
       // Step 8: Parse response in Rust
       const parsed = await VeilRuntime.parseCreateDirectResponse(responseBase64);
-      
-      // Step 9: Install conversation in SQLCipher
-      const outcome = await VeilRuntime.installDirectConversation(
-        result.userId, 
-        parsed.conversationId, 
-        parsed.createdAt
-      );
 
       onExit();
       // Navigate to the direct conversation view
@@ -185,11 +178,11 @@ export function InlineContactSearch({ onExit }: Props) {
       <View style={{ zIndex: 10 }}>
         {/* Search Panel */}
         <View style={styles.panel}>
-          <Search size={20} color={colors.textLow} style={styles.searchIcon} />
+          <Search size={20} color={colors.textLo} style={styles.searchIcon} />
           <TextInput
             style={styles.input}
             placeholder="Exact username..."
-            placeholderTextColor={colors.textLow}
+            placeholderTextColor={colors.textLo}
             value={query}
             onChangeText={setQuery}
             autoCapitalize="none"
@@ -211,7 +204,7 @@ export function InlineContactSearch({ onExit }: Props) {
             style={styles.actionBtnHitbox}
             hitSlop={12}
           >
-            <X size={18} color={colors.textLow} />
+            <X size={18} color={colors.textLo} />
           </Pressable>
         </View>
 
@@ -289,7 +282,7 @@ const styles = StyleSheet.create({
   },
   hostnameHint: {
     fontSize: 13,
-    color: colors.textLow, // same brightness as placeholder
+    color: colors.textLo, // same brightness as placeholder
     marginLeft: spacing.sm,
   },
   actionBtnHitbox: {
@@ -303,7 +296,7 @@ const styles = StyleSheet.create({
     marginTop: 12,
   },
   emptyText: {
-    color: colors.textLow,
+    color: colors.textLo,
     fontSize: 14,
     textAlign: "center",
     marginTop: spacing.xl,
@@ -376,7 +369,7 @@ const styles = StyleSheet.create({
     fontWeight: "600",
   },
   resultId: {
-    color: colors.textLow,
+    color: colors.textLo,
     fontSize: 12,
     marginTop: 2,
   },

@@ -14,8 +14,11 @@ use zeroize::Zeroize;
 pub const DEVICE_BINDING_VERSION_V1: u64 = 1;
 pub const DEVICE_CAPABILITY_SENDER_KEY_V5: u64 = 1;
 pub const DEVICE_CAPABILITY_SEALED_SKDM_V3: u64 = 2;
+pub const DEVICE_CAPABILITY_MEMBERSHIP_EPOCH_V1: u64 = 4;
 pub const REQUIRED_DEVICE_CAPABILITIES: u64 =
     DEVICE_CAPABILITY_SENDER_KEY_V5 | DEVICE_CAPABILITY_SEALED_SKDM_V3;
+pub const CURRENT_DEVICE_CAPABILITIES: u64 =
+    REQUIRED_DEVICE_CAPABILITIES | DEVICE_CAPABILITY_MEMBERSHIP_EPOCH_V1;
 pub const DEVICE_BINDING_STATUS_ACTIVE: u8 = 1;
 const MAX_DEVICE_V1_INTEGER: u64 = i64::MAX as u64;
 
@@ -128,7 +131,7 @@ impl DeviceIdentityV1 {
             DEVICE_BINDING_VERSION_V1,
             &device_identity_key,
             &device_signing_key,
-            REQUIRED_DEVICE_CAPABILITIES,
+            CURRENT_DEVICE_CAPABILITIES,
             DEVICE_BINDING_STATUS_ACTIVE,
         );
         let account_signature = signature::sign(account, &signing_bytes);
@@ -140,7 +143,7 @@ impl DeviceIdentityV1 {
             ed25519_secret: ed25519_signing.to_bytes(),
             device_identity_key,
             device_signing_key,
-            capabilities: REQUIRED_DEVICE_CAPABILITIES,
+            capabilities: CURRENT_DEVICE_CAPABILITIES,
             status: DEVICE_BINDING_STATUS_ACTIVE,
             account_identity_key,
             account_signing_key,
@@ -240,16 +243,82 @@ impl DeviceIdentityV1 {
     }
 
     pub fn clone_for_background(&self) -> Self {
-        let x_bytes = self.x25519_secret.to_bytes();
-        let e_bytes = self.ed25519_signing.to_bytes();
-        
+        let mut x_bytes = self.x25519_secret.to_bytes();
+        let mut e_bytes = self.ed25519_signing.to_bytes();
+
         let x25519_secret = X25519StaticSecret::from(x_bytes);
         let ed25519_signing = SigningKey::from_bytes(&e_bytes);
-        
+
+        x_bytes.zeroize();
+        e_bytes.zeroize();
+
         Self {
             x25519_secret,
             ed25519_signing,
             binding: self.binding.clone(),
+        }
+    }
+
+    pub(crate) fn capability_upgrade_v1(
+        &self,
+        account: &IdentityKeyPair,
+    ) -> Result<Option<Self>, String> {
+        if self.binding.capabilities & CURRENT_DEVICE_CAPABILITIES == CURRENT_DEVICE_CAPABILITIES {
+            return Ok(None);
+        }
+        let version = self
+            .binding
+            .version
+            .checked_add(1)
+            .filter(|value| *value <= MAX_DEVICE_V1_INTEGER)
+            .ok_or("device binding version is exhausted")?;
+        let account_identity_key = account.x25519_public_bytes();
+        let account_signing_key = account.ed25519_public_bytes();
+        let capabilities = self.binding.capabilities | CURRENT_DEVICE_CAPABILITIES;
+        let signing_bytes = device_binding_signing_bytes(
+            &account_identity_key,
+            &account_signing_key,
+            &self.binding.device_id,
+            version,
+            &self.binding.device_identity_key,
+            &self.binding.device_signing_key,
+            capabilities,
+            self.binding.status,
+        );
+        let binding = DeviceBindingPublicV1 {
+            device_id: self.binding.device_id,
+            device_identity_key: self.binding.device_identity_key,
+            device_signing_key: self.binding.device_signing_key,
+            version,
+            capabilities,
+            status: self.binding.status,
+            account_signature: signature::sign(account, &signing_bytes),
+        };
+        let mut x25519 = self.x25519_secret.to_bytes();
+        let mut ed25519 = self.ed25519_signing.to_bytes();
+        let upgraded = Self {
+            x25519_secret: X25519StaticSecret::from(x25519),
+            ed25519_signing: SigningKey::from_bytes(&ed25519),
+            binding,
+        };
+        x25519.zeroize();
+        ed25519.zeroize();
+        Ok(Some(upgraded))
+    }
+
+    pub(crate) fn to_stored_v1(&self, account: &IdentityKeyPair) -> LocalDeviceIdentityV1 {
+        LocalDeviceIdentityV1 {
+            device_id: self.binding.device_id,
+            version: self.binding.version,
+            x25519_secret: self.x25519_secret.to_bytes(),
+            ed25519_secret: self.ed25519_signing.to_bytes(),
+            device_identity_key: self.binding.device_identity_key,
+            device_signing_key: self.binding.device_signing_key,
+            capabilities: self.binding.capabilities,
+            status: self.binding.status,
+            account_identity_key: account.x25519_public_bytes(),
+            account_signing_key: account.ed25519_public_bytes(),
+            account_signature: self.binding.account_signature,
         }
     }
 
@@ -369,6 +438,51 @@ mod tests {
             .err()
             .unwrap()
             .contains("account signature is invalid"));
+    }
+
+    #[test]
+    fn legacy_device_capabilities_upgrade_once_without_replacing_private_identity() {
+        let account = IdentityKeyPair::from_mnemonic(TEST_MNEMONIC).unwrap();
+        let mut stored = DeviceIdentityV1::generate_stored(&account, [0xB5; 16]).unwrap();
+        stored.capabilities = REQUIRED_DEVICE_CAPABILITIES;
+        stored.account_signature = signature::sign(
+            &account,
+            &device_binding_signing_bytes(
+                &stored.account_identity_key,
+                &stored.account_signing_key,
+                &stored.device_id,
+                stored.version,
+                &stored.device_identity_key,
+                &stored.device_signing_key,
+                stored.capabilities,
+                stored.status,
+            ),
+        );
+        let original_version = stored.version;
+        let original_device_id = stored.device_id;
+        let original_x25519_secret = stored.x25519_secret;
+        let original_ed25519_secret = stored.ed25519_secret;
+        let original_device_identity_key = stored.device_identity_key;
+        let original_device_signing_key = stored.device_signing_key;
+        let original_account_signature = stored.account_signature;
+        let legacy = DeviceIdentityV1::from_stored(&account, stored).unwrap();
+        let upgraded = legacy
+            .capability_upgrade_v1(&account)
+            .unwrap()
+            .expect("legacy capability set must be upgraded");
+        let persisted = upgraded.to_stored_v1(&account);
+
+        assert_eq!(persisted.version, original_version + 1);
+        assert_eq!(persisted.capabilities, CURRENT_DEVICE_CAPABILITIES);
+        assert_eq!(persisted.device_id, original_device_id);
+        assert_eq!(persisted.x25519_secret, original_x25519_secret);
+        assert_eq!(persisted.ed25519_secret, original_ed25519_secret);
+        assert_eq!(persisted.device_identity_key, original_device_identity_key);
+        assert_eq!(persisted.device_signing_key, original_device_signing_key);
+        assert_ne!(persisted.account_signature, original_account_signature);
+
+        let restored = DeviceIdentityV1::from_stored(&account, persisted).unwrap();
+        assert!(restored.capability_upgrade_v1(&account).unwrap().is_none());
     }
 
     #[test]

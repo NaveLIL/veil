@@ -1,0 +1,66 @@
+{
+  "version": 1,
+  "canonical_origin": "https://node.example:443",
+  "conversation_id": "44000000000000000000000000000055",
+  "conversation_kind": 1,
+  "owner": {
+    "account_id": "00000000000000000000000000000001",
+    "account_signing_key": "ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c"
+  },
+  "epochs": [
+    {
+      "number": "1",
+      "predecessor_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+      "roster_version": "7",
+      "roster_commitment": "3333333333333333333333333333333333333333333333333333333333333333",
+      "policy_threshold": 2,
+      "policy_signers": [
+        {
+          "account_id": "00000000000000000000000000000001",
+          "account_signing_key": "ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c"
+        },
+        {
+          "account_id": "00000000000000000000000000000002",
+          "account_signing_key": "fd1724385aa0c75b64fb78cd602fa1d991fdebf76b13c58ed702eac835e9f618"
+        }
+      ],
+      "crypto_profile": 1,
+      "crypto_era": "1",
+      "mutation_nonce": "7777777777777777777777777777777777777777777777777777777777777777",
+      "epoch_hash": "570fb705074a58dc5c16bdb48277f7c90f9a6bde8cc5e16d0d5539ffd95424f4",
+      "signatures": [
+        {
+          "signer_account_id": "00000000000000000000000000000001",
+          "signature": "e44d4ec298d673c7a91cdda920cc610881bf036b3f27512ea8f504d7bbaf0a5016aa47112ecb725470eba8778f75aa51358fb5ea2c74945f8b3e737cf85d2c00"
+        }
+      ]
+    },
+    {
+      "number": "2",
+      "predecessor_hash": "570fb705074a58dc5c16bdb48277f7c90f9a6bde8cc5e16d0d5539ffd95424f4",
+      "roster_version": "8",
+      "roster_commitment": "4545454545454545454545454545454545454545454545454545454545454545",
+      "policy_threshold": 1,
+      "policy_signers": [
+        {
+          "account_id": "00000000000000000000000000000001",
+          "account_signing_key": "ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c"
+        }
+      ],
+      "crypto_profile": 1,
+      "crypto_era": "1",
+      "mutation_nonce": "8888888888888888888888888888888888888888888888888888888888888888",
+      "epoch_hash": "815086652076ec3afb87530ee0aea70bf215dafc562e6cc2c9bbd0516919d42a",
+      "signatures": [
+        {
+          "signer_account_id": "00000000000000000000000000000001",
+          "signature": "f2c218158266a978285156c4e993b6187c28f7c9f3586503023dc9a85b6e4f44c2d98cbac8092d142e6c2a0bf3cbb4554853ba226ac2320df7f78cfb0dff600b"
+        },
+        {
+          "signer_account_id": "00000000000000000000000000000002",
+          "signature": "a3872e1fc5a9e9737bac68ffeaeb23bf537ca6f530f473bdcd9a99816238ab5d9cce154f1a942839776f2a0cd4ae66736375e3a1fb7d50952b72f288fd19e20a"
+        }
+      ]
+    }
+  ]
+}

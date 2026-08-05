@@ -38,7 +38,12 @@ jobs:
         run: cargo install cargo-audit --version 0.22.2 --locked
 
       - name: Run cargo audit
-        run: cargo audit
+        # Tauri's Linux WebKitGTK stack still pins glib 0.18.5. The advisory is
+        # limited to VariantStrIter methods Veil does not call and cannot be
+        # upgraded independently of the Tauri runtime. Keep that single,
+        # reviewed exception explicit while making every new unsound advisory
+        # a hard failure.
+        run: cargo audit --deny unsound --ignore RUSTSEC-2024-0429
 
   cargo-deny:
     name: Cargo Deny (licenses + advisories)
@@ -65,7 +70,7 @@ jobs:
           cache-dependency-path: veil-server/go.sum
 
       - name: Install govulncheck
-        run: go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
 
       - name: Scan reachable Go code
         working-directory: veil-server
@@ -77,10 +82,8 @@ jobs:
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
-      # pnpm 10 uses npm's retired quick-audit endpoints. pnpm 11 uses the
-      # supported bulk advisory API while auditing the committed lockfile.
-      # Build/install jobs stay on pnpm 10 until overrides move to
-      # pnpm-workspace.yaml; this audit-only job does not rewrite the lockfile.
+      # pnpm 11 uses the supported bulk advisory API while auditing the
+      # committed lockfile. Security overrides live in pnpm-workspace.yaml.
       - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
           version: 11.13.0

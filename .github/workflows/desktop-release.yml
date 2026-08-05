@@ -14,7 +14,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  VITE_VEIL_WS_URL: wss://veil.erez.pro/ws
+  VITE_VEIL_WS_URL: wss://veil.erez.pro/v3/events
   VITE_VEIL_HTTP_URL: https://veil.erez.pro
   VEIL_PROJECT_SOURCE_URL: https://github.com/${{ github.repository }}/tree/${{ github.sha }}
   VEIL_RELEASE_PUBLISHER: NaveLIL

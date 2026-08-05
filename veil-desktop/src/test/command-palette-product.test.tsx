@@ -165,7 +165,9 @@ describe("message search product boundary", () => {
     renderPalette(async () => true);
 
     const warning = await screen.findByTestId("search-coverage-warning");
-    expect(warning).toHaveTextContent("Search covers the newest 12,345 messages");
+    expect(warning).toHaveTextContent(
+      /Search covers the newest 12[\s,.'’]?345 messages/,
+    );
     expect(warning).toHaveTextContent("Older local history is omitted");
     expect(invokeMock).toHaveBeenCalledWith("get_search_coverage");
   });

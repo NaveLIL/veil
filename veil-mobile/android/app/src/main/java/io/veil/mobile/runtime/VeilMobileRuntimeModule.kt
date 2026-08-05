@@ -104,6 +104,64 @@ internal class VeilMobileRuntimeModule(
     }
   }
 
+  @ReactMethod
+  fun getDirectIdentityVerification(
+    conversationId: String,
+    expectedDirectGeneration: Double,
+    promise: Promise,
+  ) = onRuntimePublication(promise) {
+    val generation = expectedDirectGeneration.toSafeDirectGenerationOrNull()
+    if (generation == null) {
+      promise.resolve(null)
+    } else {
+      runtime.publishDirectIdentityVerification(conversationId, generation, null) { verification ->
+        promise.resolve(verification?.toWritableMap())
+      }
+    }
+  }
+
+  @ReactMethod
+  fun confirmDirectIdentityVerification(
+    conversationId: String,
+    expectedDirectGeneration: Double,
+    expectedFingerprintHex: String,
+    promise: Promise,
+  ) = onRuntimePublication(promise) {
+    val generation = expectedDirectGeneration.toSafeDirectGenerationOrNull()
+    if (generation == null) {
+      promise.resolve(null)
+    } else {
+      runtime.publishDirectIdentityVerification(
+        conversationId,
+        generation,
+        expectedFingerprintHex,
+      ) { verification ->
+        promise.resolve(verification?.toWritableMap())
+      }
+    }
+  }
+
+  @ReactMethod
+  fun confirmDirectIdentityVerificationQr(
+    conversationId: String,
+    expectedDirectGeneration: Double,
+    scannedQrPayload: String,
+    promise: Promise,
+  ) = onRuntimePublication(promise) {
+    val generation = expectedDirectGeneration.toSafeDirectGenerationOrNull()
+    if (generation == null) {
+      promise.resolve(null)
+    } else {
+      runtime.publishDirectIdentityVerificationQr(
+        conversationId,
+        generation,
+        scannedQrPayload,
+      ) { verification ->
+        promise.resolve(verification?.toWritableMap())
+      }
+    }
+  }
+
   /**
    * Explicit UI action only. The caller must bind the selected conversation to
    * the exact generation published in the same runtime snapshot.
@@ -144,81 +202,66 @@ internal class VeilMobileRuntimeModule(
   fun prepareContactSearch(username: String, promise: Promise) = onRuntime(promise) {
     val req = runtime.prepareContactSearchRequest(username)
     val sigMap = Arguments.createMap().apply {
+      putString("version", req.signature.version)
       putString("userId", req.signature.userId)
       putString("timestampMs", req.signature.timestampMs)
-      putString("signatureBase64", req.signature.signatureBase64)
+      putString("nonceBase64url", req.signature.nonceBase64url)
+      putString("signatureBase64url", req.signature.signatureBase64url)
     }
     Arguments.createMap().apply {
       putString("method", req.method)
       putString("target", req.requestTarget)
       putMap("signature", sigMap)
-    }.let { promise.resolve(it) }
-  }
-
-  @ReactMethod
-  fun prepareFriendRequest(peerUserId: String, promise: Promise) = onRuntime(promise) {
-    val req = runtime.prepareFriendRequest(peerUserId)
-    val sigMap = Arguments.createMap().apply {
-      putString("userId", req.signature.userId)
-      putString("timestampMs", req.signature.timestampMs)
-      putString("signatureBase64", req.signature.signatureBase64)
     }
-    Arguments.createMap().apply {
-      putString("method", req.method)
-      putString("target", req.requestTarget)
-      putMap("signature", sigMap)
-    }.let { promise.resolve(it) }
   }
 
   @ReactMethod
   fun prepareCreateDirect(peerUserId: String, promise: Promise) = onRuntime(promise) {
     val req = runtime.prepareCreateDirectRequest(peerUserId)
     val sigMap = Arguments.createMap().apply {
+      putString("version", req.signature.version)
       putString("userId", req.signature.userId)
       putString("timestampMs", req.signature.timestampMs)
-      putString("signatureBase64", req.signature.signatureBase64)
+      putString("nonceBase64url", req.signature.nonceBase64url)
+      putString("signatureBase64url", req.signature.signatureBase64url)
     }
-    val bodyBase64 = android.util.Base64.encodeToString(req.body, android.util.Base64.NO_WRAP)
-    Arguments.createMap().apply {
-      putString("method", req.method)
-      putString("target", req.requestTarget)
-      putString("bodyBase64", bodyBase64)
-      putMap("signature", sigMap)
-    }.let { promise.resolve(it) }
+    try {
+      val bodyBase64 = android.util.Base64.encodeToString(req.body, android.util.Base64.NO_WRAP)
+      Arguments.createMap().apply {
+        putString("method", req.method)
+        putString("target", req.requestTarget)
+        putString("bodyBase64", bodyBase64)
+        putMap("signature", sigMap)
+      }
+    } finally {
+      req.body.fill(0)
+    }
   }
 
   @ReactMethod
   fun parseContactSearchResponse(responseBase64: String, promise: Promise) = onRuntime(promise) {
     val responseBytes = android.util.Base64.decode(responseBase64, android.util.Base64.DEFAULT)
-    val res = runtime.parseContactSearchResponse(responseBytes)
-    Arguments.createMap().apply {
-      putString("userId", res.userId)
-      putString("username", res.username)
-      putString("identityKeyBase64", android.util.Base64.encodeToString(res.identityKey, android.util.Base64.NO_WRAP))
-      putString("signingKeyBase64", android.util.Base64.encodeToString(res.signingKey, android.util.Base64.NO_WRAP))
-    }.let { promise.resolve(it) }
+    try {
+      val res = runtime.parseContactSearchResponse(responseBytes)
+      Arguments.createMap().apply {
+        putString("userId", res.userId)
+        putString("username", res.username)
+      }
+    } finally {
+      responseBytes.fill(0)
+    }
   }
 
   @ReactMethod
   fun parseCreateDirectResponse(responseBase64: String, promise: Promise) = onRuntime(promise) {
     val responseBytes = android.util.Base64.decode(responseBase64, android.util.Base64.DEFAULT)
-    val res = runtime.parseCreateDirectResponse(responseBytes)
-    Arguments.createMap().apply {
-      putString("conversationId", res.conversationId)
-      putString("createdAt", res.createdAt)
-    }.let { promise.resolve(it) }
-  }
-
-  @ReactMethod
-  fun installDirectConversation(
-    peerUserId: String,
-    conversationId: String,
-    createdAt: String,
-    promise: Promise
-  ) = onRuntime(promise) {
-    when (val outcome = runtime.installDirectConversation(peerUserId, conversationId, createdAt)) {
-      uniffi.veil_ffi.MobileDirectConversationInstallOutcome.Installed -> promise.resolve("installed")
-      uniffi.veil_ffi.MobileDirectConversationInstallOutcome.AlreadyExists -> promise.resolve("already_exists")
+    try {
+      val conversationId = runtime.completeCreateDirectResponse(responseBytes)
+      Arguments.createMap().apply {
+        putString("conversationId", conversationId)
+      }
+    } finally {
+      responseBytes.fill(0)
     }
   }
 
@@ -505,6 +548,25 @@ private fun NativeDirectMessageView.toWritableMap(): WritableMap = Arguments.cre
   putString("direction", direction.name.lowercase())
   putString("delivery", delivery.name.lowercase())
 }
+
+private fun NativeDirectIdentityVerification.toWritableMap(): WritableMap =
+  Arguments.createMap().apply {
+    putString("canonicalServerOrigin", canonicalServerOrigin)
+    putString("peerUserId", peerUserId)
+    putString("fingerprintVersion", fingerprintVersion)
+    putString("fingerprintEmoji", fingerprintEmoji)
+    putString("fingerprintHex", fingerprintHex)
+    putString("qrPayload", qrPayload)
+    putString(
+      "state",
+      when (state) {
+        NativeDirectIdentityVerificationState.NOT_COMPARED -> "not_compared"
+        NativeDirectIdentityVerificationState.VERIFIED_ON_THIS_DEVICE ->
+          "verified_on_this_device"
+        NativeDirectIdentityVerificationState.IDENTITY_CHANGED -> "identity_changed"
+      },
+    )
+  }
 
 private fun NativeDirectPreKeyInstall.toWritableMap(): WritableMap = Arguments.createMap().apply {
   putString(

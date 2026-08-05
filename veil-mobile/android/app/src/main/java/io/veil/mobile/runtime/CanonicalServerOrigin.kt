@@ -46,7 +46,7 @@ internal data class CanonicalServerOrigin(
       val authority = if (host.contains(':')) "[$host]" else host
       val value = "$scheme://$authority:$port"
       val websocketScheme = if (scheme == "https") "wss" else "ws"
-      return CanonicalServerOrigin(value, "$websocketScheme://$authority:$port/ws")
+      return CanonicalServerOrigin(value, "$websocketScheme://$authority:$port/v3/events")
     }
 
     private fun canonicalHost(raw: String): String {

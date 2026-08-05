@@ -53,30 +53,40 @@ type messageHistoryAttachmentJSON struct {
 }
 
 type messageHistoryMessageJSON struct {
-	ID                   string                         `json:"id"`
-	ConversationID       string                         `json:"conversation_id"`
-	SenderID             string                         `json:"sender_id"`
-	SenderIdentityKey    string                         `json:"sender_identity_key"`
-	SenderSigningKey     string                         `json:"sender_signing_key"`
-	Ciphertext           string                         `json:"ciphertext"` // lowercase hex (legacy wire contract)
-	Header               string                         `json:"header"`     // lowercase hex (legacy wire contract)
-	MsgType              int16                          `json:"msg_type"`
-	ReplyToID            *string                        `json:"reply_to_id,omitempty"`
-	ExpiresAt            *string                        `json:"expires_at,omitempty"`
-	EditedAt             *string                        `json:"edited_at"`
-	IsDeleted            bool                           `json:"is_deleted"`
-	IsExpired            bool                           `json:"is_expired"`
-	Reactions            []messageHistoryReactionJSON   `json:"reactions"`
-	Attachments          []messageHistoryAttachmentJSON `json:"attachments"`
-	CreatedAt            string                         `json:"created_at"`
-	ServerTimestamp      int64                          `json:"server_timestamp"`
-	RevisionTimestamp    int64                          `json:"revision_timestamp"`
-	CryptoProfile        string                         `json:"crypto_profile"`
-	CryptoEra            string                         `json:"crypto_era,omitempty"`
-	RosterVersion        string                         `json:"roster_version,omitempty"`
-	RosterCommitment     string                         `json:"roster_commitment,omitempty"`
-	SenderDeviceID       string                         `json:"sender_device_id,omitempty"`
-	SenderBindingVersion string                         `json:"sender_binding_version,omitempty"`
+	ID                        string                         `json:"id"`
+	ConversationID            string                         `json:"conversation_id"`
+	SenderID                  string                         `json:"sender_id"`
+	SenderIdentityKey         string                         `json:"sender_identity_key"`
+	SenderSigningKey          string                         `json:"sender_signing_key"`
+	Ciphertext                string                         `json:"ciphertext"` // lowercase hex (legacy wire contract)
+	Header                    string                         `json:"header"`     // lowercase hex (legacy wire contract)
+	MsgType                   int16                          `json:"msg_type"`
+	ReplyToID                 *string                        `json:"reply_to_id,omitempty"`
+	ExpiresAt                 *string                        `json:"expires_at,omitempty"`
+	EditedAt                  *string                        `json:"edited_at"`
+	IsDeleted                 bool                           `json:"is_deleted"`
+	IsExpired                 bool                           `json:"is_expired"`
+	Reactions                 []messageHistoryReactionJSON   `json:"reactions"`
+	Attachments               []messageHistoryAttachmentJSON `json:"attachments"`
+	CreatedAt                 string                         `json:"created_at"`
+	ServerTimestamp           int64                          `json:"server_timestamp"`
+	RevisionTimestamp         int64                          `json:"revision_timestamp"`
+	CryptoProfile             string                         `json:"crypto_profile"`
+	CryptoEra                 string                         `json:"crypto_era,omitempty"`
+	RosterVersion             string                         `json:"roster_version,omitempty"`
+	RosterCommitment          string                         `json:"roster_commitment,omitempty"`
+	MembershipEpoch           string                         `json:"membership_epoch,omitempty"`
+	MembershipEpochHash       string                         `json:"membership_epoch_hash,omitempty"`
+	SenderDeviceID            string                         `json:"sender_device_id,omitempty"`
+	SenderBindingVersion      string                         `json:"sender_binding_version,omitempty"`
+	SenderDeviceIdentityKey   string                         `json:"sender_device_identity_key,omitempty"`
+	SenderDeviceSigningKey    string                         `json:"sender_device_signing_key,omitempty"`
+	SenderDeviceCapabilities  string                         `json:"sender_device_capabilities,omitempty"`
+	SenderDeviceBindingStatus uint8                          `json:"sender_device_binding_status,omitempty"`
+	SenderAccountSignature    string                         `json:"sender_account_signature,omitempty"`
+	TargetDeviceID            string                         `json:"target_device_id,omitempty"`
+	TargetBindingVersion      string                         `json:"target_binding_version,omitempty"`
+	DirectSessionID           string                         `json:"direct_session_id,omitempty"`
 }
 
 // Field order is intentional: encodeMessageHistoryPageWithinBudget accounts
@@ -90,15 +100,22 @@ type messageHistoryPageJSON struct {
 // Handler provides REST endpoints for the chat service.
 // Message sync, conversation management.
 type Handler struct {
-	svc *Service
-	mw  *authmw.Middleware
-	rl  *authmw.RateLimit
+	svc            *Service
+	mw             *authmw.Middleware
+	restDispatcher *authmw.RESTAuthVersionDispatcher
+	rl             *authmw.RateLimit
 }
 
 // NewHandler builds the chat REST handler. mw and rl may be nil to disable
 // signature checks / rate limiting (used in tests and the all-in-one binary).
 func NewHandler(svc *Service, mw *authmw.Middleware, rl *authmw.RateLimit) *Handler {
 	return &Handler{svc: svc, mw: mw, rl: rl}
+}
+
+// SetRESTAuthVersionDispatcher activates explicit v1/v2 selection for every
+// signed chat route while preserving v1-only isolated service fixtures.
+func (h *Handler) SetRESTAuthVersionDispatcher(dispatcher *authmw.RESTAuthVersionDispatcher) {
+	h.restDispatcher = dispatcher
 }
 
 // SigningKeyLookup returns an authmw.UserKeyLookup backed by the service's
@@ -121,31 +138,40 @@ func (s *Service) SigningKeyLookup() authmw.UserKeyLookup {
 
 // RegisterRoutes registers chat REST endpoints on the given mux.
 func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
-	signed := func(f http.HandlerFunc) http.HandlerFunc {
+	signed := func(policy authmw.RESTAuthV2HTTPPolicy, f http.HandlerFunc) http.HandlerFunc {
 		if h.rl != nil {
 			f = h.rl.Wrap(f)
 		}
-		if h.mw != nil {
+		if h.restDispatcher != nil {
+			f = h.restDispatcher.RequireSigned(policy, f)
+		} else if h.mw != nil {
 			// Verify first; the limiter keys from verified principal context.
 			f = h.mw.RequireSigned(f)
 		}
 		return f
 	}
+	jsonPolicy, err := authmw.NewRESTAuthV2JSONHTTPPolicy(64 * 1024)
+	if err != nil {
+		panic("invalid chat REST v2 JSON policy")
+	}
+	bodylessPolicy := authmw.RESTAuthV2BodylessHTTPPolicy()
 
 	// no-store remains outermost so authenticated chat state cannot be cached
 	// even when signature verification or rate limiting rejects the request.
-	mux.HandleFunc("GET /v1/messages/{conversationID}", chatNoStore(signed(h.GetMessages)))
-	mux.HandleFunc("GET /v1/conversations", chatNoStore(signed(h.ListConversations)))
-	mux.HandleFunc("GET /v1/conversations/{conversationID}", chatNoStore(signed(h.GetConversation)))
-	mux.HandleFunc("POST /v1/conversations/dm", signed(h.CreateDM))
-	mux.HandleFunc("GET /v1/conversations/{conversationID}/members", chatNoStore(signed(h.GetMembers)))
-	mux.HandleFunc("GET /v1/conversations/{conversationID}/device-directory", chatNoStore(signed(h.GetDeviceDirectory)))
+	mux.HandleFunc("GET /v1/messages/{conversationID}", chatNoStore(signed(bodylessPolicy, h.GetMessages)))
+	mux.HandleFunc("GET /v1/conversations", chatNoStore(signed(bodylessPolicy, h.ListConversations)))
+	mux.HandleFunc("GET /v1/conversations/{conversationID}", chatNoStore(signed(bodylessPolicy, h.GetConversation)))
+	mux.HandleFunc("POST /v1/conversations/dm", signed(jsonPolicy, h.CreateDM))
+	mux.HandleFunc("GET /v1/conversations/{conversationID}/members", chatNoStore(signed(bodylessPolicy, h.GetMembers)))
+	mux.HandleFunc("GET /v1/conversations/{conversationID}/device-directory", chatNoStore(signed(bodylessPolicy, h.GetDeviceDirectory)))
+	mux.HandleFunc("GET /v1/conversations/{conversationID}/membership-epochs", chatNoStore(signed(bodylessPolicy, h.ListMembershipEpochsV1)))
+	mux.HandleFunc("POST /v1/conversations/{conversationID}/membership-epochs", chatNoStore(signed(jsonPolicy, h.StoreMembershipEpochV1)))
 
 	// Group endpoints
-	mux.HandleFunc("POST /v1/groups", signed(h.CreateGroup))
-	mux.HandleFunc("POST /v1/groups/{groupID}/members", signed(h.AddGroupMember))
-	mux.HandleFunc("DELETE /v1/groups/{groupID}/members/{userID}", signed(h.RemoveGroupMember))
-	mux.HandleFunc("GET /v1/groups/{groupID}/members", chatNoStore(signed(h.GetGroupMembers)))
+	mux.HandleFunc("POST /v1/groups", signed(jsonPolicy, h.CreateGroup))
+	mux.HandleFunc("POST /v1/groups/{groupID}/members", signed(jsonPolicy, h.AddGroupMember))
+	mux.HandleFunc("DELETE /v1/groups/{groupID}/members/{userID}", signed(bodylessPolicy, h.RemoveGroupMember))
+	mux.HandleFunc("GET /v1/groups/{groupID}/members", chatNoStore(signed(bodylessPolicy, h.GetGroupMembers)))
 }
 
 func chatNoStore(next http.HandlerFunc) http.HandlerFunc {
@@ -311,20 +337,61 @@ func (h *Handler) GetMessages(w http.ResponseWriter, r *http.Request) {
 		}
 		if m.SecurityContext != nil {
 			security := m.SecurityContext
-			if security.CryptoProfile != db.MessageCryptoProfileSenderKeyV5 ||
-				security.CryptoEra != db.MessageCryptoEraSenderKeyV5 ||
-				security.RosterVersion == 0 || len(security.RosterCommitment) != 32 ||
-				len(security.SenderDeviceID) != 16 || security.SenderBindingVersion == 0 {
-				log.Printf("message_ref=%s has invalid persisted security context", logsafe.Ref("message", m.ID))
+			mj.CryptoProfile = security.CryptoProfile
+			mj.CryptoEra = strconv.FormatUint(security.CryptoEra, 10)
+			mj.SenderDeviceID = hex.EncodeToString(security.SenderDeviceID)
+			mj.SenderBindingVersion = strconv.FormatUint(security.SenderBindingVersion, 10)
+			switch security.CryptoProfile {
+			case db.MessageCryptoProfileSenderKeyV5:
+				if security.CryptoEra != db.MessageCryptoEraSenderKeyV5 ||
+					security.RosterVersion == 0 || len(security.RosterCommitment) != 32 ||
+					len(security.SenderDeviceID) != 16 || security.SenderBindingVersion == 0 {
+					log.Printf("message_ref=%s has invalid Sender-Key context", logsafe.Ref("message", m.ID))
+					writeJSON(w, http.StatusInternalServerError, errorResp("message security context is invalid"))
+					return
+				}
+				mj.RosterVersion = strconv.FormatUint(security.RosterVersion, 10)
+				mj.RosterCommitment = hex.EncodeToString(security.RosterCommitment)
+			case db.MessageCryptoProfileSenderKeyV6:
+				if security.CryptoEra != db.MessageCryptoEraSenderKeyV6 ||
+					security.RosterVersion == 0 || len(security.RosterCommitment) != 32 ||
+					security.MembershipEpoch == 0 || len(security.MembershipEpochHash) != 32 ||
+					len(security.SenderDeviceID) != 16 || security.SenderBindingVersion == 0 {
+					log.Printf("message_ref=%s has invalid Sender-Key v6 context", logsafe.Ref("message", m.ID))
+					writeJSON(w, http.StatusInternalServerError, errorResp("message security context is invalid"))
+					return
+				}
+				mj.RosterVersion = strconv.FormatUint(security.RosterVersion, 10)
+				mj.RosterCommitment = hex.EncodeToString(security.RosterCommitment)
+				mj.MembershipEpoch = strconv.FormatUint(security.MembershipEpoch, 10)
+				mj.MembershipEpochHash = hex.EncodeToString(security.MembershipEpochHash)
+			case db.MessageCryptoProfileDirectV2:
+				if security.CryptoEra != db.MessageCryptoEraDirectV2 ||
+					len(security.SenderDeviceID) != 16 || security.SenderBindingVersion == 0 ||
+					len(security.SenderDeviceIdentityKey) != 32 ||
+					len(security.SenderDeviceSigningKey) != 32 ||
+					security.SenderDeviceCapabilities == 0 ||
+					security.SenderDeviceBindingStatus != db.DeviceBindingActive ||
+					len(security.SenderAccountSignature) != 64 ||
+					len(security.TargetDeviceID) != 16 || security.TargetBindingVersion == 0 ||
+					len(security.DirectSessionID) != 32 {
+					log.Printf("message_ref=%s has invalid Direct v2 context", logsafe.Ref("message", m.ID))
+					writeJSON(w, http.StatusInternalServerError, errorResp("message security context is invalid"))
+					return
+				}
+				mj.SenderDeviceIdentityKey = hex.EncodeToString(security.SenderDeviceIdentityKey)
+				mj.SenderDeviceSigningKey = hex.EncodeToString(security.SenderDeviceSigningKey)
+				mj.SenderDeviceCapabilities = strconv.FormatUint(security.SenderDeviceCapabilities, 10)
+				mj.SenderDeviceBindingStatus = uint8(security.SenderDeviceBindingStatus)
+				mj.SenderAccountSignature = hex.EncodeToString(security.SenderAccountSignature)
+				mj.TargetDeviceID = hex.EncodeToString(security.TargetDeviceID)
+				mj.TargetBindingVersion = strconv.FormatUint(security.TargetBindingVersion, 10)
+				mj.DirectSessionID = hex.EncodeToString(security.DirectSessionID)
+			default:
+				log.Printf("message_ref=%s has unknown persisted security context", logsafe.Ref("message", m.ID))
 				writeJSON(w, http.StatusInternalServerError, errorResp("message security context is invalid"))
 				return
 			}
-			mj.CryptoProfile = security.CryptoProfile
-			mj.CryptoEra = strconv.FormatUint(security.CryptoEra, 10)
-			mj.RosterVersion = strconv.FormatUint(security.RosterVersion, 10)
-			mj.RosterCommitment = hex.EncodeToString(security.RosterCommitment)
-			mj.SenderDeviceID = hex.EncodeToString(security.SenderDeviceID)
-			mj.SenderBindingVersion = strconv.FormatUint(security.SenderBindingVersion, 10)
 		}
 		if m.ExpiresAt != nil {
 			t := m.ExpiresAt.UTC().Format(time.RFC3339)

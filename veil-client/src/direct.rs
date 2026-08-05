@@ -15,6 +15,7 @@ use veil_store::models::{
 };
 
 use crate::api::VeilClient;
+use crate::direct_v2::DirectDeviceCoordinateV2;
 
 pub const DIRECT_DIRECTORY_PAGE_LIMIT: usize = 100;
 pub const DIRECT_DIRECTORY_RESPONSE_LIMIT: usize = 8 * 1024 * 1024;
@@ -109,6 +110,7 @@ struct DirectoryMemberWire {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PreKeyBundleWire {
     identity_key: String,
     signing_key: String,
@@ -119,6 +121,33 @@ struct PreKeyBundleWire {
     one_time_prekey: Option<String>,
     #[serde(default)]
     one_time_prekey_id: Option<u32>,
+    #[serde(default)]
+    opk_low_warning: Option<bool>,
+    #[serde(default)]
+    opk_remaining: Option<u32>,
+    #[serde(default)]
+    device_id: Option<String>,
+    #[serde(default)]
+    device_binding_version: Option<u64>,
+    #[serde(default)]
+    device_identity_key: Option<String>,
+    #[serde(default)]
+    device_signing_key: Option<String>,
+    #[serde(default)]
+    device_capabilities: Option<u64>,
+    #[serde(default)]
+    device_binding_status: Option<u8>,
+    #[serde(default)]
+    device_account_signature: Option<String>,
+    #[serde(default)]
+    identity_transparency: Option<PreKeyTransparencyWire>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PreKeyTransparencyWire {
+    account: serde_json::Value,
+    device_binding: serde_json::Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -423,11 +452,14 @@ pub fn install_authenticated_direct_conversation_v1(
     db.upsert_directory_directs(canonical_server_origin, &[stored_conversation])?;
 
     // 4. Preflight and register the DM binding locally
-    client.ensure_dm_conversation_binding_compatible(&conversation.id, conversation.peer.identity_key)?;
-    
+    client.ensure_dm_conversation_binding_compatible(
+        &conversation.id,
+        conversation.peer.identity_key,
+    )?;
+
     // 5. Publish to runtime memory
     publish_direct_conversation(client, conversation)?;
-    
+
     Ok(())
 }
 
@@ -465,6 +497,67 @@ pub fn install_authenticated_direct_prekey_bundle_classified_v1(
     expected_peer_identity_key: [u8; 32],
     expected_peer_signing_key: [u8; 32],
     response: &[u8],
+) -> Result<DirectPreKeyInstallResult, DirectPreKeyInstallErrorV1> {
+    install_authenticated_direct_prekey_bundle_classified_with_security_policy_v1(
+        client,
+        peer_user_id,
+        expected_peer_identity_key,
+        expected_peer_signing_key,
+        response,
+        None,
+        None,
+    )
+}
+
+pub fn install_authenticated_direct_prekey_bundle_with_rollback_anchor_v1(
+    client: &mut VeilClient,
+    peer_user_id: &str,
+    expected_peer_identity_key: [u8; 32],
+    expected_peer_signing_key: [u8; 32],
+    response: &[u8],
+    rollback_anchor: &veil_store::db::IdentityTransparencyPinnedHeadV1,
+) -> Result<DirectPreKeyInstallResult, String> {
+    install_authenticated_direct_prekey_bundle_classified_with_security_policy_v1(
+        client,
+        peer_user_id,
+        expected_peer_identity_key,
+        expected_peer_signing_key,
+        response,
+        Some(rollback_anchor),
+        None,
+    )
+    .map_err(DirectPreKeyInstallErrorV1::into_detail)
+}
+
+pub fn install_authenticated_direct_prekey_bundle_with_security_policy_v1(
+    client: &mut VeilClient,
+    peer_user_id: &str,
+    expected_peer_identity_key: [u8; 32],
+    expected_peer_signing_key: [u8; 32],
+    response: &[u8],
+    rollback_anchor: Option<&veil_store::db::IdentityTransparencyPinnedHeadV1>,
+    witness_policy: Option<&crate::transparency::TransparencyWitnessPolicyV1>,
+) -> Result<DirectPreKeyInstallResult, String> {
+    install_authenticated_direct_prekey_bundle_classified_with_security_policy_v1(
+        client,
+        peer_user_id,
+        expected_peer_identity_key,
+        expected_peer_signing_key,
+        response,
+        rollback_anchor,
+        witness_policy,
+    )
+    .map_err(DirectPreKeyInstallErrorV1::into_detail)
+}
+
+pub fn install_authenticated_direct_prekey_bundle_classified_with_security_policy_v1(
+    client: &mut VeilClient,
+    peer_user_id: &str,
+    expected_peer_identity_key: [u8; 32],
+    expected_peer_signing_key: [u8; 32],
+    response: &[u8],
+    rollback_anchor: Option<&veil_store::db::IdentityTransparencyPinnedHeadV1>,
+    witness_policy: Option<&crate::transparency::TransparencyWitnessPolicyV1>,
 ) -> Result<DirectPreKeyInstallResult, DirectPreKeyInstallErrorV1> {
     if response.len() > DIRECT_PREKEY_RESPONSE_LIMIT {
         return Err(DirectPreKeyInstallErrorV1::rejected(
@@ -565,7 +658,195 @@ pub fn install_authenticated_direct_prekey_bundle_classified_v1(
         one_time_prekey,
         one_time_prekey_id: wire.one_time_prekey_id,
     };
-    match client.establish_session_classified_v1(&expected_peer_identity_key, &bundle) {
+    if wire.opk_low_warning == Some(true) && wire.opk_remaining.is_none() {
+        return Err(DirectPreKeyInstallErrorV1::rejected(
+            "Direct prekey low warning omitted its remaining count",
+        ));
+    }
+    let peer_device = match (
+        wire.device_id.as_deref(),
+        wire.device_binding_version,
+        wire.device_identity_key.as_deref(),
+        wire.device_signing_key.as_deref(),
+        wire.device_capabilities,
+        wire.device_binding_status,
+        wire.device_account_signature.as_deref(),
+    ) {
+        (
+            Some(device_id),
+            Some(binding_version),
+            Some(device_identity_key),
+            Some(device_signing_key),
+            Some(capabilities),
+            Some(status),
+            Some(account_signature),
+        ) => {
+            let coordinate = DirectDeviceCoordinateV2 {
+                device_id: decode_lower_hex_fixed::<16>("Direct prekey device_id", device_id)
+                    .map_err(DirectPreKeyInstallErrorV1::rejected)?,
+                binding_version,
+                capabilities,
+                status,
+                identity_key: decode_canonical_b64_fixed::<32>(
+                    "Direct prekey device_identity_key",
+                    device_identity_key,
+                )
+                .map_err(DirectPreKeyInstallErrorV1::rejected)?,
+                signing_key: decode_canonical_b64_fixed::<32>(
+                    "Direct prekey device_signing_key",
+                    device_signing_key,
+                )
+                .map_err(DirectPreKeyInstallErrorV1::rejected)?,
+                account_signature: decode_canonical_b64_fixed::<64>(
+                    "Direct prekey device_account_signature",
+                    account_signature,
+                )
+                .map_err(DirectPreKeyInstallErrorV1::rejected)?,
+            };
+            if coordinate.binding_version == 0
+                || coordinate.capabilities & crate::device_identity::REQUIRED_DEVICE_CAPABILITIES
+                    != crate::device_identity::REQUIRED_DEVICE_CAPABILITIES
+                || coordinate.status != crate::device_identity::DEVICE_BINDING_STATUS_ACTIVE
+            {
+                return Err(DirectPreKeyInstallErrorV1::rejected(
+                    "Direct prekey device binding is not eligible",
+                ));
+            }
+            Some(coordinate)
+        }
+        (None, None, None, None, None, None, None) => None,
+        _ => {
+            return Err(DirectPreKeyInstallErrorV1::rejected(
+                "Direct prekey response contains incomplete device binding metadata",
+            ));
+        }
+    };
+
+    #[cfg(not(any(test, feature = "test-utils")))]
+    if peer_device.is_none() {
+        return Err(DirectPreKeyInstallErrorV1::rejected(
+            "Direct v2 device binding metadata is required",
+        ));
+    }
+
+    match wire.identity_transparency {
+        Some(transparency) => {
+            let canonical_server_origin = client
+                .authenticated_server_origin_v1()
+                .map_err(DirectPreKeyInstallErrorV1::rejected)?;
+            let db = client.db().ok_or_else(|| {
+                DirectPreKeyInstallErrorV1::StorageUncertain(
+                    "Direct transparency SQLCipher database is unavailable".to_string(),
+                )
+            })?;
+            let peer_device = peer_device.as_ref().ok_or_else(|| {
+                DirectPreKeyInstallErrorV1::rejected(
+                    "Direct transparency proof omitted its device binding",
+                )
+            })?;
+            let account_response = serde_json::to_vec(&transparency.account).map_err(|_| {
+                DirectPreKeyInstallErrorV1::rejected(
+                    "Direct account transparency proof is not encodable",
+                )
+            })?;
+            let device_response =
+                serde_json::to_vec(&transparency.device_binding).map_err(|_| {
+                    DirectPreKeyInstallErrorV1::rejected(
+                        "Direct device transparency proof is not encodable",
+                    )
+                })?;
+            let account_expected = crate::transparency::TransparentAccountExpectedV1 {
+                user_id: peer_user_id.to_string(),
+                identity_key: expected_peer_identity_key,
+                signing_key: expected_peer_signing_key,
+            };
+            let account_result =
+                crate::transparency::verify_account_transparency_response_with_security_policy_v1(
+                    db,
+                    &canonical_server_origin,
+                    &account_expected,
+                    &account_response,
+                    rollback_anchor,
+                    witness_policy,
+                );
+            account_result.map_err(|_| {
+                DirectPreKeyInstallErrorV1::StorageUncertain(
+                    "Direct account transparency verification failed".to_string(),
+                )
+            })?;
+            let device_expected = crate::transparency::TransparentDeviceBindingExpectedV1 {
+                account_user_id: peer_user_id.to_string(),
+                account_identity_key: expected_peer_identity_key,
+                account_signing_key: expected_peer_signing_key,
+                device_key: peer_device.device_id,
+                device_identity_key: peer_device.identity_key,
+                device_signing_key: peer_device.signing_key,
+                binding_version: peer_device.binding_version,
+                capabilities: peer_device.capabilities,
+                status: peer_device.status,
+                account_signature: peer_device.account_signature,
+            };
+            let device_result = crate::transparency::verify_device_binding_transparency_response_with_security_policy_v1(
+                db,
+                &canonical_server_origin,
+                &device_expected,
+                &device_response,
+                rollback_anchor,
+                witness_policy,
+            );
+            device_result.map_err(|_| {
+                DirectPreKeyInstallErrorV1::StorageUncertain(
+                    "Direct device transparency verification failed".to_string(),
+                )
+            })?;
+        }
+        None => {
+            if rollback_anchor.is_some() || witness_policy.is_some() {
+                return Err(DirectPreKeyInstallErrorV1::rejected(
+                    "Direct prekey response removed a required transparency proof",
+                ));
+            }
+            if let Ok(canonical_server_origin) = client.authenticated_server_origin_v1() {
+                let db = client.db().ok_or_else(|| {
+                    DirectPreKeyInstallErrorV1::StorageUncertain(
+                        "Direct transparency SQLCipher database is unavailable".to_string(),
+                    )
+                })?;
+                if db
+                    .identity_transparency_pinned_head_v1(&canonical_server_origin)
+                    .map_err(|_| {
+                        DirectPreKeyInstallErrorV1::StorageUncertain(
+                            "Direct transparency downgrade check failed".to_string(),
+                        )
+                    })?
+                    .is_some()
+                {
+                    return Err(DirectPreKeyInstallErrorV1::rejected(
+                        "Direct prekey response removed previously pinned transparency proofs",
+                    ));
+                }
+            }
+        }
+    }
+
+    let establishment = if let Some(peer_device) = peer_device {
+        let conversation_id = client
+            .direct_v2_conversation_for_peer(&expected_peer_identity_key)
+            .map_err(DirectPreKeyInstallErrorV1::rejected)?;
+        let context = client
+            .direct_v2_initiator_context(
+                &conversation_id,
+                peer_user_id,
+                expected_peer_identity_key,
+                expected_peer_signing_key,
+                peer_device,
+            )
+            .map_err(DirectPreKeyInstallErrorV1::rejected)?;
+        client.establish_session_classified_v2(&expected_peer_identity_key, &bundle, context)
+    } else {
+        client.establish_session_classified_v1(&expected_peer_identity_key, &bundle)
+    };
+    match establishment {
         Ok(()) => Ok(DirectPreKeyInstallResult::Established),
         Err(crate::api::DirectSessionEstablishErrorV1::Rejected(detail)) => {
             Err(DirectPreKeyInstallErrorV1::Rejected(detail))

@@ -78,16 +78,14 @@ membership и delivery state. E2EE не скрывает эту информац
 
 Canonical HTTPS origin входит в identity аккаунта. Одинаковый user ID на двух
 Node не означает одну identity. Wildcard origin, HTTP downgrade и
-автоматическое доверие self-signed сертификату нарушают эту границу. Текущий
-Preview строго проверяет URL/TLS и exact legacy REST authority на managed
-ingress, но WS v2/REST v1 ещё не связывают полный canonical origin/user context
-end to end. Gateway регистрирует отдельный экспериментальный `/v3/events`, а
-Rust/FFI/Android содержат первый background-events consumer; основной `/ws`
-остаётся legacy v2. Этот срез пока не проходит полный workspace build,
-generated Kotlin bindings отстают, а cross-client и hostile two-Node evidence
-отсутствуют. REST v2 HTTP/version dispatcher не подключён к live routes.
-Полный protocol/route cutover, two-Node matrix и проверенное client consumption
-остаются blocking gate Phase 5S.
+автоматическое доверие self-signed сертификату нарушают эту границу. Live
+desktop/Android transport использует exact `/v3/events`: WS v3 подписывает
+canonical origin, account, device и registration intent, а один socket несёт
+commands, ACK и events. Signed HTTP routes принимают REST v2, где transcript
+связывает origin, account, method, raw target, nonce и body hash; replay state
+хранится в PostgreSQL. Legacy `/ws` выключен по умолчанию и доступен только по
+явному аварийному operator flag без client-side downgrade. Hostile two-Node,
+cross-client и независимый audit evidence остаются blocking release gate.
 
 ### Локальные данные и поиск
 
@@ -104,12 +102,21 @@ release matrices ещё входят в открытые Preview gates.
 
 ## Crypto и access model
 
-- Direct использует X3DH и Double Ratchet.
+- Direct использует X3DH и Double Ratchet. Активный Direct v2 связывает
+  canonical origin, account identities, точные device bindings и X3DH
+  transcript в session commitment и запрещает sticky downgrade после первого
+  durable v2 состояния.
 - Circle и text Room используют authenticated Sender Keys v5.
 - Space/Room access задаётся server-side ACL, но presentation metadata не
   участвует в crypto trust.
 - Изменение roster/access требует корректной key rotation/distribution.
 - Key transparency пока отсутствует; текущая модель service-mediated TOFU.
+  Account-v2 safety number можно независимо сравнить и явно отметить как
+  `Verified on this device`; замена identity снимает этот статус.
+- Production UniFFI не экспортирует raw ratchet, AEAD, X3DH, signing, KDF,
+  generic signature verification или caller-assembled fingerprint primitives.
+  Android получает высокоуровневые account/session операции и публикует в JS
+  только необходимую public projection.
 - MLS и calls не являются включёнными пользовательскими функциями Preview.
 
 Точные решения следует сверять с

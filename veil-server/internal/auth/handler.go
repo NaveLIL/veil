@@ -25,15 +25,24 @@ import (
 // Prekey management, device registry, user lookup.
 // (Challenge-response stays in the gateway — it's WS-bound.)
 type Handler struct {
-	svc *Service
-	mw  *authmw.Middleware
-	rl  *authmw.RateLimit
+	svc                        *Service
+	mw                         *authmw.Middleware
+	restDispatcher             *authmw.RESTAuthVersionDispatcher
+	rl                         *authmw.RateLimit
+	identityTransparencySigner *IdentityTransparencySigner
 }
 
 // NewHandler builds the auth REST handler. mw and rl may be nil to disable
 // signature checks / rate limiting (used in tests and the all-in-one binary).
 func NewHandler(svc *Service, mw *authmw.Middleware, rl *authmw.RateLimit) *Handler {
 	return &Handler{svc: svc, mw: mw, rl: rl}
+}
+
+// SetRESTAuthVersionDispatcher activates explicit v1/v2 selection for every
+// signed auth route. A nil dispatcher leaves the existing v1-only behavior in
+// place for isolated service binaries and legacy integration fixtures.
+func (h *Handler) SetRESTAuthVersionDispatcher(dispatcher *authmw.RESTAuthVersionDispatcher) {
+	h.restDispatcher = dispatcher
 }
 
 // SigningKeyLookup returns an authmw.UserKeyLookup backed by the service's
@@ -56,28 +65,37 @@ func (s *Service) SigningKeyLookup() authmw.UserKeyLookup {
 
 // RegisterRoutes registers auth REST endpoints on the given mux.
 func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
-	signed := func(f http.HandlerFunc) http.HandlerFunc {
+	signed := func(policy authmw.RESTAuthV2HTTPPolicy, f http.HandlerFunc) http.HandlerFunc {
 		if h.rl != nil {
 			f = h.rl.Wrap(f)
 		}
-		if h.mw != nil {
+		if h.restDispatcher != nil {
+			f = h.restDispatcher.RequireSigned(policy, f)
+		} else if h.mw != nil {
 			// Signature verification must be the outermost middleware so the
 			// limiter sees only an authenticated principal context.
 			f = h.mw.RequireSigned(f)
 		}
 		return f
 	}
+	jsonPolicy, err := authmw.NewRESTAuthV2JSONHTTPPolicy(64 * 1024)
+	if err != nil {
+		panic("invalid auth REST v2 JSON policy")
+	}
+	bodylessPolicy := authmw.RESTAuthV2BodylessHTTPPolicy()
 
 	// no-store remains outermost so authentication and rate-limit failures on
 	// sensitive prekey routes cannot be cached either.
-	mux.HandleFunc("POST /v1/prekeys", preKeyNoStore(signed(h.UploadPreKeys)))
-	mux.HandleFunc("GET /v1/prekeys/{identityKey}", preKeyNoStore(signed(h.GetPreKeyBundle)))
-	mux.HandleFunc("GET /v1/prekeys/{identityKey}/count", preKeyNoStore(signed(h.GetOPKCount)))
-	mux.HandleFunc("GET /v1/devices/{userID}", signed(h.ListDevices))
-	mux.HandleFunc("GET /v1/device-bindings/{deviceKey}", signed(h.GetDeviceBinding))
-	mux.HandleFunc("PUT /v1/device-bindings/{deviceKey}", signed(h.PutDeviceBinding))
-	mux.HandleFunc("GET /v1/users/search", signed(h.SearchUser))
-	mux.HandleFunc("GET /v1/users/{identityKey}", signed(h.LookupUser))
+	mux.HandleFunc("POST /v1/prekeys", preKeyNoStore(signed(jsonPolicy, h.UploadPreKeys)))
+	mux.HandleFunc("GET /v1/prekeys/{identityKey}", preKeyNoStore(signed(bodylessPolicy, h.GetPreKeyBundle)))
+	mux.HandleFunc("GET /v1/prekeys/{identityKey}/count", preKeyNoStore(signed(bodylessPolicy, h.GetOPKCount)))
+	mux.HandleFunc("GET /v1/devices/{userID}", signed(bodylessPolicy, h.ListDevices))
+	mux.HandleFunc("GET /v1/device-bindings/{deviceKey}", signed(bodylessPolicy, h.GetDeviceBinding))
+	mux.HandleFunc("PUT /v1/device-bindings/{deviceKey}", signed(jsonPolicy, h.PutDeviceBinding))
+	mux.HandleFunc("GET /v1/users/search", signed(bodylessPolicy, h.SearchUser))
+	mux.HandleFunc("GET /v1/users/{identityKey}", signed(bodylessPolicy, h.LookupUser))
+	mux.HandleFunc("GET /v1/transparency/accounts/{userID}", identityTransparencyNoStore(signed(bodylessPolicy, h.GetIdentityTransparencyAccountProof)))
+	mux.HandleFunc("GET /v1/transparency/devices/{deviceKey}/bindings/{bindingVersion}", identityTransparencyNoStore(signed(bodylessPolicy, h.GetIdentityTransparencyDeviceBindingProof)))
 }
 
 // --- Prekey Upload ---
@@ -265,6 +283,13 @@ func (h *Handler) GetPreKeyBundle(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusUnauthorized, errorResp("authenticated user required"))
 		return
 	}
+	transparencyFrom, _, err := exactTransparencySizeQuery(
+		r, "transparency_from_size",
+	)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, errorResp("invalid prekey transparency query"))
+		return
+	}
 
 	bundle, err := h.svc.GetPreKeyBundle(r.Context(), requesterID, identityKey)
 	if err != nil {
@@ -276,6 +301,29 @@ func (h *Handler) GetPreKeyBundle(w http.ResponseWriter, r *http.Request) {
 		}
 		publicerr.Write(w, http.StatusNotFound, err)
 		return
+	}
+	if h.identityTransparencySigner != nil {
+		deviceKeyHex, keyOK := bundle["device_id"].(string)
+		bindingVersion, versionOK := bundle["device_binding_version"].(uint64)
+		deviceKey, keyErr := hex.DecodeString(deviceKeyHex)
+		if !keyOK || !versionOK || keyErr != nil || len(deviceKey) != 16 ||
+			hex.EncodeToString(deviceKey) != deviceKeyHex || bindingVersion == 0 {
+			writeJSON(w, http.StatusInternalServerError, errorResp("prekey transparency subject is invalid"))
+			return
+		}
+		proofs, proofErr := h.identityTransparencyPreKeyProofs(
+			r.Context(), identityKey, deviceKey, bindingVersion, transparencyFrom,
+		)
+		if proofErr != nil {
+			if errors.Is(proofErr, db.ErrIdentityTransparencyHeadRegression) {
+				writeJSON(w, http.StatusConflict, errorResp("identity transparency head regression"))
+				return
+			}
+			log.Printf("prekey transparency proof error: class=%s", logsafe.ErrorClass(proofErr))
+			writeJSON(w, http.StatusInternalServerError, errorResp("failed to build prekey transparency proofs"))
+			return
+		}
+		bundle["identity_transparency"] = proofs
 	}
 
 	writeJSON(w, http.StatusOK, bundle)
@@ -495,6 +543,13 @@ func (s *Service) GetPreKeyBundle(ctx context.Context, requesterID string, targe
 	// protocol with per-device sessions and fan-out; do not silently combine
 	// device keys into this single-device response.
 	device := devices[0]
+	binding, err := s.db.GetLatestDeviceBinding(ctx, device.ID)
+	if err != nil || binding.Status != db.DeviceBindingActive ||
+		len(binding.DeviceKey) != 16 || len(binding.DeviceIdentityKey) != 32 ||
+		len(binding.DeviceSigningKey) != 32 || binding.Version == 0 ||
+		len(binding.AccountSignature) != 64 {
+		return nil, errors.New("no active device binding available")
+	}
 
 	spk, err := s.db.GetSignedPreKey(ctx, device.ID)
 	if err != nil {
@@ -502,11 +557,18 @@ func (s *Service) GetPreKeyBundle(ctx context.Context, requesterID string, targe
 	}
 
 	bundle := map[string]any{
-		"identity_key":            base64.StdEncoding.EncodeToString(user.IdentityKey),
-		"signing_key":             base64.StdEncoding.EncodeToString(user.SigningKey),
-		"signed_prekey":           base64.StdEncoding.EncodeToString(spk.PublicKey),
-		"signed_prekey_signature": base64.StdEncoding.EncodeToString(spk.Signature),
-		"signed_prekey_id":        spk.ProtocolKeyID,
+		"identity_key":             base64.StdEncoding.EncodeToString(user.IdentityKey),
+		"signing_key":              base64.StdEncoding.EncodeToString(user.SigningKey),
+		"signed_prekey":            base64.StdEncoding.EncodeToString(spk.PublicKey),
+		"signed_prekey_signature":  base64.StdEncoding.EncodeToString(spk.Signature),
+		"signed_prekey_id":         spk.ProtocolKeyID,
+		"device_id":                hex.EncodeToString(binding.DeviceKey),
+		"device_binding_version":   binding.Version,
+		"device_identity_key":      base64.StdEncoding.EncodeToString(binding.DeviceIdentityKey),
+		"device_signing_key":       base64.StdEncoding.EncodeToString(binding.DeviceSigningKey),
+		"device_capabilities":      binding.Capabilities,
+		"device_binding_status":    uint8(binding.Status),
+		"device_account_signature": base64.StdEncoding.EncodeToString(binding.AccountSignature),
 	}
 
 	opk, err := s.db.ClaimOneTimePreKey(ctx, device.ID)
@@ -718,10 +780,16 @@ func (h *Handler) SearchUser(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, errorResp("user not found"))
 		return
 	}
+	if len(user.IdentityKey) != 32 || len(user.SigningKey) != ed25519.PublicKeySize {
+		log.Printf("search user_ref=%s has invalid public key material", logsafe.Ref("user", user.ID))
+		writeJSON(w, http.StatusConflict, errorResp("user cryptographic identity is invalid"))
+		return
+	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"user_id":      user.ID,
 		"username":     user.Username,
 		"identity_key": hex.EncodeToString(user.IdentityKey),
+		"signing_key":  hex.EncodeToString(user.SigningKey),
 	})
 }

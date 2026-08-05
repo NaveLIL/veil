@@ -29,13 +29,14 @@ const headerVeilUser = "X-Veil-Upload-User"
 // handler, the bearer middleware, the token-mint endpoint and the
 // background sweeper.
 type Service struct {
-	cfg       Config
-	tokenKey  []byte
-	store     Store
-	composer  *tusd.StoreComposer
-	tusHandle *tusd.Handler
-	fileStore filestore.FileStore
-	logger    *slog.Logger
+	cfg                Config
+	tokenKey           []byte
+	store              Store
+	composer           *tusd.StoreComposer
+	tusHandle          *tusd.Handler
+	fileStore          filestore.FileStore
+	logger             *slog.Logger
+	restAuthDispatcher *authmw.RESTAuthVersionDispatcher
 }
 
 // New wires a Service. tokenKey is the HMAC secret returned by
@@ -95,6 +96,12 @@ func New(cfg Config, tokenKey []byte, store Store, logger *slog.Logger) (*Servic
 // callers may still mount the routes — every request returns 503.
 func (s *Service) Enabled() bool { return len(s.tokenKey) >= MinTokenKeyLen }
 
+// SetRESTAuthVersionDispatcher activates the REST v2 boundary for the signed
+// token-mint endpoint. Bearer-authenticated tus routes remain unchanged.
+func (s *Service) SetRESTAuthVersionDispatcher(dispatcher *authmw.RESTAuthVersionDispatcher) {
+	s.restAuthDispatcher = dispatcher
+}
+
 // RegisterRoutes mounts:
 //
 //	POST   /v1/uploads/token              — signed (X-Veil triplet)
@@ -109,7 +116,13 @@ func (s *Service) RegisterRoutes(mux *http.ServeMux, signedMw *authmw.Middleware
 		if rl != nil {
 			f = rl.Wrap(f)
 		}
-		if signedMw != nil {
+		if s.restAuthDispatcher != nil {
+			jsonPolicy, err := authmw.NewRESTAuthV2JSONHTTPPolicy(4 << 10)
+			if err != nil {
+				panic("invalid uploads REST v2 JSON policy")
+			}
+			f = s.restAuthDispatcher.RequireSigned(jsonPolicy, f)
+		} else if signedMw != nil {
 			f = signedMw.RequireSigned(f)
 		}
 		return f
@@ -149,8 +162,8 @@ func (s *Service) handleIssueToken(w http.ResponseWriter, r *http.Request) {
 			map[string]string{"error": "uploads disabled"})
 		return
 	}
-	userID := r.Header.Get("X-Veil-User")
-	if userID == "" {
+	userID, ok := authmw.VerifiedUserID(r.Context())
+	if !ok {
 		writeJSON(w, http.StatusUnauthorized,
 			map[string]string{"error": "unauthenticated"})
 		return

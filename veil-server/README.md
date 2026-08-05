@@ -36,14 +36,72 @@ trailing DNS dot, Unicode host aliases, and parser-normalized spellings are
 rejected. Startup fails closed when the value is absent or invalid. It is never
 derived from `Host`, forwarded headers, redirects, or DNS.
 
-This began as the Phase 5S.3B-1 configuration foundation. The gateway now
-registers a separate experimental `/v3/events` endpoint backed by the WS v3
-verifier/admission work, while the primary `/ws` path remains legacy Preview WS
-auth v2. The endpoint's client/FFI/Android integration and two-Node evidence are
-not complete, so it is not a production cutover. The transport-neutral REST v2
-verifier and PostgreSQL replay migration also exist, but signed REST routes
-remain v1 until route media policy, replay operations, downgrade cutover, and
-two-Node relay evidence are complete.
+This began as the Phase 5S.3B-1 configuration foundation. The live authenticated
+transport is now `/v3/events`: desktop and Android use the same WS v3 barrier
+for commands and events, and all signed REST handlers use the REST v2 profile
+with the durable PostgreSQL replay store. Missing, legacy, mixed, duplicate, or
+unknown REST authentication fields fail closed.
+
+The legacy `/ws` route is disabled by default and returns HTTP 426 without
+upgrading. An operator may temporarily restore it only through the explicit
+emergency compatibility flag:
+
+```text
+VEIL_ALLOW_LEGACY_WS_V2=true
+```
+
+That flag re-enables origin-unbound WS v2 and therefore must not be used for a
+normal or production deployment. It exists for controlled rollback while old
+Preview clients are retired; clients never downgrade automatically. Hostile
+two-Node and independent-review evidence are still release gates, so this
+runtime cutover is not by itself a production-readiness claim.
+
+## Identity transparency rollout
+
+Identity Transparency v1 is an explicit, one-way per-origin rollout. It is
+disabled by default so an existing Node is never silently relabelled as having
+transparent identity history. A new empty Node can enable it with:
+
+```text
+VEIL_IDENTITY_TRANSPARENCY_ENABLED=true
+VEIL_IDENTITY_TRANSPARENCY_SIGNING_SEED=<canonical-unpadded-base64url-32-byte-seed>
+```
+
+The seed is a dedicated Ed25519 seed for transparency tree heads; it is not an
+account key, transport key, or TLS key. Store it in the deployment secret
+manager, keep recoverable offline backup material, and never rotate or replace
+it as an ordinary configuration change. The canonical public origin and the
+derived transparency public key permanently determine the log id.
+
+Startup performs a complete audit of the log head, every account registration,
+every device-binding version, every immutable leaf, and the compact Merkle
+nodes. It fails closed if the configured origin/key differs, if an event is
+missing or changed, or if a non-empty legacy Node has no existing audited log.
+There is intentionally no automatic legacy backfill. Such a deployment needs a
+separately specified and reviewed bootstrap ceremony before this flag may be
+enabled.
+
+When active, account creation and device-binding publication append their exact
+events in the same PostgreSQL transaction as the product mutation. Authenticated
+clients can request bounded inclusion/consistency proofs from:
+
+```text
+GET /v1/transparency/accounts/{account_uuid}?from_size={pinned_size}
+GET /v1/transparency/devices/{device_id}/bindings/{version}?from_size={pinned_size}
+```
+
+`GET /v1/prekeys/{identity_key}?transparency_from_size={pinned_size}` embeds the
+account and exact device-binding proof under one identical signed tree head.
+Desktop and Android verify these proofs and atomically advance a SQLCipher pin.
+After a pin exists, omission of the proofs is a sticky downgrade error. A Node
+that has never enabled transparency remains usable on first contact to preserve
+existing deployments, but it receives no transparency/verified security claim.
+
+Independent witnesses and client gossip are still an open release gate. Until
+they are active, the Node-signed append-only log protects against rollback in a
+client's observed history but cannot alone prevent a malicious Node from giving
+different first-time clients consistent-looking split views. Fingerprint/QR
+comparison remains the immediate out-of-band verification path.
 
 ## Account registration
 
@@ -58,7 +116,7 @@ VEIL_ALLOW_REGISTRATION=true
 Production Compose keeps this flag `false` unless the operator explicitly
 changes it. Invalid values fail startup instead of silently enabling access.
 
-## Current multi-device limitation
+## Current Direct multi-device limitation
 
 The X3DH prekey-bundle endpoints currently return a bundle for only the most
 recently seen device. A safe multi-device implementation needs a versioned

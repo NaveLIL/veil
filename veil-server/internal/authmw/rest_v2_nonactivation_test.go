@@ -43,6 +43,18 @@ var restAuthV2PrivateCallAllowlist = map[string]restAuthV2ConstructorDefinition{
 	},
 }
 
+var restAuthV2ReviewedLiveCallers = map[string]restAuthV2ConstructorDefinition{
+	"NewRESTAuthV2Verifier": {
+		file: filepath.Clean(filepath.Join("cmd", "gateway", "main.go")), function: "main",
+	},
+	"NewRESTAuthV2HTTPBoundary": {
+		file: filepath.Clean(filepath.Join("cmd", "gateway", "main.go")), function: "main",
+	},
+	"NewRESTAuthVersionDispatcher": {
+		file: filepath.Clean(filepath.Join("cmd", "gateway", "main.go")), function: "main",
+	},
+}
+
 var restAuthV2CompositeDefinitions = map[string]restAuthV2ConstructorDefinition{
 	"RESTAuthV2Verifier": {
 		file: filepath.Clean(filepath.Join("internal", "authmw", "rest_v2_verifier.go")), function: "newRESTAuthV2VerifierWithClock",
@@ -77,7 +89,7 @@ func restAuthV2ModuleRoot(t *testing.T) string {
 	}
 }
 
-func TestRESTAuthV2HTTPStackHasNoLiveCallSite(t *testing.T) {
+func TestRESTAuthV2HTTPStackHasOnlyReviewedLiveCallSites(t *testing.T) {
 	root := restAuthV2ModuleRoot(t)
 	fileSet := token.NewFileSet()
 	err := filepath.Walk(root, func(path string, info os.FileInfo, walkErr error) error {
@@ -150,6 +162,22 @@ func restAuthV2NonactivationViolations(
 				return true
 			})
 		}
+		for callable, definition := range restAuthV2ReviewedLiveCallers {
+			if relative != definition.file || function.Name.Name != definition.function {
+				continue
+			}
+			ast.Inspect(function.Body, func(node ast.Node) bool {
+				call, callOK := node.(*ast.CallExpr)
+				if !callOK {
+					return true
+				}
+				identifier := restAuthV2CalledIdentifier(call.Fun)
+				if identifier != nil && identifier.Name == callable {
+					allowedIdentifiers[identifier.Pos()] = struct{}{}
+				}
+				return true
+			})
+		}
 	}
 
 	position := func(node ast.Node) string { return fileSet.Position(node.Pos()).String() }
@@ -183,7 +211,7 @@ func restAuthV2NonactivationViolations(
 			if definition, guarded := restAuthV2CompositeDefinitions[candidate.Name.Name]; guarded && relative == definition.file {
 				break
 			}
-			if allowedFile, allowed := restAuthV2ReviewedContainerTypes[candidate.Name.Name]; allowed && relative == allowedFile {
+			if restAuthV2ReviewedContainerType(relative, candidate.Name.Name) {
 				break
 			}
 			if typeName := restAuthV2GuardedTypeWithin(candidate.Type); typeName != "" {
@@ -416,7 +444,37 @@ func restAuthV2GuardedTypeWithinFields(fields *ast.FieldList) string {
 
 func restAuthV2ReviewedConstructorFunction(relative, name string) bool {
 	definition, ok := restAuthV2CallableDefinitions[name]
-	return ok && relative == definition.file && name == definition.function
+	if ok && relative == definition.file && name == definition.function {
+		return true
+	}
+	if name != "SetRESTAuthVersionDispatcher" {
+		return false
+	}
+	return restAuthV2ReviewedRouteContainerFile(relative)
+}
+
+func restAuthV2ReviewedContainerType(relative, name string) bool {
+	if allowedFile, allowed := restAuthV2ReviewedContainerTypes[name]; allowed && relative == allowedFile {
+		return true
+	}
+	return (name == "Handler" || name == "Service") && restAuthV2ReviewedRouteContainerFile(relative)
+}
+
+func restAuthV2ReviewedRouteContainerFile(relative string) bool {
+	for _, path := range []string{
+		filepath.Join("internal", "auth", "handler.go"),
+		filepath.Join("internal", "chat", "handler.go"),
+		filepath.Join("internal", "mls", "handler.go"),
+		filepath.Join("internal", "profiles", "handler.go"),
+		filepath.Join("internal", "push", "handler.go"),
+		filepath.Join("internal", "servers", "handler.go"),
+		filepath.Join("internal", "uploads", "handler.go"),
+	} {
+		if relative == filepath.Clean(path) {
+			return true
+		}
+	}
+	return false
 }
 
 func restAuthV2GuardedType(typeName string) bool {

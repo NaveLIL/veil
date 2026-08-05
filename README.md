@@ -90,14 +90,13 @@ Access Pass и preview Veil Link. Узкий Secure Share Viewer заплани�
   локальном checkpoint. A04/A05 и cross-client
   E2EE/airplane matrix, connected recovery/capture instrumentation, app-wide
   публичные коды ошибок и подписанный standalone APK ещё входят в Phase 5A/5B.
-  Нативный Android Direct надёжно открывает и обслуживает только уже
-  аутентифицированный каталог существующих Direct. В beta baseline `f6dbf5a`
-  появились экраны и FFI/Kotlin/request scaffolding для поиска человека,
-  заявки в друзья и создания Direct, но flow ещё не работоспособен: generated
-  Kotlin bindings отстают, route/header расходятся с Go, а подготовленный
-  friend-request REST route отсутствует. Эти возможности обязательны для
-  функционального паритета с desktop и не выдаются за готовый mobile contact
-  flow.
+  Нативный Android Direct поддерживает аутентифицированный каталог, точный
+  account/origin-bound поиск контакта и создание Direct с повторной сверкой
+  ключей ответа. Для Direct доступен account-v2 safety number: UI получает
+  только emoji/hex fingerprint для точного Ready generation, а статус
+  `Verified on this device` записывается лишь после явного подтверждения
+  пользователем именно показанного digest. QR/camera-сверка и физическая
+  cross-client матрица ещё не закрыты.
   `PublicFailureCodeV1` покрывает Android identity setup и secure runtime gate,
   включая сохранение точной terminal-причины при React recreation, но Direct
   send/delivery и desktop/Go consumer parity открыты; MLS runtime и звонки не
@@ -131,7 +130,10 @@ integration blockers и локальной macOS x86_64 сборкой опуб�
 
 ## Security model и известные границы
 
-- DM используют X3DH + Double Ratchet. Группы и text Rooms используют
+- DM используют X3DH + Double Ratchet. Direct v2 дополнительно связывает
+  canonical Node origin, оба account UUID/identity, оба device binding и X3DH
+  transcript; после durable v2 commitment downgrade к Direct v1 запрещён.
+  Группы и text Rooms используют
   authenticated Sender Keys v5; изменение roster/access требует ротации, а
   незавершённая раздача блокирует отправку.
 - Локальный поиск не создаёт persistent plaintext index: Tantivy живёт только
@@ -146,6 +148,10 @@ integration blockers и локальной macOS x86_64 сборкой опуб�
 - Текущий TOFU service-mediated: key transparency ещё отсутствует. Статус
   `Verified on this device` появляется только после явного независимого
   сравнения fingerprint и не наследуется новым identity key.
+- Пополнение X3DH-инвентаря повторно публикует точный текущий signed prekey и
+  создаёт только новые монотонные OPK. Локальные SPK не удаляются без
+  подтверждённого grace/receive-протокола, поэтому отложенные initial messages
+  не становятся недешифруемыми.
 - Veil Node неизбежно видит routing metadata: размеры, время, account/
   conversation membership и сетевые адреса. E2EE не скрывает эти данные.
 - Один account locator включает canonical server origin, user ID и identity
@@ -190,15 +196,14 @@ Gateway разработки публикуется только на `127.0.0.1
 публичного proxy значение нужно явно заменить на его exact HTTPS origin.
 Отсутствующее или неканоническое значение блокирует gateway fail closed.
 
-Это configured-origin foundation, а не завершённый protocol cutover. Gateway
-теперь регистрирует отдельный экспериментальный `/v3/events`, а Rust/FFI/Android
-содержат первый background-events consumer; основной `/ws` остаётся legacy
-Preview WS auth v2. Новый endpoint ещё не проходит полный workspace build и не
-имеет законченного generated-Kotlin/cross-client/two-Node evidence. REST v2
-private preparer, HTTP boundary, version dispatcher и PostgreSQL replay boundary
-по-прежнему не подключены к live routes, а signed REST остаётся v1. До полного
-route/media/ServeMux cutover, relay-матрицы и независимого review эти компоненты
-не являются production-готовностью или новой live криптографической гарантией.
+Live transport переведён на origin-bound контракты: desktop и Android используют
+`/v3/events` для единого authenticated command/event socket, а signed REST
+routes принимают только REST v2 с durable PostgreSQL replay protection. Legacy
+`/ws` по умолчанию не upgrade-ится и отвечает `426`; его можно временно вернуть
+только явным аварийным `VEIL_ALLOW_LEGACY_WS_V2=true`. Клиенты downgrade не
+делают. Полный cross-client/hostile two-Node evidence и независимый review всё
+ещё остаются release gates, поэтому сам runtime cutover не является заявлением
+о production-готовности всей криптосистемы.
 
 Uploads и push намеренно fail closed, пока не заданы их ключи:
 

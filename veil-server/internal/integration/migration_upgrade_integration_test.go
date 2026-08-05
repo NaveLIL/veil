@@ -1393,18 +1393,205 @@ func TestMigrationUpgradePreflights(t *testing.T) {
 		}
 	})
 
-	t.Run("fresh migration chain includes and applies 001 through 030", func(t *testing.T) {
+	t.Run("031 preserves legacy rows and enforces exact Direct v2 context", func(t *testing.T) {
+		pool := newMigrationDatabase(t, admin, baseDSN, "veil_migration_031")
+		applyMigrationsBefore(t, pool, migrations, 31)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		var senderID string
+		if err := pool.QueryRow(ctx,
+			`INSERT INTO users(identity_key, signing_key, username)
+				 VALUES ($1, $2, 'direct-v2-migration-sender') RETURNING id::text`,
+			bytes.Repeat([]byte{0x11}, 32), bytes.Repeat([]byte{0x12}, 32),
+		).Scan(&senderID); err != nil {
+			t.Fatal(err)
+		}
+		var directConversationID, groupConversationID string
+		if err := pool.QueryRow(ctx,
+			`INSERT INTO conversations(conv_type, name)
+				 VALUES (0, '031-direct') RETURNING id::text`,
+		).Scan(&directConversationID); err != nil {
+			t.Fatal(err)
+		}
+		if err := pool.QueryRow(ctx,
+			`INSERT INTO conversations(conv_type, name)
+				 VALUES (1, '031-group') RETURNING id::text`,
+		).Scan(&groupConversationID); err != nil {
+			t.Fatal(err)
+		}
+
+		var legacyMessageID, senderKeyMessageID string
+		if err := pool.QueryRow(ctx,
+			`INSERT INTO messages(conversation_id, sender_id, ciphertext, header)
+				 VALUES ($1::uuid, $2::uuid, $3, $4) RETURNING id::text`,
+			directConversationID, senderID, []byte("legacy-direct"), []byte{0x01},
+		).Scan(&legacyMessageID); err != nil {
+			t.Fatalf("insert pre-031 legacy Direct row: %v", err)
+		}
+		if err := pool.QueryRow(ctx,
+			`INSERT INTO messages(
+				   conversation_id, sender_id, ciphertext, header,
+				   crypto_profile, crypto_era, roster_version, roster_commitment,
+				   sender_device_id, sender_binding_version
+				 ) VALUES ($1::uuid, $2::uuid, $3, $4, 'sender_key_v5', 1, 9, $5, $6, 7)
+				 RETURNING id::text`,
+			groupConversationID, senderID, []byte("sender-key"), []byte{0x05},
+			bytes.Repeat([]byte{0x21}, 32), bytes.Repeat([]byte{0x22}, 16),
+		).Scan(&senderKeyMessageID); err != nil {
+			t.Fatalf("insert pre-031 Sender-Key row: %v", err)
+		}
+
+		if err := execMigration(t, pool, migrations, 31); err != nil {
+			t.Fatalf("migration 031: %v", err)
+		}
+
+		var legacyRows, senderKeyRows int
+		if err := pool.QueryRow(ctx,
+			`SELECT count(*) FROM messages
+				 WHERE id=$1::uuid
+				   AND crypto_profile IS NULL AND target_device_id IS NULL
+				   AND direct_session_id IS NULL AND sender_account_signature IS NULL`,
+			legacyMessageID,
+		).Scan(&legacyRows); err != nil || legacyRows != 1 {
+			t.Fatalf("legacy Direct rows=%d err=%v, want preserved all-NULL context", legacyRows, err)
+		}
+		if err := pool.QueryRow(ctx,
+			`SELECT count(*) FROM messages
+				 WHERE id=$1::uuid AND crypto_profile='sender_key_v5'
+				   AND target_device_id IS NULL AND direct_session_id IS NULL
+				   AND sender_device_identity_key IS NULL AND sender_account_signature IS NULL`,
+			senderKeyMessageID,
+		).Scan(&senderKeyRows); err != nil || senderKeyRows != 1 {
+			t.Fatalf("Sender-Key rows=%d err=%v, want preserved profile-specific context", senderKeyRows, err)
+		}
+
+		senderDeviceID := bytes.Repeat([]byte{0x31}, 16)
+		targetDeviceID := bytes.Repeat([]byte{0x32}, 16)
+		directSessionID := bytes.Repeat([]byte{0x33}, 32)
+		identityKey := bytes.Repeat([]byte{0x34}, 32)
+		signingKey := bytes.Repeat([]byte{0x35}, 32)
+		accountSignature := bytes.Repeat([]byte{0x36}, 64)
+		var directV2MessageID string
+		if err := pool.QueryRow(ctx,
+			`INSERT INTO messages(
+				   conversation_id, sender_id, ciphertext, header,
+				   crypto_profile, crypto_era, sender_device_id, sender_binding_version,
+				   target_device_id, target_binding_version, direct_session_id,
+				   sender_device_identity_key, sender_device_signing_key,
+				   sender_device_capabilities, sender_device_binding_status,
+				   sender_account_signature
+				 ) VALUES (
+				   $1::uuid, $2::uuid, $3, $4, 'direct_v2', 1, $5, 7,
+				   $6, 8, $7, $8, $9, 3, 1, $10
+				 ) RETURNING id::text`,
+			directConversationID, senderID, []byte("direct-v2"), []byte{0x11},
+			senderDeviceID, targetDeviceID, directSessionID,
+			identityKey, signingKey, accountSignature,
+		).Scan(&directV2MessageID); err != nil {
+			t.Fatalf("insert valid Direct v2 row: %v", err)
+		}
+
+		for name, mutation := range map[string]struct {
+			sessionID   []byte
+			targetID    []byte
+			identityKey []byte
+			signingKey  []byte
+			signature   []byte
+		}{
+			"zero session": {
+				sessionID: make([]byte, 32), targetID: targetDeviceID,
+				identityKey: identityKey, signingKey: signingKey, signature: accountSignature,
+			},
+			"sender target collision": {
+				sessionID: directSessionID, targetID: senderDeviceID,
+				identityKey: identityKey, signingKey: signingKey, signature: accountSignature,
+			},
+			"zero identity key": {
+				sessionID: directSessionID, targetID: targetDeviceID,
+				identityKey: make([]byte, 32), signingKey: signingKey, signature: accountSignature,
+			},
+			"key collision": {
+				sessionID: directSessionID, targetID: targetDeviceID,
+				identityKey: identityKey, signingKey: identityKey, signature: accountSignature,
+			},
+			"zero signature": {
+				sessionID: directSessionID, targetID: targetDeviceID,
+				identityKey: identityKey, signingKey: signingKey, signature: make([]byte, 64),
+			},
+		} {
+			t.Run(name, func(t *testing.T) {
+				_, err := pool.Exec(ctx,
+					`INSERT INTO messages(
+						   conversation_id, sender_id, ciphertext, crypto_profile, crypto_era,
+						   sender_device_id, sender_binding_version,
+						   target_device_id, target_binding_version, direct_session_id,
+						   sender_device_identity_key, sender_device_signing_key,
+						   sender_device_capabilities, sender_device_binding_status,
+						   sender_account_signature
+						 ) VALUES ($1::uuid, $2::uuid, $3, 'direct_v2', 1, $4, 7, $5, 8, $6, $7, $8, 3, 1, $9)`,
+					directConversationID, senderID, []byte("invalid-direct-v2"),
+					senderDeviceID, mutation.targetID, mutation.sessionID,
+					mutation.identityKey, mutation.signingKey, mutation.signature,
+				)
+				requireMigrationError(t, err, "23514", "messages_security_context_all_or_none")
+			})
+		}
+
+		_, err := pool.Exec(ctx,
+			`INSERT INTO messages(
+				   conversation_id, sender_id, ciphertext,
+				   crypto_profile, crypto_era, roster_version, roster_commitment,
+				   sender_device_id, sender_binding_version
+				 ) VALUES ($1::uuid, $2::uuid, $3, 'sender_key_v5', 1, 1, $4, $5, 1)`,
+			directConversationID, senderID, []byte("profile-smuggling"),
+			bytes.Repeat([]byte{0x41}, 32), bytes.Repeat([]byte{0x42}, 16),
+		)
+		requireMigrationError(t, err, "23514", "direct-message row has an invalid crypto profile")
+
+		_, err = pool.Exec(ctx,
+			`INSERT INTO messages(
+				   conversation_id, sender_id, ciphertext, crypto_profile, crypto_era,
+				   sender_device_id, sender_binding_version,
+				   target_device_id, target_binding_version, direct_session_id,
+				   sender_device_identity_key, sender_device_signing_key,
+				   sender_device_capabilities, sender_device_binding_status,
+				   sender_account_signature
+				 ) VALUES ($1::uuid, $2::uuid, $3, 'direct_v2', 1, $4, 7, $5, 8, $6, $7, $8, 3, 1, $9)`,
+			groupConversationID, senderID, []byte("cross-profile"),
+			senderDeviceID, targetDeviceID, directSessionID,
+			identityKey, signingKey, accountSignature,
+		)
+		requireMigrationError(t, err, "23514", "new group/channel message requires persisted Sender-Key security context")
+
+		_, err = pool.Exec(ctx,
+			`UPDATE messages SET ciphertext=$1 WHERE id=$2::uuid`,
+			[]byte("mutated-direct-v2"), directV2MessageID,
+		)
+		requireMigrationError(t, err, "23514", "versioned secure ciphertext edits require a new exact routing protocol")
+
+		var targetIndexes int
+		if err := pool.QueryRow(ctx,
+			`SELECT count(*) FROM pg_indexes
+				 WHERE schemaname=current_schema() AND tablename='messages'
+				   AND indexname='idx_messages_direct_v2_target'`,
+		).Scan(&targetIndexes); err != nil || targetIndexes != 1 {
+			t.Fatalf("Direct v2 target indexes=%d err=%v, want 1", targetIndexes, err)
+		}
+	})
+
+	t.Run("fresh migration chain includes and applies 001 through 031", func(t *testing.T) {
 		pool := newMigrationDatabase(t, admin, baseDSN, "veil_migration_fresh")
 		seen := make(map[int]bool)
 		for _, item := range migrations {
 			seen[migrationNumber(t, item.name)] = true
 		}
-		for number := 1; number <= 30; number++ {
+		for number := 1; number <= 31; number++ {
 			if !seen[number] {
 				t.Fatalf("migration chain is missing %03d", number)
 			}
 		}
-		applyMigrationsBefore(t, pool, migrations, 31)
+		applyMigrationsBefore(t, pool, migrations, 32)
 	})
 }
 

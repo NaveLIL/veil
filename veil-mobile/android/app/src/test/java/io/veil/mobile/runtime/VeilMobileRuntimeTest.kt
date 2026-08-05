@@ -43,6 +43,8 @@ import uniffi.veil_ffi.MobileDirectRestRequest
 import uniffi.veil_ffi.MobileDirectSendReadiness
 import uniffi.veil_ffi.MobileDirectSyncLease
 import uniffi.veil_ffi.MobileRetryableReason
+import uniffi.veil_ffi.MobileWsEventsCallback
+import uniffi.veil_ffi.MobileWsEventsController
 import uniffi.veil_ffi.RestSignatureData
 import uniffi.veil_ffi.VeilException
 
@@ -324,7 +326,7 @@ class VeilMobileRuntimeTest {
 
       assertEquals(1, fakeSession.plainConnectCount)
       assertEquals(0, fakeSession.accessPassConnectCount)
-      assertEquals("wss://resume.example:443/ws", fakeSession.websocketUrl)
+      assertEquals("wss://resume.example:443/v3/events", fakeSession.websocketUrl)
       assertEquals("https://resume.example:443", fakeSession.canonicalOrigin)
       assertEquals(NativeConnectionState.CONNECTED, runtime.snapshot().connectionState)
       assertEquals(USER_ID, runtime.snapshot().binding?.userId)
@@ -898,6 +900,115 @@ class VeilMobileRuntimeTest {
   }
 
   @Test
+  fun directIdentityVerificationRequiresTheExactReadyGenerationAndFingerprint() {
+    val executor = daemonExecutor()
+    val fakeSession = FakeSession()
+    val transport = ControllableDirectTransport()
+    val runtime = runtime(executor, fakeSession, directTransport = transport)
+    val conversation = directConversation("10", "Alice", "11", "alice", needsPreKey = false)
+    val fingerprint = "ab".repeat(32)
+    val qrPayload = "veil-identity:account-v2:$fingerprint"
+    fakeSession.directoryInstalls.clear()
+    fakeSession.directoryInstalls.add(
+      NativeDirectDirectoryInstall(listOf(conversation), directoryComplete = true),
+    )
+    try {
+      runtime.openSession()
+      val binding = runtime.connect("https://access.example")
+      completeOwnPreKeyBootstrap(runtime, transport)
+      transport.completeNext(NativeDirectHttpResult.Success("directory-ready".toByteArray()))
+      awaitRuntimeIdle(runtime)
+      forceDirectoryReadyForProjectionTest(runtime)
+      val generation = checkNotNull(runtime.snapshot().directGeneration)
+      fakeSession.directIdentityVerification = NativeDirectIdentityVerification(
+        canonicalServerOrigin = binding.canonicalServerOrigin,
+        peerUserId = conversation.peerUserId,
+        peerIdentityKeyHex = "11".repeat(32),
+        peerSigningKeyHex = "22".repeat(32),
+        fingerprintVersion = "account_v2",
+        fingerprintEmoji = "🔒🛡️🗝️⚡",
+        fingerprintHex = fingerprint,
+        qrPayload = qrPayload,
+        state = NativeDirectIdentityVerificationState.NOT_COMPARED,
+      )
+
+      val shown = AtomicReference<NativeDirectIdentityVerification?>()
+      runtime.publishDirectIdentityVerification(
+        conversation.conversationId,
+        generation,
+        null,
+      ) { shown.set(it) }
+      assertEquals(NativeDirectIdentityVerificationState.NOT_COMPARED, shown.get()?.state)
+      assertEquals(1, fakeSession.directIdentityVerificationCount)
+
+      val confirmed = AtomicReference<NativeDirectIdentityVerification?>()
+      runtime.publishDirectIdentityVerification(
+        conversation.conversationId,
+        generation,
+        fingerprint,
+      ) { confirmed.set(it) }
+      assertEquals(
+        NativeDirectIdentityVerificationState.VERIFIED_ON_THIS_DEVICE,
+        confirmed.get()?.state,
+      )
+      assertEquals(1, fakeSession.directIdentityConfirmationCount)
+
+      val qrConfirmed = AtomicReference<NativeDirectIdentityVerification?>()
+      runtime.publishDirectIdentityVerificationQr(
+        conversation.conversationId,
+        generation,
+        qrPayload,
+      ) { qrConfirmed.set(it) }
+      assertEquals(
+        NativeDirectIdentityVerificationState.VERIFIED_ON_THIS_DEVICE,
+        qrConfirmed.get()?.state,
+      )
+      assertEquals(1, fakeSession.directIdentityQrConfirmationCount)
+
+      val malformedQr = AtomicReference<NativeDirectIdentityVerification?>()
+      runtime.publishDirectIdentityVerificationQr(
+        conversation.conversationId,
+        generation,
+        "veil-identity:account-v1:$fingerprint",
+      ) { malformedQr.set(it) }
+      assertNull(malformedQr.get())
+      assertEquals(1, fakeSession.directIdentityQrConfirmationCount)
+
+      val stale = AtomicReference<NativeDirectIdentityVerification?>()
+      runtime.publishDirectIdentityVerification(
+        conversation.conversationId,
+        generation + 1,
+        fingerprint,
+      ) { stale.set(it) }
+      assertNull(stale.get())
+      assertEquals(1, fakeSession.directIdentityConfirmationCount)
+
+      val staleQr = AtomicReference<NativeDirectIdentityVerification?>()
+      runtime.publishDirectIdentityVerificationQr(
+        conversation.conversationId,
+        generation + 1,
+        qrPayload,
+      ) { staleQr.set(it) }
+      assertNull(staleQr.get())
+      assertEquals(1, fakeSession.directIdentityQrConfirmationCount)
+
+      fakeSession.directIdentityVerification = confirmed.get()?.copy(
+        canonicalServerOrigin = "https://other.example:443",
+      )
+      val mismatched = AtomicReference<NativeDirectIdentityVerification?>()
+      runtime.publishDirectIdentityVerification(
+        conversation.conversationId,
+        generation,
+        null,
+      ) { mismatched.set(it) }
+      assertNull(mismatched.get())
+    } finally {
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
   fun directProjectionRejectsAnOldSameSessionReconnectGenerationAfterNativeReturns() {
     val executor = daemonExecutor()
     val fakeSession = FakeSession()
@@ -1081,7 +1192,7 @@ class VeilMobileRuntimeTest {
       assertEquals(NativeSessionState.OPEN, runtime.openSession().sessionState)
       val binding = runtime.connect("https://CHAT.Example")
       assertEquals("https://chat.example:443", binding.canonicalServerOrigin)
-      assertEquals("wss://chat.example:443/ws", fakeSession.websocketUrl)
+      assertEquals("wss://chat.example:443/v3/events", fakeSession.websocketUrl)
       assertEquals(NativeConnectionState.CONNECTED, runtime.snapshot().connectionState)
 
       assertEquals(NativeConnectionState.DISCONNECTED, runtime.disconnect().connectionState)
@@ -3074,7 +3185,10 @@ class VeilMobileRuntimeTest {
       assertEquals(requestCount + 1, transport.requests.size)
       assertEquals(1, transport.pendingCount())
       assertEquals(NativeDirectHttpMethod.GET, transport.requests.last().method)
-      assertEquals("/v1/prekeys/${"cd".repeat(32)}", transport.requests.last().requestTarget)
+      assertEquals(
+        "/v1/prekeys/${"cd".repeat(32)}?transparency_from_size=0",
+        transport.requests.last().requestTarget,
+      )
       assertEquals(NativeDirectHttpLimits.PREKEY_BYTES, transport.requests.last().responseLimitBytes)
       assertTrue(transport.requests.last().body.isEmpty())
       assertArrayEquals(expectedUtf8, fakeSession.directTextPlaintextReferences.single())
@@ -4339,7 +4453,10 @@ class VeilMobileRuntimeTest {
       assertEquals(1, transport.pendingCount())
       val request = transport.requests.last()
       assertEquals(NativeDirectHttpMethod.GET, request.method)
-      assertEquals("/v1/prekeys/${"cd".repeat(32)}", request.requestTarget)
+      assertEquals(
+        "/v1/prekeys/${"cd".repeat(32)}?transparency_from_size=0",
+        request.requestTarget,
+      )
       assertEquals(NativeDirectHttpLimits.PREKEY_BYTES, request.responseLimitBytes)
       assertTrue(request.body.isEmpty())
       assertTrue(transport.calls.last().started.get())
@@ -4889,9 +5006,12 @@ class VeilMobileRuntimeTest {
     )
     val request = generatedRequest.toNativeDirectRestRequest()
     val signature = RestSignatureData(
+      version = "2",
       userId = USER_ID,
       timestampMs = "1712345678901",
-      signatureBase64 = signatureValue,
+      nonceBase64url = Base64.getUrlEncoder().withoutPadding()
+        .encodeToString(ByteArray(32) { 0x42 }),
+      signatureBase64url = signatureValue,
     ).toNativeRestSignature()
 
     assertEquals(leaseToken, lease.leaseToken)
@@ -4903,9 +5023,10 @@ class VeilMobileRuntimeTest {
     assertArrayEquals(requestBody, request.body)
     assertTrue(generatedRequest.body.all { it == 0.toByte() })
     assertEquals(NativeDirectHttpLimits.OWN_PREKEY_UPLOAD_BYTES, request.responseLimitBytes)
+    assertEquals("2", signature.version)
     assertEquals(USER_ID, signature.userId)
     assertEquals("1712345678901", signature.timestampMs)
-    assertEquals(signatureValue, signature.signatureBase64)
+    assertEquals(signatureValue, signature.signatureBase64url)
     assertFalse(lease.toString().contains(leaseToken))
     assertFalse(request.toString().contains(requestToken))
     assertFalse(request.toString().contains(requestTarget))
@@ -5565,6 +5686,10 @@ class VeilMobileRuntimeTest {
     @Volatile var directProjectionEntered: CountDownLatch? = null
     @Volatile var directProjectionRelease: CountDownLatch? = null
     @Volatile var directProjectionFailure: Throwable? = null
+    var directIdentityVerificationCount = 0
+    var directIdentityConfirmationCount = 0
+    var directIdentityQrConfirmationCount = 0
+    @Volatile var directIdentityVerification: NativeDirectIdentityVerification? = null
     @Volatile var directReplayEntered: CountDownLatch? = null
     @Volatile var directReplayRelease: CountDownLatch? = null
     var failLiveBufferPump = false
@@ -5608,6 +5733,11 @@ class VeilMobileRuntimeTest {
     @Volatile var disconnectRelease: CountDownLatch? = null
     @Volatile var disconnectFailure: Throwable? = null
     private val inConnect = AtomicBoolean(false)
+    val contactIdentityKey = ByteArray(32) { index -> (index + 1).toByte() }
+    val contactSigningKey = ByteArray(32) { index -> (index + 65).toByte() }
+    var contactUserId = "550e8400-e29b-41d4-a716-446655440002"
+    var contactUsername = "alice"
+    var createdConversationId = "550e8400-e29b-41d4-a716-446655440003"
 
     override fun mobileReconnectTarget(): NativeMobileReconnectTarget? {
       storedReconnectTargetLoadCount += 1
@@ -5840,6 +5970,35 @@ class VeilMobileRuntimeTest {
       return directProjection
     }
 
+    override fun directIdentityVerification(
+      conversationId: String,
+    ): NativeDirectIdentityVerification? {
+      directIdentityVerificationCount += 1
+      return directIdentityVerification
+    }
+
+    override fun confirmDirectIdentityVerification(
+      conversationId: String,
+      expectedFingerprintHex: String,
+    ): NativeDirectIdentityVerification? {
+      directIdentityConfirmationCount += 1
+      val current = directIdentityVerification ?: return null
+      if (current.fingerprintHex != expectedFingerprintHex) return null
+      return current.copy(state = NativeDirectIdentityVerificationState.VERIFIED_ON_THIS_DEVICE)
+        .also { directIdentityVerification = it }
+    }
+
+    override fun confirmDirectIdentityVerificationQr(
+      conversationId: String,
+      scannedQrPayload: String,
+    ): NativeDirectIdentityVerification? {
+      directIdentityQrConfirmationCount += 1
+      val current = directIdentityVerification ?: return null
+      if (current.qrPayload != scannedQrPayload) return null
+      return current.copy(state = NativeDirectIdentityVerificationState.VERIFIED_ON_THIS_DEVICE)
+        .also { directIdentityVerification = it }
+    }
+
     override fun directSendReadiness(
       leaseToken: String,
       conversationId: String,
@@ -5875,7 +6034,7 @@ class VeilMobileRuntimeTest {
         NativeDirectRestRequest(
           requestToken = "test-peer-prekey-request-$peerPreKeyRequestCount",
           method = "GET",
-          requestTarget = "/v1/prekeys/${"cd".repeat(32)}",
+          requestTarget = "/v1/prekeys/${"cd".repeat(32)}?transparency_from_size=0",
           body = byteArrayOf(),
           responseLimitBytes = NativeDirectHttpLimits.PREKEY_BYTES,
         ),
@@ -5904,6 +6063,60 @@ class VeilMobileRuntimeTest {
       return NativeDirectPreKeyInstall(peerPreKeyInstallStatus)
     }
 
+    override fun startBackgroundEvents(
+      deviceName: String,
+      clientVersion: String,
+      callback: MobileWsEventsCallback,
+    ): MobileWsEventsController = throw UnsupportedOperationException("not used by runtime unit tests")
+
+    override fun prepareContactSearchRequest(username: String): NativeContactRequest =
+      NativeContactRequest(
+        method = "GET",
+        requestTarget = "/v1/users/search?username=$username",
+        body = byteArrayOf(),
+        signature = testRestSignature(),
+      )
+
+    override fun parseContactSearchResponse(response: ByteArray): NativeContactSearchResult =
+      NativeContactSearchResult(
+        userId = contactUserId,
+        username = contactUsername,
+        identityKey = contactIdentityKey.copyOf(),
+        signingKey = contactSigningKey.copyOf(),
+      ).also { response.fill(0) }
+
+    override fun prepareCreateDirectRequest(peerUserId: String): NativeContactRequest =
+      NativeContactRequest(
+        method = "POST",
+        requestTarget = "/v1/conversations/dm",
+        body = "{\"peer_user_id\":\"$peerUserId\"}".toByteArray(),
+        signature = testRestSignature(),
+      )
+
+    override fun parseCreateDirectResponse(response: ByteArray): NativeDirectCreatedConversation =
+      NativeDirectCreatedConversation(
+        conversationId = createdConversationId,
+        peerIdentityKey = contactIdentityKey.copyOf(),
+        peerSigningKey = contactSigningKey.copyOf(),
+      ).also { response.fill(0) }
+
+    override fun installDirectConversation(
+      leaseToken: String,
+      conversationId: String,
+      peerUserId: String,
+      peerIdentityKey: ByteArray,
+      peerSigningKey: ByteArray,
+    ): NativeDirectConversationInstallOutcome {
+      check(leaseToken == "test-direct-lease")
+      check(conversationId == createdConversationId)
+      check(peerUserId == contactUserId)
+      check(peerIdentityKey.contentEquals(contactIdentityKey))
+      check(peerSigningKey.contentEquals(contactSigningKey))
+      peerIdentityKey.fill(0)
+      peerSigningKey.fill(0)
+      return NativeDirectConversationInstallOutcome.INSTALLED
+    }
+
     override fun cancelDirectSync(leaseToken: String) {
       directLeaseCancellations += 1
       lifecycleEvents.add("cancel-direct")
@@ -5928,12 +6141,18 @@ class VeilMobileRuntimeTest {
       signedRequestCopies.add(
         SignedRequestCopy(prepared.method, prepared.requestTarget, prepared.body.copyOf()),
       )
-      return NativeRestSignature(
-        userId = USER_ID,
-        timestampMs = "1712345678901",
-        signatureBase64 = Base64.getEncoder().encodeToString(ByteArray(64)),
-      )
+      return testRestSignature()
     }
+
+    private fun testRestSignature(): NativeRestSignature = NativeRestSignature(
+      version = "2",
+      userId = USER_ID,
+      timestampMs = "1712345678901",
+      nonceBase64url = Base64.getUrlEncoder().withoutPadding()
+        .encodeToString(ByteArray(32) { 0x41 }),
+      signatureBase64url = Base64.getUrlEncoder().withoutPadding()
+        .encodeToString(ByteArray(64)),
+    )
 
     override fun disconnect() {
       lifecycleEvents.add("disconnect")

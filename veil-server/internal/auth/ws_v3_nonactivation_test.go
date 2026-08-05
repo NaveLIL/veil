@@ -13,27 +13,43 @@ import (
 	"testing"
 )
 
-// TestWSAuthV3HasNoProductionActivationCallsite is an executable activation
-// barrier. Generated v3 types are not capability negotiation: until the live
-// cutover is separately reviewed, no production Go code may issue or verify a
-// v3 challenge. The verifier's one transport-neutral admission call is the
-// only intentional production call in this foundation.
-func TestWSAuthV3HasNoProductionActivationCallsite(t *testing.T) {
+type wsAuthV3AllowedCallsite struct {
+	path      string
+	enclosing string
+}
+
+// TestWSAuthV3ActivationIsConfinedToReviewedEndpoint is an executable
+// activation boundary. WS auth v3 is live only on the dedicated /v3/events
+// route: future callsites must fail this test until they receive an explicit
+// protocol and downgrade review.
+func TestWSAuthV3ActivationIsConfinedToReviewedEndpoint(t *testing.T) {
 	t.Helper()
 	_, thisFile, _, ok := runtime.Caller(0)
 	if !ok {
 		t.Fatal("locate nonactivation test source")
 	}
 	repositoryRoot := filepath.Clean(filepath.Join(filepath.Dir(thisFile), "..", "..", ".."))
-	targets := map[string]struct{}{
-		"CreateChallengeV3": {},
-		"VerifyResponseV3":  {},
-		"AdmitWSAuthV3":     {},
+	allowed := map[string]wsAuthV3AllowedCallsite{
+		"HandleWebSocketV3": {
+			path: "veil-server/cmd/gateway/main.go", enclosing: "main",
+		},
+		"CreateChallengeV3": {
+			path: "veil-server/internal/gateway/ws_v3.go", enclosing: "runWSAuthV3",
+		},
+		"VerifyResponseV3": {
+			path: "veil-server/internal/gateway/ws_v3.go", enclosing: "runWSAuthV3",
+		},
+		"AdmitWSAuthV3": {
+			path: "veil-server/internal/auth/ws_v3_verifier.go", enclosing: "VerifyResponseV3",
+		},
 	}
-	const allowedPath = "veil-server/internal/auth/ws_v3_verifier.go"
+	targets := make(map[string]struct{}, len(allowed))
+	for name := range allowed {
+		targets[name] = struct{}{}
+	}
 
 	var violations []string
-	allowedAdmissionCalls := 0
+	allowedCalls := make(map[string]int, len(allowed))
 	walkErr := filepath.WalkDir(repositoryRoot, func(path string, entry fs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -68,9 +84,10 @@ func TestWSAuthV3HasNoProductionActivationCallsite(t *testing.T) {
 				enclosing = function.Name.Name
 			}
 			for _, reference := range wsAuthV3TargetReferences(declaration, targets) {
-				if reference.directCall && reference.name == "AdmitWSAuthV3" &&
-					relativePath == allowedPath && enclosing == "VerifyResponseV3" {
-					allowedAdmissionCalls++
+				callsite, isAllowed := allowed[reference.name]
+				if reference.directCall && isAllowed && relativePath == callsite.path &&
+					enclosing == callsite.enclosing {
+					allowedCalls[reference.name]++
 					continue
 				}
 				position := fileSet.Position(reference.position)
@@ -88,10 +105,12 @@ func TestWSAuthV3HasNoProductionActivationCallsite(t *testing.T) {
 	if walkErr != nil {
 		t.Fatal(walkErr)
 	}
-	if allowedAdmissionCalls != 1 {
-		violations = append(violations, fmt.Sprintf(
-			"allowed verifier-to-admission call count = %d, want exactly 1", allowedAdmissionCalls,
-		))
+	for name := range allowed {
+		if allowedCalls[name] != 1 {
+			violations = append(violations, fmt.Sprintf(
+				"reviewed %s call count = %d, want exactly 1", name, allowedCalls[name],
+			))
+		}
 	}
 	if len(violations) != 0 {
 		sort.Strings(violations)

@@ -16,9 +16,11 @@ pub mod connection;
 mod device_identity;
 pub mod direct;
 pub mod direct_history;
+mod direct_v2;
 pub mod prekeys;
 pub mod protocol;
 mod rest_auth_v2;
+pub mod transparency;
 mod ws_auth_v3;
 pub mod ws_events_v3;
 

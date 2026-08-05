@@ -1,6 +1,9 @@
 package config_test
 
 import (
+	"bytes"
+	"encoding/base64"
+	"encoding/hex"
 	"os"
 	"testing"
 	"time"
@@ -23,6 +26,7 @@ func TestLoadDefaultsWithExplicitDevOptIn(t *testing.T) {
 	t.Setenv("AUTH_CHALLENGE_TTL", "")
 	t.Setenv("AUTH_MAX_ATTEMPTS", "")
 	t.Setenv("VEIL_ALLOW_REGISTRATION", "")
+	t.Setenv("VEIL_ALLOW_LEGACY_WS_V2", "")
 
 	cfg, err := config.Load()
 	if err != nil {
@@ -41,6 +45,9 @@ func TestLoadDefaultsWithExplicitDevOptIn(t *testing.T) {
 	if cfg.AllowRegistration {
 		t.Error("default AllowRegistration = true, want fail-closed false")
 	}
+	if cfg.AllowLegacyWSV2 {
+		t.Error("default AllowLegacyWSV2 = true, want fail-closed false")
+	}
 	if cfg.MaxMessageSize != 64*1024 {
 		t.Errorf("default MaxMessageSize = %d, want %d", cfg.MaxMessageSize, 64*1024)
 	}
@@ -57,6 +64,7 @@ func TestLoadFromEnv(t *testing.T) {
 	t.Setenv("AUTH_CHALLENGE_TTL", "1m")
 	t.Setenv("AUTH_MAX_ATTEMPTS", "5")
 	t.Setenv("VEIL_ALLOW_REGISTRATION", "true")
+	t.Setenv("VEIL_ALLOW_LEGACY_WS_V2", "true")
 
 	cfg, err := config.Load()
 	if err != nil {
@@ -74,6 +82,9 @@ func TestLoadFromEnv(t *testing.T) {
 	}
 	if !cfg.AllowRegistration {
 		t.Error("AllowRegistration = false, want true")
+	}
+	if !cfg.AllowLegacyWSV2 {
+		t.Error("AllowLegacyWSV2 = false, want true")
 	}
 	if !cfg.PublicOrigin.IsZero() {
 		t.Errorf("PublicOrigin = %q, want empty for shared Load", cfg.PublicOrigin.String())
@@ -145,6 +156,106 @@ func TestLoadGatewayRejectsNonCanonicalPublicOrigin(t *testing.T) {
 			t.Setenv("VEIL_PUBLIC_ORIGIN", value)
 			if _, err := config.LoadGateway(); err == nil {
 				t.Fatalf("LoadGateway accepted non-canonical VEIL_PUBLIC_ORIGIN %q", value)
+			}
+		})
+	}
+}
+
+func TestLoadGatewayIdentityTransparencyIsExplicitAndStrict(t *testing.T) {
+	setGatewayDatabaseEnv(t)
+	t.Setenv("VEIL_PUBLIC_ORIGIN", "https://veil.example:443")
+	canonicalSeed := base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{0x42}, 32))
+
+	t.Run("disabled by default", func(t *testing.T) {
+		t.Setenv("VEIL_IDENTITY_TRANSPARENCY_ENABLED", "")
+		t.Setenv("VEIL_IDENTITY_TRANSPARENCY_SIGNING_SEED", "")
+		cfg, err := config.LoadGateway()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.IdentityTransparency != nil {
+			t.Fatal("identity transparency unexpectedly enabled")
+		}
+	})
+
+	t.Run("requires explicit enable", func(t *testing.T) {
+		t.Setenv("VEIL_IDENTITY_TRANSPARENCY_ENABLED", "false")
+		t.Setenv("VEIL_IDENTITY_TRANSPARENCY_SIGNING_SEED", canonicalSeed)
+		if _, err := config.LoadGateway(); err == nil {
+			t.Fatal("seed was accepted while identity transparency was disabled")
+		}
+	})
+
+	t.Run("requires seed", func(t *testing.T) {
+		t.Setenv("VEIL_IDENTITY_TRANSPARENCY_ENABLED", "true")
+		t.Setenv("VEIL_IDENTITY_TRANSPARENCY_SIGNING_SEED", "")
+		if _, err := config.LoadGateway(); err == nil {
+			t.Fatal("identity transparency was enabled without a signing seed")
+		}
+	})
+
+	for name, value := range map[string]string{
+		"padded":       canonicalSeed + "=",
+		"short":        base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{0x42}, 31)),
+		"whitespace":   " " + canonicalSeed,
+		"standard b64": "+/" + canonicalSeed[2:],
+	} {
+		t.Run("rejects "+name, func(t *testing.T) {
+			t.Setenv("VEIL_IDENTITY_TRANSPARENCY_ENABLED", "true")
+			t.Setenv("VEIL_IDENTITY_TRANSPARENCY_SIGNING_SEED", value)
+			if _, err := config.LoadGateway(); err == nil {
+				t.Fatalf("accepted malformed signing seed %q", name)
+			}
+		})
+	}
+
+	t.Run("accepts canonical seed", func(t *testing.T) {
+		t.Setenv("VEIL_IDENTITY_TRANSPARENCY_ENABLED", "true")
+		t.Setenv("VEIL_IDENTITY_TRANSPARENCY_SIGNING_SEED", canonicalSeed)
+		cfg, err := config.LoadGateway()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.IdentityTransparency == nil ||
+			!bytes.Equal(cfg.IdentityTransparency.SigningSeed[:], bytes.Repeat([]byte{0x42}, 32)) {
+			t.Fatal("canonical signing seed was not preserved exactly")
+		}
+	})
+
+	t.Run("accepts an explicit external witness quorum", func(t *testing.T) {
+		t.Setenv("VEIL_IDENTITY_TRANSPARENCY_ENABLED", "true")
+		t.Setenv("VEIL_IDENTITY_TRANSPARENCY_SIGNING_SEED", canonicalSeed)
+		witnessKey := hex.EncodeToString(bytes.Repeat([]byte{0x24}, 32))
+		t.Setenv(
+			"VEIL_IDENTITY_TRANSPARENCY_WITNESSES",
+			"https://witness.example:443/v1/checkpoint|"+witnessKey,
+		)
+		t.Setenv("VEIL_IDENTITY_TRANSPARENCY_WITNESS_QUORUM", "1")
+		cfg, err := config.LoadGateway()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(cfg.IdentityTransparency.Witnesses) != 1 ||
+			cfg.IdentityTransparency.WitnessThreshold != 1 ||
+			cfg.IdentityTransparency.Witnesses[0].URL != "https://witness.example:443/v1/checkpoint" ||
+			hex.EncodeToString(cfg.IdentityTransparency.Witnesses[0].SigningKey[:]) != witnessKey {
+			t.Fatalf("witness configuration changed: %#v", cfg.IdentityTransparency)
+		}
+	})
+
+	for name, values := range map[string][2]string{
+		"partial":         {"https://witness.example:443/v1/checkpoint|" + hex.EncodeToString(bytes.Repeat([]byte{1}, 32)), ""},
+		"non tls":         {"http://witness.example:80/v1/checkpoint|" + hex.EncodeToString(bytes.Repeat([]byte{1}, 32)), "1"},
+		"leading zero":    {"https://witness.example:443/v1/checkpoint|" + hex.EncodeToString(bytes.Repeat([]byte{1}, 32)), "01"},
+		"quorum too high": {"https://witness.example:443/v1/checkpoint|" + hex.EncodeToString(bytes.Repeat([]byte{1}, 32)), "2"},
+	} {
+		t.Run("rejects witness "+name, func(t *testing.T) {
+			t.Setenv("VEIL_IDENTITY_TRANSPARENCY_ENABLED", "true")
+			t.Setenv("VEIL_IDENTITY_TRANSPARENCY_SIGNING_SEED", canonicalSeed)
+			t.Setenv("VEIL_IDENTITY_TRANSPARENCY_WITNESSES", values[0])
+			t.Setenv("VEIL_IDENTITY_TRANSPARENCY_WITNESS_QUORUM", values[1])
+			if _, err := config.LoadGateway(); err == nil {
+				t.Fatalf("accepted invalid witness configuration %q", name)
 			}
 		})
 	}

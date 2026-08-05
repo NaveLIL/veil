@@ -1,6 +1,7 @@
 package io.veil.mobile.runtime
 
 import io.veil.mobile.BuildConfig
+import java.util.Base64
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
@@ -13,7 +14,6 @@ import okhttp3.tls.HandshakeCertificates
 import okhttp3.tls.HeldCertificate
 import kotlin.concurrent.thread
 import okio.Buffer
-import okio.ByteString.Companion.toByteString
 import org.junit.After
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
@@ -80,9 +80,11 @@ class NativeDirectHttpTransportTest {
     assertEquals(0L, recorded.bodySize)
     assertEquals("${server.url("/").host}:${server.port}", recorded.getHeader("Host"))
     assertEquals("application/json", recorded.getHeader("Accept"))
+    assertEquals(REST_AUTH_VERSION, recorded.getHeader("X-Veil-REST-Auth-Version"))
     assertEquals(USER_ID, recorded.getHeader("X-Veil-User"))
     assertEquals(TIMESTAMP_MS, recorded.getHeader("X-Veil-Timestamp"))
-    assertEquals(SIGNATURE_BASE64, recorded.getHeader("X-Veil-Signature"))
+    assertEquals(NONCE_BASE64URL, recorded.getHeader("X-Veil-Nonce"))
+    assertEquals(SIGNATURE_BASE64URL, recorded.getHeader("X-Veil-Signature"))
     assertNull(recorded.getHeader("X-User-ID"))
     assertNull(recorded.getHeader("Content-Type"))
   }
@@ -116,11 +118,13 @@ class NativeDirectHttpTransportTest {
     assertEquals("application/json", recorded.getHeader("Content-Type"))
     assertEquals(original.size.toString(), recorded.getHeader("Content-Length"))
     assertEquals("application/json", recorded.getHeader("Accept"))
+    assertEquals(REST_AUTH_VERSION, recorded.getHeader("X-Veil-REST-Auth-Version"))
     assertEquals(USER_ID, recorded.getHeader("X-Veil-User"))
     assertEquals(TIMESTAMP_MS, recorded.getHeader("X-Veil-Timestamp"))
-    assertEquals(SIGNATURE_BASE64, recorded.getHeader("X-Veil-Signature"))
+    assertEquals(NONCE_BASE64URL, recorded.getHeader("X-Veil-Nonce"))
+    assertEquals(SIGNATURE_BASE64URL, recorded.getHeader("X-Veil-Signature"))
     assertFalse(input.toString().contains(String(original)))
-    assertFalse(input.toString().contains(SIGNATURE_BASE64))
+    assertFalse(input.toString().contains(SIGNATURE_BASE64URL))
   }
 
   @Test
@@ -163,7 +167,15 @@ class NativeDirectHttpTransportTest {
     assertEquals(target, prepared.url.encodedPath + "?" + prepared.url.encodedQuery)
     assertEquals("example.test:443", prepared.header("Host"))
     assertEquals(
-      setOf("Accept", "Host", "X-Veil-Signature", "X-Veil-Timestamp", "X-Veil-User"),
+      setOf(
+        "Accept",
+        "Host",
+        "X-Veil-Nonce",
+        "X-Veil-REST-Auth-Version",
+        "X-Veil-Signature",
+        "X-Veil-Timestamp",
+        "X-Veil-User",
+      ),
       prepared.headers.names(),
     )
   }
@@ -192,7 +204,7 @@ class NativeDirectHttpTransportTest {
     // A second response would make an accidental OkHttp retry look successful.
     server.enqueue(MockResponse().setResponseCode(200).setBody("must-not-be-used"))
     val request = signedRequest(
-      target = "/v1/prekeys/${"ab".repeat(32)}",
+      target = "/v1/prekeys/${"ab".repeat(32)}?transparency_from_size=0",
       responseLimit = NativeDirectHttpLimits.PREKEY_BYTES,
     )
 
@@ -214,7 +226,7 @@ class NativeDirectHttpTransportTest {
     // response would make the destructive peer-prekey GET appear successful.
     server.enqueue(MockResponse().setResponseCode(200).setBody("must-not-be-used"))
     val request = signedRequest(
-      target = "/v1/prekeys/${"ab".repeat(32)}",
+      target = "/v1/prekeys/${"ab".repeat(32)}?transparency_from_size=0",
       responseLimit = NativeDirectHttpLimits.PREKEY_BYTES,
     )
 
@@ -272,7 +284,7 @@ class NativeDirectHttpTransportTest {
   fun cancellationCompletesOnceWithSanitizedFailureAndHandle() {
     requireDebugTestTlsFixture()
     val target = "/v1/prekeys/peer-identity-key-must-not-leak"
-    val signature = SIGNATURE_BASE64
+    val signature = SIGNATURE_BASE64URL
     server.enqueue(
       MockResponse()
         .setSocketPolicy(SocketPolicy.NO_RESPONSE),
@@ -378,10 +390,10 @@ class NativeDirectHttpTransportTest {
   @Test
   fun httpAndNonCanonicalBase64AreRejectedWithoutNetworkOrSensitiveDiagnostics() {
     requireDebugTestTlsFixture()
-    val unpaddedSignature = SIGNATURE_BASE64.removeSuffix("==")
+    val paddedSignature = "$SIGNATURE_BASE64URL=="
     val invalidHttp = signedRequest(origin = "http://127.0.0.1:80")
     val invalidSignature = signedRequest().copy(
-      signature = NativeRestSignature(USER_ID, TIMESTAMP_MS, unpaddedSignature),
+      signature = signedRequest().signature.copy(signatureBase64url = paddedSignature),
     )
 
     val httpResult = executeAndAwait(invalidHttp)
@@ -390,7 +402,7 @@ class NativeDirectHttpTransportTest {
     assertFailure(NativeDirectHttpFailure.INVALID_REQUEST, httpResult)
     assertFailure(NativeDirectHttpFailure.INVALID_REQUEST, signatureResult)
     assertEquals(0, server.requestCount)
-    assertFalse(invalidSignature.toString().contains(unpaddedSignature))
+    assertFalse(invalidSignature.toString().contains(paddedSignature))
   }
 
   @Test
@@ -479,9 +491,11 @@ class NativeDirectHttpTransportTest {
     canonicalServerOrigin = origin,
     requestTarget = target,
     signature = NativeRestSignature(
+      version = REST_AUTH_VERSION,
       userId = USER_ID,
       timestampMs = TIMESTAMP_MS,
-      signatureBase64 = SIGNATURE_BASE64,
+      nonceBase64url = NONCE_BASE64URL,
+      signatureBase64url = SIGNATURE_BASE64URL,
     ),
     responseLimitBytes = responseLimit,
     method = method,
@@ -520,8 +534,10 @@ class NativeDirectHttpTransportTest {
   private companion object {
     const val USER_ID = "550e8400-e29b-41d4-a716-446655440001"
     const val TIMESTAMP_MS = "1712345678901"
-    val SIGNATURE_BASE64: String = ByteArray(64) { index -> (index + 1).toByte() }
-      .toByteString()
-      .base64()
+    const val REST_AUTH_VERSION = "2"
+    val NONCE_BASE64URL: String = Base64.getUrlEncoder().withoutPadding()
+      .encodeToString(ByteArray(32) { index -> (index + 1).toByte() })
+    val SIGNATURE_BASE64URL: String = Base64.getUrlEncoder().withoutPadding()
+      .encodeToString(ByteArray(64) { index -> (index + 1).toByte() })
   }
 }

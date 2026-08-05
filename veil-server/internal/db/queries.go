@@ -62,6 +62,10 @@ const (
 const (
 	MessageCryptoProfileSenderKeyV5 = "sender_key_v5"
 	MessageCryptoEraSenderKeyV5     = uint64(1)
+	MessageCryptoProfileSenderKeyV6 = "sender_key_v6"
+	MessageCryptoEraSenderKeyV6     = uint64(1)
+	MessageCryptoProfileDirectV2    = "direct_v2"
+	MessageCryptoEraDirectV2        = uint64(1)
 )
 
 // MaxReactionsPerMessage is the shared server/mobile history bound. Admission
@@ -97,8 +101,13 @@ func (db *DB) CreateUser(ctx context.Context, identityKey, signingKey []byte, us
 	if len(identityKey) != 32 || !cryptokey.ValidEd25519PublicKey(signingKey) {
 		return nil, errors.New("invalid account cryptographic public keys")
 	}
+	tx, err := db.Pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		return nil, fmt.Errorf("begin user registration: %w", err)
+	}
+	defer tx.Rollback(ctx)
 	var u User
-	err := db.Pool.QueryRow(ctx,
+	err = tx.QueryRow(ctx,
 		`INSERT INTO users (identity_key, signing_key, username)
 		 VALUES ($1, $2, $3)
 		 RETURNING id, identity_key, signing_key, username, created_at`,
@@ -106,6 +115,12 @@ func (db *DB) CreateUser(ctx context.Context, identityKey, signingKey []byte, us
 	).Scan(&u.ID, &u.IdentityKey, &u.SigningKey, &u.Username, &u.CreatedAt)
 	if err != nil {
 		return nil, fmt.Errorf("create user: %w", err)
+	}
+	if err := db.appendIdentityTransparencyAccountTx(ctx, tx, &u); err != nil {
+		return nil, fmt.Errorf("append user transparency event: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit user registration: %w", err)
 	}
 	return &u, nil
 }
@@ -873,13 +888,24 @@ type Message struct {
 // for a Sender-Key group/channel ciphertext. SenderDeviceDatabaseID is used
 // only while admitting a new row and is never returned on the wire.
 type MessageSecurityContext struct {
-	CryptoProfile          string
-	CryptoEra              uint64
-	RosterVersion          uint64
-	RosterCommitment       []byte
-	SenderDeviceID         []byte
-	SenderBindingVersion   uint64
-	SenderDeviceDatabaseID string
+	CryptoProfile             string
+	CryptoEra                 uint64
+	RosterVersion             uint64
+	RosterCommitment          []byte
+	MembershipEpoch           uint64
+	MembershipEpochHash       []byte
+	SenderDeviceID            []byte
+	SenderBindingVersion      uint64
+	SenderDeviceDatabaseID    string
+	SenderDeviceIdentityKey   []byte
+	SenderDeviceSigningKey    []byte
+	SenderDeviceCapabilities  uint64
+	SenderDeviceBindingStatus DeviceBindingStatus
+	SenderAccountSignature    []byte
+	TargetDeviceID            []byte
+	TargetBindingVersion      uint64
+	TargetDeviceDatabaseID    string
+	DirectSessionID           []byte
 }
 
 type MessageAttachment struct {
@@ -899,6 +925,8 @@ type MessageSendOutcome struct {
 	MessageID        string
 	ServerTimestamp  time.Time
 	AckRosterVersion *uint64
+	MembershipEpoch  *uint64
+	MembershipHash   []byte
 	Replayed         bool
 }
 
@@ -924,13 +952,17 @@ func (db *DB) LookupMessageSendOutcome(
 		messageID       string
 		serverTimestamp time.Time
 		rosterVersion   *int64
+		membershipEpoch *int64
+		membershipHash  []byte
 	)
 	err := db.Pool.QueryRow(ctx,
-		`SELECT request_digest, message_id::text, server_timestamp, ack_roster_version
+		`SELECT request_digest, message_id::text, server_timestamp, ack_roster_version,
+		        ack_membership_epoch, ack_membership_epoch_hash
 		 FROM message_send_idempotency
 		 WHERE sender_id = $1::uuid AND client_message_id = $2::uuid`,
 		senderID, clientMessageID,
-	).Scan(&storedDigest, &messageID, &serverTimestamp, &rosterVersion)
+	).Scan(&storedDigest, &messageID, &serverTimestamp, &rosterVersion,
+		&membershipEpoch, &membershipHash)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
@@ -952,6 +984,16 @@ func (db *DB) LookupMessageSendOutcome(
 	if rosterVersion != nil {
 		version := uint64(*rosterVersion)
 		outcome.AckRosterVersion = &version
+	}
+	if membershipEpoch != nil {
+		if *membershipEpoch <= 0 || len(membershipHash) != 32 {
+			return nil, errors.New("invalid stored membership send outcome")
+		}
+		epoch := uint64(*membershipEpoch)
+		outcome.MembershipEpoch = &epoch
+		outcome.MembershipHash = append([]byte(nil), membershipHash...)
+	} else if membershipHash != nil {
+		return nil, errors.New("partial stored membership send outcome")
 	}
 	return outcome, nil
 }
@@ -1007,30 +1049,44 @@ func (db *DB) storeMessageIdempotentOnce(
 
 	messageID := uuid.NewString()
 	var ackRosterVersion any
-	if m.SecurityContext != nil {
+	var ackMembershipEpoch, ackMembershipHash any
+	if m.SecurityContext != nil && (m.SecurityContext.CryptoProfile == MessageCryptoProfileSenderKeyV5 ||
+		m.SecurityContext.CryptoProfile == MessageCryptoProfileSenderKeyV6) {
 		ackRosterVersion = int64(m.SecurityContext.RosterVersion)
+		if m.SecurityContext.CryptoProfile == MessageCryptoProfileSenderKeyV6 {
+			ackMembershipEpoch = int64(m.SecurityContext.MembershipEpoch)
+			ackMembershipHash = m.SecurityContext.MembershipEpochHash
+		}
 	}
 	var (
-		serverTimestamp     time.Time
-		storedRosterVersion *int64
+		serverTimestamp       time.Time
+		storedRosterVersion   *int64
+		storedMembershipEpoch *int64
+		storedMembershipHash  []byte
 	)
 	err = tx.QueryRow(ctx,
 		`INSERT INTO message_send_idempotency (
 		   sender_id, client_message_id, request_digest, message_id,
-		   server_timestamp, ack_roster_version
-		 ) VALUES ($1::uuid, $2::uuid, $3, $4::uuid, now(), $5)
+		   server_timestamp, ack_roster_version, ack_membership_epoch,
+		   ack_membership_epoch_hash
+		 ) VALUES ($1::uuid, $2::uuid, $3, $4::uuid, now(), $5, $6, $7)
 		 ON CONFLICT (sender_id, client_message_id) DO NOTHING
-		 RETURNING message_id::text, server_timestamp, ack_roster_version`,
+		 RETURNING message_id::text, server_timestamp, ack_roster_version,
+		           ack_membership_epoch, ack_membership_epoch_hash`,
 		m.SenderID, clientMessageID, requestDigest, messageID, ackRosterVersion,
-	).Scan(&messageID, &serverTimestamp, &storedRosterVersion)
+		ackMembershipEpoch, ackMembershipHash,
+	).Scan(&messageID, &serverTimestamp, &storedRosterVersion,
+		&storedMembershipEpoch, &storedMembershipHash)
 	if errors.Is(err, pgx.ErrNoRows) {
 		var storedDigest []byte
 		err = tx.QueryRow(ctx,
-			`SELECT request_digest, message_id::text, server_timestamp, ack_roster_version
+			`SELECT request_digest, message_id::text, server_timestamp, ack_roster_version,
+			        ack_membership_epoch, ack_membership_epoch_hash
 			 FROM message_send_idempotency
 			 WHERE sender_id = $1::uuid AND client_message_id = $2::uuid`,
 			m.SenderID, clientMessageID,
-		).Scan(&storedDigest, &messageID, &serverTimestamp, &storedRosterVersion)
+		).Scan(&storedDigest, &messageID, &serverTimestamp, &storedRosterVersion,
+			&storedMembershipEpoch, &storedMembershipHash)
 		if err != nil {
 			return nil, err
 		}
@@ -1051,6 +1107,16 @@ func (db *DB) storeMessageIdempotentOnce(
 		if storedRosterVersion != nil {
 			version := uint64(*storedRosterVersion)
 			outcome.AckRosterVersion = &version
+		}
+		if storedMembershipEpoch != nil {
+			if *storedMembershipEpoch <= 0 || len(storedMembershipHash) != 32 {
+				return nil, errors.New("invalid stored membership send outcome")
+			}
+			epoch := uint64(*storedMembershipEpoch)
+			outcome.MembershipEpoch = &epoch
+			outcome.MembershipHash = append([]byte(nil), storedMembershipHash...)
+		} else if storedMembershipHash != nil {
+			return nil, errors.New("partial stored membership send outcome")
 		}
 		return outcome, nil
 	}
@@ -1095,18 +1161,41 @@ func (db *DB) storeMessageIdempotentOnce(
 			return nil, err
 		}
 	} else if m.SecurityContext != nil {
-		return nil, ErrMessageSecurityContext
+		if err := validateDirectMessageDeviceSnapshot(
+			ctx, tx, m.ConversationID, m.SenderID, m.SecurityContext,
+		); err != nil {
+			return nil, err
+		}
 	}
 
-	var securityProfile, rosterCommitment, senderDeviceID any
-	var securityEra, rosterVersion, senderBindingVersion any
+	var securityProfile, rosterCommitment, senderDeviceID, targetDeviceID, directSessionID any
+	var senderDeviceIdentityKey, senderDeviceSigningKey, senderAccountSignature any
+	var membershipEpoch, membershipEpochHash any
+	var securityEra, rosterVersion, senderBindingVersion, targetBindingVersion any
+	var senderDeviceCapabilities, senderDeviceBindingStatus any
 	if m.SecurityContext != nil {
 		securityProfile = m.SecurityContext.CryptoProfile
 		securityEra = int64(m.SecurityContext.CryptoEra)
-		rosterVersion = int64(m.SecurityContext.RosterVersion)
-		rosterCommitment = m.SecurityContext.RosterCommitment
 		senderDeviceID = m.SecurityContext.SenderDeviceID
 		senderBindingVersion = int64(m.SecurityContext.SenderBindingVersion)
+		if m.SecurityContext.CryptoProfile == MessageCryptoProfileSenderKeyV5 ||
+			m.SecurityContext.CryptoProfile == MessageCryptoProfileSenderKeyV6 {
+			rosterVersion = int64(m.SecurityContext.RosterVersion)
+			rosterCommitment = m.SecurityContext.RosterCommitment
+			if m.SecurityContext.CryptoProfile == MessageCryptoProfileSenderKeyV6 {
+				membershipEpoch = int64(m.SecurityContext.MembershipEpoch)
+				membershipEpochHash = m.SecurityContext.MembershipEpochHash
+			}
+		} else {
+			targetDeviceID = m.SecurityContext.TargetDeviceID
+			targetBindingVersion = int64(m.SecurityContext.TargetBindingVersion)
+			directSessionID = m.SecurityContext.DirectSessionID
+			senderDeviceIdentityKey = m.SecurityContext.SenderDeviceIdentityKey
+			senderDeviceSigningKey = m.SecurityContext.SenderDeviceSigningKey
+			senderDeviceCapabilities = int64(m.SecurityContext.SenderDeviceCapabilities)
+			senderDeviceBindingStatus = int16(m.SecurityContext.SenderDeviceBindingStatus)
+			senderAccountSignature = m.SecurityContext.SenderAccountSignature
+		}
 	}
 
 	m.ID = messageID
@@ -1116,10 +1205,15 @@ func (db *DB) storeMessageIdempotentOnce(
 		   id, conversation_id, sender_id, ciphertext, header, msg_type,
 		   reply_to_id, expires_at, crypto_profile, crypto_era,
 		   roster_version, roster_commitment, sender_device_id,
-		   sender_binding_version, created_at
+           sender_binding_version, target_device_id, target_binding_version,
+           direct_session_id, sender_device_identity_key,
+           sender_device_signing_key, sender_device_capabilities,
+           sender_device_binding_status, sender_account_signature,
+           membership_epoch, membership_epoch_hash, created_at
 		 )
 		 SELECT $1::uuid, $2::uuid, $3::uuid, $4, $5, $6, $7::uuid, $8,
-		        $9, $10, $11, $12, $13, $14, $15
+                $9, $10, $11, $12, $13, $14, $15, $16, $17, $18,
+                $19, $20, $21, $22, $23, $24, $25
 		 WHERE $7::uuid IS NULL OR EXISTS (
 		   SELECT 1 FROM messages reply
 		   WHERE reply.id = $7::uuid
@@ -1129,7 +1223,10 @@ func (db *DB) storeMessageIdempotentOnce(
 		 RETURNING id::text, created_at`,
 		m.ID, m.ConversationID, m.SenderID, m.Ciphertext, m.Header, m.MsgType,
 		m.ReplyToID, m.ExpiresAt, securityProfile, securityEra, rosterVersion,
-		rosterCommitment, senderDeviceID, senderBindingVersion, m.CreatedAt,
+		rosterCommitment, senderDeviceID, senderBindingVersion, targetDeviceID,
+		targetBindingVersion, directSessionID, senderDeviceIdentityKey,
+		senderDeviceSigningKey, senderDeviceCapabilities, senderDeviceBindingStatus,
+		senderAccountSignature, membershipEpoch, membershipEpochHash, m.CreatedAt,
 	).Scan(&m.ID, &m.CreatedAt)
 	if errors.Is(err, pgx.ErrNoRows) && m.ReplyToID != nil {
 		return nil, ErrReplyTargetMismatch
@@ -1171,6 +1268,16 @@ func (db *DB) storeMessageIdempotentOnce(
 	if storedRosterVersion != nil {
 		version := uint64(*storedRosterVersion)
 		outcome.AckRosterVersion = &version
+	}
+	if storedMembershipEpoch != nil {
+		if *storedMembershipEpoch <= 0 || len(storedMembershipHash) != 32 {
+			return nil, errors.New("invalid stored membership send outcome")
+		}
+		epoch := uint64(*storedMembershipEpoch)
+		outcome.MembershipEpoch = &epoch
+		outcome.MembershipHash = append([]byte(nil), storedMembershipHash...)
+	} else if storedMembershipHash != nil {
+		return nil, errors.New("partial stored membership send outcome")
 	}
 	return outcome, nil
 }
@@ -1237,28 +1344,56 @@ func (db *DB) storeMessageOnce(ctx context.Context, m *Message) error {
 			return err
 		}
 	} else if m.SecurityContext != nil {
-		return ErrMessageSecurityContext
+		if err := validateDirectMessageDeviceSnapshot(
+			ctx, tx, m.ConversationID, m.SenderID, m.SecurityContext,
+		); err != nil {
+			return err
+		}
 	}
 
-	var securityProfile, rosterCommitment, senderDeviceID any
-	var securityEra, rosterVersion, senderBindingVersion any
+	var securityProfile, rosterCommitment, senderDeviceID, targetDeviceID, directSessionID any
+	var senderDeviceIdentityKey, senderDeviceSigningKey, senderAccountSignature any
+	var membershipEpoch, membershipEpochHash any
+	var securityEra, rosterVersion, senderBindingVersion, targetBindingVersion any
+	var senderDeviceCapabilities, senderDeviceBindingStatus any
 	if m.SecurityContext != nil {
 		securityProfile = m.SecurityContext.CryptoProfile
 		securityEra = int64(m.SecurityContext.CryptoEra)
-		rosterVersion = int64(m.SecurityContext.RosterVersion)
-		rosterCommitment = m.SecurityContext.RosterCommitment
 		senderDeviceID = m.SecurityContext.SenderDeviceID
 		senderBindingVersion = int64(m.SecurityContext.SenderBindingVersion)
+		if m.SecurityContext.CryptoProfile == MessageCryptoProfileSenderKeyV5 ||
+			m.SecurityContext.CryptoProfile == MessageCryptoProfileSenderKeyV6 {
+			rosterVersion = int64(m.SecurityContext.RosterVersion)
+			rosterCommitment = m.SecurityContext.RosterCommitment
+			if m.SecurityContext.CryptoProfile == MessageCryptoProfileSenderKeyV6 {
+				membershipEpoch = int64(m.SecurityContext.MembershipEpoch)
+				membershipEpochHash = m.SecurityContext.MembershipEpochHash
+			}
+		} else {
+			targetDeviceID = m.SecurityContext.TargetDeviceID
+			targetBindingVersion = int64(m.SecurityContext.TargetBindingVersion)
+			directSessionID = m.SecurityContext.DirectSessionID
+			senderDeviceIdentityKey = m.SecurityContext.SenderDeviceIdentityKey
+			senderDeviceSigningKey = m.SecurityContext.SenderDeviceSigningKey
+			senderDeviceCapabilities = int64(m.SecurityContext.SenderDeviceCapabilities)
+			senderDeviceBindingStatus = int16(m.SecurityContext.SenderDeviceBindingStatus)
+			senderAccountSignature = m.SecurityContext.SenderAccountSignature
+		}
 	}
 
 	err = tx.QueryRow(ctx,
 		`INSERT INTO messages (
 		   conversation_id, sender_id, ciphertext, header, msg_type, reply_to_id, expires_at,
 		   crypto_profile, crypto_era, roster_version, roster_commitment,
-		   sender_device_id, sender_binding_version
+           sender_device_id, sender_binding_version, target_device_id,
+           target_binding_version, direct_session_id, sender_device_identity_key,
+           sender_device_signing_key, sender_device_capabilities,
+           sender_device_binding_status, sender_account_signature,
+           membership_epoch, membership_epoch_hash
 		 )
 		 SELECT $1::uuid, $2::uuid, $3, $4, $5, $6::uuid, $7,
-		        $8, $9, $10, $11, $12, $13
+                $8, $9, $10, $11, $12, $13, $14, $15, $16,
+                $17, $18, $19, $20, $21, $22, $23
 		 WHERE $6::uuid IS NULL OR EXISTS (
 		   SELECT 1 FROM messages reply
 		   WHERE reply.id = $6::uuid
@@ -1267,7 +1402,11 @@ func (db *DB) storeMessageOnce(ctx context.Context, m *Message) error {
 		 )
 		 RETURNING id, created_at`,
 		m.ConversationID, m.SenderID, m.Ciphertext, m.Header, m.MsgType, m.ReplyToID, m.ExpiresAt,
-		securityProfile, securityEra, rosterVersion, rosterCommitment, senderDeviceID, senderBindingVersion,
+		securityProfile, securityEra, rosterVersion, rosterCommitment, senderDeviceID,
+		senderBindingVersion, targetDeviceID, targetBindingVersion, directSessionID,
+		senderDeviceIdentityKey, senderDeviceSigningKey, senderDeviceCapabilities,
+		senderDeviceBindingStatus, senderAccountSignature,
+		membershipEpoch, membershipEpochHash,
 	).Scan(&m.ID, &m.CreatedAt)
 	if errors.Is(err, pgx.ErrNoRows) && m.ReplyToID != nil {
 		return ErrReplyTargetMismatch
@@ -1303,12 +1442,59 @@ func (db *DB) storeMessageOnce(ctx context.Context, m *Message) error {
 }
 
 func validateMessageSecurityContext(security *MessageSecurityContext) error {
-	if security == nil || security.CryptoProfile != MessageCryptoProfileSenderKeyV5 ||
-		security.CryptoEra != MessageCryptoEraSenderKeyV5 ||
-		security.RosterVersion == 0 || security.RosterVersion > math.MaxInt64 ||
-		len(security.RosterCommitment) != 32 || len(security.SenderDeviceID) != 16 ||
+	if security == nil || len(security.SenderDeviceID) != 16 ||
+		bytes.Equal(security.SenderDeviceID, make([]byte, 16)) ||
 		security.SenderBindingVersion == 0 || security.SenderBindingVersion > math.MaxInt64 ||
 		security.SenderDeviceDatabaseID == "" {
+		return ErrMessageSecurityContext
+	}
+	switch security.CryptoProfile {
+	case MessageCryptoProfileSenderKeyV5:
+		if security.CryptoEra != MessageCryptoEraSenderKeyV5 ||
+			security.RosterVersion == 0 || security.RosterVersion > math.MaxInt64 ||
+			len(security.RosterCommitment) != 32 ||
+			bytes.Equal(security.RosterCommitment, make([]byte, 32)) ||
+			len(security.TargetDeviceID) != 0 ||
+			security.MembershipEpoch != 0 || len(security.MembershipEpochHash) != 0 ||
+			security.TargetBindingVersion != 0 || security.TargetDeviceDatabaseID != "" ||
+			len(security.DirectSessionID) != 0 || len(security.SenderDeviceIdentityKey) != 0 ||
+			len(security.SenderDeviceSigningKey) != 0 || security.SenderDeviceCapabilities != 0 ||
+			security.SenderDeviceBindingStatus != 0 || len(security.SenderAccountSignature) != 0 {
+			return ErrMessageSecurityContext
+		}
+	case MessageCryptoProfileSenderKeyV6:
+		if security.CryptoEra != MessageCryptoEraSenderKeyV6 ||
+			security.RosterVersion == 0 || security.RosterVersion > math.MaxInt64 ||
+			len(security.RosterCommitment) != 32 ||
+			bytes.Equal(security.RosterCommitment, make([]byte, 32)) ||
+			security.MembershipEpoch == 0 ||
+			security.MembershipEpoch > math.MaxInt64 || len(security.MembershipEpochHash) != 32 ||
+			bytes.Equal(security.MembershipEpochHash, make([]byte, 32)) ||
+			len(security.TargetDeviceID) != 0 || security.TargetBindingVersion != 0 ||
+			security.TargetDeviceDatabaseID != "" || len(security.DirectSessionID) != 0 ||
+			len(security.SenderDeviceIdentityKey) != 0 || len(security.SenderDeviceSigningKey) != 0 ||
+			security.SenderDeviceCapabilities != 0 || security.SenderDeviceBindingStatus != 0 ||
+			len(security.SenderAccountSignature) != 0 {
+			return ErrMessageSecurityContext
+		}
+	case MessageCryptoProfileDirectV2:
+		if security.CryptoEra != MessageCryptoEraDirectV2 ||
+			security.RosterVersion != 0 || len(security.RosterCommitment) != 0 ||
+			security.MembershipEpoch != 0 || len(security.MembershipEpochHash) != 0 ||
+			len(security.SenderDeviceIdentityKey) != 32 ||
+			len(security.SenderDeviceSigningKey) != 32 ||
+			bytes.Equal(security.SenderDeviceIdentityKey, security.SenderDeviceSigningKey) ||
+			security.SenderDeviceCapabilities == 0 ||
+			security.SenderDeviceCapabilities > math.MaxInt64 ||
+			security.SenderDeviceBindingStatus != DeviceBindingActive ||
+			len(security.SenderAccountSignature) != 64 ||
+			len(security.TargetDeviceID) != 16 ||
+			bytes.Equal(security.SenderDeviceID, security.TargetDeviceID) ||
+			security.TargetBindingVersion == 0 || security.TargetBindingVersion > math.MaxInt64 ||
+			security.TargetDeviceDatabaseID == "" || len(security.DirectSessionID) != 32 {
+			return ErrMessageSecurityContext
+		}
+	default:
 		return ErrMessageSecurityContext
 	}
 	return nil
@@ -1318,6 +1504,13 @@ func validateMessageRosterSnapshot(ctx context.Context, tx pgx.Tx, roster *Conve
 	if roster == nil || !roster.Ready || security == nil ||
 		roster.Version != security.RosterVersion ||
 		!bytes.Equal(roster.Commitment[:], security.RosterCommitment) {
+		return ErrMessageRosterChanged
+	}
+	if err := validateMembershipTrafficContextV1(
+		ctx, tx, conversationID, security.CryptoProfile,
+		security.RosterVersion, security.RosterCommitment,
+		security.MembershipEpoch, security.MembershipEpochHash,
+	); err != nil {
 		return ErrMessageRosterChanged
 	}
 	senderFound := false
@@ -1353,6 +1546,84 @@ func validateMessageRosterSnapshot(ctx context.Context, tx pgx.Tx, roster *Conve
 	}
 	if !canSend {
 		return ErrMessageRosterChanged
+	}
+	return nil
+}
+
+func validateDirectMessageDeviceSnapshot(
+	ctx context.Context,
+	tx pgx.Tx,
+	conversationID string,
+	senderUserID string,
+	security *MessageSecurityContext,
+) error {
+	if validateMessageSecurityContext(security) != nil ||
+		security.CryptoProfile != MessageCryptoProfileDirectV2 {
+		return ErrMessageSecurityContext
+	}
+	var (
+		sourceUserID, targetUserID                                  string
+		sourceDeviceKey, targetDeviceKey                            []byte
+		sourceIdentityKey, sourceSigningKey, sourceAccountSignature []byte
+		sourceVersion, targetVersion, sourceCapabilities            int64
+		sourceStatus, targetStatus                                  int16
+	)
+	err := tx.QueryRow(ctx,
+		`SELECT source.user_id::text, source.device_key,
+		        source_keys.device_identity_key, source_keys.device_signing_key,
+		        source_version.binding_version, source_version.capabilities,
+		        source_version.binding_status, source_version.account_signature,
+                target.user_id::text, target.device_key,
+                target_version.binding_version, target_version.binding_status
+         FROM devices source
+		 JOIN device_crypto_keys source_keys ON source_keys.device_id = source.id
+         JOIN device_binding_heads source_head ON source_head.device_id = source.id
+         JOIN device_binding_versions source_version
+           ON source_version.device_id = source.id
+          AND source_version.binding_version = source_head.binding_version
+         JOIN devices target ON target.id = $3::uuid
+         JOIN device_binding_heads target_head ON target_head.device_id = target.id
+         JOIN device_binding_versions target_version
+           ON target_version.device_id = target.id
+          AND target_version.binding_version = target_head.binding_version
+         WHERE source.id = $1::uuid AND source.user_id = $2::uuid
+         FOR UPDATE OF source_head, target_head`,
+		security.SenderDeviceDatabaseID,
+		senderUserID,
+		security.TargetDeviceDatabaseID,
+	).Scan(
+		&sourceUserID, &sourceDeviceKey, &sourceIdentityKey, &sourceSigningKey,
+		&sourceVersion, &sourceCapabilities, &sourceStatus, &sourceAccountSignature,
+		&targetUserID, &targetDeviceKey, &targetVersion, &targetStatus,
+	)
+	if err != nil || sourceUserID != senderUserID || targetUserID == senderUserID ||
+		!bytes.Equal(sourceDeviceKey, security.SenderDeviceID) ||
+		!bytes.Equal(sourceIdentityKey, security.SenderDeviceIdentityKey) ||
+		!bytes.Equal(sourceSigningKey, security.SenderDeviceSigningKey) ||
+		sourceCapabilities <= 0 || uint64(sourceCapabilities) != security.SenderDeviceCapabilities ||
+		!bytes.Equal(sourceAccountSignature, security.SenderAccountSignature) ||
+		!bytes.Equal(targetDeviceKey, security.TargetDeviceID) ||
+		sourceVersion <= 0 || uint64(sourceVersion) != security.SenderBindingVersion ||
+		targetVersion <= 0 || uint64(targetVersion) != security.TargetBindingVersion ||
+		DeviceBindingStatus(sourceStatus) != security.SenderDeviceBindingStatus ||
+		DeviceBindingStatus(sourceStatus) != DeviceBindingActive ||
+		DeviceBindingStatus(targetStatus) != DeviceBindingActive {
+		return ErrMessageSecurityContext
+	}
+	sourceAllowed, err := canAccessConversationWithQuery(
+		ctx, tx, conversationID, senderUserID, PermViewChannel|PermSendMessages,
+	)
+	if err != nil {
+		return err
+	}
+	targetAllowed, err := canAccessConversationWithQuery(
+		ctx, tx, conversationID, targetUserID, PermViewChannel,
+	)
+	if err != nil {
+		return err
+	}
+	if !sourceAllowed || !targetAllowed {
+		return ErrMessageSecurityContext
 	}
 	return nil
 }
@@ -1448,7 +1719,12 @@ func getPendingMessagesWithQuery(ctx context.Context, query rosterQuerier, conve
 		        m.ciphertext, m.header, m.msg_type, m.reply_to_id, m.expires_at,
 		        m.edited_at, m.is_deleted, m.created_at,
 		        m.crypto_profile, m.crypto_era, m.roster_version,
-		        m.roster_commitment, m.sender_device_id, m.sender_binding_version
+		        m.roster_commitment, m.sender_device_id, m.sender_binding_version,
+		        m.target_device_id, m.target_binding_version, m.direct_session_id,
+		        m.sender_device_identity_key, m.sender_device_signing_key,
+		        m.sender_device_capabilities, m.sender_device_binding_status,
+		        m.sender_account_signature, m.membership_epoch,
+		        m.membership_epoch_hash
 		 FROM messages m
 		 JOIN conversation_members cm ON cm.conversation_id = m.conversation_id
 		 JOIN users u ON u.id = m.sender_id
@@ -1465,30 +1741,92 @@ func getPendingMessagesWithQuery(ctx context.Context, query rosterQuerier, conve
 	for rows.Next() {
 		var m Message
 		var profile *string
-		var era, rosterVersion, senderBindingVersion *int64
-		var rosterCommitment, senderDeviceID []byte
+		var era, rosterVersion, senderBindingVersion, targetBindingVersion *int64
+		var membershipEpoch *int64
+		var sourceCapabilities *int64
+		var sourceStatus *int16
+		var rosterCommitment, senderDeviceID, targetDeviceID, directSessionID []byte
+		var sourceIdentityKey, sourceSigningKey, sourceAccountSignature []byte
+		var membershipEpochHash []byte
 		if err := rows.Scan(&m.ID, &m.ConversationID, &m.SenderID,
 			&m.SenderIdentityKey, &m.SenderSigningKey, &m.Ciphertext, &m.Header,
 			&m.MsgType, &m.ReplyToID, &m.ExpiresAt, &m.EditedAt, &m.IsDeleted, &m.CreatedAt,
 			&profile, &era, &rosterVersion, &rosterCommitment, &senderDeviceID, &senderBindingVersion,
+			&targetDeviceID, &targetBindingVersion, &directSessionID,
+			&sourceIdentityKey, &sourceSigningKey, &sourceCapabilities, &sourceStatus,
+			&sourceAccountSignature, &membershipEpoch, &membershipEpochHash,
 		); err != nil {
 			rows.Close()
 			return nil, err
 		}
 		if profile != nil || era != nil || rosterVersion != nil || rosterCommitment != nil ||
-			senderDeviceID != nil || senderBindingVersion != nil {
-			if profile == nil || era == nil || rosterVersion == nil || len(rosterCommitment) != 32 ||
-				len(senderDeviceID) != 16 || senderBindingVersion == nil || *era <= 0 ||
-				*rosterVersion <= 0 || *senderBindingVersion <= 0 {
+			senderDeviceID != nil || senderBindingVersion != nil || targetDeviceID != nil ||
+			targetBindingVersion != nil || directSessionID != nil {
+			if profile == nil || era == nil || len(senderDeviceID) != 16 ||
+				senderBindingVersion == nil || *era <= 0 || *senderBindingVersion <= 0 {
 				return nil, ErrMessageSecurityContext
 			}
-			m.SecurityContext = &MessageSecurityContext{
-				CryptoProfile:        *profile,
-				CryptoEra:            uint64(*era),
-				RosterVersion:        uint64(*rosterVersion),
-				RosterCommitment:     append([]byte(nil), rosterCommitment...),
-				SenderDeviceID:       append([]byte(nil), senderDeviceID...),
-				SenderBindingVersion: uint64(*senderBindingVersion),
+			switch *profile {
+			case MessageCryptoProfileSenderKeyV5:
+				if uint64(*era) != MessageCryptoEraSenderKeyV5 || rosterVersion == nil ||
+					*rosterVersion <= 0 || len(rosterCommitment) != 32 ||
+					targetDeviceID != nil || targetBindingVersion != nil || directSessionID != nil ||
+					membershipEpoch != nil || membershipEpochHash != nil {
+					return nil, ErrMessageSecurityContext
+				}
+				m.SecurityContext = &MessageSecurityContext{
+					CryptoProfile:        *profile,
+					CryptoEra:            uint64(*era),
+					RosterVersion:        uint64(*rosterVersion),
+					RosterCommitment:     append([]byte(nil), rosterCommitment...),
+					SenderDeviceID:       append([]byte(nil), senderDeviceID...),
+					SenderBindingVersion: uint64(*senderBindingVersion),
+				}
+			case MessageCryptoProfileSenderKeyV6:
+				if uint64(*era) != MessageCryptoEraSenderKeyV6 || rosterVersion == nil ||
+					*rosterVersion <= 0 || len(rosterCommitment) != 32 ||
+					targetDeviceID != nil || targetBindingVersion != nil || directSessionID != nil ||
+					membershipEpoch == nil || *membershipEpoch <= 0 || len(membershipEpochHash) != 32 {
+					return nil, ErrMessageSecurityContext
+				}
+				m.SecurityContext = &MessageSecurityContext{
+					CryptoProfile:        *profile,
+					CryptoEra:            uint64(*era),
+					RosterVersion:        uint64(*rosterVersion),
+					RosterCommitment:     append([]byte(nil), rosterCommitment...),
+					MembershipEpoch:      uint64(*membershipEpoch),
+					MembershipEpochHash:  append([]byte(nil), membershipEpochHash...),
+					SenderDeviceID:       append([]byte(nil), senderDeviceID...),
+					SenderBindingVersion: uint64(*senderBindingVersion),
+				}
+			case MessageCryptoProfileDirectV2:
+				if uint64(*era) != MessageCryptoEraDirectV2 || rosterVersion != nil ||
+					rosterCommitment != nil || len(targetDeviceID) != 16 ||
+					targetBindingVersion == nil || *targetBindingVersion <= 0 ||
+					len(directSessionID) != sha256.Size || len(sourceIdentityKey) != 32 ||
+					len(sourceSigningKey) != 32 || sourceCapabilities == nil ||
+					*sourceCapabilities <= 0 || sourceStatus == nil ||
+					DeviceBindingStatus(*sourceStatus) != DeviceBindingActive ||
+					len(sourceAccountSignature) != 64 || membershipEpoch != nil ||
+					membershipEpochHash != nil {
+					return nil, ErrMessageSecurityContext
+				}
+				m.SecurityContext = &MessageSecurityContext{
+					CryptoProfile:             *profile,
+					CryptoEra:                 uint64(*era),
+					SenderDeviceID:            append([]byte(nil), senderDeviceID...),
+					SenderBindingVersion:      uint64(*senderBindingVersion),
+					SenderDeviceIdentityKey:   append([]byte(nil), sourceIdentityKey...),
+					SenderDeviceSigningKey:    append([]byte(nil), sourceSigningKey...),
+					SenderDeviceCapabilities:  uint64(*sourceCapabilities),
+					SenderDeviceBindingStatus: DeviceBindingStatus(*sourceStatus),
+					SenderAccountSignature:    append([]byte(nil), sourceAccountSignature...),
+					TargetDeviceID:            append([]byte(nil), targetDeviceID...),
+					TargetBindingVersion:      uint64(*targetBindingVersion),
+					DirectSessionID:           append([]byte(nil), directSessionID...),
+				}
+			default:
+				return nil, ErrMessageSecurityContext
 			}
 		}
 		msgs = append(msgs, m)
@@ -2037,14 +2375,21 @@ type senderKeyWrite struct {
 	rosterCommitment     []byte
 	ownerBindingVersion  uint64
 	targetBindingVersion uint64
+	membershipEpoch      uint64
+	membershipEpochHash  []byte
 	deviceRouted         bool
 }
 
 const senderKeyDeviceRouteDomainV1 = "veil-sender-key-device-route-v1\x00"
+const senderKeyDeviceRouteDomainV2 = "veil-sender-key-device-route-v2\x00"
 
 func senderKeyDeviceRouteCommitment(envelopeCommitment [32]byte, write senderKeyWrite) [32]byte {
-	message := make([]byte, 0, len(senderKeyDeviceRouteDomainV1)+32+8+32+8+8)
-	message = append(message, senderKeyDeviceRouteDomainV1...)
+	domain := senderKeyDeviceRouteDomainV1
+	if write.membershipEpoch != 0 {
+		domain = senderKeyDeviceRouteDomainV2
+	}
+	message := make([]byte, 0, len(domain)+32+8+32+8+8+8+32)
+	message = append(message, domain...)
 	message = append(message, envelopeCommitment[:]...)
 	var integer [8]byte
 	binary.BigEndian.PutUint64(integer[:], write.rosterVersion)
@@ -2054,6 +2399,11 @@ func senderKeyDeviceRouteCommitment(envelopeCommitment [32]byte, write senderKey
 	message = append(message, integer[:]...)
 	binary.BigEndian.PutUint64(integer[:], write.targetBindingVersion)
 	message = append(message, integer[:]...)
+	if write.membershipEpoch != 0 {
+		binary.BigEndian.PutUint64(integer[:], write.membershipEpoch)
+		message = append(message, integer[:]...)
+		message = append(message, write.membershipEpochHash...)
+	}
 	return sha256.Sum256(message)
 }
 
@@ -2061,9 +2411,18 @@ func senderKeyDeviceRouteCommitment(envelopeCommitment [32]byte, write senderKey
 // eligible device and binds the retained row to the roster and both immutable
 // binding versions that authorized it.
 func (db *DB) StoreDeviceSenderKey(ctx context.Context, convID, ownerDeviceID, targetDeviceID string, encryptedKey []byte, generation uint32, rosterVersion uint64, rosterCommitment []byte, ownerBindingVersion, targetBindingVersion uint64) error {
+	return db.StoreDeviceSenderKeyForMembership(
+		ctx, convID, ownerDeviceID, targetDeviceID, encryptedKey, generation,
+		rosterVersion, rosterCommitment, ownerBindingVersion, targetBindingVersion,
+		0, nil,
+	)
+}
+
+func (db *DB) StoreDeviceSenderKeyForMembership(ctx context.Context, convID, ownerDeviceID, targetDeviceID string, encryptedKey []byte, generation uint32, rosterVersion uint64, rosterCommitment []byte, ownerBindingVersion, targetBindingVersion, membershipEpoch uint64, membershipEpochHash []byte) error {
 	if rosterVersion == 0 || rosterVersion > math.MaxInt64 || len(rosterCommitment) != 32 ||
 		ownerBindingVersion == 0 || ownerBindingVersion > math.MaxInt64 ||
-		targetBindingVersion == 0 || targetBindingVersion > math.MaxInt64 {
+		targetBindingVersion == 0 || targetBindingVersion > math.MaxInt64 ||
+		!validOptionalMembershipCoordinateV1(membershipEpoch, membershipEpochHash) {
 		return errors.New("invalid sender key device route")
 	}
 	return db.storeSenderKeyWrites(ctx, convID, ownerDeviceID, generation, []senderKeyWrite{{
@@ -2073,6 +2432,8 @@ func (db *DB) StoreDeviceSenderKey(ctx context.Context, convID, ownerDeviceID, t
 		rosterCommitment:     append([]byte(nil), rosterCommitment...),
 		ownerBindingVersion:  ownerBindingVersion,
 		targetBindingVersion: targetBindingVersion,
+		membershipEpoch:      membershipEpoch,
+		membershipEpochHash:  append([]byte(nil), membershipEpochHash...),
 		deviceRouted:         true,
 	}})
 }
@@ -2202,11 +2563,26 @@ func (db *DB) storeSenderKeyWritesOnce(ctx context.Context, convID, ownerDeviceI
 				write.targetBindingVersion > math.MaxInt64 {
 				return errors.New("invalid sender key device route")
 			}
+			if !validOptionalMembershipCoordinateV1(write.membershipEpoch, write.membershipEpochHash) {
+				return errors.New("invalid sender key membership coordinate")
+			}
 		} else if write.rosterVersion != 0 || len(write.rosterCommitment) != 0 ||
-			write.ownerBindingVersion != 0 || write.targetBindingVersion != 0 {
+			write.ownerBindingVersion != 0 || write.targetBindingVersion != 0 ||
+			write.membershipEpoch != 0 || len(write.membershipEpochHash) != 0 {
 			return errors.New("partial sender key device route")
 		}
 		if write.deviceRouted {
+			profile := MessageCryptoProfileSenderKeyV5
+			if write.membershipEpoch != 0 {
+				profile = MessageCryptoProfileSenderKeyV6
+			}
+			if err := validateMembershipTrafficContextV1(
+				ctx, tx, convID, profile, write.rosterVersion,
+				write.rosterCommitment, write.membershipEpoch,
+				write.membershipEpochHash,
+			); err != nil {
+				return ErrSenderKeyRosterChanged
+			}
 			if err := validateSenderKeyRouteSnapshot(
 				ctx, tx, secureRoster, convID, ownerDeviceID, targetDeviceID, write,
 			); err != nil {
@@ -2258,12 +2634,13 @@ func (db *DB) storeSenderKeyWritesOnce(ctx context.Context, convID, ownerDeviceI
 			if !bytes.Equal(currentCommitment, headCommitment[:]) {
 				return ErrSenderKeyGenerationConflict
 			}
-			var retainedKey, retainedCommitment, retainedRosterCommitment []byte
-			var retainedRosterVersion, retainedOwnerBindingVersion, retainedTargetBindingVersion int64
+			var retainedKey, retainedCommitment, retainedRosterCommitment, retainedMembershipHash []byte
+			var retainedRosterVersion, retainedOwnerBindingVersion, retainedTargetBindingVersion, retainedMembershipEpoch int64
 			err := tx.QueryRow(ctx,
 				`SELECT encrypted_key, envelope_commitment,
 				        COALESCE(roster_version, 0), COALESCE(roster_commitment, ''::bytea),
-				        COALESCE(owner_binding_version, 0), COALESCE(target_binding_version, 0)
+				        COALESCE(owner_binding_version, 0), COALESCE(target_binding_version, 0),
+				        COALESCE(membership_epoch, 0), COALESCE(membership_epoch_hash, ''::bytea)
 				 FROM sender_keys
 				 WHERE conversation_id = $1::uuid
 				   AND owner_device_id = $2::uuid
@@ -2271,7 +2648,8 @@ func (db *DB) storeSenderKeyWritesOnce(ctx context.Context, convID, ownerDeviceI
 				   AND generation = $4`,
 				convID, ownerDeviceID, targetDeviceID, int64(generation),
 			).Scan(&retainedKey, &retainedCommitment, &retainedRosterVersion,
-				&retainedRosterCommitment, &retainedOwnerBindingVersion, &retainedTargetBindingVersion)
+				&retainedRosterCommitment, &retainedOwnerBindingVersion, &retainedTargetBindingVersion,
+				&retainedMembershipEpoch, &retainedMembershipHash)
 			if errors.Is(err, pgx.ErrNoRows) {
 				// The row was explicitly collected after its stream head was
 				// committed. An exact retry remains idempotent but must not
@@ -2284,7 +2662,8 @@ func (db *DB) storeSenderKeyWritesOnce(ctx context.Context, convID, ownerDeviceI
 			}
 			if !senderKeyWriteMatches(write, retainedKey, retainedCommitment,
 				retainedRosterVersion, retainedRosterCommitment,
-				retainedOwnerBindingVersion, retainedTargetBindingVersion) {
+				retainedOwnerBindingVersion, retainedTargetBindingVersion,
+				retainedMembershipEpoch, retainedMembershipHash) {
 				return ErrSenderKeyGenerationConflict
 			}
 			continue
@@ -2311,10 +2690,11 @@ func (db *DB) storeSenderKeyWritesOnce(ctx context.Context, convID, ownerDeviceI
 			   conversation_id, owner_device_id, target_device_id,
 			   encrypted_key, generation, envelope_commitment, roster_version,
 			   roster_commitment, owner_binding_version, target_binding_version,
+			   membership_epoch, membership_epoch_hash,
 			   expires_at
 			 ) VALUES (
 			   $1::uuid, $2::uuid, $3::uuid, $4, $5, $6, $7, $8, $9, $10,
-			   now() + ($11 * INTERVAL '1 second')
+			   $11, $12, now() + ($13 * INTERVAL '1 second')
 			 )
 			 ON CONFLICT (conversation_id, owner_device_id, target_device_id, generation)
 			 DO NOTHING`,
@@ -2323,6 +2703,8 @@ func (db *DB) storeSenderKeyWritesOnce(ctx context.Context, convID, ownerDeviceI
 			nullableSenderKeyBytes(write.rosterCommitment, write.deviceRouted),
 			nullableSenderKeyRoute(write.ownerBindingVersion, write.deviceRouted),
 			nullableSenderKeyRoute(write.targetBindingVersion, write.deviceRouted),
+			nullableSenderKeyRoute(write.membershipEpoch, write.membershipEpoch != 0),
+			nullableSenderKeyBytes(write.membershipEpochHash, write.membershipEpoch != 0),
 			int64(SenderKeyReceiptTTL/time.Second),
 		); err != nil {
 			return fmt.Errorf("store sender key target: %w", err)
@@ -2331,12 +2713,13 @@ func (db *DB) storeSenderKeyWritesOnce(ctx context.Context, convID, ownerDeviceI
 		// ON CONFLICT is intentionally non-mutating. Verify the retained row so
 		// an inconsistent legacy row, or even a theoretical commitment collision,
 		// cannot make a generation replace authenticated state.
-		var retainedKey, retainedCommitment, retainedRosterCommitment []byte
-		var retainedRosterVersion, retainedOwnerBindingVersion, retainedTargetBindingVersion int64
+		var retainedKey, retainedCommitment, retainedRosterCommitment, retainedMembershipHash []byte
+		var retainedRosterVersion, retainedOwnerBindingVersion, retainedTargetBindingVersion, retainedMembershipEpoch int64
 		if err := tx.QueryRow(ctx,
 			`SELECT encrypted_key, envelope_commitment,
 			        COALESCE(roster_version, 0), COALESCE(roster_commitment, ''::bytea),
-			        COALESCE(owner_binding_version, 0), COALESCE(target_binding_version, 0)
+			        COALESCE(owner_binding_version, 0), COALESCE(target_binding_version, 0),
+			        COALESCE(membership_epoch, 0), COALESCE(membership_epoch_hash, ''::bytea)
 			 FROM sender_keys
 			 WHERE conversation_id = $1::uuid
 			   AND owner_device_id = $2::uuid
@@ -2344,12 +2727,14 @@ func (db *DB) storeSenderKeyWritesOnce(ctx context.Context, convID, ownerDeviceI
 			   AND generation = $4`,
 			convID, ownerDeviceID, targetDeviceID, int64(generation),
 		).Scan(&retainedKey, &retainedCommitment, &retainedRosterVersion,
-			&retainedRosterCommitment, &retainedOwnerBindingVersion, &retainedTargetBindingVersion); err != nil {
+			&retainedRosterCommitment, &retainedOwnerBindingVersion, &retainedTargetBindingVersion,
+			&retainedMembershipEpoch, &retainedMembershipHash); err != nil {
 			return fmt.Errorf("verify retained sender key target: %w", err)
 		}
 		if !senderKeyWriteMatches(write, retainedKey, retainedCommitment,
 			retainedRosterVersion, retainedRosterCommitment,
-			retainedOwnerBindingVersion, retainedTargetBindingVersion) {
+			retainedOwnerBindingVersion, retainedTargetBindingVersion,
+			retainedMembershipEpoch, retainedMembershipHash) {
 			return ErrSenderKeyGenerationConflict
 		}
 	}
@@ -2415,10 +2800,18 @@ func validateSenderKeyRouteSnapshot(ctx context.Context, tx pgx.Tx, roster *Conv
 // Roster mutations therefore linearize either before the callback (which is
 // skipped) or after it (and may then prune the retained row).
 func (db *DB) WithCurrentSenderKeyRoute(ctx context.Context, conversationID, ownerDeviceID, targetDeviceID string, rosterVersion uint64, rosterCommitment []byte, ownerBindingVersion, targetBindingVersion uint64, publish func() error) error {
+	return db.WithCurrentSenderKeyRouteForMembership(
+		ctx, conversationID, ownerDeviceID, targetDeviceID, rosterVersion,
+		rosterCommitment, ownerBindingVersion, targetBindingVersion, 0, nil, publish,
+	)
+}
+
+func (db *DB) WithCurrentSenderKeyRouteForMembership(ctx context.Context, conversationID, ownerDeviceID, targetDeviceID string, rosterVersion uint64, rosterCommitment []byte, ownerBindingVersion, targetBindingVersion, membershipEpoch uint64, membershipEpochHash []byte, publish func() error) error {
 	if conversationID == "" || ownerDeviceID == "" || targetDeviceID == "" ||
 		rosterVersion == 0 || rosterVersion > math.MaxInt64 || len(rosterCommitment) != 32 ||
 		ownerBindingVersion == 0 || ownerBindingVersion > math.MaxInt64 ||
-		targetBindingVersion == 0 || targetBindingVersion > math.MaxInt64 || publish == nil {
+		targetBindingVersion == 0 || targetBindingVersion > math.MaxInt64 ||
+		!validOptionalMembershipCoordinateV1(membershipEpoch, membershipEpochHash) || publish == nil {
 		return ErrSenderKeyRosterChanged
 	}
 	tx, err := db.Pool.Begin(ctx)
@@ -2437,6 +2830,16 @@ func (db *DB) WithCurrentSenderKeyRoute(ctx context.Context, conversationID, own
 	if err != nil {
 		return err
 	}
+	profile := MessageCryptoProfileSenderKeyV5
+	if membershipEpoch != 0 {
+		profile = MessageCryptoProfileSenderKeyV6
+	}
+	if err := validateMembershipTrafficContextV1(
+		ctx, tx, conversationID, profile, rosterVersion, rosterCommitment,
+		membershipEpoch, membershipEpochHash,
+	); err != nil {
+		return ErrSenderKeyRosterChanged
+	}
 	if err := validateSenderKeyRouteSnapshot(
 		ctx, tx, roster, conversationID, ownerDeviceID, targetDeviceID,
 		senderKeyWrite{
@@ -2445,6 +2848,8 @@ func (db *DB) WithCurrentSenderKeyRoute(ctx context.Context, conversationID, own
 			rosterCommitment:     rosterCommitment,
 			ownerBindingVersion:  ownerBindingVersion,
 			targetBindingVersion: targetBindingVersion,
+			membershipEpoch:      membershipEpoch,
+			membershipEpochHash:  membershipEpochHash,
 			deviceRouted:         true,
 		},
 	); err != nil {
@@ -2461,9 +2866,17 @@ func (db *DB) WithCurrentSenderKeyRoute(ctx context.Context, conversationID, own
 // head remains the rollback barrier, so the sender must correct with a newer
 // generation for the new roster.
 func (db *DB) DiscardDeviceSenderKey(ctx context.Context, conversationID, ownerDeviceID, targetDeviceID string, generation uint32, rosterVersion uint64, envelopeCommitment []byte) error {
+	return db.DiscardDeviceSenderKeyForMembership(
+		ctx, conversationID, ownerDeviceID, targetDeviceID, generation,
+		rosterVersion, envelopeCommitment, 0, nil,
+	)
+}
+
+func (db *DB) DiscardDeviceSenderKeyForMembership(ctx context.Context, conversationID, ownerDeviceID, targetDeviceID string, generation uint32, rosterVersion uint64, envelopeCommitment []byte, membershipEpoch uint64, membershipEpochHash []byte) error {
 	if conversationID == "" || ownerDeviceID == "" || targetDeviceID == "" ||
 		generation == 0 || rosterVersion == 0 || rosterVersion > math.MaxInt64 ||
-		len(envelopeCommitment) != 32 {
+		len(envelopeCommitment) != 32 ||
+		!validOptionalMembershipCoordinateV1(membershipEpoch, membershipEpochHash) {
 		return ErrSenderKeyReceiptMismatch
 	}
 	_, err := db.Pool.Exec(ctx,
@@ -2473,9 +2886,13 @@ func (db *DB) DiscardDeviceSenderKey(ctx context.Context, conversationID, ownerD
 		   AND target_device_id = $3::uuid
 		   AND generation = $4
 		   AND roster_version = $5
-		   AND envelope_commitment = $6`,
+		   AND envelope_commitment = $6
+		   AND membership_epoch IS NOT DISTINCT FROM $7
+		   AND membership_epoch_hash IS NOT DISTINCT FROM $8`,
 		conversationID, ownerDeviceID, targetDeviceID, int64(generation),
 		int64(rosterVersion), envelopeCommitment,
+		nullableSenderKeyRoute(membershipEpoch, membershipEpoch != 0),
+		nullableSenderKeyBytes(membershipEpochHash, membershipEpoch != 0),
 	)
 	return err
 }
@@ -2683,7 +3100,7 @@ func nullableSenderKeyBytes(value []byte, present bool) any {
 	return value
 }
 
-func senderKeyWriteMatches(write senderKeyWrite, retainedKey, retainedCommitment []byte, rosterVersion int64, rosterCommitment []byte, ownerBindingVersion, targetBindingVersion int64) bool {
+func senderKeyWriteMatches(write senderKeyWrite, retainedKey, retainedCommitment []byte, rosterVersion int64, rosterCommitment []byte, ownerBindingVersion, targetBindingVersion, membershipEpoch int64, membershipEpochHash []byte) bool {
 	envelopeCommitment := sha256.Sum256(write.encryptedKey)
 	if !bytes.Equal(retainedKey, write.encryptedKey) ||
 		!bytes.Equal(retainedCommitment, envelopeCommitment[:]) {
@@ -2691,12 +3108,15 @@ func senderKeyWriteMatches(write senderKeyWrite, retainedKey, retainedCommitment
 	}
 	if !write.deviceRouted {
 		return rosterVersion == 0 && len(rosterCommitment) == 0 &&
-			ownerBindingVersion == 0 && targetBindingVersion == 0
+			ownerBindingVersion == 0 && targetBindingVersion == 0 &&
+			membershipEpoch == 0 && len(membershipEpochHash) == 0
 	}
 	return rosterVersion == int64(write.rosterVersion) &&
 		bytes.Equal(rosterCommitment, write.rosterCommitment) &&
 		ownerBindingVersion == int64(write.ownerBindingVersion) &&
-		targetBindingVersion == int64(write.targetBindingVersion)
+		targetBindingVersion == int64(write.targetBindingVersion) &&
+		membershipEpoch == int64(write.membershipEpoch) &&
+		bytes.Equal(membershipEpochHash, write.membershipEpochHash)
 }
 
 // SenderKeyConversationBacklog is bounded metadata used by pre-auth restore
@@ -2743,6 +3163,8 @@ func (db *DB) ListPendingSenderKeyConversations(ctx context.Context, targetDevic
 		          OR sender_key.roster_commitment IS NULL
 		          OR sender_key.owner_binding_version IS NULL
 		          OR sender_key.target_binding_version IS NULL
+		          OR (sender_key.membership_epoch IS NULL) <>
+		             (sender_key.membership_epoch_hash IS NULL)
 		        ), FALSE)
 		 FROM sender_keys AS sender_key
 		 JOIN conversations AS conversation
@@ -2873,6 +3295,7 @@ func (db *DB) loadPendingSenderKeyConversationOnce(ctx context.Context, targetDe
 		        COALESCE(bool_or(
 		          roster_version IS NULL OR roster_commitment IS NULL
 		          OR owner_binding_version IS NULL OR target_binding_version IS NULL
+		          OR (membership_epoch IS NULL) <> (membership_epoch_hash IS NULL)
 		        ), FALSE)
 		 FROM sender_keys
 		 WHERE target_device_id = $1::uuid
@@ -2902,6 +3325,8 @@ func (db *DB) loadPendingSenderKeyConversationOnce(ctx context.Context, targetDe
 		        sender_key.encrypted_key, sender_key.generation,
 		        sender_key.roster_version, sender_key.roster_commitment,
 		        sender_key.owner_binding_version, sender_key.target_binding_version,
+		        COALESCE(sender_key.membership_epoch, 0),
+		        COALESCE(sender_key.membership_epoch_hash, ''::bytea),
 		        sender_key.envelope_commitment,
 		        sender_key.created_at, sender_key.expires_at
 		 FROM sender_keys AS sender_key
@@ -2919,12 +3344,13 @@ func (db *DB) loadPendingSenderKeyConversationOnce(ctx context.Context, targetDe
 	keys := make([]SenderKeyRow, 0, int(totalRows))
 	for rows.Next() {
 		var key SenderKeyRow
-		var rosterVersion, ownerBindingVersion, targetBindingVersion int64
+		var rosterVersion, ownerBindingVersion, targetBindingVersion, membershipEpoch int64
 		if err := rows.Scan(
 			&key.ConversationID, &key.OwnerDeviceID, &key.TargetDeviceID,
 			&key.TargetUserID, &key.EncryptedKey, &key.Generation,
 			&rosterVersion, &key.RosterCommitment,
 			&ownerBindingVersion, &targetBindingVersion,
+			&membershipEpoch, &key.MembershipEpochHash,
 			&key.EnvelopeCommitment, &key.CreatedAt, &key.ExpiresAt,
 		); err != nil {
 			rows.Close()
@@ -2937,6 +3363,11 @@ func (db *DB) loadPendingSenderKeyConversationOnce(ctx context.Context, targetDe
 		key.RosterVersion = uint64(rosterVersion)
 		key.OwnerBindingVersion = uint64(ownerBindingVersion)
 		key.TargetBindingVersion = uint64(targetBindingVersion)
+		if !validOptionalMembershipCoordinateV1(uint64(membershipEpoch), key.MembershipEpochHash) {
+			rows.Close()
+			return nil, ErrSenderKeyLegacyState
+		}
+		key.MembershipEpoch = uint64(membershipEpoch)
 		keys = append(keys, key)
 	}
 	if err := rows.Err(); err != nil {
@@ -3001,6 +3432,7 @@ func (db *DB) GetPendingSenderKeys(ctx context.Context, targetDeviceID string) (
 		        COALESCE(bool_or(
 		          roster_version IS NULL OR roster_commitment IS NULL
 		          OR owner_binding_version IS NULL OR target_binding_version IS NULL
+		          OR (membership_epoch IS NULL) <> (membership_epoch_hash IS NULL)
 		        ), FALSE)
 		 FROM sender_keys WHERE target_device_id = $1::uuid`,
 		targetDeviceID,
@@ -3024,6 +3456,7 @@ func (db *DB) GetPendingSenderKeys(ctx context.Context, targetDeviceID string) (
 		        target_device.user_id, sk.encrypted_key, sk.generation,
 		        COALESCE(sk.roster_version, 0), COALESCE(sk.roster_commitment, ''::bytea),
 		        COALESCE(sk.owner_binding_version, 0), COALESCE(sk.target_binding_version, 0),
+		        COALESCE(sk.membership_epoch, 0), COALESCE(sk.membership_epoch_hash, ''::bytea),
 		        sk.envelope_commitment, sk.created_at, sk.expires_at
 		 FROM sender_keys sk
 		 JOIN conversations conversation ON conversation.id = sk.conversation_id AND conversation.conv_type IN (1, 2)
@@ -3044,10 +3477,11 @@ func (db *DB) GetPendingSenderKeys(ctx context.Context, targetDeviceID string) (
 	var keys []SenderKeyRow
 	for rows.Next() {
 		var k SenderKeyRow
-		var rosterVersion, ownerBindingVersion, targetBindingVersion int64
+		var rosterVersion, ownerBindingVersion, targetBindingVersion, membershipEpoch int64
 		if err := rows.Scan(&k.ConversationID, &k.OwnerDeviceID, &k.TargetDeviceID,
 			&k.TargetUserID, &k.EncryptedKey, &k.Generation, &rosterVersion,
 			&k.RosterCommitment, &ownerBindingVersion, &targetBindingVersion,
+			&membershipEpoch, &k.MembershipEpochHash,
 			&k.EnvelopeCommitment, &k.CreatedAt, &k.ExpiresAt); err != nil {
 			rows.Close()
 			return nil, err
@@ -3055,6 +3489,11 @@ func (db *DB) GetPendingSenderKeys(ctx context.Context, targetDeviceID string) (
 		k.RosterVersion = uint64(rosterVersion)
 		k.OwnerBindingVersion = uint64(ownerBindingVersion)
 		k.TargetBindingVersion = uint64(targetBindingVersion)
+		if !validOptionalMembershipCoordinateV1(uint64(membershipEpoch), k.MembershipEpochHash) {
+			rows.Close()
+			return nil, ErrSenderKeyLegacyState
+		}
+		k.MembershipEpoch = uint64(membershipEpoch)
 		keys = append(keys, k)
 	}
 	if err := rows.Err(); err != nil {
@@ -3097,6 +3536,8 @@ type SenderKeyRow struct {
 	Generation           uint32
 	RosterVersion        uint64
 	RosterCommitment     []byte
+	MembershipEpoch      uint64
+	MembershipEpochHash  []byte
 	OwnerBindingVersion  uint64
 	TargetBindingVersion uint64
 	EnvelopeCommitment   []byte
@@ -3108,9 +3549,17 @@ type SenderKeyRow struct {
 // authenticated target device. The stream head is deliberately retained so a
 // replay cannot resurrect or replace an acknowledged generation.
 func (db *DB) AcknowledgeSenderKey(ctx context.Context, conversationID, ownerDeviceID, targetDeviceID string, generation uint32, rosterVersion uint64, envelopeCommitment []byte) error {
+	return db.AcknowledgeSenderKeyForMembership(
+		ctx, conversationID, ownerDeviceID, targetDeviceID, generation,
+		rosterVersion, envelopeCommitment, 0, nil,
+	)
+}
+
+func (db *DB) AcknowledgeSenderKeyForMembership(ctx context.Context, conversationID, ownerDeviceID, targetDeviceID string, generation uint32, rosterVersion uint64, envelopeCommitment []byte, membershipEpoch uint64, membershipEpochHash []byte) error {
 	if conversationID == "" || ownerDeviceID == "" || targetDeviceID == "" ||
 		generation == 0 || rosterVersion == 0 || rosterVersion > math.MaxInt64 ||
-		len(envelopeCommitment) != 32 {
+		len(envelopeCommitment) != 32 ||
+		!validOptionalMembershipCoordinateV1(membershipEpoch, membershipEpochHash) {
 		return ErrSenderKeyReceiptMismatch
 	}
 	tag, err := db.Pool.Exec(ctx,
@@ -3120,9 +3569,13 @@ func (db *DB) AcknowledgeSenderKey(ctx context.Context, conversationID, ownerDev
 		   AND target_device_id = $3::uuid
 		   AND generation = $4
 		   AND roster_version = $5
-		   AND envelope_commitment = $6`,
+		   AND envelope_commitment = $6
+		   AND membership_epoch IS NOT DISTINCT FROM $7
+		   AND membership_epoch_hash IS NOT DISTINCT FROM $8`,
 		conversationID, ownerDeviceID, targetDeviceID, int64(generation),
 		int64(rosterVersion), envelopeCommitment,
+		nullableSenderKeyRoute(membershipEpoch, membershipEpoch != 0),
+		nullableSenderKeyBytes(membershipEpochHash, membershipEpoch != 0),
 	)
 	if err != nil {
 		return err

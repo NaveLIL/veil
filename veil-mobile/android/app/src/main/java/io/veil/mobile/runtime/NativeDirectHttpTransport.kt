@@ -4,6 +4,7 @@ import androidx.annotation.VisibleForTesting
 import io.veil.mobile.BuildConfig
 import java.io.IOException
 import java.net.URI
+import java.util.Base64
 import java.util.UUID
 import java.util.concurrent.Executor
 import java.util.concurrent.TimeUnit
@@ -21,7 +22,6 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import okhttp3.ResponseBody
-import okio.ByteString.Companion.decodeBase64
 
 /** Response limits mirrored from the native Direct contract. */
 internal object NativeDirectHttpLimits {
@@ -301,9 +301,11 @@ internal class NativeDirectHttpTransport private constructor(
       .tag(ExactNetworkExchangeGuard::class.java, ExactNetworkExchangeGuard())
       .header("Host", authority)
       .header("Accept", JSON_MEDIA_TYPE)
+      .header("X-Veil-REST-Auth-Version", input.signature.version)
       .header("X-Veil-User", input.signature.userId)
       .header("X-Veil-Timestamp", input.signature.timestampMs)
-      .header("X-Veil-Signature", input.signature.signatureBase64)
+      .header("X-Veil-Nonce", input.signature.nonceBase64url)
+      .header("X-Veil-Signature", input.signature.signatureBase64url)
     when (input.method) {
       NativeDirectHttpMethod.GET -> builder.get()
       NativeDirectHttpMethod.POST -> {
@@ -330,6 +332,7 @@ internal class NativeDirectHttpTransport private constructor(
   }
 
   private fun requireValidSignature(signature: NativeRestSignature) {
+    require(signature.version == REST_AUTH_VERSION) { "Direct signature version is unsupported" }
     val userId = try {
       UUID.fromString(signature.userId).toString()
     } catch (_: IllegalArgumentException) {
@@ -338,15 +341,28 @@ internal class NativeDirectHttpTransport private constructor(
     require(userId == signature.userId) { "Direct signature user is not canonical" }
 
     val timestamp = signature.timestampMs.toLongOrNull()
-    require(timestamp != null && timestamp >= 0 && timestamp.toString() == signature.timestampMs) {
+    require(timestamp != null && timestamp > 0 && timestamp.toString() == signature.timestampMs) {
       "Direct signature timestamp is invalid"
     }
-    val signatureBytes = signature.signatureBase64.decodeBase64()
-      ?: throw IllegalArgumentException("Direct signature is invalid")
+    requireCanonicalBase64Url(signature.nonceBase64url, REST_NONCE_BYTES, "nonce")
+    requireCanonicalBase64Url(
+      signature.signatureBase64url,
+      ED25519_SIGNATURE_BYTES,
+      "signature",
+    )
+  }
+
+  private fun requireCanonicalBase64Url(value: String, expectedBytes: Int, label: String) {
+    require(value.isNotEmpty() && '=' !in value) { "Direct $label is invalid" }
+    val decoded = try {
+      Base64.getUrlDecoder().decode(value)
+    } catch (_: IllegalArgumentException) {
+      throw IllegalArgumentException("Direct $label is invalid")
+    }
     require(
-      signatureBytes.size == ED25519_SIGNATURE_BYTES &&
-        signatureBytes.base64() == signature.signatureBase64
-    ) { "Direct signature is invalid" }
+      decoded.size == expectedBytes &&
+        Base64.getUrlEncoder().withoutPadding().encodeToString(decoded) == value
+    ) { "Direct $label is invalid" }
   }
 
   private fun readBounded(
@@ -512,6 +528,8 @@ internal class NativeDirectHttpTransport private constructor(
     val OWN_PREKEY_COUNT_TARGET = Regex("^/v1/prekeys/[0-9a-f]{64}/count$")
     const val MAX_REQUEST_TARGET_CHARS = 8 * 1024
     const val MAX_REQUEST_BODY_BYTES = 64 * 1024
+    const val REST_AUTH_VERSION = "2"
+    const val REST_NONCE_BYTES = 32
     const val ED25519_SIGNATURE_BYTES = 64
     const val READ_CHUNK_BYTES = 8 * 1024
     const val CONNECT_TIMEOUT_SECONDS = 10L

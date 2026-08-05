@@ -656,15 +656,37 @@ internal open class UniffiForeignFutureStructVoid(
 internal interface UniffiForeignFutureCompleteVoid : com.sun.jna.Callback {
     fun callback(`callbackData`: Long,`result`: UniffiForeignFutureStructVoid.UniffiByValue,)
 }
+internal interface UniffiCallbackInterfaceMobileWsEventsCallbackMethod0 : com.sun.jna.Callback {
+    fun callback(`uniffiHandle`: Long,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,)
+}
+internal interface UniffiCallbackInterfaceMobileWsEventsCallbackMethod1 : com.sun.jna.Callback {
+    fun callback(`uniffiHandle`: Long,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,)
+}
+internal interface UniffiCallbackInterfaceMobileWsEventsCallbackMethod2 : com.sun.jna.Callback {
+    fun callback(`uniffiHandle`: Long,`exit`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,)
+}
+@Structure.FieldOrder("onAuthenticated", "onEventsReady", "onTerminal", "uniffiFree")
+internal open class UniffiVTableCallbackInterfaceMobileWsEventsCallback(
+    @JvmField internal var `onAuthenticated`: UniffiCallbackInterfaceMobileWsEventsCallbackMethod0? = null,
+    @JvmField internal var `onEventsReady`: UniffiCallbackInterfaceMobileWsEventsCallbackMethod1? = null,
+    @JvmField internal var `onTerminal`: UniffiCallbackInterfaceMobileWsEventsCallbackMethod2? = null,
+    @JvmField internal var `uniffiFree`: UniffiCallbackInterfaceFree? = null,
+) : Structure() {
+    class UniffiByValue(
+        `onAuthenticated`: UniffiCallbackInterfaceMobileWsEventsCallbackMethod0? = null,
+        `onEventsReady`: UniffiCallbackInterfaceMobileWsEventsCallbackMethod1? = null,
+        `onTerminal`: UniffiCallbackInterfaceMobileWsEventsCallbackMethod2? = null,
+        `uniffiFree`: UniffiCallbackInterfaceFree? = null,
+    ): UniffiVTableCallbackInterfaceMobileWsEventsCallback(`onAuthenticated`,`onEventsReady`,`onTerminal`,`uniffiFree`,), Structure.ByValue
 
+   internal fun uniffiSetValue(other: UniffiVTableCallbackInterfaceMobileWsEventsCallback) {
+        `onAuthenticated` = other.`onAuthenticated`
+        `onEventsReady` = other.`onEventsReady`
+        `onTerminal` = other.`onTerminal`
+        `uniffiFree` = other.`uniffiFree`
+    }
 
-
-
-
-
-
-
-
+}
 
 
 
@@ -883,29 +905,7 @@ internal interface UniffiForeignFutureCompleteVoid : com.sun.jna.Callback {
 // when the library is loaded.
 internal interface IntegrityCheckingUniffiLib : Library {
     // Integrity check functions only
-    fun uniffi_veil_ffi_checksum_func_aead_decrypt(
-): Short
-fun uniffi_veil_ffi_checksum_func_aead_encrypt(
-): Short
-fun uniffi_veil_ffi_checksum_func_decrypt_share(
-): Short
-fun uniffi_veil_ffi_checksum_func_derive_key_from_password(
-): Short
-fun uniffi_veil_ffi_checksum_func_derive_key_from_pin(
-): Short
-fun uniffi_veil_ffi_checksum_func_ed25519_verify(
-): Short
-fun uniffi_veil_ffi_checksum_func_encrypt_share(
-): Short
-fun uniffi_veil_ffi_checksum_func_generate_account_fingerprint_v2(
-): Short
-fun uniffi_veil_ffi_checksum_func_generate_mnemonic(
-): Short
-fun uniffi_veil_ffi_checksum_func_validate_mnemonic(
-): Short
-fun uniffi_veil_ffi_checksum_func_x3dh_initiate(
-): Short
-fun uniffi_veil_ffi_checksum_method_mobileconnectcancellation_cancel(
+    fun uniffi_veil_ffi_checksum_method_mobileconnectcancellation_cancel(
 ): Short
 fun uniffi_veil_ffi_checksum_method_mobiledirectmessagedata_delivery(
 ): Short
@@ -917,9 +917,17 @@ fun uniffi_veil_ffi_checksum_method_mobiledirectmessagedata_text(
 ): Short
 fun uniffi_veil_ffi_checksum_method_mobiledirectmessagedata_timestamp_ms(
 ): Short
-fun uniffi_veil_ffi_checksum_method_veilidentity_identity_key(
+fun uniffi_veil_ffi_checksum_method_mobilewseventscallback_on_authenticated(
 ): Short
-fun uniffi_veil_ffi_checksum_method_veilidentity_sign(
+fun uniffi_veil_ffi_checksum_method_mobilewseventscallback_on_events_ready(
+): Short
+fun uniffi_veil_ffi_checksum_method_mobilewseventscallback_on_terminal(
+): Short
+fun uniffi_veil_ffi_checksum_method_mobilewseventscontroller_network_changed(
+): Short
+fun uniffi_veil_ffi_checksum_method_mobilewseventscontroller_stop(
+): Short
+fun uniffi_veil_ffi_checksum_method_veilidentity_identity_key(
 ): Short
 fun uniffi_veil_ffi_checksum_method_veilidentity_signing_key(
 ): Short
@@ -933,6 +941,10 @@ fun uniffi_veil_ffi_checksum_method_veilmobilesession_buffer_direct_live_events_
 ): Short
 fun uniffi_veil_ffi_checksum_method_veilmobilesession_cancel_direct_sync(
 ): Short
+fun uniffi_veil_ffi_checksum_method_veilmobilesession_confirm_direct_identity_verification(
+): Short
+fun uniffi_veil_ffi_checksum_method_veilmobilesession_confirm_direct_identity_verification_qr(
+): Short
 fun uniffi_veil_ffi_checksum_method_veilmobilesession_connect(
 ): Short
 fun uniffi_veil_ffi_checksum_method_veilmobilesession_connect_cancellable(
@@ -941,9 +953,13 @@ fun uniffi_veil_ffi_checksum_method_veilmobilesession_connect_with_node_access_p
 ): Short
 fun uniffi_veil_ffi_checksum_method_veilmobilesession_connect_with_node_access_pass_cancellable(
 ): Short
+fun uniffi_veil_ffi_checksum_method_veilmobilesession_direct_identity_verification(
+): Short
 fun uniffi_veil_ffi_checksum_method_veilmobilesession_direct_send_readiness(
 ): Short
 fun uniffi_veil_ffi_checksum_method_veilmobilesession_disconnect(
+): Short
+fun uniffi_veil_ffi_checksum_method_veilmobilesession_install_direct_conversation(
 ): Short
 fun uniffi_veil_ffi_checksum_method_veilmobilesession_install_direct_directory_page(
 ): Short
@@ -954,6 +970,14 @@ fun uniffi_veil_ffi_checksum_method_veilmobilesession_install_direct_prekey_bund
 fun uniffi_veil_ffi_checksum_method_veilmobilesession_install_own_prekey_response(
 ): Short
 fun uniffi_veil_ffi_checksum_method_veilmobilesession_mobile_reconnect_target(
+): Short
+fun uniffi_veil_ffi_checksum_method_veilmobilesession_parse_contact_search_response(
+): Short
+fun uniffi_veil_ffi_checksum_method_veilmobilesession_parse_create_direct_response(
+): Short
+fun uniffi_veil_ffi_checksum_method_veilmobilesession_prepare_contact_search_request(
+): Short
+fun uniffi_veil_ffi_checksum_method_veilmobilesession_prepare_create_direct_request(
 ): Short
 fun uniffi_veil_ffi_checksum_method_veilmobilesession_prepare_direct_directory_request(
 ): Short
@@ -973,11 +997,7 @@ fun uniffi_veil_ffi_checksum_method_veilmobilesession_send_direct_text(
 ): Short
 fun uniffi_veil_ffi_checksum_method_veilmobilesession_sign_direct_rest_request(
 ): Short
-fun uniffi_veil_ffi_checksum_method_veilratchet_decrypt(
-): Short
-fun uniffi_veil_ffi_checksum_method_veilratchet_encrypt(
-): Short
-fun uniffi_veil_ffi_checksum_method_veilratchet_serialize(
+fun uniffi_veil_ffi_checksum_method_veilmobilesession_start_background_events(
 ): Short
 fun uniffi_veil_ffi_checksum_method_veilrecoverydraft_cancel(
 ): Short
@@ -1005,21 +1025,11 @@ fun uniffi_veil_ffi_checksum_method_veilrecoverydraft_word_index(
 ): Short
 fun uniffi_veil_ffi_checksum_constructor_mobileconnectcancellation_new(
 ): Short
-fun uniffi_veil_ffi_checksum_constructor_veilidentity_from_mnemonic(
-): Short
 fun uniffi_veil_ffi_checksum_constructor_veilidentity_from_mnemonic_bytes(
 ): Short
 fun uniffi_veil_ffi_checksum_constructor_veilidentity_generate(
 ): Short
-fun uniffi_veil_ffi_checksum_constructor_veilmobilesession_from_mnemonic(
-): Short
 fun uniffi_veil_ffi_checksum_constructor_veilmobilesession_from_mnemonic_bytes(
-): Short
-fun uniffi_veil_ffi_checksum_constructor_veilratchet_deserialize(
-): Short
-fun uniffi_veil_ffi_checksum_constructor_veilratchet_init_initiator(
-): Short
-fun uniffi_veil_ffi_checksum_constructor_veilratchet_init_responder(
 ): Short
 fun uniffi_veil_ffi_checksum_constructor_veilrecoverydraft_new_create(
 ): Short
@@ -1063,6 +1073,7 @@ internal interface UniffiLib : Library {
             val lib = loadIndirect<UniffiLib>(componentName)
             // No need to check the contract version and checksums, since
             // we already did that with `IntegrityCheckingUniffiLib` above.
+            uniffiCallbackInterfaceMobileWsEventsCallback.register(lib)
             // Loading of library with integrity check done.
             lib
         }
@@ -1096,19 +1107,35 @@ fun uniffi_veil_ffi_fn_method_mobiledirectmessagedata_text(`ptr`: Pointer,uniffi
 ): RustBuffer.ByValue
 fun uniffi_veil_ffi_fn_method_mobiledirectmessagedata_timestamp_ms(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
 ): RustBuffer.ByValue
+fun uniffi_veil_ffi_fn_clone_mobilewseventscallback(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
+): Pointer
+fun uniffi_veil_ffi_fn_free_mobilewseventscallback(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
+): Unit
+fun uniffi_veil_ffi_fn_init_callback_vtable_mobilewseventscallback(`vtable`: UniffiVTableCallbackInterfaceMobileWsEventsCallback,
+): Unit
+fun uniffi_veil_ffi_fn_method_mobilewseventscallback_on_authenticated(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
+): Unit
+fun uniffi_veil_ffi_fn_method_mobilewseventscallback_on_events_ready(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
+): Unit
+fun uniffi_veil_ffi_fn_method_mobilewseventscallback_on_terminal(`ptr`: Pointer,`exit`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+): Unit
+fun uniffi_veil_ffi_fn_clone_mobilewseventscontroller(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
+): Pointer
+fun uniffi_veil_ffi_fn_free_mobilewseventscontroller(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
+): Unit
+fun uniffi_veil_ffi_fn_method_mobilewseventscontroller_network_changed(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
+): Unit
+fun uniffi_veil_ffi_fn_method_mobilewseventscontroller_stop(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
+): Unit
 fun uniffi_veil_ffi_fn_clone_veilidentity(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
 ): Pointer
 fun uniffi_veil_ffi_fn_free_veilidentity(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
 ): Unit
-fun uniffi_veil_ffi_fn_constructor_veilidentity_from_mnemonic(`mnemonic`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
-): Pointer
 fun uniffi_veil_ffi_fn_constructor_veilidentity_from_mnemonic_bytes(`mnemonicUtf8`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
 ): Pointer
 fun uniffi_veil_ffi_fn_constructor_veilidentity_generate(uniffi_out_err: UniffiRustCallStatus,
 ): Pointer
 fun uniffi_veil_ffi_fn_method_veilidentity_identity_key(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
-): RustBuffer.ByValue
-fun uniffi_veil_ffi_fn_method_veilidentity_sign(`ptr`: Pointer,`message`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
 ): RustBuffer.ByValue
 fun uniffi_veil_ffi_fn_method_veilidentity_signing_key(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
 ): RustBuffer.ByValue
@@ -1118,8 +1145,6 @@ fun uniffi_veil_ffi_fn_clone_veilmobilesession(`ptr`: Pointer,uniffi_out_err: Un
 ): Pointer
 fun uniffi_veil_ffi_fn_free_veilmobilesession(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
 ): Unit
-fun uniffi_veil_ffi_fn_constructor_veilmobilesession_from_mnemonic(`mnemonic`: RustBuffer.ByValue,`databasePath`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
-): Pointer
 fun uniffi_veil_ffi_fn_constructor_veilmobilesession_from_mnemonic_bytes(`mnemonicUtf8`: RustBuffer.ByValue,`databasePath`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
 ): Pointer
 fun uniffi_veil_ffi_fn_method_veilmobilesession_authenticated_binding(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
@@ -1130,6 +1155,10 @@ fun uniffi_veil_ffi_fn_method_veilmobilesession_buffer_direct_live_events_during
 ): RustBuffer.ByValue
 fun uniffi_veil_ffi_fn_method_veilmobilesession_cancel_direct_sync(`ptr`: Pointer,`leaseToken`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
 ): Unit
+fun uniffi_veil_ffi_fn_method_veilmobilesession_confirm_direct_identity_verification(`ptr`: Pointer,`conversationId`: RustBuffer.ByValue,`expectedFingerprintHex`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+): RustBuffer.ByValue
+fun uniffi_veil_ffi_fn_method_veilmobilesession_confirm_direct_identity_verification_qr(`ptr`: Pointer,`conversationId`: RustBuffer.ByValue,`scannedQrPayload`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+): RustBuffer.ByValue
 fun uniffi_veil_ffi_fn_method_veilmobilesession_connect(`ptr`: Pointer,`websocketUrl`: RustBuffer.ByValue,`canonicalServerOrigin`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
 ): RustBuffer.ByValue
 fun uniffi_veil_ffi_fn_method_veilmobilesession_connect_cancellable(`ptr`: Pointer,`websocketUrl`: RustBuffer.ByValue,`canonicalServerOrigin`: RustBuffer.ByValue,`cancellation`: Pointer,uniffi_out_err: UniffiRustCallStatus,
@@ -1138,10 +1167,14 @@ fun uniffi_veil_ffi_fn_method_veilmobilesession_connect_with_node_access_pass(`p
 ): RustBuffer.ByValue
 fun uniffi_veil_ffi_fn_method_veilmobilesession_connect_with_node_access_pass_cancellable(`ptr`: Pointer,`websocketUrl`: RustBuffer.ByValue,`canonicalServerOrigin`: RustBuffer.ByValue,`nodeAccessPass`: RustBuffer.ByValue,`cancellation`: Pointer,uniffi_out_err: UniffiRustCallStatus,
 ): RustBuffer.ByValue
+fun uniffi_veil_ffi_fn_method_veilmobilesession_direct_identity_verification(`ptr`: Pointer,`conversationId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+): RustBuffer.ByValue
 fun uniffi_veil_ffi_fn_method_veilmobilesession_direct_send_readiness(`ptr`: Pointer,`leaseToken`: RustBuffer.ByValue,`conversationId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
 ): RustBuffer.ByValue
 fun uniffi_veil_ffi_fn_method_veilmobilesession_disconnect(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
 ): Unit
+fun uniffi_veil_ffi_fn_method_veilmobilesession_install_direct_conversation(`ptr`: Pointer,`leaseToken`: RustBuffer.ByValue,`conversationId`: RustBuffer.ByValue,`peerUserId`: RustBuffer.ByValue,`peerIdentityKey`: RustBuffer.ByValue,`peerSigningKey`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+): RustBuffer.ByValue
 fun uniffi_veil_ffi_fn_method_veilmobilesession_install_direct_directory_page(`ptr`: Pointer,`leaseToken`: RustBuffer.ByValue,`requestToken`: RustBuffer.ByValue,`response`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
 ): RustBuffer.ByValue
 fun uniffi_veil_ffi_fn_method_veilmobilesession_install_direct_history_response(`ptr`: Pointer,`leaseToken`: RustBuffer.ByValue,`requestToken`: RustBuffer.ByValue,`response`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
@@ -1151,6 +1184,14 @@ fun uniffi_veil_ffi_fn_method_veilmobilesession_install_direct_prekey_bundle(`pt
 fun uniffi_veil_ffi_fn_method_veilmobilesession_install_own_prekey_response(`ptr`: Pointer,`leaseToken`: RustBuffer.ByValue,`requestToken`: RustBuffer.ByValue,`response`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
 ): RustBuffer.ByValue
 fun uniffi_veil_ffi_fn_method_veilmobilesession_mobile_reconnect_target(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
+): RustBuffer.ByValue
+fun uniffi_veil_ffi_fn_method_veilmobilesession_parse_contact_search_response(`ptr`: Pointer,`response`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+): RustBuffer.ByValue
+fun uniffi_veil_ffi_fn_method_veilmobilesession_parse_create_direct_response(`ptr`: Pointer,`response`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+): RustBuffer.ByValue
+fun uniffi_veil_ffi_fn_method_veilmobilesession_prepare_contact_search_request(`ptr`: Pointer,`username`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+): RustBuffer.ByValue
+fun uniffi_veil_ffi_fn_method_veilmobilesession_prepare_create_direct_request(`ptr`: Pointer,`peerUserId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
 ): RustBuffer.ByValue
 fun uniffi_veil_ffi_fn_method_veilmobilesession_prepare_direct_directory_request(`ptr`: Pointer,`leaseToken`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
 ): RustBuffer.ByValue
@@ -1170,22 +1211,8 @@ fun uniffi_veil_ffi_fn_method_veilmobilesession_send_direct_text(`ptr`: Pointer,
 ): RustBuffer.ByValue
 fun uniffi_veil_ffi_fn_method_veilmobilesession_sign_direct_rest_request(`ptr`: Pointer,`leaseToken`: RustBuffer.ByValue,`requestToken`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
 ): RustBuffer.ByValue
-fun uniffi_veil_ffi_fn_clone_veilratchet(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
+fun uniffi_veil_ffi_fn_method_veilmobilesession_start_background_events(`ptr`: Pointer,`deviceName`: RustBuffer.ByValue,`clientVersion`: RustBuffer.ByValue,`callback`: Pointer,uniffi_out_err: UniffiRustCallStatus,
 ): Pointer
-fun uniffi_veil_ffi_fn_free_veilratchet(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
-): Unit
-fun uniffi_veil_ffi_fn_constructor_veilratchet_deserialize(`json`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
-): Pointer
-fun uniffi_veil_ffi_fn_constructor_veilratchet_init_initiator(`sharedSecret`: RustBuffer.ByValue,`peerRatchetKey`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
-): Pointer
-fun uniffi_veil_ffi_fn_constructor_veilratchet_init_responder(`sharedSecret`: RustBuffer.ByValue,`ourSpkSecret`: RustBuffer.ByValue,`ourSpkPublic`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
-): Pointer
-fun uniffi_veil_ffi_fn_method_veilratchet_decrypt(`ptr`: Pointer,`headerBytes`: RustBuffer.ByValue,`ciphertext`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
-): RustBuffer.ByValue
-fun uniffi_veil_ffi_fn_method_veilratchet_encrypt(`ptr`: Pointer,`plaintext`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
-): RustBuffer.ByValue
-fun uniffi_veil_ffi_fn_method_veilratchet_serialize(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
-): RustBuffer.ByValue
 fun uniffi_veil_ffi_fn_clone_veilrecoverydraft(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
 ): Pointer
 fun uniffi_veil_ffi_fn_free_veilrecoverydraft(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
@@ -1218,28 +1245,6 @@ fun uniffi_veil_ffi_fn_method_veilrecoverydraft_word_count(`ptr`: Pointer,uniffi
 ): Byte
 fun uniffi_veil_ffi_fn_method_veilrecoverydraft_word_index(`ptr`: Pointer,`position`: Byte,uniffi_out_err: UniffiRustCallStatus,
 ): Short
-fun uniffi_veil_ffi_fn_func_aead_decrypt(`key`: RustBuffer.ByValue,`ciphertext`: RustBuffer.ByValue,`nonce`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
-): RustBuffer.ByValue
-fun uniffi_veil_ffi_fn_func_aead_encrypt(`key`: RustBuffer.ByValue,`plaintext`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
-): RustBuffer.ByValue
-fun uniffi_veil_ffi_fn_func_decrypt_share(`ciphertext`: RustBuffer.ByValue,`contentKey`: RustBuffer.ByValue,`password`: RustBuffer.ByValue,`wrappedKey`: RustBuffer.ByValue,`salt`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
-): RustBuffer.ByValue
-fun uniffi_veil_ffi_fn_func_derive_key_from_password(`password`: RustBuffer.ByValue,`salt`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
-): RustBuffer.ByValue
-fun uniffi_veil_ffi_fn_func_derive_key_from_pin(`pin`: RustBuffer.ByValue,`salt`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
-): RustBuffer.ByValue
-fun uniffi_veil_ffi_fn_func_ed25519_verify(`publicKey`: RustBuffer.ByValue,`message`: RustBuffer.ByValue,`sig`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
-): Byte
-fun uniffi_veil_ffi_fn_func_encrypt_share(`payload`: RustBuffer.ByValue,`password`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
-): RustBuffer.ByValue
-fun uniffi_veil_ffi_fn_func_generate_account_fingerprint_v2(`canonicalServerOrigin`: RustBuffer.ByValue,`userIdA`: RustBuffer.ByValue,`identityKeyA`: RustBuffer.ByValue,`signingKeyA`: RustBuffer.ByValue,`userIdB`: RustBuffer.ByValue,`identityKeyB`: RustBuffer.ByValue,`signingKeyB`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
-): RustBuffer.ByValue
-fun uniffi_veil_ffi_fn_func_generate_mnemonic(uniffi_out_err: UniffiRustCallStatus,
-): RustBuffer.ByValue
-fun uniffi_veil_ffi_fn_func_validate_mnemonic(`mnemonic`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
-): Byte
-fun uniffi_veil_ffi_fn_func_x3dh_initiate(`identity`: Pointer,`peerBundle`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
-): RustBuffer.ByValue
 fun ffi_veil_ffi_rustbuffer_alloc(`size`: Long,uniffi_out_err: UniffiRustCallStatus,
 ): RustBuffer.ByValue
 fun ffi_veil_ffi_rustbuffer_from_bytes(`bytes`: ForeignBytes.ByValue,uniffi_out_err: UniffiRustCallStatus,
@@ -1366,39 +1371,6 @@ private fun uniffiCheckContractApiVersion(lib: IntegrityCheckingUniffiLib) {
 }
 @Suppress("UNUSED_PARAMETER")
 private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
-    if (lib.uniffi_veil_ffi_checksum_func_aead_decrypt() != 46235.toShort()) {
-        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    }
-    if (lib.uniffi_veil_ffi_checksum_func_aead_encrypt() != 59358.toShort()) {
-        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    }
-    if (lib.uniffi_veil_ffi_checksum_func_decrypt_share() != 17211.toShort()) {
-        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    }
-    if (lib.uniffi_veil_ffi_checksum_func_derive_key_from_password() != 44083.toShort()) {
-        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    }
-    if (lib.uniffi_veil_ffi_checksum_func_derive_key_from_pin() != 37423.toShort()) {
-        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    }
-    if (lib.uniffi_veil_ffi_checksum_func_ed25519_verify() != 57686.toShort()) {
-        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    }
-    if (lib.uniffi_veil_ffi_checksum_func_encrypt_share() != 21860.toShort()) {
-        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    }
-    if (lib.uniffi_veil_ffi_checksum_func_generate_account_fingerprint_v2() != 5202.toShort()) {
-        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    }
-    if (lib.uniffi_veil_ffi_checksum_func_generate_mnemonic() != 65135.toShort()) {
-        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    }
-    if (lib.uniffi_veil_ffi_checksum_func_validate_mnemonic() != 19996.toShort()) {
-        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    }
-    if (lib.uniffi_veil_ffi_checksum_func_x3dh_initiate() != 23751.toShort()) {
-        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    }
     if (lib.uniffi_veil_ffi_checksum_method_mobileconnectcancellation_cancel() != 39557.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1417,10 +1389,22 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_veil_ffi_checksum_method_mobiledirectmessagedata_timestamp_ms() != 10321.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_veil_ffi_checksum_method_veilidentity_identity_key() != 64826.toShort()) {
+    if (lib.uniffi_veil_ffi_checksum_method_mobilewseventscallback_on_authenticated() != 11890.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_veil_ffi_checksum_method_veilidentity_sign() != 58882.toShort()) {
+    if (lib.uniffi_veil_ffi_checksum_method_mobilewseventscallback_on_events_ready() != 19491.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_veil_ffi_checksum_method_mobilewseventscallback_on_terminal() != 17897.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_veil_ffi_checksum_method_mobilewseventscontroller_network_changed() != 2906.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_veil_ffi_checksum_method_mobilewseventscontroller_stop() != 48476.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_veil_ffi_checksum_method_veilidentity_identity_key() != 64826.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_veil_ffi_checksum_method_veilidentity_signing_key() != 44333.toShort()) {
@@ -1441,6 +1425,12 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_cancel_direct_sync() != 53148.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_confirm_direct_identity_verification() != 13016.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_confirm_direct_identity_verification_qr() != 53180.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_connect() != 62689.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1453,10 +1443,16 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_connect_with_node_access_pass_cancellable() != 57674.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_direct_identity_verification() != 23594.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_direct_send_readiness() != 43278.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_disconnect() != 63203.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_install_direct_conversation() != 44626.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_install_direct_directory_page() != 42994.toShort()) {
@@ -1472,6 +1468,18 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_mobile_reconnect_target() != 50260.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_parse_contact_search_response() != 52312.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_parse_create_direct_response() != 15543.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_prepare_contact_search_request() != 25157.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_prepare_create_direct_request() != 45484.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_prepare_direct_directory_request() != 63870.toShort()) {
@@ -1501,13 +1509,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_sign_direct_rest_request() != 2886.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_veil_ffi_checksum_method_veilratchet_decrypt() != 38547.toShort()) {
-        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    }
-    if (lib.uniffi_veil_ffi_checksum_method_veilratchet_encrypt() != 30279.toShort()) {
-        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    }
-    if (lib.uniffi_veil_ffi_checksum_method_veilratchet_serialize() != 60336.toShort()) {
+    if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_start_background_events() != 16891.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_veil_ffi_checksum_method_veilrecoverydraft_cancel() != 49968.toShort()) {
@@ -1549,28 +1551,13 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_veil_ffi_checksum_constructor_mobileconnectcancellation_new() != 64803.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_veil_ffi_checksum_constructor_veilidentity_from_mnemonic() != 47191.toShort()) {
-        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    }
     if (lib.uniffi_veil_ffi_checksum_constructor_veilidentity_from_mnemonic_bytes() != 61700.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_veil_ffi_checksum_constructor_veilidentity_generate() != 34969.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_veil_ffi_checksum_constructor_veilmobilesession_from_mnemonic() != 36500.toShort()) {
-        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    }
     if (lib.uniffi_veil_ffi_checksum_constructor_veilmobilesession_from_mnemonic_bytes() != 10254.toShort()) {
-        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    }
-    if (lib.uniffi_veil_ffi_checksum_constructor_veilratchet_deserialize() != 1736.toShort()) {
-        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    }
-    if (lib.uniffi_veil_ffi_checksum_constructor_veilratchet_init_initiator() != 59593.toShort()) {
-        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    }
-    if (lib.uniffi_veil_ffi_checksum_constructor_veilratchet_init_responder() != 46456.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_veil_ffi_checksum_constructor_veilrecoverydraft_new_create() != 16323.toShort()) {
@@ -1656,7 +1643,38 @@ inline fun <T : Disposable?, R> T.use(block: (T) -> R) =
  *
  * @suppress
  * */
-object NoPointer
+object NoPointer// Magic number for the Rust proxy to call using the same mechanism as every other method,
+// to free the callback once it's dropped by Rust.
+internal const val IDX_CALLBACK_FREE = 0
+// Callback return codes
+internal const val UNIFFI_CALLBACK_SUCCESS = 0
+internal const val UNIFFI_CALLBACK_ERROR = 1
+internal const val UNIFFI_CALLBACK_UNEXPECTED_ERROR = 2
+
+/**
+ * @suppress
+ */
+public abstract class FfiConverterCallbackInterface<CallbackInterface: Any>: FfiConverter<CallbackInterface, Long> {
+    internal val handleMap = UniffiHandleMap<CallbackInterface>()
+
+    internal fun drop(handle: Long) {
+        handleMap.remove(handle)
+    }
+
+    override fun lift(value: Long): CallbackInterface {
+        return handleMap.get(value)
+    }
+
+    override fun read(buf: ByteBuffer) = lift(buf.getLong())
+
+    override fun lower(value: CallbackInterface) = handleMap.insert(value)
+
+    override fun allocationSize(value: CallbackInterface) = 8UL
+
+    override fun write(value: CallbackInterface, buf: ByteBuffer) {
+        buf.putLong(lower(value))
+    }
+}
 /**
  * The cleaner interface for Object finalization code to run.
  * This is the entry point to any implementation that we're using.
@@ -2580,11 +2598,637 @@ public object FfiConverterTypeMobileDirectMessageData: FfiConverter<MobileDirect
 //
 
 
+/**
+ * Callbacks into the Kotlin Foreground Service. All methods are invoked from
+ * the native runtime with NO Rust locks held; implementations must be cheap
+ * and non-blocking (post to a Handler/Channel, return immediately).
+ */
+public interface MobileWsEventsCallback {
+
+    /**
+     * AuthResultV3 barrier passed; retained SKDM buffer already ingested.
+     */
+    fun `onAuthenticated`()
+
+    /**
+     * One or more events were ingested into the buffered live queue.
+     * Coalesced hint: schedule ONE pump turn (replayDirectLiveEventsV1)
+     * via the existing turn-based JNI - never decrypt here.
+     */
+    fun `onEventsReady`()
+
+    /**
+     * Supervisor finished. Fires exactly once per controller.
+     */
+    fun `onTerminal`(`exit`: MobileWsEventsExit)
+
+    companion object
+}
+
+/**
+ * Callbacks into the Kotlin Foreground Service. All methods are invoked from
+ * the native runtime with NO Rust locks held; implementations must be cheap
+ * and non-blocking (post to a Handler/Channel, return immediately).
+ */
+open class MobileWsEventsCallbackImpl: Disposable, AutoCloseable, MobileWsEventsCallback
+{
+
+    constructor(pointer: Pointer) {
+        this.pointer = pointer
+        this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(pointer))
+    }
+
+    /**
+     * This constructor can be used to instantiate a fake object. Only used for tests. Any
+     * attempt to actually use an object constructed this way will fail as there is no
+     * connected Rust object.
+     */
+    @Suppress("UNUSED_PARAMETER")
+    constructor(noPointer: NoPointer) {
+        this.pointer = null
+        this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(pointer))
+    }
+
+    protected val pointer: Pointer?
+    protected val cleanable: UniffiCleaner.Cleanable
+
+    private val wasDestroyed = AtomicBoolean(false)
+    private val callCounter = AtomicLong(1)
+
+    override fun destroy() {
+        // Only allow a single call to this method.
+        // TODO: maybe we should log a warning if called more than once?
+        if (this.wasDestroyed.compareAndSet(false, true)) {
+            // This decrement always matches the initial count of 1 given at creation time.
+            if (this.callCounter.decrementAndGet() == 0L) {
+                cleanable.clean()
+            }
+        }
+    }
+
+    @Synchronized
+    override fun close() {
+        this.destroy()
+    }
+
+    internal inline fun <R> callWithPointer(block: (ptr: Pointer) -> R): R {
+        // Check and increment the call counter, to keep the object alive.
+        // This needs a compare-and-set retry loop in case of concurrent updates.
+        do {
+            val c = this.callCounter.get()
+            if (c == 0L) {
+                throw IllegalStateException("${this.javaClass.simpleName} object has already been destroyed")
+            }
+            if (c == Long.MAX_VALUE) {
+                throw IllegalStateException("${this.javaClass.simpleName} call counter would overflow")
+            }
+        } while (! this.callCounter.compareAndSet(c, c + 1L))
+        // Now we can safely do the method call without the pointer being freed concurrently.
+        try {
+            return block(this.uniffiClonePointer())
+        } finally {
+            // This decrement always matches the increment we performed above.
+            if (this.callCounter.decrementAndGet() == 0L) {
+                cleanable.clean()
+            }
+        }
+    }
+
+    // Use a static inner class instead of a closure so as not to accidentally
+    // capture `this` as part of the cleanable's action.
+    private class UniffiCleanAction(private val pointer: Pointer?) : Runnable {
+        override fun run() {
+            pointer?.let { ptr ->
+                uniffiRustCall { status ->
+                    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_free_mobilewseventscallback(ptr, status)
+                }
+            }
+        }
+    }
+
+    fun uniffiClonePointer(): Pointer {
+        return uniffiRustCall() { status ->
+            UniffiLib.INSTANCE.uniffi_veil_ffi_fn_clone_mobilewseventscallback(pointer!!, status)
+        }
+    }
+
+
+    /**
+     * AuthResultV3 barrier passed; retained SKDM buffer already ingested.
+     */override fun `onAuthenticated`()
+        =
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_mobilewseventscallback_on_authenticated(
+        it, _status)
+}
+    }
+
+
+
+
+    /**
+     * One or more events were ingested into the buffered live queue.
+     * Coalesced hint: schedule ONE pump turn (replayDirectLiveEventsV1)
+     * via the existing turn-based JNI - never decrypt here.
+     */override fun `onEventsReady`()
+        =
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_mobilewseventscallback_on_events_ready(
+        it, _status)
+}
+    }
+
+
+
+
+    /**
+     * Supervisor finished. Fires exactly once per controller.
+     */override fun `onTerminal`(`exit`: MobileWsEventsExit)
+        =
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_mobilewseventscallback_on_terminal(
+        it, FfiConverterTypeMobileWsEventsExit.lower(`exit`),_status)
+}
+    }
+
+
+
+
+
+
+
+    companion object
+
+}
+
+
+// Put the implementation in an object so we don't pollute the top-level namespace
+internal object uniffiCallbackInterfaceMobileWsEventsCallback {
+    internal object `onAuthenticated`: UniffiCallbackInterfaceMobileWsEventsCallbackMethod0 {
+        override fun callback(`uniffiHandle`: Long,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,) {
+            val uniffiObj = FfiConverterTypeMobileWsEventsCallback.handleMap.get(uniffiHandle)
+            val makeCall = { ->
+                uniffiObj.`onAuthenticated`(
+                )
+            }
+            val writeReturn = { _: Unit -> Unit }
+            uniffiTraitInterfaceCall(uniffiCallStatus, makeCall, writeReturn)
+        }
+    }
+    internal object `onEventsReady`: UniffiCallbackInterfaceMobileWsEventsCallbackMethod1 {
+        override fun callback(`uniffiHandle`: Long,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,) {
+            val uniffiObj = FfiConverterTypeMobileWsEventsCallback.handleMap.get(uniffiHandle)
+            val makeCall = { ->
+                uniffiObj.`onEventsReady`(
+                )
+            }
+            val writeReturn = { _: Unit -> Unit }
+            uniffiTraitInterfaceCall(uniffiCallStatus, makeCall, writeReturn)
+        }
+    }
+    internal object `onTerminal`: UniffiCallbackInterfaceMobileWsEventsCallbackMethod2 {
+        override fun callback(`uniffiHandle`: Long,`exit`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,) {
+            val uniffiObj = FfiConverterTypeMobileWsEventsCallback.handleMap.get(uniffiHandle)
+            val makeCall = { ->
+                uniffiObj.`onTerminal`(
+                    FfiConverterTypeMobileWsEventsExit.lift(`exit`),
+                )
+            }
+            val writeReturn = { _: Unit -> Unit }
+            uniffiTraitInterfaceCall(uniffiCallStatus, makeCall, writeReturn)
+        }
+    }
+
+    internal object uniffiFree: UniffiCallbackInterfaceFree {
+        override fun callback(handle: Long) {
+            FfiConverterTypeMobileWsEventsCallback.handleMap.remove(handle)
+        }
+    }
+
+    internal var vtable = UniffiVTableCallbackInterfaceMobileWsEventsCallback.UniffiByValue(
+        `onAuthenticated`,
+        `onEventsReady`,
+        `onTerminal`,
+        uniffiFree,
+    )
+
+    // Registers the foreign callback with the Rust side.
+    // This method is generated for each callback interface.
+    internal fun register(lib: UniffiLib) {
+        lib.uniffi_veil_ffi_fn_init_callback_vtable_mobilewseventscallback(vtable)
+    }
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeMobileWsEventsCallback: FfiConverter<MobileWsEventsCallback, Pointer> {
+    internal val handleMap = UniffiHandleMap<MobileWsEventsCallback>()
+
+    override fun lower(value: MobileWsEventsCallback): Pointer {
+        return Pointer(handleMap.insert(value))
+    }
+
+    override fun lift(value: Pointer): MobileWsEventsCallback {
+        return MobileWsEventsCallbackImpl(value)
+    }
+
+    override fun read(buf: ByteBuffer): MobileWsEventsCallback {
+        // The Rust code always writes pointers as 8 bytes, and will
+        // fail to compile if they don't fit.
+        return lift(Pointer(buf.getLong()))
+    }
+
+    override fun allocationSize(value: MobileWsEventsCallback) = 8UL
+
+    override fun write(value: MobileWsEventsCallback, buf: ByteBuffer) {
+        // The Rust code always expects pointers written as 8 bytes,
+        // and will fail to compile if they don't fit.
+        buf.putLong(Pointer.nativeValue(lower(value)))
+    }
+}
+
+
+// This template implements a class for working with a Rust struct via a Pointer/Arc<T>
+// to the live Rust struct on the other side of the FFI.
+//
+// Each instance implements core operations for working with the Rust `Arc<T>` and the
+// Kotlin Pointer to work with the live Rust struct on the other side of the FFI.
+//
+// There's some subtlety here, because we have to be careful not to operate on a Rust
+// struct after it has been dropped, and because we must expose a public API for freeing
+// theq Kotlin wrapper object in lieu of reliable finalizers. The core requirements are:
+//
+//   * Each instance holds an opaque pointer to the underlying Rust struct.
+//     Method calls need to read this pointer from the object's state and pass it in to
+//     the Rust FFI.
+//
+//   * When an instance is no longer needed, its pointer should be passed to a
+//     special destructor function provided by the Rust FFI, which will drop the
+//     underlying Rust struct.
+//
+//   * Given an instance, calling code is expected to call the special
+//     `destroy` method in order to free it after use, either by calling it explicitly
+//     or by using a higher-level helper like the `use` method. Failing to do so risks
+//     leaking the underlying Rust struct.
+//
+//   * We can't assume that calling code will do the right thing, and must be prepared
+//     to handle Kotlin method calls executing concurrently with or even after a call to
+//     `destroy`, and to handle multiple (possibly concurrent!) calls to `destroy`.
+//
+//   * We must never allow Rust code to operate on the underlying Rust struct after
+//     the destructor has been called, and must never call the destructor more than once.
+//     Doing so may trigger memory unsafety.
+//
+//   * To mitigate many of the risks of leaking memory and use-after-free unsafety, a `Cleaner`
+//     is implemented to call the destructor when the Kotlin object becomes unreachable.
+//     This is done in a background thread. This is not a panacea, and client code should be aware that
+//      1. the thread may starve if some there are objects that have poorly performing
+//     `drop` methods or do significant work in their `drop` methods.
+//      2. the thread is shared across the whole library. This can be tuned by using `android_cleaner = true`,
+//         or `android = true` in the [`kotlin` section of the `uniffi.toml` file](https://mozilla.github.io/uniffi-rs/kotlin/configuration.html).
+//
+// If we try to implement this with mutual exclusion on access to the pointer, there is the
+// possibility of a race between a method call and a concurrent call to `destroy`:
+//
+//    * Thread A starts a method call, reads the value of the pointer, but is interrupted
+//      before it can pass the pointer over the FFI to Rust.
+//    * Thread B calls `destroy` and frees the underlying Rust struct.
+//    * Thread A resumes, passing the already-read pointer value to Rust and triggering
+//      a use-after-free.
+//
+// One possible solution would be to use a `ReadWriteLock`, with each method call taking
+// a read lock (and thus allowed to run concurrently) and the special `destroy` method
+// taking a write lock (and thus blocking on live method calls). However, we aim not to
+// generate methods with any hidden blocking semantics, and a `destroy` method that might
+// block if called incorrectly seems to meet that bar.
+//
+// So, we achieve our goals by giving each instance an associated `AtomicLong` counter to track
+// the number of in-flight method calls, and an `AtomicBoolean` flag to indicate whether `destroy`
+// has been called. These are updated according to the following rules:
+//
+//    * The initial value of the counter is 1, indicating a live object with no in-flight calls.
+//      The initial value for the flag is false.
+//
+//    * At the start of each method call, we atomically check the counter.
+//      If it is 0 then the underlying Rust struct has already been destroyed and the call is aborted.
+//      If it is nonzero them we atomically increment it by 1 and proceed with the method call.
+//
+//    * At the end of each method call, we atomically decrement and check the counter.
+//      If it has reached zero then we destroy the underlying Rust struct.
+//
+//    * When `destroy` is called, we atomically flip the flag from false to true.
+//      If the flag was already true we silently fail.
+//      Otherwise we atomically decrement and check the counter.
+//      If it has reached zero then we destroy the underlying Rust struct.
+//
+// Astute readers may observe that this all sounds very similar to the way that Rust's `Arc<T>` works,
+// and indeed it is, with the addition of a flag to guard against multiple calls to `destroy`.
+//
+// The overall effect is that the underlying Rust struct is destroyed only when `destroy` has been
+// called *and* all in-flight method calls have completed, avoiding violating any of the expectations
+// of the underlying Rust code.
+//
+// This makes a cleaner a better alternative to _not_ calling `destroy()` as
+// and when the object is finished with, but the abstraction is not perfect: if the Rust object's `drop`
+// method is slow, and/or there are many objects to cleanup, and it's on a low end Android device, then the cleaner
+// thread may be starved, and the app will leak memory.
+//
+// In this case, `destroy`ing manually may be a better solution.
+//
+// The cleaner can live side by side with the manual calling of `destroy`. In the order of responsiveness, uniffi objects
+// with Rust peers are reclaimed:
+//
+// 1. By calling the `destroy` method of the object, which calls `rustObject.free()`. If that doesn't happen:
+// 2. When the object becomes unreachable, AND the Cleaner thread gets to call `rustObject.free()`. If the thread is starved then:
+// 3. The memory is reclaimed when the process terminates.
+//
+// [1] https://stackoverflow.com/questions/24376768/can-java-finalize-an-object-when-it-is-still-in-scope/24380219
+//
+
+
+/**
+ * Host handle for one running background controller. Thread-safe; both
+ * methods are designed for Android lifecycle threads (like
+ * MobileConnectCancellation) and never touch the VeilClient mutex.
+ */
+public interface MobileWsEventsControllerInterface {
+
+    /**
+     * ConnectivityManager.onAvailable hook: wakes a backoff sleep early.
+     * Policy is NOT bypassed - fail-closed stays stopped, the zero-delay
+     * budget still applies.
+     */
+    fun `networkChanged`()
+
+    /**
+     * Sticky, idempotent stop. The supervisor exits Cancelled; a session in
+     * flight is dropped, which aborts its socket I/O immediately.
+     */
+    fun `stop`()
+
+    companion object
+}
+
+/**
+ * Host handle for one running background controller. Thread-safe; both
+ * methods are designed for Android lifecycle threads (like
+ * MobileConnectCancellation) and never touch the VeilClient mutex.
+ */
+open class MobileWsEventsController: Disposable, AutoCloseable, MobileWsEventsControllerInterface
+{
+
+    constructor(pointer: Pointer) {
+        this.pointer = pointer
+        this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(pointer))
+    }
+
+    /**
+     * This constructor can be used to instantiate a fake object. Only used for tests. Any
+     * attempt to actually use an object constructed this way will fail as there is no
+     * connected Rust object.
+     */
+    @Suppress("UNUSED_PARAMETER")
+    constructor(noPointer: NoPointer) {
+        this.pointer = null
+        this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(pointer))
+    }
+
+    protected val pointer: Pointer?
+    protected val cleanable: UniffiCleaner.Cleanable
+
+    private val wasDestroyed = AtomicBoolean(false)
+    private val callCounter = AtomicLong(1)
+
+    override fun destroy() {
+        // Only allow a single call to this method.
+        // TODO: maybe we should log a warning if called more than once?
+        if (this.wasDestroyed.compareAndSet(false, true)) {
+            // This decrement always matches the initial count of 1 given at creation time.
+            if (this.callCounter.decrementAndGet() == 0L) {
+                cleanable.clean()
+            }
+        }
+    }
+
+    @Synchronized
+    override fun close() {
+        this.destroy()
+    }
+
+    internal inline fun <R> callWithPointer(block: (ptr: Pointer) -> R): R {
+        // Check and increment the call counter, to keep the object alive.
+        // This needs a compare-and-set retry loop in case of concurrent updates.
+        do {
+            val c = this.callCounter.get()
+            if (c == 0L) {
+                throw IllegalStateException("${this.javaClass.simpleName} object has already been destroyed")
+            }
+            if (c == Long.MAX_VALUE) {
+                throw IllegalStateException("${this.javaClass.simpleName} call counter would overflow")
+            }
+        } while (! this.callCounter.compareAndSet(c, c + 1L))
+        // Now we can safely do the method call without the pointer being freed concurrently.
+        try {
+            return block(this.uniffiClonePointer())
+        } finally {
+            // This decrement always matches the increment we performed above.
+            if (this.callCounter.decrementAndGet() == 0L) {
+                cleanable.clean()
+            }
+        }
+    }
+
+    // Use a static inner class instead of a closure so as not to accidentally
+    // capture `this` as part of the cleanable's action.
+    private class UniffiCleanAction(private val pointer: Pointer?) : Runnable {
+        override fun run() {
+            pointer?.let { ptr ->
+                uniffiRustCall { status ->
+                    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_free_mobilewseventscontroller(ptr, status)
+                }
+            }
+        }
+    }
+
+    fun uniffiClonePointer(): Pointer {
+        return uniffiRustCall() { status ->
+            UniffiLib.INSTANCE.uniffi_veil_ffi_fn_clone_mobilewseventscontroller(pointer!!, status)
+        }
+    }
+
+
+    /**
+     * ConnectivityManager.onAvailable hook: wakes a backoff sleep early.
+     * Policy is NOT bypassed - fail-closed stays stopped, the zero-delay
+     * budget still applies.
+     */override fun `networkChanged`()
+        =
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_mobilewseventscontroller_network_changed(
+        it, _status)
+}
+    }
+
+
+
+
+    /**
+     * Sticky, idempotent stop. The supervisor exits Cancelled; a session in
+     * flight is dropped, which aborts its socket I/O immediately.
+     */override fun `stop`()
+        =
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_mobilewseventscontroller_stop(
+        it, _status)
+}
+    }
+
+
+
+
+
+
+
+    companion object
+
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeMobileWsEventsController: FfiConverter<MobileWsEventsController, Pointer> {
+
+    override fun lower(value: MobileWsEventsController): Pointer {
+        return value.uniffiClonePointer()
+    }
+
+    override fun lift(value: Pointer): MobileWsEventsController {
+        return MobileWsEventsController(value)
+    }
+
+    override fun read(buf: ByteBuffer): MobileWsEventsController {
+        // The Rust code always writes pointers as 8 bytes, and will
+        // fail to compile if they don't fit.
+        return lift(Pointer(buf.getLong()))
+    }
+
+    override fun allocationSize(value: MobileWsEventsController) = 8UL
+
+    override fun write(value: MobileWsEventsController, buf: ByteBuffer) {
+        // The Rust code always expects pointers written as 8 bytes,
+        // and will fail to compile if they don't fit.
+        buf.putLong(Pointer.nativeValue(lower(value)))
+    }
+}
+
+
+// This template implements a class for working with a Rust struct via a Pointer/Arc<T>
+// to the live Rust struct on the other side of the FFI.
+//
+// Each instance implements core operations for working with the Rust `Arc<T>` and the
+// Kotlin Pointer to work with the live Rust struct on the other side of the FFI.
+//
+// There's some subtlety here, because we have to be careful not to operate on a Rust
+// struct after it has been dropped, and because we must expose a public API for freeing
+// theq Kotlin wrapper object in lieu of reliable finalizers. The core requirements are:
+//
+//   * Each instance holds an opaque pointer to the underlying Rust struct.
+//     Method calls need to read this pointer from the object's state and pass it in to
+//     the Rust FFI.
+//
+//   * When an instance is no longer needed, its pointer should be passed to a
+//     special destructor function provided by the Rust FFI, which will drop the
+//     underlying Rust struct.
+//
+//   * Given an instance, calling code is expected to call the special
+//     `destroy` method in order to free it after use, either by calling it explicitly
+//     or by using a higher-level helper like the `use` method. Failing to do so risks
+//     leaking the underlying Rust struct.
+//
+//   * We can't assume that calling code will do the right thing, and must be prepared
+//     to handle Kotlin method calls executing concurrently with or even after a call to
+//     `destroy`, and to handle multiple (possibly concurrent!) calls to `destroy`.
+//
+//   * We must never allow Rust code to operate on the underlying Rust struct after
+//     the destructor has been called, and must never call the destructor more than once.
+//     Doing so may trigger memory unsafety.
+//
+//   * To mitigate many of the risks of leaking memory and use-after-free unsafety, a `Cleaner`
+//     is implemented to call the destructor when the Kotlin object becomes unreachable.
+//     This is done in a background thread. This is not a panacea, and client code should be aware that
+//      1. the thread may starve if some there are objects that have poorly performing
+//     `drop` methods or do significant work in their `drop` methods.
+//      2. the thread is shared across the whole library. This can be tuned by using `android_cleaner = true`,
+//         or `android = true` in the [`kotlin` section of the `uniffi.toml` file](https://mozilla.github.io/uniffi-rs/kotlin/configuration.html).
+//
+// If we try to implement this with mutual exclusion on access to the pointer, there is the
+// possibility of a race between a method call and a concurrent call to `destroy`:
+//
+//    * Thread A starts a method call, reads the value of the pointer, but is interrupted
+//      before it can pass the pointer over the FFI to Rust.
+//    * Thread B calls `destroy` and frees the underlying Rust struct.
+//    * Thread A resumes, passing the already-read pointer value to Rust and triggering
+//      a use-after-free.
+//
+// One possible solution would be to use a `ReadWriteLock`, with each method call taking
+// a read lock (and thus allowed to run concurrently) and the special `destroy` method
+// taking a write lock (and thus blocking on live method calls). However, we aim not to
+// generate methods with any hidden blocking semantics, and a `destroy` method that might
+// block if called incorrectly seems to meet that bar.
+//
+// So, we achieve our goals by giving each instance an associated `AtomicLong` counter to track
+// the number of in-flight method calls, and an `AtomicBoolean` flag to indicate whether `destroy`
+// has been called. These are updated according to the following rules:
+//
+//    * The initial value of the counter is 1, indicating a live object with no in-flight calls.
+//      The initial value for the flag is false.
+//
+//    * At the start of each method call, we atomically check the counter.
+//      If it is 0 then the underlying Rust struct has already been destroyed and the call is aborted.
+//      If it is nonzero them we atomically increment it by 1 and proceed with the method call.
+//
+//    * At the end of each method call, we atomically decrement and check the counter.
+//      If it has reached zero then we destroy the underlying Rust struct.
+//
+//    * When `destroy` is called, we atomically flip the flag from false to true.
+//      If the flag was already true we silently fail.
+//      Otherwise we atomically decrement and check the counter.
+//      If it has reached zero then we destroy the underlying Rust struct.
+//
+// Astute readers may observe that this all sounds very similar to the way that Rust's `Arc<T>` works,
+// and indeed it is, with the addition of a flag to guard against multiple calls to `destroy`.
+//
+// The overall effect is that the underlying Rust struct is destroyed only when `destroy` has been
+// called *and* all in-flight method calls have completed, avoiding violating any of the expectations
+// of the underlying Rust code.
+//
+// This makes a cleaner a better alternative to _not_ calling `destroy()` as
+// and when the object is finished with, but the abstraction is not perfect: if the Rust object's `drop`
+// method is slow, and/or there are many objects to cleanup, and it's on a low end Android device, then the cleaner
+// thread may be starved, and the app will leak memory.
+//
+// In this case, `destroy`ing manually may be a better solution.
+//
+// The cleaner can live side by side with the manual calling of `destroy`. In the order of responsiveness, uniffi objects
+// with Rust peers are reclaimed:
+//
+// 1. By calling the `destroy` method of the object, which calls `rustObject.free()`. If that doesn't happen:
+// 2. When the object becomes unreachable, AND the Cleaner thread gets to call `rustObject.free()`. If the thread is starved then:
+// 3. The memory is reclaimed when the process terminates.
+//
+// [1] https://stackoverflow.com/questions/24376768/can-java-finalize-an-object-when-it-is-still-in-scope/24380219
+//
+
+
 public interface VeilIdentityInterface {
 
     fun `identityKey`(): kotlin.ByteArray
-
-    fun `sign`(`message`: kotlin.ByteArray): kotlin.ByteArray
 
     fun `signingKey`(): kotlin.ByteArray
 
@@ -2687,18 +3331,6 @@ open class VeilIdentity: Disposable, AutoCloseable, VeilIdentityInterface
     }
 
 
-    override fun `sign`(`message`: kotlin.ByteArray): kotlin.ByteArray {
-            return FfiConverterByteArray.lift(
-    callWithPointer {
-    uniffiRustCall() { _status ->
-    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilidentity_sign(
-        it, FfiConverterByteArray.lower(`message`),_status)
-}
-    }
-    )
-    }
-
-
     override fun `signingKey`(): kotlin.ByteArray {
             return FfiConverterByteArray.lift(
     callWithPointer {
@@ -2727,22 +3359,6 @@ open class VeilIdentity: Disposable, AutoCloseable, VeilIdentityInterface
 
 
     companion object {
-
-    /**
-     * Compatibility constructor for non-mobile callers. Android must use
-     * `from_mnemonic_bytes` so its decrypted mnemonic never becomes a JVM
-     * `String`.
-     */
-    @Throws(VeilException::class) fun `fromMnemonic`(`mnemonic`: kotlin.String): VeilIdentity {
-            return FfiConverterTypeVeilIdentity.lift(
-    uniffiRustCallWithError(VeilException) { _status ->
-    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_constructor_veilidentity_from_mnemonic(
-        FfiConverterString.lower(`mnemonic`),_status)
-}
-    )
-    }
-
-
 
     @Throws(VeilException::class) fun `fromMnemonicBytes`(`mnemonicUtf8`: kotlin.ByteArray): VeilIdentity {
             return FfiConverterTypeVeilIdentity.lift(
@@ -2930,6 +3546,21 @@ public interface VeilMobileSessionInterface {
 
     fun `cancelDirectSync`(`leaseToken`: kotlin.String)
 
+    /**
+     * Persist an explicit account-v2 comparison for one Ready Direct route.
+     * The displayed fingerprint is accepted only in its canonical lowercase
+     * form and rechecked against native state while all lifecycle guards and
+     * the client remain locked in the documented order.
+     */
+    fun `confirmDirectIdentityVerification`(`conversationId`: kotlin.String, `expectedFingerprintHex`: kotlin.String): MobileDirectIdentityVerification?
+
+    /**
+     * Persist an explicit account-v2 comparison from one exact, bounded QR
+     * payload. The client parses the versioned payload and repeats the fresh
+     * route derivation plus constant-time digest comparison before writing.
+     */
+    fun `confirmDirectIdentityVerificationQr`(`conversationId`: kotlin.String, `scannedQrPayload`: kotlin.String): MobileDirectIdentityVerification?
+
     fun `connect`(`websocketUrl`: kotlin.String, `canonicalServerOrigin`: kotlin.String): MobileAuthenticatedBinding
 
     /**
@@ -2955,6 +3586,13 @@ public interface VeilMobileSessionInterface {
     fun `connectWithNodeAccessPassCancellable`(`websocketUrl`: kotlin.String, `canonicalServerOrigin`: kotlin.String, `nodeAccessPass`: kotlin.ByteArray, `cancellation`: MobileConnectCancellation): MobileAuthenticatedBinding
 
     /**
+     * Return an account-v2 safety number for exactly one Ready Direct route.
+     * Every stale, blocked, revoked, or scope-mismatched state collapses to
+     * `None`, preventing the platform layer from enumerating denied routes.
+     */
+    fun `directIdentityVerification`(`conversationId`: kotlin.String): MobileDirectIdentityVerification?
+
+    /**
      * Return coarse, advisory send readiness for one exact Direct route under
      * the current Ready lease.
      *
@@ -2966,6 +3604,23 @@ public interface VeilMobileSessionInterface {
     fun `directSendReadiness`(`leaseToken`: kotlin.String, `conversationId`: kotlin.String): MobileDirectSendReadiness
 
     fun `disconnect`()
+
+    /**
+     * Register one freshly created Direct conversation under the exact
+     * current Ready lease so the existing peer-prekey flow
+     * (`prepare_direct_prekey_request` → `sign_direct_rest_request` →
+     * `install_direct_prekey_bundle`) can establish the X3DH session.
+     *
+     * Peer identity comes from the authenticated contact-search response,
+     * not from the create-DM response, so the server cannot swap keys
+     * between the two calls. Guards repeat the module-wide order
+     * `direct_sync -> binding -> client` and every authority check is done
+     * under the held locks.
+     *
+     * Idempotent for the exact same peer binding. A conversation already
+     * bound to different keys is terminal: no overwrite, no retry hint.
+     */
+    fun `installDirectConversation`(`leaseToken`: kotlin.String, `conversationId`: kotlin.String, `peerUserId`: kotlin.String, `peerIdentityKey`: kotlin.ByteArray, `peerSigningKey`: kotlin.ByteArray): MobileDirectConversationInstallOutcome
 
     /**
      * Validate and install one raw directory response under the exact lease
@@ -2996,6 +3651,18 @@ public interface VeilMobileSessionInterface {
      * persisted or returned through this interface.
      */
     fun `mobileReconnectTarget`(): MobileReconnectTarget?
+
+    fun `parseContactSearchResponse`(`response`: kotlin.ByteArray): MobileContactSearchResult
+
+    /**
+     * Parse one bounded POST /v1/conversations/dm response using the exact
+     * server contract. The server-controlled body is wiped on every path.
+     */
+    fun `parseCreateDirectResponse`(`response`: kotlin.ByteArray): MobileDirectCreatedConversation
+
+    fun `prepareContactSearchRequest`(`username`: kotlin.String): MobileContactRequest
+
+    fun `prepareCreateDirectRequest`(`peerUserId`: kotlin.String): MobileContactRequest
 
     fun `prepareDirectDirectoryRequest`(`leaseToken`: kotlin.String): MobileDirectRestRequest
 
@@ -3072,6 +3739,21 @@ public interface VeilMobileSessionInterface {
      * most one signature because each server fetch consumes an OPK.
      */
     fun `signDirectRestRequest`(`leaseToken`: kotlin.String, `requestToken`: kotlin.String): RestSignatureData
+
+    /**
+     * Start the background /v3/events controller on the native runtime.
+     *
+     * Preconditions (mirrors the Kotlin host contract in ws_events_v3.rs):
+     * - mobile_reconnect_target() returned Some(target); its canonical
+     * origin selects the endpoint. Absent target => do not call this.
+     * - Exactly one controller per session at a time. Native code enforces
+     * this as a hard invariant and owns a cancellation capability so a
+     * foreground connect, disconnect or logout revokes the controller.
+     *
+     * The returned controller owns no client lock; all waits happen off the
+     * mutex, so lifecycle calls can never deadlock the serialized runtime.
+     */
+    fun `startBackgroundEvents`(`deviceName`: kotlin.String, `clientVersion`: kotlin.String, `callback`: MobileWsEventsCallback): MobileWsEventsController
 
     companion object
 }
@@ -3234,6 +3916,43 @@ open class VeilMobileSession: Disposable, AutoCloseable, VeilMobileSessionInterf
 
 
 
+    /**
+     * Persist an explicit account-v2 comparison for one Ready Direct route.
+     * The displayed fingerprint is accepted only in its canonical lowercase
+     * form and rechecked against native state while all lifecycle guards and
+     * the client remain locked in the documented order.
+     */
+    @Throws(VeilException::class)override fun `confirmDirectIdentityVerification`(`conversationId`: kotlin.String, `expectedFingerprintHex`: kotlin.String): MobileDirectIdentityVerification? {
+            return FfiConverterOptionalTypeMobileDirectIdentityVerification.lift(
+    callWithPointer {
+    uniffiRustCallWithError(VeilException) { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilmobilesession_confirm_direct_identity_verification(
+        it, FfiConverterString.lower(`conversationId`),FfiConverterString.lower(`expectedFingerprintHex`),_status)
+}
+    }
+    )
+    }
+
+
+
+    /**
+     * Persist an explicit account-v2 comparison from one exact, bounded QR
+     * payload. The client parses the versioned payload and repeats the fresh
+     * route derivation plus constant-time digest comparison before writing.
+     */
+    @Throws(VeilException::class)override fun `confirmDirectIdentityVerificationQr`(`conversationId`: kotlin.String, `scannedQrPayload`: kotlin.String): MobileDirectIdentityVerification? {
+            return FfiConverterOptionalTypeMobileDirectIdentityVerification.lift(
+    callWithPointer {
+    uniffiRustCallWithError(VeilException) { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilmobilesession_confirm_direct_identity_verification_qr(
+        it, FfiConverterString.lower(`conversationId`),FfiConverterString.lower(`scannedQrPayload`),_status)
+}
+    }
+    )
+    }
+
+
+
     @Throws(VeilException::class)override fun `connect`(`websocketUrl`: kotlin.String, `canonicalServerOrigin`: kotlin.String): MobileAuthenticatedBinding {
             return FfiConverterTypeMobileAuthenticatedBinding.lift(
     callWithPointer {
@@ -3303,6 +4022,24 @@ open class VeilMobileSession: Disposable, AutoCloseable, VeilMobileSessionInterf
 
 
     /**
+     * Return an account-v2 safety number for exactly one Ready Direct route.
+     * Every stale, blocked, revoked, or scope-mismatched state collapses to
+     * `None`, preventing the platform layer from enumerating denied routes.
+     */
+    @Throws(VeilException::class)override fun `directIdentityVerification`(`conversationId`: kotlin.String): MobileDirectIdentityVerification? {
+            return FfiConverterOptionalTypeMobileDirectIdentityVerification.lift(
+    callWithPointer {
+    uniffiRustCallWithError(VeilException) { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilmobilesession_direct_identity_verification(
+        it, FfiConverterString.lower(`conversationId`),_status)
+}
+    }
+    )
+    }
+
+
+
+    /**
      * Return coarse, advisory send readiness for one exact Direct route under
      * the current Ready lease.
      *
@@ -3332,6 +4069,34 @@ open class VeilMobileSession: Disposable, AutoCloseable, VeilMobileSessionInterf
 }
     }
 
+
+
+
+    /**
+     * Register one freshly created Direct conversation under the exact
+     * current Ready lease so the existing peer-prekey flow
+     * (`prepare_direct_prekey_request` → `sign_direct_rest_request` →
+     * `install_direct_prekey_bundle`) can establish the X3DH session.
+     *
+     * Peer identity comes from the authenticated contact-search response,
+     * not from the create-DM response, so the server cannot swap keys
+     * between the two calls. Guards repeat the module-wide order
+     * `direct_sync -> binding -> client` and every authority check is done
+     * under the held locks.
+     *
+     * Idempotent for the exact same peer binding. A conversation already
+     * bound to different keys is terminal: no overwrite, no retry hint.
+     */
+    @Throws(VeilException::class)override fun `installDirectConversation`(`leaseToken`: kotlin.String, `conversationId`: kotlin.String, `peerUserId`: kotlin.String, `peerIdentityKey`: kotlin.ByteArray, `peerSigningKey`: kotlin.ByteArray): MobileDirectConversationInstallOutcome {
+            return FfiConverterTypeMobileDirectConversationInstallOutcome.lift(
+    callWithPointer {
+    uniffiRustCallWithError(VeilException) { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilmobilesession_install_direct_conversation(
+        it, FfiConverterString.lower(`leaseToken`),FfiConverterString.lower(`conversationId`),FfiConverterString.lower(`peerUserId`),FfiConverterByteArray.lower(`peerIdentityKey`),FfiConverterByteArray.lower(`peerSigningKey`),_status)
+}
+    }
+    )
+    }
 
 
 
@@ -3413,6 +4178,62 @@ open class VeilMobileSession: Disposable, AutoCloseable, VeilMobileSessionInterf
     uniffiRustCallWithError(VeilException) { _status ->
     UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilmobilesession_mobile_reconnect_target(
         it, _status)
+}
+    }
+    )
+    }
+
+
+
+    @Throws(VeilException::class)override fun `parseContactSearchResponse`(`response`: kotlin.ByteArray): MobileContactSearchResult {
+            return FfiConverterTypeMobileContactSearchResult.lift(
+    callWithPointer {
+    uniffiRustCallWithError(VeilException) { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilmobilesession_parse_contact_search_response(
+        it, FfiConverterByteArray.lower(`response`),_status)
+}
+    }
+    )
+    }
+
+
+
+    /**
+     * Parse one bounded POST /v1/conversations/dm response using the exact
+     * server contract. The server-controlled body is wiped on every path.
+     */
+    @Throws(VeilException::class)override fun `parseCreateDirectResponse`(`response`: kotlin.ByteArray): MobileDirectCreatedConversation {
+            return FfiConverterTypeMobileDirectCreatedConversation.lift(
+    callWithPointer {
+    uniffiRustCallWithError(VeilException) { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilmobilesession_parse_create_direct_response(
+        it, FfiConverterByteArray.lower(`response`),_status)
+}
+    }
+    )
+    }
+
+
+
+    @Throws(VeilException::class)override fun `prepareContactSearchRequest`(`username`: kotlin.String): MobileContactRequest {
+            return FfiConverterTypeMobileContactRequest.lift(
+    callWithPointer {
+    uniffiRustCallWithError(VeilException) { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilmobilesession_prepare_contact_search_request(
+        it, FfiConverterString.lower(`username`),_status)
+}
+    }
+    )
+    }
+
+
+
+    @Throws(VeilException::class)override fun `prepareCreateDirectRequest`(`peerUserId`: kotlin.String): MobileContactRequest {
+            return FfiConverterTypeMobileContactRequest.lift(
+    callWithPointer {
+    uniffiRustCallWithError(VeilException) { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilmobilesession_prepare_create_direct_request(
+        it, FfiConverterString.lower(`peerUserId`),_status)
 }
     }
     )
@@ -3595,25 +4416,35 @@ open class VeilMobileSession: Disposable, AutoCloseable, VeilMobileSessionInterf
 
 
 
-
-
-    companion object {
-
     /**
-     * Compatibility constructor for non-mobile callers. Android must pass
-     * decrypted mnemonic bytes to `from_mnemonic_bytes` and clear its own
-     * `ByteArray` immediately after this call.
+     * Start the background /v3/events controller on the native runtime.
+     *
+     * Preconditions (mirrors the Kotlin host contract in ws_events_v3.rs):
+     * - mobile_reconnect_target() returned Some(target); its canonical
+     * origin selects the endpoint. Absent target => do not call this.
+     * - Exactly one controller per session at a time. Native code enforces
+     * this as a hard invariant and owns a cancellation capability so a
+     * foreground connect, disconnect or logout revokes the controller.
+     *
+     * The returned controller owns no client lock; all waits happen off the
+     * mutex, so lifecycle calls can never deadlock the serialized runtime.
      */
-    @Throws(VeilException::class) fun `fromMnemonic`(`mnemonic`: kotlin.String, `databasePath`: kotlin.String): VeilMobileSession {
-            return FfiConverterTypeVeilMobileSession.lift(
+    @Throws(VeilException::class)override fun `startBackgroundEvents`(`deviceName`: kotlin.String, `clientVersion`: kotlin.String, `callback`: MobileWsEventsCallback): MobileWsEventsController {
+            return FfiConverterTypeMobileWsEventsController.lift(
+    callWithPointer {
     uniffiRustCallWithError(VeilException) { _status ->
-    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_constructor_veilmobilesession_from_mnemonic(
-        FfiConverterString.lower(`mnemonic`),FfiConverterString.lower(`databasePath`),_status)
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilmobilesession_start_background_events(
+        it, FfiConverterString.lower(`deviceName`),FfiConverterString.lower(`clientVersion`),FfiConverterTypeMobileWsEventsCallback.lower(`callback`),_status)
 }
+    }
     )
     }
 
 
+
+
+
+    companion object {
 
     @Throws(VeilException::class) fun `fromMnemonicBytes`(`mnemonicUtf8`: kotlin.ByteArray, `databasePath`: kotlin.String): VeilMobileSession {
             return FfiConverterTypeVeilMobileSession.lift(
@@ -3652,307 +4483,6 @@ public object FfiConverterTypeVeilMobileSession: FfiConverter<VeilMobileSession,
     override fun allocationSize(value: VeilMobileSession) = 8UL
 
     override fun write(value: VeilMobileSession, buf: ByteBuffer) {
-        // The Rust code always expects pointers written as 8 bytes,
-        // and will fail to compile if they don't fit.
-        buf.putLong(Pointer.nativeValue(lower(value)))
-    }
-}
-
-
-// This template implements a class for working with a Rust struct via a Pointer/Arc<T>
-// to the live Rust struct on the other side of the FFI.
-//
-// Each instance implements core operations for working with the Rust `Arc<T>` and the
-// Kotlin Pointer to work with the live Rust struct on the other side of the FFI.
-//
-// There's some subtlety here, because we have to be careful not to operate on a Rust
-// struct after it has been dropped, and because we must expose a public API for freeing
-// theq Kotlin wrapper object in lieu of reliable finalizers. The core requirements are:
-//
-//   * Each instance holds an opaque pointer to the underlying Rust struct.
-//     Method calls need to read this pointer from the object's state and pass it in to
-//     the Rust FFI.
-//
-//   * When an instance is no longer needed, its pointer should be passed to a
-//     special destructor function provided by the Rust FFI, which will drop the
-//     underlying Rust struct.
-//
-//   * Given an instance, calling code is expected to call the special
-//     `destroy` method in order to free it after use, either by calling it explicitly
-//     or by using a higher-level helper like the `use` method. Failing to do so risks
-//     leaking the underlying Rust struct.
-//
-//   * We can't assume that calling code will do the right thing, and must be prepared
-//     to handle Kotlin method calls executing concurrently with or even after a call to
-//     `destroy`, and to handle multiple (possibly concurrent!) calls to `destroy`.
-//
-//   * We must never allow Rust code to operate on the underlying Rust struct after
-//     the destructor has been called, and must never call the destructor more than once.
-//     Doing so may trigger memory unsafety.
-//
-//   * To mitigate many of the risks of leaking memory and use-after-free unsafety, a `Cleaner`
-//     is implemented to call the destructor when the Kotlin object becomes unreachable.
-//     This is done in a background thread. This is not a panacea, and client code should be aware that
-//      1. the thread may starve if some there are objects that have poorly performing
-//     `drop` methods or do significant work in their `drop` methods.
-//      2. the thread is shared across the whole library. This can be tuned by using `android_cleaner = true`,
-//         or `android = true` in the [`kotlin` section of the `uniffi.toml` file](https://mozilla.github.io/uniffi-rs/kotlin/configuration.html).
-//
-// If we try to implement this with mutual exclusion on access to the pointer, there is the
-// possibility of a race between a method call and a concurrent call to `destroy`:
-//
-//    * Thread A starts a method call, reads the value of the pointer, but is interrupted
-//      before it can pass the pointer over the FFI to Rust.
-//    * Thread B calls `destroy` and frees the underlying Rust struct.
-//    * Thread A resumes, passing the already-read pointer value to Rust and triggering
-//      a use-after-free.
-//
-// One possible solution would be to use a `ReadWriteLock`, with each method call taking
-// a read lock (and thus allowed to run concurrently) and the special `destroy` method
-// taking a write lock (and thus blocking on live method calls). However, we aim not to
-// generate methods with any hidden blocking semantics, and a `destroy` method that might
-// block if called incorrectly seems to meet that bar.
-//
-// So, we achieve our goals by giving each instance an associated `AtomicLong` counter to track
-// the number of in-flight method calls, and an `AtomicBoolean` flag to indicate whether `destroy`
-// has been called. These are updated according to the following rules:
-//
-//    * The initial value of the counter is 1, indicating a live object with no in-flight calls.
-//      The initial value for the flag is false.
-//
-//    * At the start of each method call, we atomically check the counter.
-//      If it is 0 then the underlying Rust struct has already been destroyed and the call is aborted.
-//      If it is nonzero them we atomically increment it by 1 and proceed with the method call.
-//
-//    * At the end of each method call, we atomically decrement and check the counter.
-//      If it has reached zero then we destroy the underlying Rust struct.
-//
-//    * When `destroy` is called, we atomically flip the flag from false to true.
-//      If the flag was already true we silently fail.
-//      Otherwise we atomically decrement and check the counter.
-//      If it has reached zero then we destroy the underlying Rust struct.
-//
-// Astute readers may observe that this all sounds very similar to the way that Rust's `Arc<T>` works,
-// and indeed it is, with the addition of a flag to guard against multiple calls to `destroy`.
-//
-// The overall effect is that the underlying Rust struct is destroyed only when `destroy` has been
-// called *and* all in-flight method calls have completed, avoiding violating any of the expectations
-// of the underlying Rust code.
-//
-// This makes a cleaner a better alternative to _not_ calling `destroy()` as
-// and when the object is finished with, but the abstraction is not perfect: if the Rust object's `drop`
-// method is slow, and/or there are many objects to cleanup, and it's on a low end Android device, then the cleaner
-// thread may be starved, and the app will leak memory.
-//
-// In this case, `destroy`ing manually may be a better solution.
-//
-// The cleaner can live side by side with the manual calling of `destroy`. In the order of responsiveness, uniffi objects
-// with Rust peers are reclaimed:
-//
-// 1. By calling the `destroy` method of the object, which calls `rustObject.free()`. If that doesn't happen:
-// 2. When the object becomes unreachable, AND the Cleaner thread gets to call `rustObject.free()`. If the thread is starved then:
-// 3. The memory is reclaimed when the process terminates.
-//
-// [1] https://stackoverflow.com/questions/24376768/can-java-finalize-an-object-when-it-is-still-in-scope/24380219
-//
-
-
-public interface VeilRatchetInterface {
-
-    fun `decrypt`(`headerBytes`: kotlin.ByteArray, `ciphertext`: kotlin.ByteArray): kotlin.ByteArray
-
-    fun `encrypt`(`plaintext`: kotlin.ByteArray): RatchetMessage
-
-    fun `serialize`(): kotlin.String
-
-    companion object
-}
-
-open class VeilRatchet: Disposable, AutoCloseable, VeilRatchetInterface
-{
-
-    constructor(pointer: Pointer) {
-        this.pointer = pointer
-        this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(pointer))
-    }
-
-    /**
-     * This constructor can be used to instantiate a fake object. Only used for tests. Any
-     * attempt to actually use an object constructed this way will fail as there is no
-     * connected Rust object.
-     */
-    @Suppress("UNUSED_PARAMETER")
-    constructor(noPointer: NoPointer) {
-        this.pointer = null
-        this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(pointer))
-    }
-
-    protected val pointer: Pointer?
-    protected val cleanable: UniffiCleaner.Cleanable
-
-    private val wasDestroyed = AtomicBoolean(false)
-    private val callCounter = AtomicLong(1)
-
-    override fun destroy() {
-        // Only allow a single call to this method.
-        // TODO: maybe we should log a warning if called more than once?
-        if (this.wasDestroyed.compareAndSet(false, true)) {
-            // This decrement always matches the initial count of 1 given at creation time.
-            if (this.callCounter.decrementAndGet() == 0L) {
-                cleanable.clean()
-            }
-        }
-    }
-
-    @Synchronized
-    override fun close() {
-        this.destroy()
-    }
-
-    internal inline fun <R> callWithPointer(block: (ptr: Pointer) -> R): R {
-        // Check and increment the call counter, to keep the object alive.
-        // This needs a compare-and-set retry loop in case of concurrent updates.
-        do {
-            val c = this.callCounter.get()
-            if (c == 0L) {
-                throw IllegalStateException("${this.javaClass.simpleName} object has already been destroyed")
-            }
-            if (c == Long.MAX_VALUE) {
-                throw IllegalStateException("${this.javaClass.simpleName} call counter would overflow")
-            }
-        } while (! this.callCounter.compareAndSet(c, c + 1L))
-        // Now we can safely do the method call without the pointer being freed concurrently.
-        try {
-            return block(this.uniffiClonePointer())
-        } finally {
-            // This decrement always matches the increment we performed above.
-            if (this.callCounter.decrementAndGet() == 0L) {
-                cleanable.clean()
-            }
-        }
-    }
-
-    // Use a static inner class instead of a closure so as not to accidentally
-    // capture `this` as part of the cleanable's action.
-    private class UniffiCleanAction(private val pointer: Pointer?) : Runnable {
-        override fun run() {
-            pointer?.let { ptr ->
-                uniffiRustCall { status ->
-                    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_free_veilratchet(ptr, status)
-                }
-            }
-        }
-    }
-
-    fun uniffiClonePointer(): Pointer {
-        return uniffiRustCall() { status ->
-            UniffiLib.INSTANCE.uniffi_veil_ffi_fn_clone_veilratchet(pointer!!, status)
-        }
-    }
-
-
-    @Throws(VeilException::class)override fun `decrypt`(`headerBytes`: kotlin.ByteArray, `ciphertext`: kotlin.ByteArray): kotlin.ByteArray {
-            return FfiConverterByteArray.lift(
-    callWithPointer {
-    uniffiRustCallWithError(VeilException) { _status ->
-    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilratchet_decrypt(
-        it, FfiConverterByteArray.lower(`headerBytes`),FfiConverterByteArray.lower(`ciphertext`),_status)
-}
-    }
-    )
-    }
-
-
-
-    @Throws(VeilException::class)override fun `encrypt`(`plaintext`: kotlin.ByteArray): RatchetMessage {
-            return FfiConverterTypeRatchetMessage.lift(
-    callWithPointer {
-    uniffiRustCallWithError(VeilException) { _status ->
-    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilratchet_encrypt(
-        it, FfiConverterByteArray.lower(`plaintext`),_status)
-}
-    }
-    )
-    }
-
-
-
-    @Throws(VeilException::class)override fun `serialize`(): kotlin.String {
-            return FfiConverterString.lift(
-    callWithPointer {
-    uniffiRustCallWithError(VeilException) { _status ->
-    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilratchet_serialize(
-        it, _status)
-}
-    }
-    )
-    }
-
-
-
-
-
-    companion object {
-
-    @Throws(VeilException::class) fun `deserialize`(`json`: kotlin.String): VeilRatchet {
-            return FfiConverterTypeVeilRatchet.lift(
-    uniffiRustCallWithError(VeilException) { _status ->
-    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_constructor_veilratchet_deserialize(
-        FfiConverterString.lower(`json`),_status)
-}
-    )
-    }
-
-
-
-    @Throws(VeilException::class) fun `initInitiator`(`sharedSecret`: kotlin.ByteArray, `peerRatchetKey`: kotlin.ByteArray): VeilRatchet {
-            return FfiConverterTypeVeilRatchet.lift(
-    uniffiRustCallWithError(VeilException) { _status ->
-    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_constructor_veilratchet_init_initiator(
-        FfiConverterByteArray.lower(`sharedSecret`),FfiConverterByteArray.lower(`peerRatchetKey`),_status)
-}
-    )
-    }
-
-
-
-    @Throws(VeilException::class) fun `initResponder`(`sharedSecret`: kotlin.ByteArray, `ourSpkSecret`: kotlin.ByteArray, `ourSpkPublic`: kotlin.ByteArray): VeilRatchet {
-            return FfiConverterTypeVeilRatchet.lift(
-    uniffiRustCallWithError(VeilException) { _status ->
-    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_constructor_veilratchet_init_responder(
-        FfiConverterByteArray.lower(`sharedSecret`),FfiConverterByteArray.lower(`ourSpkSecret`),FfiConverterByteArray.lower(`ourSpkPublic`),_status)
-}
-    )
-    }
-
-
-
-    }
-
-}
-
-/**
- * @suppress
- */
-public object FfiConverterTypeVeilRatchet: FfiConverter<VeilRatchet, Pointer> {
-
-    override fun lower(value: VeilRatchet): Pointer {
-        return value.uniffiClonePointer()
-    }
-
-    override fun lift(value: Pointer): VeilRatchet {
-        return VeilRatchet(value)
-    }
-
-    override fun read(buf: ByteBuffer): VeilRatchet {
-        // The Rust code always writes pointers as 8 bytes, and will
-        // fail to compile if they don't fit.
-        return lift(Pointer(buf.getLong()))
-    }
-
-    override fun allocationSize(value: VeilRatchet) = 8UL
-
-    override fun write(value: VeilRatchet, buf: ByteBuffer) {
         // The Rust code always expects pointers written as 8 bytes,
         // and will fail to compile if they don't fit.
         buf.putLong(Pointer.nativeValue(lower(value)))
@@ -4442,70 +4972,6 @@ public object FfiConverterTypeVeilRecoveryDraft: FfiConverter<VeilRecoveryDraft,
 
 
 
-data class AeadResult (
-    var `ciphertext`: kotlin.ByteArray,
-    var `nonce`: kotlin.ByteArray
-) {
-
-    companion object
-}
-
-/**
- * @suppress
- */
-public object FfiConverterTypeAeadResult: FfiConverterRustBuffer<AeadResult> {
-    override fun read(buf: ByteBuffer): AeadResult {
-        return AeadResult(
-            FfiConverterByteArray.read(buf),
-            FfiConverterByteArray.read(buf),
-        )
-    }
-
-    override fun allocationSize(value: AeadResult) = (
-            FfiConverterByteArray.allocationSize(value.`ciphertext`) +
-            FfiConverterByteArray.allocationSize(value.`nonce`)
-    )
-
-    override fun write(value: AeadResult, buf: ByteBuffer) {
-            FfiConverterByteArray.write(value.`ciphertext`, buf)
-            FfiConverterByteArray.write(value.`nonce`, buf)
-    }
-}
-
-
-
-data class FingerprintResult (
-    var `emoji`: kotlin.String,
-    var `hex`: kotlin.String
-) {
-
-    companion object
-}
-
-/**
- * @suppress
- */
-public object FfiConverterTypeFingerprintResult: FfiConverterRustBuffer<FingerprintResult> {
-    override fun read(buf: ByteBuffer): FingerprintResult {
-        return FingerprintResult(
-            FfiConverterString.read(buf),
-            FfiConverterString.read(buf),
-        )
-    }
-
-    override fun allocationSize(value: FingerprintResult) = (
-            FfiConverterString.allocationSize(value.`emoji`) +
-            FfiConverterString.allocationSize(value.`hex`)
-    )
-
-    override fun write(value: FingerprintResult, buf: ByteBuffer) {
-            FfiConverterString.write(value.`emoji`, buf)
-            FfiConverterString.write(value.`hex`, buf)
-    }
-}
-
-
-
 data class KeyBundleData (
     var `identityKey`: kotlin.ByteArray,
     var `signingKey`: kotlin.ByteArray
@@ -4570,6 +5036,90 @@ public object FfiConverterTypeMobileAuthenticatedBinding: FfiConverterRustBuffer
 
 
 
+data class MobileContactRequest (
+    var `token`: kotlin.String,
+    var `method`: kotlin.String,
+    var `target`: kotlin.String,
+    var `body`: kotlin.ByteArray,
+    var `signatureData`: RestSignatureData
+) {
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeMobileContactRequest: FfiConverterRustBuffer<MobileContactRequest> {
+    override fun read(buf: ByteBuffer): MobileContactRequest {
+        return MobileContactRequest(
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterByteArray.read(buf),
+            FfiConverterTypeRestSignatureData.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: MobileContactRequest) = (
+            FfiConverterString.allocationSize(value.`token`) +
+            FfiConverterString.allocationSize(value.`method`) +
+            FfiConverterString.allocationSize(value.`target`) +
+            FfiConverterByteArray.allocationSize(value.`body`) +
+            FfiConverterTypeRestSignatureData.allocationSize(value.`signatureData`)
+    )
+
+    override fun write(value: MobileContactRequest, buf: ByteBuffer) {
+            FfiConverterString.write(value.`token`, buf)
+            FfiConverterString.write(value.`method`, buf)
+            FfiConverterString.write(value.`target`, buf)
+            FfiConverterByteArray.write(value.`body`, buf)
+            FfiConverterTypeRestSignatureData.write(value.`signatureData`, buf)
+    }
+}
+
+
+
+data class MobileContactSearchResult (
+    var `userId`: kotlin.String,
+    var `username`: kotlin.String,
+    var `identityKey`: kotlin.ByteArray,
+    var `signingKey`: kotlin.ByteArray
+) {
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeMobileContactSearchResult: FfiConverterRustBuffer<MobileContactSearchResult> {
+    override fun read(buf: ByteBuffer): MobileContactSearchResult {
+        return MobileContactSearchResult(
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterByteArray.read(buf),
+            FfiConverterByteArray.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: MobileContactSearchResult) = (
+            FfiConverterString.allocationSize(value.`userId`) +
+            FfiConverterString.allocationSize(value.`username`) +
+            FfiConverterByteArray.allocationSize(value.`identityKey`) +
+            FfiConverterByteArray.allocationSize(value.`signingKey`)
+    )
+
+    override fun write(value: MobileContactSearchResult, buf: ByteBuffer) {
+            FfiConverterString.write(value.`userId`, buf)
+            FfiConverterString.write(value.`username`, buf)
+            FfiConverterByteArray.write(value.`identityKey`, buf)
+            FfiConverterByteArray.write(value.`signingKey`, buf)
+    }
+}
+
+
+
 data class MobileDirectConversationData (
     var `conversationId`: kotlin.String,
     var `name`: kotlin.String,
@@ -4617,6 +5167,47 @@ public object FfiConverterTypeMobileDirectConversationData: FfiConverterRustBuff
             FfiConverterString.write(value.`peerIdentityKeyHex`, buf)
             FfiConverterString.write(value.`peerSigningKeyHex`, buf)
             FfiConverterBoolean.write(value.`needsPrekey`, buf)
+    }
+}
+
+
+
+/**
+ * Parsed result of one POST /v1/conversations/dm response. Peer keys are
+ * returned only so the platform runtime can compare them with the separately
+ * authenticated contact lookup before installing the conversation.
+ */
+data class MobileDirectCreatedConversation (
+    var `conversationId`: kotlin.String,
+    var `peerIdentityKey`: kotlin.ByteArray,
+    var `peerSigningKey`: kotlin.ByteArray
+) {
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeMobileDirectCreatedConversation: FfiConverterRustBuffer<MobileDirectCreatedConversation> {
+    override fun read(buf: ByteBuffer): MobileDirectCreatedConversation {
+        return MobileDirectCreatedConversation(
+            FfiConverterString.read(buf),
+            FfiConverterByteArray.read(buf),
+            FfiConverterByteArray.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: MobileDirectCreatedConversation) = (
+            FfiConverterString.allocationSize(value.`conversationId`) +
+            FfiConverterByteArray.allocationSize(value.`peerIdentityKey`) +
+            FfiConverterByteArray.allocationSize(value.`peerSigningKey`)
+    )
+
+    override fun write(value: MobileDirectCreatedConversation, buf: ByteBuffer) {
+            FfiConverterString.write(value.`conversationId`, buf)
+            FfiConverterByteArray.write(value.`peerIdentityKey`, buf)
+            FfiConverterByteArray.write(value.`peerSigningKey`, buf)
     }
 }
 
@@ -4721,6 +5312,71 @@ public object FfiConverterTypeMobileDirectHistoryProgress: FfiConverterRustBuffe
     override fun write(value: MobileDirectHistoryProgress, buf: ByteBuffer) {
             FfiConverterTypeMobileDirectHistoryOutcome.write(value.`outcome`, buf)
             FfiConverterBoolean.write(value.`historiesTerminal`, buf)
+    }
+}
+
+
+
+/**
+ * Public comparison material for one exact authenticated Direct route. No
+ * device secret, ratchet key, prekey, signature capability, or raw DB handle
+ * crosses this boundary.
+ */
+data class MobileDirectIdentityVerification (
+    var `canonicalServerOrigin`: kotlin.String,
+    var `peerUserId`: kotlin.String,
+    var `peerIdentityKeyHex`: kotlin.String,
+    var `peerSigningKeyHex`: kotlin.String,
+    var `fingerprintVersion`: kotlin.String,
+    var `fingerprintEmoji`: kotlin.String,
+    var `fingerprintHex`: kotlin.String,
+    var `qrPayload`: kotlin.String,
+    var `state`: MobileDirectIdentityVerificationState
+) {
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeMobileDirectIdentityVerification: FfiConverterRustBuffer<MobileDirectIdentityVerification> {
+    override fun read(buf: ByteBuffer): MobileDirectIdentityVerification {
+        return MobileDirectIdentityVerification(
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterTypeMobileDirectIdentityVerificationState.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: MobileDirectIdentityVerification) = (
+            FfiConverterString.allocationSize(value.`canonicalServerOrigin`) +
+            FfiConverterString.allocationSize(value.`peerUserId`) +
+            FfiConverterString.allocationSize(value.`peerIdentityKeyHex`) +
+            FfiConverterString.allocationSize(value.`peerSigningKeyHex`) +
+            FfiConverterString.allocationSize(value.`fingerprintVersion`) +
+            FfiConverterString.allocationSize(value.`fingerprintEmoji`) +
+            FfiConverterString.allocationSize(value.`fingerprintHex`) +
+            FfiConverterString.allocationSize(value.`qrPayload`) +
+            FfiConverterTypeMobileDirectIdentityVerificationState.allocationSize(value.`state`)
+    )
+
+    override fun write(value: MobileDirectIdentityVerification, buf: ByteBuffer) {
+            FfiConverterString.write(value.`canonicalServerOrigin`, buf)
+            FfiConverterString.write(value.`peerUserId`, buf)
+            FfiConverterString.write(value.`peerIdentityKeyHex`, buf)
+            FfiConverterString.write(value.`peerSigningKeyHex`, buf)
+            FfiConverterString.write(value.`fingerprintVersion`, buf)
+            FfiConverterString.write(value.`fingerprintEmoji`, buf)
+            FfiConverterString.write(value.`fingerprintHex`, buf)
+            FfiConverterString.write(value.`qrPayload`, buf)
+            FfiConverterTypeMobileDirectIdentityVerificationState.write(value.`state`, buf)
     }
 }
 
@@ -5073,94 +5729,12 @@ public object FfiConverterTypeMobileReconnectTarget: FfiConverterRustBuffer<Mobi
 
 
 
-data class PreKeyBundleData (
-    var `identityKey`: kotlin.ByteArray,
-    var `signingKey`: kotlin.ByteArray,
-    var `signedPrekey`: kotlin.ByteArray,
-    var `signedPrekeySignature`: kotlin.ByteArray,
-    var `signedPrekeyId`: kotlin.UInt,
-    var `oneTimePrekey`: kotlin.ByteArray?,
-    var `oneTimePrekeyId`: kotlin.UInt?
-) {
-
-    companion object
-}
-
-/**
- * @suppress
- */
-public object FfiConverterTypePreKeyBundleData: FfiConverterRustBuffer<PreKeyBundleData> {
-    override fun read(buf: ByteBuffer): PreKeyBundleData {
-        return PreKeyBundleData(
-            FfiConverterByteArray.read(buf),
-            FfiConverterByteArray.read(buf),
-            FfiConverterByteArray.read(buf),
-            FfiConverterByteArray.read(buf),
-            FfiConverterUInt.read(buf),
-            FfiConverterOptionalByteArray.read(buf),
-            FfiConverterOptionalUInt.read(buf),
-        )
-    }
-
-    override fun allocationSize(value: PreKeyBundleData) = (
-            FfiConverterByteArray.allocationSize(value.`identityKey`) +
-            FfiConverterByteArray.allocationSize(value.`signingKey`) +
-            FfiConverterByteArray.allocationSize(value.`signedPrekey`) +
-            FfiConverterByteArray.allocationSize(value.`signedPrekeySignature`) +
-            FfiConverterUInt.allocationSize(value.`signedPrekeyId`) +
-            FfiConverterOptionalByteArray.allocationSize(value.`oneTimePrekey`) +
-            FfiConverterOptionalUInt.allocationSize(value.`oneTimePrekeyId`)
-    )
-
-    override fun write(value: PreKeyBundleData, buf: ByteBuffer) {
-            FfiConverterByteArray.write(value.`identityKey`, buf)
-            FfiConverterByteArray.write(value.`signingKey`, buf)
-            FfiConverterByteArray.write(value.`signedPrekey`, buf)
-            FfiConverterByteArray.write(value.`signedPrekeySignature`, buf)
-            FfiConverterUInt.write(value.`signedPrekeyId`, buf)
-            FfiConverterOptionalByteArray.write(value.`oneTimePrekey`, buf)
-            FfiConverterOptionalUInt.write(value.`oneTimePrekeyId`, buf)
-    }
-}
-
-
-
-data class RatchetMessage (
-    var `header`: kotlin.ByteArray,
-    var `ciphertext`: kotlin.ByteArray
-) {
-
-    companion object
-}
-
-/**
- * @suppress
- */
-public object FfiConverterTypeRatchetMessage: FfiConverterRustBuffer<RatchetMessage> {
-    override fun read(buf: ByteBuffer): RatchetMessage {
-        return RatchetMessage(
-            FfiConverterByteArray.read(buf),
-            FfiConverterByteArray.read(buf),
-        )
-    }
-
-    override fun allocationSize(value: RatchetMessage) = (
-            FfiConverterByteArray.allocationSize(value.`header`) +
-            FfiConverterByteArray.allocationSize(value.`ciphertext`)
-    )
-
-    override fun write(value: RatchetMessage, buf: ByteBuffer) {
-            FfiConverterByteArray.write(value.`header`, buf)
-            FfiConverterByteArray.write(value.`ciphertext`, buf)
-    }
-}
-
-
-
 data class RestSignatureData (
+    var `version`: kotlin.String,
     var `userId`: kotlin.String,
     var `timestampMs`: kotlin.String,
-    var `signatureBase64`: kotlin.String
+    var `nonceBase64url`: kotlin.String,
+    var `signatureBase64url`: kotlin.String
 ) {
 
     companion object
@@ -5175,95 +5749,25 @@ public object FfiConverterTypeRestSignatureData: FfiConverterRustBuffer<RestSign
             FfiConverterString.read(buf),
             FfiConverterString.read(buf),
             FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
         )
     }
 
     override fun allocationSize(value: RestSignatureData) = (
+            FfiConverterString.allocationSize(value.`version`) +
             FfiConverterString.allocationSize(value.`userId`) +
             FfiConverterString.allocationSize(value.`timestampMs`) +
-            FfiConverterString.allocationSize(value.`signatureBase64`)
+            FfiConverterString.allocationSize(value.`nonceBase64url`) +
+            FfiConverterString.allocationSize(value.`signatureBase64url`)
     )
 
     override fun write(value: RestSignatureData, buf: ByteBuffer) {
+            FfiConverterString.write(value.`version`, buf)
             FfiConverterString.write(value.`userId`, buf)
             FfiConverterString.write(value.`timestampMs`, buf)
-            FfiConverterString.write(value.`signatureBase64`, buf)
-    }
-}
-
-
-
-data class ShareBundle (
-    var `ciphertext`: kotlin.ByteArray,
-    var `contentKey`: kotlin.ByteArray,
-    var `wrappedKey`: kotlin.ByteArray?,
-    var `salt`: kotlin.ByteArray?
-) {
-
-    companion object
-}
-
-/**
- * @suppress
- */
-public object FfiConverterTypeShareBundle: FfiConverterRustBuffer<ShareBundle> {
-    override fun read(buf: ByteBuffer): ShareBundle {
-        return ShareBundle(
-            FfiConverterByteArray.read(buf),
-            FfiConverterByteArray.read(buf),
-            FfiConverterOptionalByteArray.read(buf),
-            FfiConverterOptionalByteArray.read(buf),
-        )
-    }
-
-    override fun allocationSize(value: ShareBundle) = (
-            FfiConverterByteArray.allocationSize(value.`ciphertext`) +
-            FfiConverterByteArray.allocationSize(value.`contentKey`) +
-            FfiConverterOptionalByteArray.allocationSize(value.`wrappedKey`) +
-            FfiConverterOptionalByteArray.allocationSize(value.`salt`)
-    )
-
-    override fun write(value: ShareBundle, buf: ByteBuffer) {
-            FfiConverterByteArray.write(value.`ciphertext`, buf)
-            FfiConverterByteArray.write(value.`contentKey`, buf)
-            FfiConverterOptionalByteArray.write(value.`wrappedKey`, buf)
-            FfiConverterOptionalByteArray.write(value.`salt`, buf)
-    }
-}
-
-
-
-data class X3dhResultData (
-    var `sharedSecret`: kotlin.ByteArray,
-    var `ephemeralPublic`: kotlin.ByteArray,
-    var `associatedData`: kotlin.ByteArray
-) {
-
-    companion object
-}
-
-/**
- * @suppress
- */
-public object FfiConverterTypeX3dhResultData: FfiConverterRustBuffer<X3dhResultData> {
-    override fun read(buf: ByteBuffer): X3dhResultData {
-        return X3dhResultData(
-            FfiConverterByteArray.read(buf),
-            FfiConverterByteArray.read(buf),
-            FfiConverterByteArray.read(buf),
-        )
-    }
-
-    override fun allocationSize(value: X3dhResultData) = (
-            FfiConverterByteArray.allocationSize(value.`sharedSecret`) +
-            FfiConverterByteArray.allocationSize(value.`ephemeralPublic`) +
-            FfiConverterByteArray.allocationSize(value.`associatedData`)
-    )
-
-    override fun write(value: X3dhResultData, buf: ByteBuffer) {
-            FfiConverterByteArray.write(value.`sharedSecret`, buf)
-            FfiConverterByteArray.write(value.`ephemeralPublic`, buf)
-            FfiConverterByteArray.write(value.`associatedData`, buf)
+            FfiConverterString.write(value.`nonceBase64url`, buf)
+            FfiConverterString.write(value.`signatureBase64url`, buf)
     }
 }
 
@@ -5307,6 +5811,41 @@ public object FfiConverterTypeMobileConnectFailureReason: FfiConverterRustBuffer
 
 
 
+/**
+ * Terminal outcome of registering one created Direct conversation under
+ * the current lease. `AlreadyInstalled` is a safe idempotent replay of the
+ * exact same peer binding; a key conflict is an error, never a variant.
+ */
+
+enum class MobileDirectConversationInstallOutcome {
+
+    INSTALLED,
+    ALREADY_INSTALLED;
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeMobileDirectConversationInstallOutcome: FfiConverterRustBuffer<MobileDirectConversationInstallOutcome> {
+    override fun read(buf: ByteBuffer) = try {
+        MobileDirectConversationInstallOutcome.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: MobileDirectConversationInstallOutcome) = 4UL
+
+    override fun write(value: MobileDirectConversationInstallOutcome, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+
+
+
+
 
 enum class MobileDirectHistoryOutcome {
 
@@ -5332,6 +5871,40 @@ public object FfiConverterTypeMobileDirectHistoryOutcome: FfiConverterRustBuffer
     override fun allocationSize(value: MobileDirectHistoryOutcome) = 4UL
 
     override fun write(value: MobileDirectHistoryOutcome, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+
+
+
+
+/**
+ * Device-local result of comparing one exact account-v2 safety number.
+ */
+
+enum class MobileDirectIdentityVerificationState {
+
+    NOT_COMPARED,
+    VERIFIED_ON_THIS_DEVICE,
+    IDENTITY_CHANGED;
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeMobileDirectIdentityVerificationState: FfiConverterRustBuffer<MobileDirectIdentityVerificationState> {
+    override fun read(buf: ByteBuffer) = try {
+        MobileDirectIdentityVerificationState.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: MobileDirectIdentityVerificationState) = 4UL
+
+    override fun write(value: MobileDirectIdentityVerificationState, buf: ByteBuffer) {
         buf.putInt(value.ordinal + 1)
     }
 }
@@ -5564,6 +6137,47 @@ public object FfiConverterTypeMobileRetryableReason: FfiConverterRustBuffer<Mobi
 
 
 
+/**
+ * Why the background controller stopped. Mirrors WsEventsV3SupervisorExit.
+ */
+
+enum class MobileWsEventsExit {
+
+    /**
+     * Host asked (stop()/logout/service destroy). Silent, restartable.
+     */
+    CANCELLED,
+    /**
+     * Fail-closed terminal (auth denial, protocol violation, bounded-buffer
+     * failure). Kotlin MUST surface this and MUST NOT auto-restart; only an
+     * explicit user/host intent may start a new controller.
+     */
+    FAIL_CLOSED;
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeMobileWsEventsExit: FfiConverterRustBuffer<MobileWsEventsExit> {
+    override fun read(buf: ByteBuffer) = try {
+        MobileWsEventsExit.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: MobileWsEventsExit) = 4UL
+
+    override fun write(value: MobileWsEventsExit, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+
+
+
+
 
 
 sealed class VeilException: kotlin.Exception() {
@@ -5711,38 +6325,6 @@ public object FfiConverterTypeVeilError : FfiConverterRustBuffer<VeilException> 
 /**
  * @suppress
  */
-public object FfiConverterOptionalUInt: FfiConverterRustBuffer<kotlin.UInt?> {
-    override fun read(buf: ByteBuffer): kotlin.UInt? {
-        if (buf.get().toInt() == 0) {
-            return null
-        }
-        return FfiConverterUInt.read(buf)
-    }
-
-    override fun allocationSize(value: kotlin.UInt?): ULong {
-        if (value == null) {
-            return 1UL
-        } else {
-            return 1UL + FfiConverterUInt.allocationSize(value)
-        }
-    }
-
-    override fun write(value: kotlin.UInt?, buf: ByteBuffer) {
-        if (value == null) {
-            buf.put(0)
-        } else {
-            buf.put(1)
-            FfiConverterUInt.write(value, buf)
-        }
-    }
-}
-
-
-
-
-/**
- * @suppress
- */
 public object FfiConverterOptionalLong: FfiConverterRustBuffer<kotlin.Long?> {
     override fun read(buf: ByteBuffer): kotlin.Long? {
         if (buf.get().toInt() == 0) {
@@ -5807,28 +6389,28 @@ public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?>
 /**
  * @suppress
  */
-public object FfiConverterOptionalByteArray: FfiConverterRustBuffer<kotlin.ByteArray?> {
-    override fun read(buf: ByteBuffer): kotlin.ByteArray? {
+public object FfiConverterOptionalTypeMobileDirectIdentityVerification: FfiConverterRustBuffer<MobileDirectIdentityVerification?> {
+    override fun read(buf: ByteBuffer): MobileDirectIdentityVerification? {
         if (buf.get().toInt() == 0) {
             return null
         }
-        return FfiConverterByteArray.read(buf)
+        return FfiConverterTypeMobileDirectIdentityVerification.read(buf)
     }
 
-    override fun allocationSize(value: kotlin.ByteArray?): ULong {
+    override fun allocationSize(value: MobileDirectIdentityVerification?): ULong {
         if (value == null) {
             return 1UL
         } else {
-            return 1UL + FfiConverterByteArray.allocationSize(value)
+            return 1UL + FfiConverterTypeMobileDirectIdentityVerification.allocationSize(value)
         }
     }
 
-    override fun write(value: kotlin.ByteArray?, buf: ByteBuffer) {
+    override fun write(value: MobileDirectIdentityVerification?, buf: ByteBuffer) {
         if (value == null) {
             buf.put(0)
         } else {
             buf.put(1)
-            FfiConverterByteArray.write(value, buf)
+            FfiConverterTypeMobileDirectIdentityVerification.write(value, buf)
         }
     }
 }
@@ -5952,109 +6534,3 @@ public object FfiConverterSequenceTypeMobileDirectConversationData: FfiConverter
         }
     }
 }
-    @Throws(VeilException::class) fun `aeadDecrypt`(`key`: kotlin.ByteArray, `ciphertext`: kotlin.ByteArray, `nonce`: kotlin.ByteArray): kotlin.ByteArray {
-            return FfiConverterByteArray.lift(
-    uniffiRustCallWithError(VeilException) { _status ->
-    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_func_aead_decrypt(
-        FfiConverterByteArray.lower(`key`),FfiConverterByteArray.lower(`ciphertext`),FfiConverterByteArray.lower(`nonce`),_status)
-}
-    )
-    }
-
-
-    @Throws(VeilException::class) fun `aeadEncrypt`(`key`: kotlin.ByteArray, `plaintext`: kotlin.ByteArray): AeadResult {
-            return FfiConverterTypeAeadResult.lift(
-    uniffiRustCallWithError(VeilException) { _status ->
-    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_func_aead_encrypt(
-        FfiConverterByteArray.lower(`key`),FfiConverterByteArray.lower(`plaintext`),_status)
-}
-    )
-    }
-
-
-    @Throws(VeilException::class) fun `decryptShare`(`ciphertext`: kotlin.ByteArray, `contentKey`: kotlin.ByteArray?, `password`: kotlin.String?, `wrappedKey`: kotlin.ByteArray?, `salt`: kotlin.ByteArray?): kotlin.ByteArray {
-            return FfiConverterByteArray.lift(
-    uniffiRustCallWithError(VeilException) { _status ->
-    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_func_decrypt_share(
-        FfiConverterByteArray.lower(`ciphertext`),FfiConverterOptionalByteArray.lower(`contentKey`),FfiConverterOptionalString.lower(`password`),FfiConverterOptionalByteArray.lower(`wrappedKey`),FfiConverterOptionalByteArray.lower(`salt`),_status)
-}
-    )
-    }
-
-
-    @Throws(VeilException::class) fun `deriveKeyFromPassword`(`password`: kotlin.String, `salt`: kotlin.ByteArray): kotlin.ByteArray {
-            return FfiConverterByteArray.lift(
-    uniffiRustCallWithError(VeilException) { _status ->
-    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_func_derive_key_from_password(
-        FfiConverterString.lower(`password`),FfiConverterByteArray.lower(`salt`),_status)
-}
-    )
-    }
-
-
-    @Throws(VeilException::class) fun `deriveKeyFromPin`(`pin`: kotlin.String, `salt`: kotlin.ByteArray): kotlin.ByteArray {
-            return FfiConverterByteArray.lift(
-    uniffiRustCallWithError(VeilException) { _status ->
-    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_func_derive_key_from_pin(
-        FfiConverterString.lower(`pin`),FfiConverterByteArray.lower(`salt`),_status)
-}
-    )
-    }
-
-
-    @Throws(VeilException::class) fun `ed25519Verify`(`publicKey`: kotlin.ByteArray, `message`: kotlin.ByteArray, `sig`: kotlin.ByteArray): kotlin.Boolean {
-            return FfiConverterBoolean.lift(
-    uniffiRustCallWithError(VeilException) { _status ->
-    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_func_ed25519_verify(
-        FfiConverterByteArray.lower(`publicKey`),FfiConverterByteArray.lower(`message`),FfiConverterByteArray.lower(`sig`),_status)
-}
-    )
-    }
-
-
-    @Throws(VeilException::class) fun `encryptShare`(`payload`: kotlin.ByteArray, `password`: kotlin.String?): ShareBundle {
-            return FfiConverterTypeShareBundle.lift(
-    uniffiRustCallWithError(VeilException) { _status ->
-    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_func_encrypt_share(
-        FfiConverterByteArray.lower(`payload`),FfiConverterOptionalString.lower(`password`),_status)
-}
-    )
-    }
-
-
-    @Throws(VeilException::class) fun `generateAccountFingerprintV2`(`canonicalServerOrigin`: kotlin.String, `userIdA`: kotlin.String, `identityKeyA`: kotlin.ByteArray, `signingKeyA`: kotlin.ByteArray, `userIdB`: kotlin.String, `identityKeyB`: kotlin.ByteArray, `signingKeyB`: kotlin.ByteArray): FingerprintResult {
-            return FfiConverterTypeFingerprintResult.lift(
-    uniffiRustCallWithError(VeilException) { _status ->
-    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_func_generate_account_fingerprint_v2(
-        FfiConverterString.lower(`canonicalServerOrigin`),FfiConverterString.lower(`userIdA`),FfiConverterByteArray.lower(`identityKeyA`),FfiConverterByteArray.lower(`signingKeyA`),FfiConverterString.lower(`userIdB`),FfiConverterByteArray.lower(`identityKeyB`),FfiConverterByteArray.lower(`signingKeyB`),_status)
-}
-    )
-    }
-
- fun `generateMnemonic`(): kotlin.String {
-            return FfiConverterString.lift(
-    uniffiRustCall() { _status ->
-    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_func_generate_mnemonic(
-        _status)
-}
-    )
-    }
-
- fun `validateMnemonic`(`mnemonic`: kotlin.String): kotlin.Boolean {
-            return FfiConverterBoolean.lift(
-    uniffiRustCall() { _status ->
-    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_func_validate_mnemonic(
-        FfiConverterString.lower(`mnemonic`),_status)
-}
-    )
-    }
-
-
-    @Throws(VeilException::class) fun `x3dhInitiate`(`identity`: VeilIdentity, `peerBundle`: PreKeyBundleData): X3dhResultData {
-            return FfiConverterTypeX3dhResultData.lift(
-    uniffiRustCallWithError(VeilException) { _status ->
-    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_func_x3dh_initiate(
-        FfiConverterTypeVeilIdentity.lower(`identity`),FfiConverterTypePreKeyBundleData.lower(`peerBundle`),_status)
-}
-    )
-    }

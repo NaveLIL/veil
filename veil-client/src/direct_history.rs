@@ -19,8 +19,8 @@ use veil_store::models::{
 use zeroize::Zeroize;
 
 use crate::api::{
-    DirectHistoryMutationError, ReceiveMessageResult, RemoteMessageMetadata, RemoteReconcileAction,
-    VeilClient,
+    DirectHistoryMutationError, DirectMessageSecurityContextV2, MessageSecurityContextV1,
+    ReceiveMessageResult, RemoteMessageMetadata, RemoteReconcileAction, VeilClient,
 };
 
 pub const DIRECT_HISTORY_PAGE_LIMIT: usize = 25;
@@ -226,6 +226,22 @@ struct DirectHistoryMessageWire {
     sender_device_id: Option<String>,
     #[serde(default)]
     sender_binding_version: Option<String>,
+    #[serde(default)]
+    sender_device_identity_key: Option<String>,
+    #[serde(default)]
+    sender_device_signing_key: Option<String>,
+    #[serde(default)]
+    sender_device_capabilities: Option<String>,
+    #[serde(default)]
+    sender_device_binding_status: Option<u8>,
+    #[serde(default)]
+    sender_account_signature: Option<String>,
+    #[serde(default)]
+    target_device_id: Option<String>,
+    #[serde(default)]
+    target_binding_version: Option<String>,
+    #[serde(default)]
+    direct_session_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -251,6 +267,7 @@ struct ValidatedDirectHistoryMessage {
     id: String,
     sender_id: String,
     sender_identity_key: [u8; 32],
+    security_context: Option<MessageSecurityContextV1>,
     header: Vec<u8>,
     ciphertext: Vec<u8>,
     reply_to_id: Option<String>,
@@ -552,17 +569,170 @@ fn validate_message(
             DirectHistoryRejectCode::UnsupportedMessage,
         ));
     }
-    if wire.crypto_profile != "legacy_unknown"
-        || wire.crypto_era.is_some()
-        || wire.roster_version.is_some()
-        || wire.roster_commitment.is_some()
-        || wire.sender_device_id.is_some()
-        || wire.sender_binding_version.is_some()
-    {
-        return Err(DirectHistoryInstallError::rejected(
-            DirectHistoryRejectCode::UnsupportedMessage,
-        ));
-    }
+    let all_direct_fields_absent = wire.sender_device_identity_key.is_none()
+        && wire.sender_device_signing_key.is_none()
+        && wire.sender_device_capabilities.is_none()
+        && wire.sender_device_binding_status.is_none()
+        && wire.sender_account_signature.is_none()
+        && wire.target_device_id.is_none()
+        && wire.target_binding_version.is_none()
+        && wire.direct_session_id.is_none();
+    let security_context = match wire.crypto_profile.as_str() {
+        "legacy_unknown"
+            if wire.crypto_era.is_none()
+                && wire.roster_version.is_none()
+                && wire.roster_commitment.is_none()
+                && wire.sender_device_id.is_none()
+                && wire.sender_binding_version.is_none()
+                && all_direct_fields_absent =>
+        {
+            None
+        }
+        "direct_v2" if wire.roster_version.is_none() && wire.roster_commitment.is_none() => {
+            let era = parse_canonical_u63(
+                "Direct history crypto era",
+                wire.crypto_era.as_deref().ok_or_else(|| {
+                    DirectHistoryInstallError::rejected(DirectHistoryRejectCode::InvalidPage)
+                })?,
+            )?;
+            if era != 1 {
+                return Err(DirectHistoryInstallError::rejected(
+                    DirectHistoryRejectCode::UnsupportedMessage,
+                ));
+            }
+            let sender_device_id = decode_lower_hex_fixed::<16>(
+                "Direct history sender device id",
+                wire.sender_device_id.as_deref().ok_or_else(|| {
+                    DirectHistoryInstallError::rejected(DirectHistoryRejectCode::InvalidPage)
+                })?,
+            )
+            .map_err(|_| {
+                DirectHistoryInstallError::rejected(DirectHistoryRejectCode::InvalidPage)
+            })?;
+            let sender_binding_version = parse_canonical_u63(
+                "Direct history sender binding version",
+                wire.sender_binding_version.as_deref().ok_or_else(|| {
+                    DirectHistoryInstallError::rejected(DirectHistoryRejectCode::InvalidPage)
+                })?,
+            )?;
+            let sender_device_identity_key = decode_lower_hex_fixed::<32>(
+                "Direct history sender device identity key",
+                wire.sender_device_identity_key.as_deref().ok_or_else(|| {
+                    DirectHistoryInstallError::rejected(DirectHistoryRejectCode::InvalidPage)
+                })?,
+            )
+            .map_err(|_| {
+                DirectHistoryInstallError::rejected(DirectHistoryRejectCode::InvalidPage)
+            })?;
+            let sender_device_signing_key = decode_lower_hex_fixed::<32>(
+                "Direct history sender device signing key",
+                wire.sender_device_signing_key.as_deref().ok_or_else(|| {
+                    DirectHistoryInstallError::rejected(DirectHistoryRejectCode::InvalidPage)
+                })?,
+            )
+            .map_err(|_| {
+                DirectHistoryInstallError::rejected(DirectHistoryRejectCode::InvalidPage)
+            })?;
+            let sender_device_capabilities = parse_canonical_u63(
+                "Direct history sender device capabilities",
+                wire.sender_device_capabilities.as_deref().ok_or_else(|| {
+                    DirectHistoryInstallError::rejected(DirectHistoryRejectCode::InvalidPage)
+                })?,
+            )?;
+            let sender_device_binding_status =
+                wire.sender_device_binding_status.ok_or_else(|| {
+                    DirectHistoryInstallError::rejected(DirectHistoryRejectCode::InvalidPage)
+                })?;
+            let sender_account_signature = decode_lower_hex_fixed::<64>(
+                "Direct history sender account signature",
+                wire.sender_account_signature.as_deref().ok_or_else(|| {
+                    DirectHistoryInstallError::rejected(DirectHistoryRejectCode::InvalidPage)
+                })?,
+            )
+            .map_err(|_| {
+                DirectHistoryInstallError::rejected(DirectHistoryRejectCode::InvalidPage)
+            })?;
+            let target_device_id = decode_lower_hex_fixed::<16>(
+                "Direct history target device id",
+                wire.target_device_id.as_deref().ok_or_else(|| {
+                    DirectHistoryInstallError::rejected(DirectHistoryRejectCode::InvalidPage)
+                })?,
+            )
+            .map_err(|_| {
+                DirectHistoryInstallError::rejected(DirectHistoryRejectCode::InvalidPage)
+            })?;
+            let target_binding_version = parse_canonical_u63(
+                "Direct history target binding version",
+                wire.target_binding_version.as_deref().ok_or_else(|| {
+                    DirectHistoryInstallError::rejected(DirectHistoryRejectCode::InvalidPage)
+                })?,
+            )?;
+            let direct_session_id = decode_lower_hex_fixed::<32>(
+                "Direct history session id",
+                wire.direct_session_id.as_deref().ok_or_else(|| {
+                    DirectHistoryInstallError::rejected(DirectHistoryRejectCode::InvalidPage)
+                })?,
+            )
+            .map_err(|_| {
+                DirectHistoryInstallError::rejected(DirectHistoryRejectCode::InvalidPage)
+            })?;
+            if sender_device_id == [0u8; 16]
+                || sender_device_identity_key == [0u8; 32]
+                || sender_device_signing_key == [0u8; 32]
+                || sender_device_identity_key == sender_device_signing_key
+                || sender_device_capabilities == 0
+                || sender_device_binding_status
+                    != crate::device_identity::DEVICE_BINDING_STATUS_ACTIVE
+                || sender_account_signature == [0u8; 64]
+                || target_device_id == [0u8; 16]
+                || target_device_id == sender_device_id
+                || direct_session_id == [0u8; 32]
+            {
+                return Err(DirectHistoryInstallError::rejected(
+                    DirectHistoryRejectCode::InvalidPage,
+                ));
+            }
+            let binding = crate::device_identity::device_binding_signing_bytes(
+                &sender_identity_key,
+                &sender_signing_key,
+                &sender_device_id,
+                sender_binding_version,
+                &sender_device_identity_key,
+                &sender_device_signing_key,
+                sender_device_capabilities,
+                sender_device_binding_status,
+            );
+            if !veil_crypto::signature::verify(
+                &sender_signing_key,
+                &binding,
+                &sender_account_signature,
+            ) {
+                return Err(DirectHistoryInstallError::rejected(
+                    DirectHistoryRejectCode::IdentityMismatch,
+                ));
+            }
+            Some(MessageSecurityContextV1::DirectV2(
+                DirectMessageSecurityContextV2 {
+                    sender_user_id: wire.sender_id.clone(),
+                    sender_device_id,
+                    sender_binding_version,
+                    sender_device_identity_key,
+                    sender_device_signing_key,
+                    sender_device_capabilities,
+                    sender_device_binding_status,
+                    sender_account_signature,
+                    target_device_id,
+                    target_binding_version,
+                    direct_session_id,
+                },
+            ))
+        }
+        _ => {
+            return Err(DirectHistoryInstallError::rejected(
+                DirectHistoryRejectCode::UnsupportedMessage,
+            ));
+        }
+    };
 
     let created_at = parse_canonical_utc("Direct history created_at", &wire.created_at)
         .map_err(|_| DirectHistoryInstallError::rejected(DirectHistoryRejectCode::InvalidPage))?;
@@ -630,10 +800,23 @@ fn validate_message(
             MAX_HISTORY_CIPHERTEXT_BYTES,
         )
         .map_err(|_| DirectHistoryInstallError::rejected(DirectHistoryRejectCode::InvalidPage))?;
-        if !matches!(header.as_slice(), [0x01, ..] | [0x02, ..])
-            || (header[0] == 0x01 && header.len() != 82)
-            || (header[0] == 0x02 && header.len() != 42)
-        {
+        let valid_header = match security_context.as_ref() {
+            None => {
+                matches!(header.as_slice(), [0x01, ..] | [0x02, ..])
+                    && ((header[0] == 0x01 && header.len() == 82)
+                        || (header[0] == 0x02 && header.len() == 42))
+            }
+            Some(MessageSecurityContextV1::DirectV2(context)) => {
+                matches!(header.as_slice(), [0x11, ..] | [0x12, ..])
+                    && ((header[0] == 0x11 && header.len() == 114)
+                        || (header[0] == 0x12 && header.len() == 74))
+                    && header.get(1..33) == Some(context.direct_session_id.as_slice())
+            }
+            Some(
+                MessageSecurityContextV1::SenderKeyV5(_) | MessageSecurityContextV1::SenderKeyV6(_),
+            ) => false,
+        };
+        if !valid_header {
             return Err(DirectHistoryInstallError::rejected(
                 DirectHistoryRejectCode::UnsupportedMessage,
             ));
@@ -687,6 +870,7 @@ fn validate_message(
         id: wire.id,
         sender_id: wire.sender_id,
         sender_identity_key,
+        security_context,
         header,
         ciphertext,
         reply_to_id: wire.reply_to_id,
@@ -716,6 +900,31 @@ fn process_message(
     } else {
         &scope.peer_account
     };
+
+    // Account-scoped REST history may contain one envelope for a different
+    // local device. It is authenticated metadata but is not decryptable by
+    // this device and must never select or advance its ratchet.
+    if message.sender_id != scope.self_account.locator.user_id {
+        if let Some(MessageSecurityContextV1::DirectV2(context)) = message.security_context.as_ref()
+        {
+            if context.target_device_id != client.device_id()
+                || client.current_device_binding_version_v1()
+                    != Some(context.target_binding_version)
+            {
+                client
+                    .reconcile_remote_message_metadata_classified(
+                        &message.id,
+                        &scope.conversation_id,
+                        &message.sender_identity_key,
+                        &metadata,
+                        RemoteMessageStateKind::Unavailable,
+                    )
+                    .map_err(classify_history_mutation_error)?;
+                result.unavailable += 1;
+                return Ok(());
+            }
+        }
+    }
 
     // Another local device may have authored a server row that this device
     // never persisted. It cannot decrypt its own outbound ratchet ciphertext.
@@ -786,6 +995,7 @@ fn process_message(
                     &message.sender_identity_key,
                     author,
                     MessageAuthorContext::DirectoryMemberAtObservation,
+                    message.security_context.as_ref(),
                     &message.header,
                     &message.ciphertext,
                     Some(message.server_timestamp),
@@ -860,6 +1070,27 @@ fn decode_lower_hex_fixed<const N: usize>(field: &str, value: &str) -> Result<[u
         .map_err(|_| format!("{field} is invalid"))?
         .try_into()
         .map_err(|_| format!("{field} has the wrong length"))
+}
+
+fn parse_canonical_u63(_field: &str, value: &str) -> Result<u64, DirectHistoryInstallError> {
+    if value.is_empty()
+        || value.len() > 19
+        || (value.len() > 1 && value.starts_with('0'))
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(DirectHistoryInstallError::rejected(
+            DirectHistoryRejectCode::InvalidPage,
+        ));
+    }
+    let parsed = value
+        .parse::<u64>()
+        .map_err(|_| DirectHistoryInstallError::rejected(DirectHistoryRejectCode::InvalidPage))?;
+    if parsed == 0 || parsed > i64::MAX as u64 {
+        return Err(DirectHistoryInstallError::rejected(
+            DirectHistoryRejectCode::InvalidPage,
+        ));
+    }
+    Ok(parsed)
 }
 
 fn decode_lower_hex_bounded(field: &str, value: &str, limit: usize) -> Result<Vec<u8>, String> {

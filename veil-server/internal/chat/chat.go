@@ -82,6 +82,8 @@ type SendMessageResult struct {
 	Recipients       []string
 	Replayed         bool
 	AckRosterVersion *uint64
+	MembershipEpoch  *uint64
+	MembershipHash   []byte
 }
 
 // CanonicalClientMessageID returns the wire correlation key only when it is a
@@ -126,6 +128,8 @@ func sendMessageResultFromDB(outcome *db.MessageSendOutcome) *SendMessageResult 
 		ServerTimestamp:  outcome.ServerTimestamp,
 		Replayed:         outcome.Replayed,
 		AckRosterVersion: outcome.AckRosterVersion,
+		MembershipEpoch:  outcome.MembershipEpoch,
+		MembershipHash:   append([]byte(nil), outcome.MembershipHash...),
 	}
 }
 

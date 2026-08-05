@@ -18,6 +18,16 @@ jest.mock("../../components/layout/ChannelsIsland", () => {
   };
 });
 
+jest.mock("../../components/search/InlineContactSearch", () => {
+  const ReactModule = jest.requireActual<typeof import("react")>("react");
+  const { View: NativeView } =
+    jest.requireActual<typeof import("react-native")>("react-native");
+  return {
+    InlineContactSearch: () =>
+      ReactModule.createElement(NativeView, { testID: "preview-contact-search" }),
+  };
+});
+
 const metrics = {
   frame: { x: 0, y: 0, width: 390, height: 844 },
   insets: { top: 47, right: 0, bottom: 34, left: 0 },

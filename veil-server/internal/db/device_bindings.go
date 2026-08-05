@@ -22,9 +22,10 @@ const (
 )
 
 const (
-	DeviceCapabilitySenderKeyV5  uint64 = 1 << 0
-	DeviceCapabilitySealedSKDMV3 uint64 = 1 << 1
-	RequiredChannelCapabilities         = DeviceCapabilitySenderKeyV5 | DeviceCapabilitySealedSKDMV3
+	DeviceCapabilitySenderKeyV5       uint64 = 1 << 0
+	DeviceCapabilitySealedSKDMV3      uint64 = 1 << 1
+	DeviceCapabilityMembershipEpochV1 uint64 = 1 << 2
+	RequiredChannelCapabilities              = DeviceCapabilitySenderKeyV5 | DeviceCapabilitySealedSKDMV3
 )
 
 var (
@@ -82,9 +83,14 @@ func (db *DB) StoreDeviceBinding(ctx context.Context, binding *DeviceBinding) (*
 		return nil, fmt.Errorf("begin device binding transaction: %w", err)
 	}
 	defer tx.Rollback(ctx)
-	stored, err := storeDeviceBindingTx(ctx, tx, binding)
+	stored, appended, err := storeDeviceBindingTx(ctx, tx, binding)
 	if err != nil {
 		return nil, err
+	}
+	if appended {
+		if err := db.appendIdentityTransparencyDeviceBindingTx(ctx, tx, stored); err != nil {
+			return nil, fmt.Errorf("append device-binding transparency event: %w", err)
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, fmt.Errorf("commit device binding: %w", err)
@@ -96,9 +102,9 @@ func (db *DB) StoreDeviceBinding(ctx context.Context, binding *DeviceBinding) (*
 // a caller-owned transaction. It deliberately never commits or rolls back so a
 // first-account admission can make account, device, binding and Pass state one
 // indivisible database outcome.
-func storeDeviceBindingTx(ctx context.Context, tx pgx.Tx, binding *DeviceBinding) (*DeviceBinding, error) {
+func storeDeviceBindingTx(ctx context.Context, tx pgx.Tx, binding *DeviceBinding) (*DeviceBinding, bool, error) {
 	if err := validateDeviceBindingForStore(binding); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	var err error
 	var ownerID string
@@ -107,10 +113,10 @@ func storeDeviceBindingTx(ctx context.Context, tx pgx.Tx, binding *DeviceBinding
 		`SELECT user_id::text, device_key FROM devices WHERE id = $1::uuid FOR UPDATE`,
 		binding.DeviceID,
 	).Scan(&ownerID, &storedDeviceKey); err != nil {
-		return nil, fmt.Errorf("lock device binding owner: %w", err)
+		return nil, false, fmt.Errorf("lock device binding owner: %w", err)
 	}
 	if ownerID != binding.UserID || !bytes.Equal(storedDeviceKey, binding.DeviceKey) {
-		return nil, errors.New("device binding owner or protocol id mismatch")
+		return nil, false, errors.New("device binding owner or protocol id mismatch")
 	}
 
 	var storedIdentityKey, storedSigningKey []byte
@@ -121,10 +127,10 @@ func storeDeviceBindingTx(ctx context.Context, tx pgx.Tx, binding *DeviceBinding
 	).Scan(&storedIdentityKey, &storedSigningKey)
 	if errors.Is(err, pgx.ErrNoRows) {
 		if binding.Version != 1 {
-			return nil, ErrDeviceBindingVersionGap
+			return nil, false, ErrDeviceBindingVersionGap
 		}
 		if binding.Status == DeviceBindingRevoked {
-			return nil, errors.New("initial device binding cannot be revoked")
+			return nil, false, errors.New("initial device binding cannot be revoked")
 		}
 		if _, err := tx.Exec(ctx,
 			`INSERT INTO device_crypto_keys
@@ -132,66 +138,66 @@ func storeDeviceBindingTx(ctx context.Context, tx pgx.Tx, binding *DeviceBinding
 			 VALUES ($1::uuid, $2, $3)`,
 			binding.DeviceID, binding.DeviceIdentityKey, binding.DeviceSigningKey,
 		); err != nil {
-			return nil, fmt.Errorf("store immutable device keys: %w", err)
+			return nil, false, fmt.Errorf("store immutable device keys: %w", err)
 		}
 		if err := insertDeviceBindingVersion(ctx, tx, binding); err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		if _, err := tx.Exec(ctx,
 			`INSERT INTO device_binding_heads (device_id, binding_version)
 			 VALUES ($1::uuid, $2)`, binding.DeviceID, int64(binding.Version),
 		); err != nil {
-			return nil, fmt.Errorf("create device binding head: %w", err)
+			return nil, false, fmt.Errorf("create device binding head: %w", err)
 		}
 		if !deviceBindingCanReceiveSecureChannels(binding) {
 			if err := pruneDeviceSenderKeyTargets(ctx, tx, binding.DeviceID); err != nil {
-				return nil, err
+				return nil, false, err
 			}
 		}
-		return cloneDeviceBinding(binding), nil
+		return cloneDeviceBinding(binding), true, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("load immutable device keys: %w", err)
+		return nil, false, fmt.Errorf("load immutable device keys: %w", err)
 	}
 	if !bytes.Equal(storedIdentityKey, binding.DeviceIdentityKey) ||
 		!bytes.Equal(storedSigningKey, binding.DeviceSigningKey) {
-		return nil, ErrDeviceKeyReplacement
+		return nil, false, ErrDeviceKeyReplacement
 	}
 
 	current, err := scanLatestDeviceBinding(ctx, tx, binding.DeviceID, true)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	switch {
 	case binding.Version < current.Version:
-		return nil, ErrDeviceBindingStale
+		return nil, false, ErrDeviceBindingStale
 	case binding.Version == current.Version:
 		if bindingEqual(current, binding) {
-			return current, nil
+			return current, false, nil
 		}
-		return nil, ErrDeviceBindingConflict
+		return nil, false, ErrDeviceBindingConflict
 	case current.Status == DeviceBindingRevoked:
-		return nil, ErrDeviceBindingRevoked
+		return nil, false, ErrDeviceBindingRevoked
 	case binding.Version != current.Version+1:
-		return nil, ErrDeviceBindingVersionGap
+		return nil, false, ErrDeviceBindingVersionGap
 	}
 
 	if err := insertDeviceBindingVersion(ctx, tx, binding); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if _, err := tx.Exec(ctx,
 		`UPDATE device_binding_heads
 		 SET binding_version = $2, updated_at = now()
 		 WHERE device_id = $1::uuid`, binding.DeviceID, int64(binding.Version),
 	); err != nil {
-		return nil, fmt.Errorf("advance device binding head: %w", err)
+		return nil, false, fmt.Errorf("advance device binding head: %w", err)
 	}
 	if !deviceBindingCanReceiveSecureChannels(binding) {
 		if err := pruneDeviceSenderKeyTargets(ctx, tx, binding.DeviceID); err != nil {
-			return nil, err
+			return nil, false, err
 		}
 	}
-	return cloneDeviceBinding(binding), nil
+	return cloneDeviceBinding(binding), true, nil
 }
 
 func deviceBindingCanReceiveSecureChannels(binding *DeviceBinding) bool {

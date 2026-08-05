@@ -7,6 +7,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
 use veil_crypto::kdf;
 use veil_crypto::keys::{generate_mnemonic, validate_mnemonic, IdentityKeyPair};
+use veil_crypto::membership::{
+    verify_membership_epoch_bootstrap_v1, verify_membership_epoch_transition_v1,
+    MembershipEpochHashV1, MembershipEpochSignatureV1, MembershipEpochV1, MembershipPolicySignerV1,
+    MembershipPolicyV1, MEMBERSHIP_CRYPTO_ERA_V1, MEMBERSHIP_CRYPTO_PROFILE_SENDER_KEY_V6,
+};
 use veil_crypto::ratchet::{MessageHeader, RatchetSession};
 use veil_crypto::sender_key::{SenderKeyDistribution, SenderKeyStore};
 use veil_crypto::x3dh;
@@ -14,12 +19,13 @@ use veil_search::Indexer;
 use veil_store::db::{
     DeviceBindingPinV1, DeviceRosterSnapshotV1, DirectMessageOutboxEnqueueV1,
     DirectMessageOutboxReceiptV1, DirectMessageOutboxScopeV1, HistoricalDeviceBindingProofV1,
-    IncomingSenderKeyRouteV1, LocalPreKey, LocalPreKeyPublicationV1, PendingDirectMessageOutboxV1,
-    PendingSenderKeyDeviceEnvelopeV1, VeilDb, DIRECT_MESSAGE_OUTBOX_MAX_PENDING_V1,
+    IncomingSenderKeyRouteV1, LocalPreKey, LocalPreKeyPublicationV1, MembershipEpochPinV1,
+    PendingDirectMessageOutboxV1, PendingSenderKeyDeviceEnvelopeV1, VeilDb,
+    DIRECT_MESSAGE_OUTBOX_MAX_PENDING_V1,
 };
 use veil_store::models::{
-    AccountSnapshot, ConversationType, Message, MessageAuthorContext, RemoteMessageStateKind,
-    RemoteReaction,
+    AccountSnapshot, ConversationType, LocalIdentityVerification, Message, MessageAuthorContext,
+    ProfileLocator, RemoteMessageStateKind, RemoteReaction,
 };
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519StaticSecret};
 use zeroize::{Zeroize, Zeroizing};
@@ -32,7 +38,11 @@ use crate::connection::{
 };
 use crate::device_identity::{
     device_binding_signing_bytes, DeviceIdentityV1, DEVICE_BINDING_STATUS_ACTIVE,
-    REQUIRED_DEVICE_CAPABILITIES,
+    DEVICE_CAPABILITY_MEMBERSHIP_EPOCH_V1, REQUIRED_DEVICE_CAPABILITIES,
+};
+use crate::direct_v2::{
+    DirectAccountCoordinateV2, DirectDeviceCoordinateV2, DirectInitialKeyAgreementV2,
+    DirectParticipantCoordinateV2, DirectSessionContextV2, DirectSessionStateV2,
 };
 use crate::prekeys::{
     canonical_own_prekey_request_body, validate_own_prekey_count_response,
@@ -40,16 +50,23 @@ use crate::prekeys::{
     OWN_PREKEY_BATCH_SIZE, OWN_PREKEY_LOW_WATERMARK,
 };
 use crate::protocol::proto;
+use crate::ws_auth_v3::WsRegistrationModeV3;
+use crate::ws_events_v3::{connect_primary_v3_classified, WsEventsV3Config};
 
 // Wire header type tags
 const HEADER_INITIAL: u8 = 0x01; // X3DH init + ratchet header
 const HEADER_RATCHET: u8 = 0x02; // Ratchet header only
+const HEADER_INITIAL_V2: u8 = 0x11; // Direct v2 session commitment + X3DH + ratchet
+const HEADER_RATCHET_V2: u8 = 0x12; // Direct v2 session commitment + ratchet
 const HEADER_SENDER_KEY: u8 = 0x05; // Group/channel sender-key encrypted message
 
 // Inner type bytes (inside ratchet-decrypted plaintext for pairwise channel)
 const INNER_TEXT: u8 = 0x00; // UTF-8 text message
 const INNER_SKDM: u8 = 0x01; // Sender Key Distribution Message (JSON)
 const RATCHET_AD_DOMAIN: &[u8] = b"veil-ratchet-message-v1";
+const DIRECT_CRYPTO_PROFILE_V2: &str = "direct_v2";
+const DIRECT_CRYPTO_ERA_V2: u64 = 1;
+pub const DIRECT_DEVICE_BINDING_STATUS_ACTIVE_V2: u8 = DEVICE_BINDING_STATUS_ACTIVE;
 const MAX_PLAINTEXT_BYTES: usize = 32 * 1024;
 const DEVICE_ROSTER_COMMITMENT_DOMAIN: &[u8] = b"veil-conversation-device-roster-v1\0";
 const SEND_MESSAGE_REQUEST_DIGEST_DOMAIN_V1: &[u8] = b"veil.message.send.v1\0";
@@ -60,6 +77,8 @@ struct PendingInitialHeader {
     ephemeral_public: [u8; 32],
     signed_prekey_id: u32,
     one_time_prekey_id: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    direct_v2_session_id: Option<[u8; 32]>,
 }
 
 #[derive(Clone)]
@@ -136,11 +155,14 @@ struct PendingSenderKeyEnvelopeKey {
     target_binding_version: u64,
     roster_version: u64,
     roster_commitment: [u8; 32],
+    membership_epoch: u64,
+    membership_epoch_hash: [u8; 32],
     envelope_commitment: [u8; 32],
 }
 
 struct ReceiveCryptoSnapshot {
     ratchet_sessions: HashMap<[u8; 32], RatchetSession>,
+    direct_v2_sessions: HashMap<[u8; 32], DirectSessionStateV2>,
     otk_secrets: HashMap<u32, [u8; 32]>,
     sender_keys: SenderKeyStore,
     channel_conversations: HashSet<String>,
@@ -159,6 +181,7 @@ impl Drop for ReceiveCryptoSnapshot {
         // on drop; clearing here makes that destruction explicit on the
         // successful receive path where the rollback snapshot is unused.
         self.ratchet_sessions.clear();
+        self.direct_v2_sessions.clear();
         self.sender_keys = SenderKeyStore::new();
     }
 }
@@ -530,6 +553,73 @@ pub enum DirectConversationAvailabilityV1 {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectIdentityVerificationProofV2 {
+    NotCompared,
+    VerifiedOnThisDevice,
+    IdentityChanged,
+}
+
+const DIRECT_IDENTITY_QR_PREFIX_V1: &str = "veil-identity:account-v2:";
+
+fn direct_identity_qr_payload_v1(fingerprint_hex: &str) -> Result<String, String> {
+    let mut fingerprint = [0u8; 32];
+    if fingerprint_hex.len() != 64
+        || !fingerprint_hex
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        || hex::decode_to_slice(fingerprint_hex, &mut fingerprint).is_err()
+    {
+        return Err("computed Direct identity fingerprint is invalid".to_string());
+    }
+    Ok(format!("{DIRECT_IDENTITY_QR_PREFIX_V1}{fingerprint_hex}"))
+}
+
+fn direct_identity_qr_fingerprint_v1(payload: &str) -> Result<[u8; 32], String> {
+    let expected_len = DIRECT_IDENTITY_QR_PREFIX_V1.len() + 64;
+    if payload.len() != expected_len || !payload.is_ascii() {
+        return Err("scanned Direct identity QR payload is invalid".to_string());
+    }
+    let fingerprint_hex = payload
+        .strip_prefix(DIRECT_IDENTITY_QR_PREFIX_V1)
+        .ok_or_else(|| "scanned Direct identity QR payload is invalid".to_string())?;
+    if !fingerprint_hex
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err("scanned Direct identity QR payload is invalid".to_string());
+    }
+    let mut fingerprint = [0u8; 32];
+    hex::decode_to_slice(fingerprint_hex, &mut fingerprint)
+        .map_err(|_| "scanned Direct identity QR payload is invalid".to_string())?;
+    Ok(fingerprint)
+}
+
+impl From<LocalIdentityVerification> for DirectIdentityVerificationProofV2 {
+    fn from(value: LocalIdentityVerification) -> Self {
+        match value {
+            LocalIdentityVerification::NotCompared => Self::NotCompared,
+            LocalIdentityVerification::VerifiedOnThisDevice => Self::VerifiedOnThisDevice,
+            LocalIdentityVerification::IdentityChanged => Self::IdentityChanged,
+        }
+    }
+}
+
+/// Exact account-v2 safety number and device-local comparison state for one
+/// authenticated Direct route. The fingerprint binds the canonical Node
+/// origin, both account UUIDs, and both accounts' X25519 + Ed25519 public keys.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectIdentityVerificationV2 {
+    pub canonical_server_origin: String,
+    pub peer_user_id: String,
+    pub peer_identity_key: [u8; 32],
+    pub peer_signing_key: [u8; 32],
+    pub fingerprint_emoji: String,
+    pub fingerprint_hex: String,
+    pub qr_payload: String,
+    pub proof: DirectIdentityVerificationProofV2,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DirectLiveEventOutcomeV1 {
     Stored,
     Duplicate,
@@ -607,6 +697,35 @@ pub struct DeviceRosterCandidateV1 {
     pub ready: bool,
     pub member_user_ids: Vec<[u8; 16]>,
     pub devices: Vec<DeviceRosterEntryV1>,
+    pub crypto_profile: String,
+    pub membership_activated: bool,
+    pub membership_ready: bool,
+    pub membership_epoch: u64,
+    pub membership_epoch_hash: [u8; 32],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MembershipEpochRecordCandidateV1 {
+    pub epoch: MembershipEpochV1,
+    pub epoch_hash: MembershipEpochHashV1,
+    pub signatures: Vec<MembershipEpochSignatureV1>,
+    pub bootstrap_owner: Option<MembershipPolicySignerV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MembershipEpochChainCandidateV1 {
+    pub canonical_origin: String,
+    pub conversation_id: String,
+    pub head_epoch: u64,
+    pub head_hash: MembershipEpochHashV1,
+    pub records: Vec<MembershipEpochRecordCandidateV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedMembershipEpochV1 {
+    pub epoch: MembershipEpochV1,
+    pub epoch_hash: MembershipEpochHashV1,
+    pub signatures: Vec<MembershipEpochSignatureV1>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -635,8 +754,40 @@ pub struct SenderKeyMessageSecurityContextV1 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SenderKeyMessageSecurityContextV6 {
+    pub roster_version: u64,
+    pub roster_commitment: [u8; 32],
+    pub sender_device_id: [u8; 16],
+    pub target_device_id: [u8; 16],
+    pub sender_binding_version: u64,
+    pub membership_epoch: u64,
+    pub membership_epoch_hash: [u8; 32],
+}
+
+/// Persisted outer routing/authentication coordinates for a Direct v2
+/// ciphertext.  The account key is supplied separately by the authenticated
+/// directory; this value carries the exact account-signed sender device
+/// binding selected by the WS v3 principal and the exact local target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectMessageSecurityContextV2 {
+    pub sender_user_id: String,
+    pub sender_device_id: [u8; 16],
+    pub sender_binding_version: u64,
+    pub sender_device_identity_key: [u8; 32],
+    pub sender_device_signing_key: [u8; 32],
+    pub sender_device_capabilities: u64,
+    pub sender_device_binding_status: u8,
+    pub sender_account_signature: [u8; 64],
+    pub target_device_id: [u8; 16],
+    pub target_binding_version: u64,
+    pub direct_session_id: [u8; 32],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MessageSecurityContextV1 {
     SenderKeyV5(SenderKeyMessageSecurityContextV1),
+    SenderKeyV6(SenderKeyMessageSecurityContextV6),
+    DirectV2(DirectMessageSecurityContextV2),
 }
 
 /// Result of checking whether a persisted Sender-Key v5 wire has an exact
@@ -687,6 +838,8 @@ pub struct SenderKeyRouteV1 {
     pub sender_account_signature: [u8; 64],
     pub roster_version: u64,
     pub roster_commitment: [u8; 32],
+    pub membership_epoch: u64,
+    pub membership_epoch_hash: [u8; 32],
     pub sender_binding_version: u64,
     pub target_binding_version: u64,
     pub envelope_commitment: [u8; 32],
@@ -699,6 +852,8 @@ pub struct PendingSenderKeyReceiptV1 {
     pub target_device_id: [u8; 16],
     pub generation: u32,
     pub roster_version: u64,
+    pub membership_epoch: u64,
+    pub membership_epoch_hash: [u8; 32],
     pub envelope_commitment: [u8; 32],
 }
 
@@ -712,6 +867,42 @@ pub struct RetainedSenderKeyDiagnosticV1 {
 pub struct RetainedSenderKeyProcessReportV1 {
     pub processed: usize,
     pub diagnostics: Vec<RetainedSenderKeyDiagnosticV1>,
+}
+
+/// Canonical public wire values for one authenticated REST v2 request.
+///
+/// The client chooses the bound origin/account, timestamp and nonce internally;
+/// callers can neither redirect a proof to another account nor provide their
+/// own freshness. This value intentionally implements neither `Clone` nor
+/// `Debug` because the signature and nonce are single-request bearer material.
+pub struct AuthenticatedRestHeadersV2 {
+    version: &'static str,
+    user_id: String,
+    timestamp_ms: String,
+    nonce: String,
+    signature: String,
+}
+
+impl AuthenticatedRestHeadersV2 {
+    pub fn version(&self) -> &str {
+        self.version
+    }
+
+    pub fn user_id(&self) -> &str {
+        &self.user_id
+    }
+
+    pub fn timestamp_ms(&self) -> &str {
+        &self.timestamp_ms
+    }
+
+    pub fn nonce(&self) -> &str {
+        &self.nonce
+    }
+
+    pub fn signature(&self) -> &str {
+        &self.signature
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -733,6 +924,18 @@ struct ValidatedDeviceRosterV1 {
     authorized_account_identities: HashSet<[u8; 32]>,
     targets: Vec<DeviceTargetV1>,
     eligible_devices: HashMap<[u8; 16], DeviceTargetV1>,
+    account_signing_keys: HashMap<[u8; 16], [u8; 32]>,
+    membership_activated: bool,
+    membership_epoch: u64,
+    membership_epoch_hash: [u8; 32],
+}
+
+#[derive(Clone)]
+struct ValidatedMembershipEpochHeadV1 {
+    epoch: u64,
+    hash: MembershipEpochHashV1,
+    roster_version: u64,
+    roster_commitment: [u8; 32],
 }
 
 struct PreparedDeviceRosterV1 {
@@ -753,6 +956,12 @@ pub struct PreKeySet {
 struct GeneratedPreKeyBatch {
     prekeys: PreKeySet,
     local_prekeys: Vec<LocalPreKey>,
+}
+
+struct GeneratedPreKeyRefill {
+    prekeys: PreKeySet,
+    signed_prekey: LocalPreKey,
+    one_time_prekeys: Vec<LocalPreKey>,
 }
 
 /// Main client API — the single entry point for all UI interactions.
@@ -973,6 +1182,9 @@ pub struct VeilClient {
     device_id: [u8; 16],
     /// Active ratchet sessions keyed by peer identity key (X25519 public).
     ratchet_sessions: HashMap<[u8; 32], RatchetSession>,
+    /// Sticky origin/account/device/session coordinates for upgraded Direct
+    /// ratchets. Presence means v1 wire is permanently rejected for that peer.
+    direct_v2_sessions: HashMap<[u8; 32], DirectSessionStateV2>,
     /// Our signed prekey secret (for X3DH responder).
     spk_secrets: HashMap<u32, ([u8; 32], [u8; 32])>,
     spk_next_id: u32,
@@ -1007,6 +1219,7 @@ pub struct VeilClient {
     /// epoch must obtain a fresh HTTPS directory while SQLCipher retains only
     /// the monotonic rollback/key-replacement pins.
     device_rosters: HashMap<String, ValidatedDeviceRosterV1>,
+    membership_epoch_heads: HashMap<String, ValidatedMembershipEpochHeadV1>,
     last_invalidated_device_rosters: HashMap<String, (u64, [u8; 32])>,
     /// A roster was durably accepted but rotating the previous outgoing
     /// generation has not yet succeeded. Keeping this distinct from ordinary
@@ -1072,6 +1285,7 @@ impl VeilClient {
     fn receive_crypto_snapshot(&self) -> ReceiveCryptoSnapshot {
         ReceiveCryptoSnapshot {
             ratchet_sessions: self.ratchet_sessions.clone(),
+            direct_v2_sessions: self.direct_v2_sessions.clone(),
             otk_secrets: self.otk_secrets.clone(),
             sender_keys: self.sender_keys.clone(),
             channel_conversations: self.channel_conversations.clone(),
@@ -1083,6 +1297,7 @@ impl VeilClient {
 
     fn restore_receive_crypto(&mut self, mut snapshot: ReceiveCryptoSnapshot) {
         self.ratchet_sessions = std::mem::take(&mut snapshot.ratchet_sessions);
+        self.direct_v2_sessions = std::mem::take(&mut snapshot.direct_v2_sessions);
         self.otk_secrets = std::mem::take(&mut snapshot.otk_secrets);
         self.sender_keys = std::mem::replace(&mut snapshot.sender_keys, SenderKeyStore::new());
         self.channel_conversations = std::mem::take(&mut snapshot.channel_conversations);
@@ -1104,6 +1319,7 @@ impl VeilClient {
             authenticated_server_origin: None,
             device_id,
             ratchet_sessions: HashMap::new(),
+            direct_v2_sessions: HashMap::new(),
             spk_secrets: HashMap::new(),
             spk_next_id: 1,
             otk_secrets: HashMap::new(),
@@ -1119,6 +1335,7 @@ impl VeilClient {
             channel_conversations: HashSet::new(),
             authorized_conversation_senders: HashMap::new(),
             device_rosters: HashMap::new(),
+            membership_epoch_heads: HashMap::new(),
             last_invalidated_device_rosters: HashMap::new(),
             device_roster_rotation_pending: HashSet::new(),
             sender_key_distribution_pending: HashSet::new(),
@@ -1156,6 +1373,7 @@ impl VeilClient {
             authenticated_server_origin: None,
             device_id,
             ratchet_sessions: HashMap::new(),
+            direct_v2_sessions: HashMap::new(),
             spk_secrets: HashMap::new(),
             spk_next_id: 1,
             otk_secrets: HashMap::new(),
@@ -1171,6 +1389,7 @@ impl VeilClient {
             channel_conversations: HashSet::new(),
             authorized_conversation_senders: HashMap::new(),
             device_rosters: HashMap::new(),
+            membership_epoch_heads: HashMap::new(),
             last_invalidated_device_rosters: HashMap::new(),
             device_roster_rotation_pending: HashSet::new(),
             sender_key_distribution_pending: HashSet::new(),
@@ -1286,12 +1505,49 @@ impl VeilClient {
         self.zeroize_prekey_secrets();
         for mut prekey in db.load_local_prekeys()? {
             let mut secret = std::mem::take(&mut prekey.secret_key);
+            let derived_public =
+                X25519PublicKey::from(&X25519StaticSecret::from(secret)).to_bytes();
+            if secret == [0u8; 32]
+                || prekey.public_key == [0u8; 32]
+                || derived_public != prekey.public_key
+            {
+                secret.zeroize();
+                return Err(format!(
+                    "local prekey {} public key differs from its secret",
+                    prekey.protocol_key_id
+                ));
+            }
             match prekey.key_type {
                 0 => {
+                    let Some(signature) = prekey.signature else {
+                        secret.zeroize();
+                        return Err(format!(
+                            "local signed prekey {} signature is unavailable",
+                            prekey.protocol_key_id
+                        ));
+                    };
+                    if !veil_crypto::signature::verify(
+                        &identity.ed25519_public_bytes(),
+                        &x3dh::signed_prekey_signature_message(&prekey.public_key),
+                        &signature,
+                    ) {
+                        secret.zeroize();
+                        return Err(format!(
+                            "local signed prekey {} failed domain verification",
+                            prekey.protocol_key_id
+                        ));
+                    }
                     self.spk_secrets
                         .insert(prekey.protocol_key_id, (secret, prekey.public_key));
                 }
                 1 => {
+                    if prekey.signature.is_some() {
+                        secret.zeroize();
+                        return Err(format!(
+                            "local one-time prekey {} unexpectedly contains a signature",
+                            prekey.protocol_key_id
+                        ));
+                    }
                     self.otk_secrets.insert(prekey.protocol_key_id, secret);
                 }
                 _ => {
@@ -1312,6 +1568,7 @@ impl VeilClient {
         self.dm_conversations.clear();
         self.authorized_conversation_senders.clear();
         self.ratchet_sessions.clear();
+        self.direct_v2_sessions.clear();
         self.pending_initial_headers.clear();
         self.pending_initial_sequences.clear();
         let mut decoded_ratchet_sessions = HashMap::new();
@@ -1359,7 +1616,40 @@ impl VeilClient {
                 return Err("duplicate persisted pending X3DH peer identity key".to_string());
             }
         }
+        let mut hydrated_direct_v2_sessions = HashMap::new();
+        for blob in db.load_all_direct_session_bindings_v2()? {
+            let state = DirectSessionStateV2::from_store_blob(&blob)?;
+            let local = state.local();
+            if local.account.identity_key != identity.x25519_public_bytes()
+                || local.account.signing_key != identity.ed25519_public_bytes()
+                || local.device.device_id != device_identity.binding().device_id
+                || local.device.binding_version != device_identity.binding().version
+                || local.device.capabilities != device_identity.binding().capabilities
+                || local.device.status != device_identity.binding().status
+                || local.device.identity_key != device_identity.binding().device_identity_key
+                || local.device.signing_key != device_identity.binding().device_signing_key
+                || local.device.account_signature != device_identity.binding().account_signature
+            {
+                return Err(
+                    "persisted Direct v2 binding does not belong to this account/device"
+                        .to_string(),
+                );
+            }
+            if !hydrated_ratchet_sessions.contains_key(&blob.peer_identity_key) {
+                return Err(
+                    "persisted Direct v2 binding has no authorized conversation ratchet"
+                        .to_string(),
+                );
+            }
+            if hydrated_direct_v2_sessions
+                .insert(blob.peer_identity_key, state)
+                .is_some()
+            {
+                return Err("duplicate persisted Direct v2 peer binding".to_string());
+            }
+        }
         self.ratchet_sessions = hydrated_ratchet_sessions;
+        self.direct_v2_sessions = hydrated_direct_v2_sessions;
         self.pending_initial_headers = hydrated_pending_initial_headers;
 
         self.device_identity = Some(device_identity);
@@ -1405,27 +1695,129 @@ impl VeilClient {
             .ok_or_else(|| "not authenticated".to_string())
     }
 
+    pub(crate) fn authenticated_server_origin_v1(&self) -> Result<String, String> {
+        self.authenticated_server_origin
+            .clone()
+            .ok_or_else(|| "not authenticated to a canonical server origin".to_string())
+    }
+
+    /// Last SQLCipher-pinned transparency head size for the current origin.
+    /// Zero means no first-contact head has been accepted yet.
+    pub fn identity_transparency_request_from_size_v1(&self) -> Result<u64, String> {
+        let origin = self.authenticated_server_origin_v1()?;
+        crate::transparency::identity_transparency_request_from_size_v1(
+            self.db.as_ref().ok_or("database not initialized")?,
+            &origin,
+        )
+    }
+
     /// Cloned signing material for the background events controller.
     /// Never exposed over FFI; consumed inside this process only.
     pub fn background_events_v3_material(
         &self,
-    ) -> Result<(veil_crypto::IdentityKeyPair, crate::device_identity::DeviceIdentityV1), String> {
-        let account = self.identity.as_ref().map(|k| k.clone_for_background()).ok_or_else(|| "not initialized".to_string())?;
-        let device = self.device_identity.as_ref().map(|d| d.clone_for_background()).ok_or_else(|| "not initialized".to_string())?;
+    ) -> Result<
+        (
+            veil_crypto::IdentityKeyPair,
+            crate::device_identity::DeviceIdentityV1,
+        ),
+        String,
+    > {
+        if self.connection.is_some()
+            || self.authenticated_user_id.is_some()
+            || self.authenticated_server_origin.is_some()
+        {
+            return Err(
+                "background events cannot start while a primary authenticated transport is active"
+                    .to_string(),
+            );
+        }
+        let account = self
+            .identity
+            .as_ref()
+            .map(|k| k.clone_for_background())
+            .ok_or_else(|| "not initialized".to_string())?;
+        let device = self
+            .device_identity
+            .as_ref()
+            .map(|d| d.clone_for_background())
+            .ok_or_else(|| "not initialized".to_string())?;
         Ok((account, device))
     }
 
-    /// Feed one background ConnectionEvent into the SAME buffered
-    /// live-event queue that replay_direct_live_events_v1 consumes.
-    /// [VERIFY] implement as a thin push into the existing queue the
-    /// legacy /ws connection fills; do NOT build a second decrypt or
-    /// persist path - ratchet advancement stays in the pump turns.
+    /// Bind an authenticated background session to the exact durable mobile
+    /// reconnect selection. This does not install a command transport and can
+    /// never run alongside the primary Connection.
+    pub fn activate_background_events_v3_binding(
+        &mut self,
+        canonical_server_origin: &str,
+        user_id: &str,
+    ) -> Result<(), String> {
+        self.require_crypto_runtime_active_v1()?;
+        if self.connection.is_some()
+            || self.authenticated_user_id.is_some()
+            || self.authenticated_server_origin.is_some()
+        {
+            return Err("another authenticated transport is already active".to_string());
+        }
+        let identity_key = self.identity_key()?;
+        let signing_key = self.signing_key()?;
+        let target = self
+            .db
+            .as_ref()
+            .ok_or("database not initialized")?
+            .load_mobile_reconnect_target_v1(&identity_key, &signing_key)?
+            .ok_or("durable mobile reconnect target is absent")?;
+        if target.canonical_server_origin != canonical_server_origin
+            || target.expected_user_id != user_id
+        {
+            return Err(
+                "background authentication changed its durable account binding".to_string(),
+            );
+        }
+        self.reconcile_previous_transport_before_install_v1()?;
+        self.deferred_connection_events.reset_for_new_epoch();
+        self.direct_live_stop = None;
+        self.direct_ack_expiry_grace_remaining.clear();
+        self.authenticated_server_origin = Some(canonical_server_origin.to_string());
+        self.authenticated_user_id = Some(user_id.to_string());
+        Ok(())
+    }
+
+    /// Clear only the exact background binding; a concurrently installed
+    /// primary Connection always wins and is never revoked by a stale task.
+    pub fn deactivate_background_events_v3_binding(
+        &mut self,
+        canonical_server_origin: &str,
+        user_id: &str,
+    ) {
+        if self.connection.is_none()
+            && self.authenticated_server_origin.as_deref() == Some(canonical_server_origin)
+            && self.authenticated_user_id.as_deref() == Some(user_id)
+        {
+            self.authenticated_server_origin = None;
+            self.authenticated_user_id = None;
+            self.deferred_connection_events.close_epoch();
+            self.direct_ack_expiry_grace_remaining.clear();
+        }
+    }
+
+    /// Feed one background ConnectionEvent into the same bounded deferred FIFO
+    /// consumed by replay_direct_live_events_v1. Decrypt, ratchet advancement
+    /// and persistence remain exclusive to the turn-based pump.
     pub fn ingest_background_connection_event_v1(
         &mut self,
         event: crate::connection::ConnectionEvent,
     ) -> Result<(), String> {
+        if self.connection.is_some()
+            || self.authenticated_user_id.is_none()
+            || self.authenticated_server_origin.is_none()
+        {
+            return Err("background event arrived outside its authenticated epoch".to_string());
+        }
         let budget = crate::connection::ConnectionEventBudgetV1::production();
-        let budgeted = budget.try_wrap(event).map_err(|error| format!("budget wrap failed: {:?}", error))?;
+        let budgeted = budget
+            .try_wrap(event)
+            .map_err(|error| format!("budget wrap failed: {:?}", error))?;
         self.deferred_connection_events
             .try_extend(vec![budgeted])
             .map_err(|error| format!("buffer event failed: {:?}", error))?;
@@ -1464,13 +1856,30 @@ impl VeilClient {
         self.device_id
     }
 
+    pub fn current_device_binding_version_v1(&self) -> Option<u64> {
+        self.device_identity
+            .as_ref()
+            .map(|device| device.binding().version)
+    }
+
     fn prepare_device_roster_v1(
         &self,
         candidate: &DeviceRosterCandidateV1,
     ) -> Result<PreparedDeviceRosterV1, String> {
         const LEGACY_UNBOUND_STATUS: u8 = 4;
-        if !candidate.ready {
+        if !candidate.ready || !candidate.membership_ready {
             return Err("device roster is not ready for encrypted traffic".to_string());
+        }
+        match candidate.membership_activated {
+            false
+                if candidate.crypto_profile == "sender_key_v5"
+                    && candidate.membership_epoch == 0
+                    && candidate.membership_epoch_hash == [0u8; 32] => {}
+            true if candidate.crypto_profile == "sender_key_v6"
+                && candidate.membership_epoch > 0
+                && candidate.membership_epoch <= i64::MAX as u64
+                && candidate.membership_epoch_hash != [0u8; 32] => {}
+            _ => return Err("device roster membership profile is invalid".to_string()),
         }
         if candidate.roster_version == 0 || candidate.roster_version > i64::MAX as u64 {
             return Err("invalid device roster version".to_string());
@@ -1649,6 +2058,14 @@ impl VeilClient {
                                 .to_string(),
                         );
                     }
+                    if candidate.membership_activated
+                        && binding.capabilities & DEVICE_CAPABILITY_MEMBERSHIP_EPOCH_V1 == 0
+                    {
+                        return Err(
+                            "membership epoch roster contains a device without v6 support"
+                                .to_string(),
+                        );
+                    }
                     eligible_count += 1;
                     let target = DeviceTargetV1 {
                         conversation_id: candidate.conversation_id.clone(),
@@ -1713,6 +2130,13 @@ impl VeilClient {
                     .collect(),
                 targets,
                 eligible_devices,
+                account_signing_keys: account_keys
+                    .iter()
+                    .map(|(account_id, (_, signing_key))| (*account_id, *signing_key))
+                    .collect(),
+                membership_activated: candidate.membership_activated,
+                membership_epoch: candidate.membership_epoch,
+                membership_epoch_hash: candidate.membership_epoch_hash,
             },
             bindings,
             canonical_snapshot: canonical,
@@ -1743,6 +2167,17 @@ impl VeilClient {
             .contains(&conversation_id);
         self.invalidate_device_roster_v1(&conversation_id);
         let prepared = self.prepare_device_roster_v1(&candidate)?;
+        if let Some(db) = self.db.as_ref() {
+            if let Some(pinned) = db.load_membership_epoch_head_v1(&conversation_id)? {
+                if !prepared.validated.membership_activated
+                    || prepared.validated.membership_epoch < pinned.epoch
+                    || prepared.validated.membership_epoch == pinned.epoch
+                        && prepared.validated.membership_epoch_hash != pinned.epoch_hash
+                {
+                    return Err("membership epoch downgrade or equivocation rejected".to_string());
+                }
+            }
+        }
         if let Some(db) = self.db.as_ref() {
             db.commit_device_roster_snapshot_v1(&DeviceRosterSnapshotV1 {
                 conversation_id: &conversation_id,
@@ -1796,6 +2231,325 @@ impl VeilClient {
                 .remove(&conversation_id);
             self.prepared_sender_key_generations
                 .remove(&conversation_id);
+        }
+        Ok(changed)
+    }
+
+    /// Verify the complete client-authorized membership chain, bind it to the
+    /// exact already-validated device roster, and pin every predecessor in
+    /// SQLCipher before Sender-Key v6 traffic can be produced.
+    fn require_live_membership_context_v1(
+        &self,
+        conversation_id: &str,
+        roster: &ValidatedDeviceRosterV1,
+        membership_epoch: u64,
+        membership_epoch_hash: &[u8; 32],
+    ) -> Result<(), String> {
+        if !roster.membership_activated {
+            if membership_epoch == 0 && membership_epoch_hash == &[0u8; 32] {
+                return Ok(());
+            }
+            return Err("legacy group carried an unexpected membership epoch".to_string());
+        }
+        let head = self
+            .membership_epoch_heads
+            .get(conversation_id)
+            .ok_or("verified membership epoch is unavailable")?;
+        if membership_epoch == 0
+            || membership_epoch != roster.membership_epoch
+            || membership_epoch_hash != &roster.membership_epoch_hash
+            || head.epoch != membership_epoch
+            || &head.hash != membership_epoch_hash
+            || head.roster_version != roster.version
+            || head.roster_commitment != roster.commitment
+        {
+            return Err("membership epoch does not match the verified roster head".to_string());
+        }
+        Ok(())
+    }
+
+    fn prepare_membership_epoch_signature_v1(
+        &self,
+        epoch: MembershipEpochV1,
+        signer_account_id: [u8; 16],
+    ) -> Result<PreparedMembershipEpochV1, String> {
+        let local_user_id = self
+            .authenticated_user_id
+            .as_deref()
+            .ok_or("membership signing requires an authenticated account")?;
+        let local_user_id = uuid::Uuid::parse_str(local_user_id)
+            .map_err(|_| "authenticated membership signer id is invalid".to_string())?;
+        if *local_user_id.as_bytes() != signer_account_id {
+            return Err("membership signer is not the authenticated account".to_string());
+        }
+        let message = epoch.signature_message()?;
+        let signature = veil_crypto::signature::sign(
+            self.identity
+                .as_ref()
+                .ok_or("identity is not initialized")?,
+            &message,
+        );
+        Ok(PreparedMembershipEpochV1 {
+            epoch_hash: epoch.hash()?,
+            epoch,
+            signatures: vec![MembershipEpochSignatureV1 {
+                signer_account_id,
+                signature,
+            }],
+        })
+    }
+
+    pub fn prepare_membership_epoch_bootstrap_v1(
+        &self,
+        conversation_id: &str,
+        conversation_kind: u8,
+        roster_version: u64,
+        roster_commitment: [u8; 32],
+        owner: MembershipPolicySignerV1,
+    ) -> Result<PreparedMembershipEpochV1, String> {
+        let canonical_origin = self.authenticated_server_origin_v1()?;
+        let conversation_uuid = uuid::Uuid::parse_str(conversation_id)
+            .map_err(|_| "membership conversation id is invalid".to_string())?;
+        if conversation_uuid.hyphenated().to_string() != conversation_id {
+            return Err("membership conversation id is not canonical".to_string());
+        }
+        let mut mutation_nonce = [0u8; 32];
+        while mutation_nonce == [0u8; 32] {
+            rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut mutation_nonce);
+        }
+        let epoch = MembershipEpochV1 {
+            canonical_origin,
+            conversation_id: *conversation_uuid.as_bytes(),
+            conversation_kind,
+            epoch: 1,
+            predecessor_hash: [0u8; 32],
+            roster_version,
+            roster_commitment,
+            successor_policy: MembershipPolicyV1 {
+                threshold: 1,
+                signers: vec![owner],
+            },
+            crypto_profile: MEMBERSHIP_CRYPTO_PROFILE_SENDER_KEY_V6,
+            crypto_era: MEMBERSHIP_CRYPTO_ERA_V1,
+            mutation_nonce,
+        };
+        let prepared = self.prepare_membership_epoch_signature_v1(epoch, owner.account_id)?;
+        verify_membership_epoch_bootstrap_v1(&prepared.epoch, &owner, &prepared.signatures)?;
+        Ok(prepared)
+    }
+
+    pub fn prepare_membership_epoch_transition_v1(
+        &self,
+        predecessor: &MembershipEpochV1,
+        roster_version: u64,
+        roster_commitment: [u8; 32],
+    ) -> Result<PreparedMembershipEpochV1, String> {
+        let canonical_origin = self.authenticated_server_origin_v1()?;
+        if predecessor.canonical_origin != canonical_origin
+            || predecessor.successor_policy.threshold != 1
+        {
+            return Err(
+                "membership transition requires the supported single-owner policy".to_string(),
+            );
+        }
+        let local_user_id = self
+            .authenticated_user_id
+            .as_deref()
+            .and_then(|value| uuid::Uuid::parse_str(value).ok())
+            .map(|value| *value.as_bytes())
+            .ok_or("authenticated membership signer id is invalid")?;
+        let local_signer = predecessor
+            .successor_policy
+            .signers
+            .iter()
+            .find(|signer| signer.account_id == local_user_id)
+            .copied()
+            .ok_or("authenticated account cannot authorize the next membership epoch")?;
+        if local_signer.account_signing_key != self.signing_key()? {
+            return Err(
+                "membership predecessor policy substituted the local signing key".to_string(),
+            );
+        }
+        let mut mutation_nonce = [0u8; 32];
+        while mutation_nonce == [0u8; 32] {
+            rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut mutation_nonce);
+        }
+        let epoch = MembershipEpochV1 {
+            canonical_origin,
+            conversation_id: predecessor.conversation_id,
+            conversation_kind: predecessor.conversation_kind,
+            epoch: predecessor
+                .epoch
+                .checked_add(1)
+                .ok_or("membership epoch number is exhausted")?,
+            predecessor_hash: predecessor.hash()?,
+            roster_version,
+            roster_commitment,
+            successor_policy: predecessor.successor_policy.clone(),
+            crypto_profile: MEMBERSHIP_CRYPTO_PROFILE_SENDER_KEY_V6,
+            crypto_era: MEMBERSHIP_CRYPTO_ERA_V1,
+            mutation_nonce,
+        };
+        let prepared = self.prepare_membership_epoch_signature_v1(epoch, local_user_id)?;
+        verify_membership_epoch_transition_v1(predecessor, &prepared.epoch, &prepared.signatures)?;
+        Ok(prepared)
+    }
+
+    pub fn install_membership_epoch_chain_v1(
+        &mut self,
+        candidate: MembershipEpochChainCandidateV1,
+    ) -> Result<bool, String> {
+        const MAX_EPOCHS: usize = 100_000;
+        self.require_direct_conversation_available_v1(&candidate.conversation_id)?;
+        let authenticated_origin = self
+            .authenticated_server_origin
+            .as_deref()
+            .ok_or("membership epochs require an authenticated server origin")?;
+        if candidate.canonical_origin != authenticated_origin
+            || candidate.records.is_empty()
+            || candidate.records.len() > MAX_EPOCHS
+            || candidate.head_epoch == 0
+            || candidate.head_hash == [0u8; 32]
+        {
+            return Err("membership epoch chain scope is invalid".to_string());
+        }
+        let conversation_uuid = uuid::Uuid::parse_str(&candidate.conversation_id)
+            .map_err(|_| "membership conversation id is invalid".to_string())?;
+        if conversation_uuid.hyphenated().to_string() != candidate.conversation_id {
+            return Err("membership conversation id is not canonical".to_string());
+        }
+        let roster = self
+            .device_rosters
+            .get(&candidate.conversation_id)
+            .ok_or("validated device roster is unavailable for membership verification")?;
+        if !roster.membership_activated
+            || !self
+                .channel_conversations
+                .contains(&candidate.conversation_id)
+        {
+            return Err("conversation has not activated membership epochs".to_string());
+        }
+
+        let durable_head = self
+            .db
+            .as_ref()
+            .ok_or("SQLCipher database is unavailable")?
+            .load_membership_epoch_head_v1(&candidate.conversation_id)?;
+        let mut pins = Vec::with_capacity(candidate.records.len());
+        let mut predecessor: Option<&MembershipEpochV1> = None;
+        for (index, record) in candidate.records.iter().enumerate() {
+            let expected_number = u64::try_from(index)
+                .ok()
+                .and_then(|value| value.checked_add(1))
+                .ok_or("membership epoch number overflow")?;
+            if record.epoch.canonical_origin != candidate.canonical_origin
+                || record.epoch.conversation_id != *conversation_uuid.as_bytes()
+                || record.epoch.epoch != expected_number
+                || record.epoch.hash()? != record.epoch_hash
+            {
+                return Err("membership epoch chain is not canonical".to_string());
+            }
+            match predecessor {
+                None => {
+                    let owner = record
+                        .bootstrap_owner
+                        .as_ref()
+                        .ok_or("membership bootstrap owner is missing")?;
+                    if durable_head.is_none()
+                        && roster.account_signing_keys.get(&owner.account_id)
+                            != Some(&owner.account_signing_key)
+                    {
+                        return Err(
+                            "membership bootstrap owner is not independently pinned".to_string()
+                        );
+                    }
+                    verify_membership_epoch_bootstrap_v1(&record.epoch, owner, &record.signatures)?;
+                }
+                Some(previous) => {
+                    if record.bootstrap_owner.is_some() {
+                        return Err("membership transition repeats bootstrap authority".to_string());
+                    }
+                    verify_membership_epoch_transition_v1(
+                        previous,
+                        &record.epoch,
+                        &record.signatures,
+                    )?;
+                }
+            }
+            pins.push(MembershipEpochPinV1 {
+                conversation_id: candidate.conversation_id.clone(),
+                epoch: record.epoch.epoch,
+                epoch_hash: record.epoch_hash,
+                predecessor_hash: record.epoch.predecessor_hash,
+                roster_version: record.epoch.roster_version,
+                roster_commitment: record.epoch.roster_commitment,
+                canonical_unsigned: record.epoch.canonical_unsigned_bytes()?,
+                bootstrap_owner_id: record
+                    .bootstrap_owner
+                    .as_ref()
+                    .map(|owner| owner.account_id),
+                bootstrap_owner_signing_key: record
+                    .bootstrap_owner
+                    .as_ref()
+                    .map(|owner| owner.account_signing_key),
+            });
+            predecessor = Some(&record.epoch);
+        }
+        let last = candidate
+            .records
+            .last()
+            .ok_or("membership epoch head is missing")?;
+        if last.epoch.epoch != candidate.head_epoch
+            || last.epoch_hash != candidate.head_hash
+            || candidate.head_epoch != roster.membership_epoch
+            || candidate.head_hash != roster.membership_epoch_hash
+            || last.epoch.roster_version != roster.version
+            || last.epoch.roster_commitment != roster.commitment
+        {
+            return Err("membership epoch head does not authorize the current roster".to_string());
+        }
+        let pinned = self
+            .db
+            .as_ref()
+            .ok_or("SQLCipher database is unavailable")?
+            .commit_membership_epoch_chain_v1(&pins)?;
+        if pinned.epoch != candidate.head_epoch
+            || pinned.epoch_hash != candidate.head_hash
+            || pinned.roster_version != roster.version
+            || pinned.roster_commitment != roster.commitment
+        {
+            return Err("persisted membership epoch head changed".to_string());
+        }
+        let had_runtime_head = self
+            .membership_epoch_heads
+            .contains_key(&candidate.conversation_id);
+        let changed = self
+            .membership_epoch_heads
+            .get(&candidate.conversation_id)
+            .is_none_or(|head| {
+                head.epoch != candidate.head_epoch || head.hash != candidate.head_hash
+            });
+        self.membership_epoch_heads.insert(
+            candidate.conversation_id.clone(),
+            ValidatedMembershipEpochHeadV1 {
+                epoch: candidate.head_epoch,
+                hash: candidate.head_hash,
+                roster_version: roster.version,
+                roster_commitment: roster.commitment,
+            },
+        );
+        // First activation and every in-process epoch transition must never
+        // reuse a generation prepared under the prior (possibly legacy v5)
+        // authorization context. During restart, a durable head plus the
+        // hydrate path's already-fresh generation avoids a second rotation.
+        if changed
+            && (durable_head.is_none()
+                || had_runtime_head
+                || !self
+                    .prepared_sender_key_generations
+                    .contains(&candidate.conversation_id))
+        {
+            self.rotate_sender_key(&candidate.conversation_id)?;
         }
         Ok(changed)
     }
@@ -2020,6 +2774,44 @@ impl VeilClient {
         Ok(veil_crypto::signature::sign(id, message))
     }
 
+    /// Prepare REST auth v2 for the exact authenticated WebSocket account and
+    /// Node origin. Method, target and body remain caller-owned wire bytes, but
+    /// origin/account/freshness cannot be supplied or downgraded by a renderer.
+    pub fn prepare_authenticated_rest_headers_v2(
+        &self,
+        method: &str,
+        request_target: &str,
+        body: &[u8],
+    ) -> Result<AuthenticatedRestHeadersV2, String> {
+        self.require_crypto_runtime_active_v1()?;
+        let account = self.identity.as_ref().ok_or("not initialized")?;
+        let canonical_origin = self
+            .authenticated_server_origin
+            .as_deref()
+            .ok_or_else(|| "not authenticated".to_string())?;
+        let user_id = self
+            .authenticated_user_id
+            .as_deref()
+            .ok_or_else(|| "not authenticated".to_string())?;
+        let prepared = crate::rest_auth_v2::prepare_rest_auth_v2(
+            account,
+            canonical_origin,
+            user_id,
+            method,
+            request_target,
+            body,
+        )
+        .map_err(|error| error.to_string())?;
+        let headers = prepared.into_headers();
+        Ok(AuthenticatedRestHeadersV2 {
+            version: headers.version(),
+            user_id: headers.user_id().to_owned(),
+            timestamp_ms: headers.timestamp_ms().to_owned(),
+            nonce: headers.nonce().to_owned(),
+            signature: headers.signature().to_owned(),
+        })
+    }
+
     // ─── Connection ──────────────────────────────────
 
     /// Connect to the Veil gateway server via WebSocket.
@@ -2179,26 +2971,66 @@ impl VeilClient {
         let identity = self.identity.as_ref().ok_or_else(|| {
             MobileConnectErrorV1::new(MobileConnectStopV1::EpochInvalid, "not initialized")
         })?;
-        let device_identity = self.device_identity.as_ref().ok_or_else(|| {
+        let existing_device_identity = self.device_identity.as_ref().ok_or_else(|| {
             MobileConnectErrorV1::new(
                 MobileConnectStopV1::EpochInvalid,
                 "per-device identity is missing; unlock migration is required",
             )
         })?;
-        let config = ConnectionConfig {
-            server_url: server_url.to_string(),
+        let mut capability_upgrade = existing_device_identity
+            .capability_upgrade_v1(identity)
+            .map_err(|detail| {
+                MobileConnectErrorV1::new(MobileConnectStopV1::EpochInvalid, detail)
+            })?;
+        let connection_device_identity = capability_upgrade
+            .as_ref()
+            .unwrap_or(existing_device_identity);
+        let websocket_path = url::Url::parse(server_url)
+            .map_err(|_| {
+                MobileConnectErrorV1::new(
+                    MobileConnectStopV1::EpochInvalid,
+                    "invalid authenticated WebSocket server URL",
+                )
+            })?
+            .path()
+            .to_string();
+        let mut conn = if websocket_path == crate::ws_auth_v3::WS_AUTH_V3_PATH {
+            let config = WsEventsV3Config {
+                websocket_url: server_url.to_string(),
+                canonical_origin: authenticated_server_origin.clone(),
+                device_name: device_name.to_string(),
+                client_id: client_id.to_string(),
+            };
+            let registration = match node_access_invite {
+                Some(pass) => WsRegistrationModeV3::Pass(
+                    pass.try_into()
+                        .expect("Node Access Pass length was validated above"),
+                ),
+                None => WsRegistrationModeV3::Open,
+            };
+            connect_primary_v3_classified(
+                &config,
+                identity,
+                connection_device_identity,
+                registration,
+            )
+            .await
+            .map_err(MobileConnectErrorV1::from_connection)?
+        } else {
+            let config = ConnectionConfig {
+                server_url: server_url.to_string(),
+            };
+            Connection::connect_classified_v1(
+                &config,
+                identity,
+                connection_device_identity,
+                device_name,
+                client_id,
+                node_access_invite,
+            )
+            .await
+            .map_err(MobileConnectErrorV1::from_connection)?
         };
-
-        let mut conn = Connection::connect_classified_v1(
-            &config,
-            identity,
-            device_identity,
-            device_name,
-            client_id,
-            node_access_invite,
-        )
-        .await
-        .map_err(MobileConnectErrorV1::from_connection)?;
 
         // Drain the Authenticated event to get user_id
         let user_id = match conn.events.try_recv() {
@@ -2211,6 +3043,23 @@ impl VeilClient {
                 MobileConnectStopV1::EpochInvalid,
                 "server authenticated without a user id",
             ));
+        }
+
+        if let Some(upgraded) = capability_upgrade.take() {
+            let stored = upgraded.to_stored_v1(identity);
+            if let Err(detail) = self
+                .db
+                .as_ref()
+                .ok_or("database not initialized".to_string())
+                .and_then(|db| db.advance_device_identity_binding_v1(&stored))
+            {
+                drop(conn);
+                return Err(MobileConnectErrorV1::new(
+                    MobileConnectStopV1::StorageUncertain,
+                    format!("persist authenticated device capability upgrade: {detail}"),
+                ));
+            }
+            self.device_identity = Some(upgraded);
         }
 
         // Sequence numbers restart for every WebSocket. Resolve all old
@@ -2857,6 +3706,149 @@ impl VeilClient {
         }
     }
 
+    fn exact_direct_identity_verification_v2(
+        &self,
+        conversation_id: &str,
+    ) -> Result<DirectIdentityVerificationV2, String> {
+        self.require_direct_conversation_available_v1(conversation_id)?;
+        let peer_identity_key = self
+            .dm_conversations
+            .get(conversation_id)
+            .copied()
+            .ok_or("conversation is not an available Direct route")?;
+        let canonical_server_origin = self
+            .authenticated_server_origin
+            .as_deref()
+            .ok_or("server origin is not authenticated")?;
+        let authenticated_user_id = self
+            .authenticated_user_id
+            .as_deref()
+            .ok_or("account is not authenticated")?;
+        let self_identity_key = self.identity_key()?;
+        let self_signing_key = self.signing_key()?;
+        let db = self.db.as_ref().ok_or("database not initialized")?;
+        let scope = db.resolve_authenticated_direct_history_scope_v1(
+            canonical_server_origin,
+            authenticated_user_id,
+            conversation_id,
+        )?;
+
+        if scope.conversation_id != conversation_id
+            || scope.self_account.locator.canonical_server_origin != canonical_server_origin
+            || scope.self_account.locator.user_id != authenticated_user_id
+            || scope.self_account.locator.identity_key != self_identity_key
+            || scope.self_account.signing_key != self_signing_key
+            || scope.self_account.source.as_u8() != 2
+            || scope.peer_account.locator.canonical_server_origin != canonical_server_origin
+            || scope.peer_account.locator.identity_key != peer_identity_key
+            || scope.peer_account.source.as_u8() != 2
+            || self
+                .known_user_keys
+                .get(&scope.peer_account.locator.user_id)
+                != Some(&peer_identity_key)
+            || self.trusted_signing_keys.get(&peer_identity_key)
+                != Some(&scope.peer_account.signing_key)
+        {
+            return Err(
+                "Direct identity verification route differs from authenticated directory state"
+                    .to_string(),
+            );
+        }
+        self.ensure_dm_conversation_binding_compatible(conversation_id, peer_identity_key)?;
+
+        let locator = ProfileLocator {
+            canonical_server_origin: canonical_server_origin.to_string(),
+            user_id: scope.peer_account.locator.user_id.clone(),
+            identity_key: peer_identity_key,
+        };
+        let proof = db.local_identity_verification_for_unlocked_account(
+            &self_identity_key,
+            &self_signing_key,
+            &locator,
+        )?;
+        let (fingerprint_emoji, fingerprint_hex) = veil_crypto::fingerprint::generate_account_v2(
+            canonical_server_origin,
+            veil_crypto::fingerprint::AccountFingerprintTuple {
+                user_id: authenticated_user_id,
+                identity_key: &self_identity_key,
+                signing_key: &self_signing_key,
+            },
+            veil_crypto::fingerprint::AccountFingerprintTuple {
+                user_id: &scope.peer_account.locator.user_id,
+                identity_key: &peer_identity_key,
+                signing_key: &scope.peer_account.signing_key,
+            },
+        );
+        let qr_payload = direct_identity_qr_payload_v1(&fingerprint_hex)?;
+        Ok(DirectIdentityVerificationV2 {
+            canonical_server_origin: canonical_server_origin.to_string(),
+            peer_user_id: scope.peer_account.locator.user_id,
+            peer_identity_key,
+            peer_signing_key: scope.peer_account.signing_key,
+            fingerprint_emoji,
+            fingerprint_hex,
+            qr_payload,
+            proof: proof.into(),
+        })
+    }
+
+    /// Return the account-v2 safety number for one exact authenticated Direct.
+    /// This is a read-only comparison view; service-mediated directory trust
+    /// remains `NotCompared` until the user explicitly confirms it out of band.
+    pub fn direct_identity_verification_v2(
+        &self,
+        conversation_id: &str,
+    ) -> Result<DirectIdentityVerificationV2, String> {
+        self.exact_direct_identity_verification_v2(conversation_id)
+    }
+
+    /// Confirm an account-v2 safety number displayed by a trusted native UI.
+    /// The exact route is re-derived and the supplied 32-byte digest is checked
+    /// in constant time before SQLCipher records a device-local proof.
+    pub fn confirm_direct_identity_verification_v2(
+        &self,
+        conversation_id: &str,
+        expected_fingerprint: &[u8; 32],
+    ) -> Result<DirectIdentityVerificationV2, String> {
+        let mut view = self.exact_direct_identity_verification_v2(conversation_id)?;
+        let mut actual_fingerprint = [0u8; 32];
+        hex::decode_to_slice(&view.fingerprint_hex, &mut actual_fingerprint)
+            .map_err(|_| "computed Direct identity fingerprint is invalid".to_string())?;
+        if expected_fingerprint.ct_eq(&actual_fingerprint).unwrap_u8() != 1 {
+            return Err("displayed Direct identity fingerprint is stale or mismatched".to_string());
+        }
+
+        let locator = ProfileLocator {
+            canonical_server_origin: view.canonical_server_origin.clone(),
+            user_id: view.peer_user_id.clone(),
+            identity_key: view.peer_identity_key,
+        };
+        let db = self.db.as_ref().ok_or("database not initialized")?;
+        let verified_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        db.mark_account_verified_v2(&locator, &verified_at)?;
+        view.proof = db
+            .local_identity_verification_for_unlocked_account(
+                &self.identity_key()?,
+                &self.signing_key()?,
+                &locator,
+            )?
+            .into();
+        Ok(view)
+    }
+
+    /// Confirm a QR payload generated by the peer's trusted native account-v2
+    /// view. Parsing is exact and bounded; the extracted digest is still
+    /// compared in constant time with the freshly-derived current route before
+    /// any durable verification state is written.
+    pub fn confirm_direct_identity_verification_qr_v1(
+        &self,
+        conversation_id: &str,
+        scanned_qr_payload: &str,
+    ) -> Result<DirectIdentityVerificationV2, String> {
+        let expected_fingerprint = direct_identity_qr_fingerprint_v1(scanned_qr_payload)?;
+        self.confirm_direct_identity_verification_v2(conversation_id, &expected_fingerprint)
+    }
+
     /// Exact native projection boundary for Stage-5 Direct history. Callers
     /// receive no quarantine identifiers and cannot use a route that was
     /// rejected by live replay; known non-Direct projections keep their
@@ -3052,6 +4044,7 @@ impl VeilClient {
         self.identity = None;
         self.device_identity = None;
         self.ratchet_sessions.clear();
+        self.direct_v2_sessions.clear();
         self.zeroize_prekey_secrets();
         self.spk_next_id = 1;
         self.otk_next_id = 1;
@@ -3338,7 +4331,13 @@ impl VeilClient {
             || ttl_seconds.is_some()
             || sealed != Some(false)
             || !attachments.is_empty()
-            || security_context.is_some()
+            || matches!(
+                security_context,
+                Some(
+                    MessageSecurityContextV1::SenderKeyV5(_)
+                        | MessageSecurityContextV1::SenderKeyV6(_)
+                )
+            )
             || header.is_empty()
             || ciphertext.is_empty()
             || header.first() == Some(&HEADER_SENDER_KEY)
@@ -3403,6 +4402,7 @@ impl VeilClient {
             &sender_identity_key,
             &author,
             MessageAuthorContext::DirectoryMemberAtObservation,
+            security_context.as_ref(),
             &header,
             &ciphertext,
             Some(server_timestamp),
@@ -3901,6 +4901,8 @@ impl VeilClient {
                 || ack.generation != receipt.generation
                 || ack.target_device_id != receipt.target_device_id
                 || ack.roster_version != receipt.roster_version
+                || ack.membership_epoch != receipt.membership_epoch
+                || ack.membership_epoch_hash != receipt.membership_epoch_hash
                 || ack.envelope_commitment != receipt.envelope_commitment
             {
                 return Err("Sender-Key receipt acknowledgement metadata mismatch".to_string());
@@ -3919,6 +4921,8 @@ impl VeilClient {
             || ack.generation != pending.generation
             || ack.target_device_id != pending.target_device_id
             || ack.roster_version != pending.roster_version
+            || ack.membership_epoch != pending.membership_epoch
+            || ack.membership_epoch_hash != pending.membership_epoch_hash
             || ack.envelope_commitment != pending.envelope_commitment
         {
             return Err("Sender-Key acknowledgement route metadata mismatch".to_string());
@@ -4440,6 +5444,8 @@ impl VeilClient {
                 || ack.generation != receipt.generation
                 || ack.target_device_id != receipt.target_device_id
                 || ack.roster_version != receipt.roster_version
+                || ack.membership_epoch != receipt.membership_epoch
+                || ack.membership_epoch_hash != receipt.membership_epoch_hash
                 || ack.envelope_commitment != receipt.envelope_commitment
             {
                 return Err("Sender-Key receipt acknowledgement metadata mismatch".to_string());
@@ -4459,6 +5465,8 @@ impl VeilClient {
             || ack.generation != pending.generation
             || ack.target_device_id != pending.target_device_id
             || ack.roster_version != pending.roster_version
+            || ack.membership_epoch != pending.membership_epoch
+            || ack.membership_epoch_hash != pending.membership_epoch_hash
             || ack.envelope_commitment != pending.envelope_commitment
         {
             return Err("Sender-Key acknowledgement route metadata mismatch".to_string());
@@ -4860,10 +5868,33 @@ impl VeilClient {
             let roster = self.device_rosters.get(conversation_id).ok_or_else(|| {
                 DirectSendErrorV1::rejected("validated current device roster is unavailable")
             })?;
-            Some((roster.version, roster.commitment))
+            Some(roster)
         } else {
             None
         };
+        let membership_proof = roster_proof
+            .filter(|roster| roster.membership_activated)
+            .map(|roster| {
+                let head = self
+                    .membership_epoch_heads
+                    .get(conversation_id)
+                    .ok_or_else(|| {
+                        DirectSendErrorV1::rejected(
+                            "verified membership epoch is unavailable for this roster",
+                        )
+                    })?;
+                if head.epoch != roster.membership_epoch
+                    || head.hash != roster.membership_epoch_hash
+                    || head.roster_version != roster.version
+                    || head.roster_commitment != roster.commitment
+                {
+                    return Err(DirectSendErrorV1::rejected(
+                        "verified membership epoch does not match this roster",
+                    ));
+                }
+                Ok((head.epoch, head.hash))
+            })
+            .transpose()?;
         let send_msg = proto::SendMessage {
             conversation_id: conversation_id.to_string(),
             ciphertext,
@@ -4889,9 +5920,45 @@ impl VeilClient {
             // Populated by the per-device roster integration. Zero/empty is
             // valid only for DMs; the gateway rejects Sender-Key traffic that
             // does not carry an exact authenticated roster proof.
-            roster_version: roster_proof.map_or(0, |proof| proof.0),
-            roster_commitment: roster_proof.map_or_else(Vec::new, |proof| proof.1.to_vec()),
+            roster_version: roster_proof.map_or(0, |roster| roster.version),
+            roster_commitment: roster_proof
+                .map_or_else(Vec::new, |roster| roster.commitment.to_vec()),
             client_message_id: local_message_id.clone(),
+            crypto_profile: membership_proof.map_or_else(
+                || {
+                    self.dm_conversations
+                        .get(conversation_id)
+                        .and_then(|peer| self.direct_v2_sessions.get(peer))
+                        .map_or_else(String::new, |_| DIRECT_CRYPTO_PROFILE_V2.to_string())
+                },
+                |_| "sender_key_v6".to_string(),
+            ),
+            crypto_era: membership_proof.map_or_else(
+                || {
+                    self.dm_conversations
+                        .get(conversation_id)
+                        .and_then(|peer| self.direct_v2_sessions.get(peer))
+                        .map_or(0, |_| DIRECT_CRYPTO_ERA_V2)
+                },
+                |_| 1,
+            ),
+            target_device_id: self
+                .dm_conversations
+                .get(conversation_id)
+                .and_then(|peer| self.direct_v2_sessions.get(peer))
+                .map_or_else(Vec::new, |state| state.peer().device.device_id.to_vec()),
+            target_binding_version: self
+                .dm_conversations
+                .get(conversation_id)
+                .and_then(|peer| self.direct_v2_sessions.get(peer))
+                .map_or(0, |state| state.peer().device.binding_version),
+            direct_session_id: self
+                .dm_conversations
+                .get(conversation_id)
+                .and_then(|peer| self.direct_v2_sessions.get(peer))
+                .map_or_else(Vec::new, |state| state.session_id().to_vec()),
+            membership_epoch: membership_proof.map_or(0, |proof| proof.0),
+            membership_epoch_hash: membership_proof.map_or_else(Vec::new, |proof| proof.1.to_vec()),
         };
 
         let env = proto::Envelope {
@@ -5067,6 +6134,28 @@ impl VeilClient {
             roster_version: 0,
             roster_commitment: Vec::new(),
             client_message_id: client_message_id.clone(),
+            crypto_profile: self
+                .direct_v2_sessions
+                .get(&peer_identity_key)
+                .map_or_else(String::new, |_| DIRECT_CRYPTO_PROFILE_V2.to_string()),
+            crypto_era: self
+                .direct_v2_sessions
+                .get(&peer_identity_key)
+                .map_or(0, |_| DIRECT_CRYPTO_ERA_V2),
+            target_device_id: self
+                .direct_v2_sessions
+                .get(&peer_identity_key)
+                .map_or_else(Vec::new, |state| state.peer().device.device_id.to_vec()),
+            target_binding_version: self
+                .direct_v2_sessions
+                .get(&peer_identity_key)
+                .map_or(0, |state| state.peer().device.binding_version),
+            direct_session_id: self
+                .direct_v2_sessions
+                .get(&peer_identity_key)
+                .map_or_else(Vec::new, |state| state.session_id().to_vec()),
+            membership_epoch: 0,
+            membership_epoch_hash: Vec::new(),
         };
         let exact_send_message_payload = send_message.encode_to_vec();
         let request_digest = send_message_request_digest_v1(&exact_send_message_payload);
@@ -5580,6 +6669,41 @@ impl VeilClient {
             if !publication.acknowledged || count.remaining >= OWN_PREKEY_LOW_WATERMARK {
                 return Ok(OwnPreKeyPublication::from_local(publication));
             }
+
+            // Refill only the OPK inventory. Retaining the exact acknowledged
+            // SPK preserves delayed initial-message decryptability and avoids
+            // accumulating a fresh signed private key on every low-watermark
+            // check. The server independently requires this SPK to equal its
+            // current immutable row.
+            let refill = self.build_prekey_refill(publication.signed_prekey_id)?;
+            let request_body = canonical_own_prekey_request_body(
+                &self.device_id,
+                &refill.prekeys.signing_key,
+                refill.prekeys.spk_id,
+                &refill.prekeys.spk_public,
+                &refill.prekeys.spk_signature,
+                &refill.prekeys.otk_publics,
+            )?;
+            let next_publication = LocalPreKeyPublicationV1 {
+                canonical_server_origin: canonical_server_origin.to_string(),
+                user_id: authenticated_user_id.to_string(),
+                device_id: self.device_id,
+                signed_prekey_id: refill.prekeys.spk_id,
+                one_time_prekey_count: OWN_PREKEY_BATCH_SIZE as u32,
+                body_sha256: Sha256::digest(&request_body).into(),
+                request_body,
+                acknowledged: false,
+            };
+            self.db
+                .as_ref()
+                .ok_or("database not initialized")?
+                .save_local_prekey_refill_with_publication(
+                    &refill.signed_prekey,
+                    &refill.one_time_prekeys,
+                    &next_publication,
+                )?;
+            self.install_generated_prekey_refill(&refill);
+            return Ok(OwnPreKeyPublication::from_local(&next_publication));
         }
 
         let batch = self.build_prekey_batch()?;
@@ -5727,6 +6851,72 @@ impl VeilClient {
         })
     }
 
+    fn build_prekey_refill(
+        &mut self,
+        signed_prekey_id: u32,
+    ) -> Result<GeneratedPreKeyRefill, String> {
+        let identity = self.identity.as_ref().ok_or("not initialized")?;
+        let db = self.db.as_ref().ok_or("database not initialized")?;
+        let signed_prekey = db
+            .load_local_signed_prekey(signed_prekey_id)?
+            .ok_or("acknowledged signed prekey is unavailable for refill")?;
+        let derived_public =
+            X25519PublicKey::from(&X25519StaticSecret::from(signed_prekey.secret_key)).to_bytes();
+        if derived_public != signed_prekey.public_key {
+            return Err("retained signed prekey public key differs from its secret".to_string());
+        }
+        let signature = signed_prekey
+            .signature
+            .ok_or("retained signed prekey signature is unavailable")?;
+        if !veil_crypto::signature::verify(
+            &identity.ed25519_public_bytes(),
+            &x3dh::signed_prekey_signature_message(&signed_prekey.public_key),
+            &signature,
+        ) {
+            return Err("retained signed prekey failed domain verification".to_string());
+        }
+        if self.spk_secrets.get(&signed_prekey_id).copied()
+            != Some((signed_prekey.secret_key, signed_prekey.public_key))
+        {
+            return Err("retained signed prekey differs from the active runtime".to_string());
+        }
+
+        let reservation = db.reserve_local_one_time_prekey_batch_ids()?;
+        self.otk_next_id = reservation.next_one_time_prekey_id;
+        let mut otk_publics = Vec::with_capacity(OWN_PREKEY_BATCH_SIZE);
+        let mut one_time_prekeys = Vec::with_capacity(OWN_PREKEY_BATCH_SIZE);
+        for offset in 0..OWN_PREKEY_BATCH_SIZE as u32 {
+            let key_id = reservation
+                .one_time_prekey_start_id
+                .checked_add(offset)
+                .ok_or_else(|| "one-time prekey id exhausted".to_string())?;
+            let opk = x3dh::OneTimePreKey::generate(key_id);
+            let public_key = *opk.public.as_bytes();
+            let mut secret_key = opk.secret.to_bytes();
+            otk_publics.push((public_key, key_id));
+            one_time_prekeys.push(LocalPreKey {
+                key_type: 1,
+                protocol_key_id: key_id,
+                secret_key,
+                public_key,
+                signature: None,
+            });
+            secret_key.zeroize();
+        }
+
+        Ok(GeneratedPreKeyRefill {
+            prekeys: PreKeySet {
+                spk_public: signed_prekey.public_key,
+                spk_id: signed_prekey.protocol_key_id,
+                spk_signature: signature,
+                signing_key: identity.ed25519_public_bytes(),
+                otk_publics,
+            },
+            signed_prekey,
+            one_time_prekeys,
+        })
+    }
+
     /// Reserve protocol ids before generating any private material. SQLCipher
     /// serializes database-backed reservations across independently opened
     /// clients; memory-only fixtures retain the same gap-on-failure semantics.
@@ -5772,6 +6962,12 @@ impl VeilClient {
         }
     }
 
+    fn install_generated_prekey_refill(&mut self, refill: &GeneratedPreKeyRefill) {
+        for key in &refill.one_time_prekeys {
+            self.otk_secrets.insert(key.protocol_key_id, key.secret_key);
+        }
+    }
+
     /// Initiate X3DH with a peer's prekey bundle, create ratchet session.
     pub fn establish_session(
         &mut self,
@@ -5780,6 +6976,164 @@ impl VeilClient {
     ) -> Result<(), String> {
         let result = self.establish_session_classified_v1(peer_identity_key, bundle);
         self.resolve_public_session_establish_v1(result)
+    }
+
+    pub(crate) fn direct_v2_initiator_context(
+        &self,
+        conversation_id: &str,
+        peer_user_id: &str,
+        peer_identity_key: [u8; 32],
+        peer_signing_key: [u8; 32],
+        peer_device: DirectDeviceCoordinateV2,
+    ) -> Result<DirectSessionContextV2, String> {
+        self.require_crypto_runtime_active_v1()?;
+        let canonical_server_origin = self
+            .authenticated_server_origin
+            .clone()
+            .ok_or("Direct v2 requires an authenticated Node origin")?;
+        let local_user_id = self
+            .authenticated_user_id
+            .clone()
+            .ok_or("Direct v2 requires an authenticated account")?;
+        if self.dm_conversations.get(conversation_id) != Some(&peer_identity_key)
+            || self.known_user_keys.get(peer_user_id) != Some(&peer_identity_key)
+            || self.trusted_signing_keys.get(&peer_identity_key) != Some(&peer_signing_key)
+        {
+            return Err("Direct v2 peer is outside the authenticated directory".to_string());
+        }
+        let identity = self.identity.as_ref().ok_or("not initialized")?;
+        let device = self
+            .device_identity
+            .as_ref()
+            .ok_or("device not initialized")?
+            .binding();
+        Ok(DirectSessionContextV2 {
+            canonical_server_origin,
+            conversation_id: conversation_id.to_string(),
+            initiator: DirectParticipantCoordinateV2 {
+                account: DirectAccountCoordinateV2 {
+                    user_id: local_user_id,
+                    identity_key: identity.x25519_public_bytes(),
+                    signing_key: identity.ed25519_public_bytes(),
+                },
+                device: DirectDeviceCoordinateV2 {
+                    device_id: device.device_id,
+                    binding_version: device.version,
+                    capabilities: device.capabilities,
+                    status: device.status,
+                    identity_key: device.device_identity_key,
+                    signing_key: device.device_signing_key,
+                    account_signature: device.account_signature,
+                },
+            },
+            responder: DirectParticipantCoordinateV2 {
+                account: DirectAccountCoordinateV2 {
+                    user_id: peer_user_id.to_string(),
+                    identity_key: peer_identity_key,
+                    signing_key: peer_signing_key,
+                },
+                device: peer_device,
+            },
+        })
+    }
+
+    fn direct_v2_responder_state(
+        &self,
+        conversation_id: &str,
+        sender_identity_key: &[u8; 32],
+        agreement: DirectInitialKeyAgreementV2,
+        security: &DirectMessageSecurityContextV2,
+    ) -> Result<DirectSessionStateV2, String> {
+        self.require_crypto_runtime_active_v1()?;
+        let canonical_server_origin = self
+            .authenticated_server_origin
+            .clone()
+            .ok_or("Direct v2 requires an authenticated Node origin")?;
+        let local_user_id = self
+            .authenticated_user_id
+            .clone()
+            .ok_or("Direct v2 requires an authenticated account")?;
+        if self.dm_conversations.get(conversation_id) != Some(sender_identity_key)
+            || self.known_user_keys.get(&security.sender_user_id) != Some(sender_identity_key)
+        {
+            return Err("Direct v2 sender is outside the authenticated directory".to_string());
+        }
+        let sender_signing_key = self
+            .trusted_signing_keys
+            .get(sender_identity_key)
+            .copied()
+            .ok_or("Direct v2 sender signing key is not pinned")?;
+        let identity = self.identity.as_ref().ok_or("not initialized")?;
+        let local = self
+            .device_identity
+            .as_ref()
+            .ok_or("device not initialized")?
+            .binding();
+        if security.target_device_id != local.device_id
+            || security.target_binding_version != local.version
+        {
+            return Err("Direct v2 ciphertext targets another device epoch".to_string());
+        }
+        let context = DirectSessionContextV2 {
+            canonical_server_origin,
+            conversation_id: conversation_id.to_string(),
+            initiator: DirectParticipantCoordinateV2 {
+                account: DirectAccountCoordinateV2 {
+                    user_id: security.sender_user_id.clone(),
+                    identity_key: *sender_identity_key,
+                    signing_key: sender_signing_key,
+                },
+                device: DirectDeviceCoordinateV2 {
+                    device_id: security.sender_device_id,
+                    binding_version: security.sender_binding_version,
+                    capabilities: security.sender_device_capabilities,
+                    status: security.sender_device_binding_status,
+                    identity_key: security.sender_device_identity_key,
+                    signing_key: security.sender_device_signing_key,
+                    account_signature: security.sender_account_signature,
+                },
+            },
+            responder: DirectParticipantCoordinateV2 {
+                account: DirectAccountCoordinateV2 {
+                    user_id: local_user_id,
+                    identity_key: identity.x25519_public_bytes(),
+                    signing_key: identity.ed25519_public_bytes(),
+                },
+                device: DirectDeviceCoordinateV2 {
+                    device_id: local.device_id,
+                    binding_version: local.version,
+                    capabilities: local.capabilities,
+                    status: local.status,
+                    identity_key: local.device_identity_key,
+                    signing_key: local.device_signing_key,
+                    account_signature: local.account_signature,
+                },
+            },
+        };
+        let state = DirectSessionStateV2::new(context, agreement, false)?;
+        if state.session_id() != security.direct_session_id {
+            return Err("Direct v2 outer session commitment is invalid".to_string());
+        }
+        Ok(state)
+    }
+
+    pub(crate) fn direct_v2_conversation_for_peer(
+        &self,
+        peer_identity_key: &[u8; 32],
+    ) -> Result<String, String> {
+        let mut matches = self
+            .dm_conversations
+            .iter()
+            .filter_map(|(conversation_id, peer)| {
+                (peer == peer_identity_key).then_some(conversation_id.as_str())
+            });
+        let conversation_id = matches
+            .next()
+            .ok_or("Direct v2 peer has no authenticated conversation")?;
+        if matches.next().is_some() {
+            return Err("Direct v2 peer maps to multiple conversations".to_string());
+        }
+        Ok(conversation_id.to_string())
     }
 
     pub(crate) fn establish_session_classified_v1(
@@ -5829,6 +7183,7 @@ impl VeilClient {
             ephemeral_public: result.ephemeral_public,
             signed_prekey_id: bundle.signed_prekey_id,
             one_time_prekey_id: bundle.one_time_prekey_id,
+            direct_v2_session_id: None,
         };
         if let Some(db) = self.db.as_ref() {
             let session_data = Zeroizing::new(session.serialize().map_err(|e| {
@@ -5848,6 +7203,125 @@ impl VeilClient {
             .insert(*peer_identity_key, pending_header);
         self.ratchet_sessions.insert(*peer_identity_key, session);
 
+        Ok(())
+    }
+
+    /// Establish the sticky Direct v2 session for one exact peer device. The
+    /// account-level X3DH output is re-keyed through the full origin/account/
+    /// device/session transcript before it initializes Double Ratchet.
+    pub(crate) fn establish_session_classified_v2(
+        &mut self,
+        peer_identity_key: &[u8; 32],
+        bundle: &x3dh::PreKeyBundle,
+        context: DirectSessionContextV2,
+    ) -> Result<(), DirectSessionEstablishErrorV1> {
+        if peer_identity_key != &bundle.identity_key
+            || context.responder.account.identity_key != *peer_identity_key
+            || context.responder.account.signing_key != bundle.signing_key
+        {
+            return Err(DirectSessionEstablishErrorV1::rejected(
+                "Direct v2 peer coordinate differs from its prekey bundle",
+            ));
+        }
+        self.require_crypto_runtime_active_v1()
+            .map_err(DirectSessionEstablishErrorV1::rejected)?;
+        if self.ratchet_sessions.contains_key(peer_identity_key)
+            || self.pending_initial_headers.contains_key(peer_identity_key)
+            || self.direct_v2_sessions.contains_key(peer_identity_key)
+        {
+            return Err(DirectSessionEstablishErrorV1::rejected(
+                "ratchet session with this peer already exists",
+            ));
+        }
+        if self
+            .db
+            .as_ref()
+            .map(|db| db.load_ratchet_session_with_revision_v1(peer_identity_key))
+            .transpose()
+            .map_err(DirectSessionEstablishErrorV1::storage)?
+            .flatten()
+            .is_some()
+        {
+            return Err(DirectSessionEstablishErrorV1::rejected(
+                "durable ratchet session with this peer already exists",
+            ));
+        }
+        if self.authenticated_server_origin.as_deref()
+            != Some(context.canonical_server_origin.as_str())
+            || self.authenticated_user_id.as_deref()
+                != Some(context.initiator.account.user_id.as_str())
+            || self.dm_conversations.get(&context.conversation_id) != Some(peer_identity_key)
+        {
+            return Err(DirectSessionEstablishErrorV1::rejected(
+                "Direct v2 context is outside the authenticated conversation epoch",
+            ));
+        }
+        let identity = self
+            .identity
+            .as_ref()
+            .ok_or_else(|| DirectSessionEstablishErrorV1::rejected("not initialized"))?;
+        let local_device = self
+            .device_identity
+            .as_ref()
+            .ok_or_else(|| DirectSessionEstablishErrorV1::rejected("device not initialized"))?;
+        let local_binding = local_device.binding();
+        if context.initiator.account.identity_key != identity.x25519_public_bytes()
+            || context.initiator.account.signing_key != identity.ed25519_public_bytes()
+            || context.initiator.device.device_id != local_binding.device_id
+            || context.initiator.device.binding_version != local_binding.version
+            || context.initiator.device.capabilities != local_binding.capabilities
+            || context.initiator.device.status != local_binding.status
+            || context.initiator.device.identity_key != local_binding.device_identity_key
+            || context.initiator.device.signing_key != local_binding.device_signing_key
+            || context.initiator.device.account_signature != local_binding.account_signature
+        {
+            return Err(DirectSessionEstablishErrorV1::rejected(
+                "Direct v2 initiator coordinate differs from this device",
+            ));
+        }
+
+        let result =
+            x3dh::initiate(identity, bundle).map_err(DirectSessionEstablishErrorV1::rejected)?;
+        let agreement = DirectInitialKeyAgreementV2 {
+            ephemeral_public: result.ephemeral_public,
+            signed_prekey_id: bundle.signed_prekey_id,
+            one_time_prekey_id: bundle.one_time_prekey_id,
+        };
+        let state = DirectSessionStateV2::new(context, agreement, true)
+            .map_err(DirectSessionEstablishErrorV1::rejected)?;
+        let mut session_secret = state
+            .transcript()
+            .derive_session_secret(&result.shared_secret, &result.associated_data)
+            .map_err(DirectSessionEstablishErrorV1::rejected)?;
+        let session = RatchetSession::init_initiator(&session_secret, &bundle.signed_prekey);
+        session_secret.zeroize();
+        let pending_header = PendingInitialHeader {
+            ephemeral_public: result.ephemeral_public,
+            signed_prekey_id: bundle.signed_prekey_id,
+            one_time_prekey_id: bundle.one_time_prekey_id,
+            direct_v2_session_id: Some(state.session_id()),
+        };
+        if let Some(db) = self.db.as_ref() {
+            let session_data = Zeroizing::new(session.serialize().map_err(|error| {
+                DirectSessionEstablishErrorV1::rejected(format!(
+                    "serialize Direct v2 initiator ratchet: {error}"
+                ))
+            })?);
+            let header_data = serde_json::to_vec(&pending_header).map_err(|error| {
+                DirectSessionEstablishErrorV1::rejected(format!(
+                    "serialize Direct v2 pending header: {error}"
+                ))
+            })?;
+            let binding = state
+                .to_store_blob()
+                .map_err(DirectSessionEstablishErrorV1::rejected)?;
+            db.save_initiator_session_v2(peer_identity_key, &session_data, &header_data, &binding)
+                .map_err(DirectSessionEstablishErrorV1::storage)?;
+        }
+        self.pending_initial_headers
+            .insert(*peer_identity_key, pending_header);
+        self.direct_v2_sessions.insert(*peer_identity_key, state);
+        self.ratchet_sessions.insert(*peer_identity_key, session);
         Ok(())
     }
 
@@ -5924,6 +7398,22 @@ impl VeilClient {
         spk_id: u32,
         opk_id: Option<u32>,
     ) -> Result<RatchetSession, String> {
+        let (result, spk_secret_bytes, spk_pub) =
+            self.build_responder_x3dh(sender_identity_key, ephemeral_key, spk_id, opk_id)?;
+        Ok(RatchetSession::init_responder(
+            &result.shared_secret,
+            &spk_secret_bytes,
+            &spk_pub,
+        ))
+    }
+
+    fn build_responder_x3dh(
+        &self,
+        sender_identity_key: &[u8; 32],
+        ephemeral_key: &[u8; 32],
+        spk_id: u32,
+        opk_id: Option<u32>,
+    ) -> Result<(x3dh::X3DHResult, [u8; 32], [u8; 32]), String> {
         let identity = self.identity.as_ref().ok_or("not initialized")?;
 
         let (spk_secret_bytes, spk_pub) = self
@@ -5963,11 +7453,7 @@ impl VeilClient {
             sender_identity_key,
             ephemeral_key,
         )?;
-        Ok(RatchetSession::init_responder(
-            &result.shared_secret,
-            &spk_secret_bytes,
-            &spk_pub,
-        ))
+        Ok((result, spk_secret_bytes, spk_pub))
     }
 
     /// Check if a ratchet session exists with a peer.
@@ -6115,23 +7601,76 @@ impl VeilClient {
             .map_err(DirectSendErrorV1::rejected)?;
         let our_identity_key = self.identity_key().map_err(DirectSendErrorV1::rejected)?;
         let pending = self.pending_initial_headers.get(peer_identity_key).copied();
-        let mut wire_prefix = Vec::with_capacity(1 + 32 + 4 + 4);
-        if let Some(initial) = pending {
-            wire_prefix.push(HEADER_INITIAL);
-            wire_prefix.extend_from_slice(&initial.ephemeral_public);
-            wire_prefix.extend_from_slice(&initial.signed_prekey_id.to_be_bytes());
-            wire_prefix
-                .extend_from_slice(&initial.one_time_prekey_id.unwrap_or(u32::MAX).to_be_bytes());
+        let direct_v2 = self.direct_v2_sessions.get(peer_identity_key);
+        let mut wire_prefix = Vec::with_capacity(1 + 32 + 32 + 4 + 4);
+        let associated_data = if let Some(state) = direct_v2 {
+            if state.context().canonical_server_origin
+                != self
+                    .authenticated_server_origin
+                    .as_deref()
+                    .ok_or_else(|| DirectSendErrorV1::rejected("Direct v2 is not authenticated"))?
+                || state.context().conversation_id != conversation_id
+                || state.local().account.user_id
+                    != self.authenticated_user_id.as_deref().ok_or_else(|| {
+                        DirectSendErrorV1::rejected("Direct v2 account is not authenticated")
+                    })?
+                || state.local().account.identity_key != our_identity_key
+                || state.peer().account.identity_key != *peer_identity_key
+                || state.local().device.device_id != self.device_id
+            {
+                return Err(DirectSendErrorV1::rejected(
+                    "Direct v2 session is outside the authenticated device epoch",
+                ));
+            }
+            if let Some(initial) = pending {
+                if initial.direct_v2_session_id != Some(state.session_id()) {
+                    return Err(DirectSendErrorV1::rejected(
+                        "Direct v2 pending header has a different session commitment",
+                    ));
+                }
+                wire_prefix.push(HEADER_INITIAL_V2);
+                wire_prefix.extend_from_slice(&state.session_id());
+                wire_prefix.extend_from_slice(&initial.ephemeral_public);
+                wire_prefix.extend_from_slice(&initial.signed_prekey_id.to_be_bytes());
+                wire_prefix.extend_from_slice(
+                    &initial.one_time_prekey_id.unwrap_or(u32::MAX).to_be_bytes(),
+                );
+            } else {
+                wire_prefix.push(HEADER_RATCHET_V2);
+                wire_prefix.extend_from_slice(&state.session_id());
+            }
+            state
+                .transcript()
+                .message_associated_data(
+                    &state.local().device.device_id,
+                    &state.peer().device.device_id,
+                    &wire_prefix,
+                )
+                .map_err(DirectSendErrorV1::rejected)?
         } else {
-            wire_prefix.push(HEADER_RATCHET);
-        }
-        let associated_data = ratchet_associated_data(
-            conversation_id,
-            &our_identity_key,
-            peer_identity_key,
-            &wire_prefix,
-        )
-        .map_err(DirectSendErrorV1::rejected)?;
+            if pending.is_some_and(|initial| initial.direct_v2_session_id.is_some()) {
+                return Err(DirectSendErrorV1::rejected(
+                    "Direct v2 pending state lost its sticky session binding",
+                ));
+            }
+            if let Some(initial) = pending {
+                wire_prefix.push(HEADER_INITIAL);
+                wire_prefix.extend_from_slice(&initial.ephemeral_public);
+                wire_prefix.extend_from_slice(&initial.signed_prekey_id.to_be_bytes());
+                wire_prefix.extend_from_slice(
+                    &initial.one_time_prekey_id.unwrap_or(u32::MAX).to_be_bytes(),
+                );
+            } else {
+                wire_prefix.push(HEADER_RATCHET);
+            }
+            ratchet_associated_data(
+                conversation_id,
+                &our_identity_key,
+                peer_identity_key,
+                &wire_prefix,
+            )
+            .map_err(DirectSendErrorV1::rejected)?
+        };
         let mut candidate = self
             .ratchet_sessions
             .get(peer_identity_key)
@@ -6184,28 +7723,63 @@ impl VeilClient {
         security_context: &MessageSecurityContextV1,
     ) -> Result<ValidatedSenderKeyRouteForMessageV1, String> {
         self.require_direct_conversation_available_v1(conversation_id)?;
-        let MessageSecurityContextV1::SenderKeyV5(context) = security_context;
+        let (
+            roster_version,
+            roster_commitment,
+            sender_device_id,
+            target_device_id,
+            sender_binding_version,
+            membership_epoch,
+            membership_epoch_hash,
+        ) = match security_context {
+            MessageSecurityContextV1::SenderKeyV5(context) => (
+                context.roster_version,
+                context.roster_commitment,
+                context.sender_device_id,
+                context.target_device_id,
+                context.sender_binding_version,
+                0,
+                [0u8; 32],
+            ),
+            MessageSecurityContextV1::SenderKeyV6(context) => (
+                context.roster_version,
+                context.roster_commitment,
+                context.sender_device_id,
+                context.target_device_id,
+                context.sender_binding_version,
+                context.membership_epoch,
+                context.membership_epoch_hash,
+            ),
+            MessageSecurityContextV1::DirectV2(_) => {
+                return Err("Direct v2 context is not valid for Sender-Key traffic".to_string());
+            }
+        };
         let local = self
             .device_identity
             .as_ref()
             .ok_or("per-device identity is not initialized")?;
-        if context.target_device_id != self.device_id {
+        if target_device_id != self.device_id {
             return Err("Sender-Key message targets another device".to_string());
         }
         let unverified = veil_crypto::sender_key::inspect_signed_sender_key_metadata(ciphertext)?;
         let local_account_identity = self.identity_key()?;
         let local_account_signing = self.signing_key()?;
         if *sender_account_identity_key == local_account_identity
-            && context.sender_device_id == self.device_id
+            && sender_device_id == self.device_id
         {
             let roster = self
                 .device_rosters
                 .get(conversation_id)
                 .filter(|roster| {
-                    roster.version == context.roster_version
-                        && roster.commitment == context.roster_commitment
+                    roster.version == roster_version && roster.commitment == roster_commitment
                 })
                 .ok_or("self-authored Sender-Key message has no exact current roster proof")?;
+            self.require_live_membership_context_v1(
+                conversation_id,
+                roster,
+                membership_epoch,
+                &membership_epoch_hash,
+            )?;
             let current = roster
                 .eligible_devices
                 .get(&self.device_id)
@@ -6213,7 +7787,7 @@ impl VeilClient {
             if current.device_identity_key != local.binding().device_identity_key
                 || current.device_signing_key != local.binding().device_signing_key
                 || current.account_signing_key != local_account_signing
-                || current.binding_version != context.sender_binding_version
+                || current.binding_version != sender_binding_version
                 || unverified.sender_identity_key != local.binding().device_identity_key
                 || self
                     .sender_keys
@@ -6238,8 +7812,10 @@ impl VeilClient {
                     sender_binding_version: local.binding().version,
                     target_device_id: self.device_id,
                     target_binding_version: local.binding().version,
-                    roster_version: context.roster_version,
-                    roster_commitment: context.roster_commitment,
+                    roster_version,
+                    roster_commitment,
+                    membership_epoch,
+                    membership_epoch_hash,
                     envelope_commitment: Sha256::digest(ciphertext).into(),
                     historical_sender_binding: Some(HistoricalDeviceBindingProofV1 {
                         sender_account_signing_key: current.account_signing_key,
@@ -6282,9 +7858,9 @@ impl VeilClient {
             )?;
         let Some(route) = route else {
             return Ok(ValidatedSenderKeyRouteForMessageV1::MissingExactRoute {
-                target_device_id: context.target_device_id,
-                message_roster_version: context.roster_version,
-                message_roster_commitment: context.roster_commitment,
+                target_device_id,
+                message_roster_version: roster_version,
+                message_roster_commitment: roster_commitment,
                 installed_roster_version: current_roster.version,
                 installed_roster_commitment: current_roster.commitment,
             });
@@ -6304,18 +7880,33 @@ impl VeilClient {
             );
         }
         if route.sender_account_identity_key != *sender_account_identity_key
-            || route.sender_device_id != context.sender_device_id
-            || route.sender_binding_version != context.sender_binding_version
-            || route.target_device_id != context.target_device_id
+            || route.sender_device_id != sender_device_id
+            || route.sender_binding_version != sender_binding_version
+            || route.target_device_id != target_device_id
             || route.target_device_id != self.device_id
             || route.target_binding_version == 0
             || route.target_binding_version > local.binding().version
-            || route.roster_version != context.roster_version
-            || route.roster_commitment != context.roster_commitment
+            || route.roster_version != roster_version
+            || route.roster_commitment != roster_commitment
+            || route.membership_epoch != membership_epoch
+            || route.membership_epoch_hash != membership_epoch_hash
         {
             return Err(
                 "Sender-Key message security context does not match installed route".to_string(),
             );
+        }
+        if membership_epoch != 0
+            && !self
+                .db
+                .as_ref()
+                .ok_or("database is required for membership history verification")?
+                .membership_epoch_matches_pin_v1(
+                    conversation_id,
+                    membership_epoch,
+                    &membership_epoch_hash,
+                )?
+        {
+            return Err("Sender-Key v6 message membership epoch is not durably pinned".to_string());
         }
         let generation = veil_crypto::sender_key::verify_signed_sender_key_envelope(
             conversation_id,
@@ -6330,6 +7921,44 @@ impl VeilClient {
             generation,
             route: Box::new(route),
         })
+    }
+
+    pub fn validate_live_sender_key_security_context_v1(
+        &self,
+        conversation_id: &str,
+        security_context: &MessageSecurityContextV1,
+    ) -> Result<(), String> {
+        let (roster_version, roster_commitment, membership_epoch, membership_epoch_hash) =
+            match security_context {
+                MessageSecurityContextV1::SenderKeyV5(context) => (
+                    context.roster_version,
+                    context.roster_commitment,
+                    0,
+                    [0u8; 32],
+                ),
+                MessageSecurityContextV1::SenderKeyV6(context) => (
+                    context.roster_version,
+                    context.roster_commitment,
+                    context.membership_epoch,
+                    context.membership_epoch_hash,
+                ),
+                MessageSecurityContextV1::DirectV2(_) => {
+                    return Err("Direct v2 context is not valid for Sender-Key traffic".to_string())
+                }
+            };
+        let roster = self
+            .device_rosters
+            .get(conversation_id)
+            .ok_or("current device roster is not installed")?;
+        if roster.version != roster_version || roster.commitment != roster_commitment {
+            return Err("live Sender-Key message belongs to a stale roster".to_string());
+        }
+        self.require_live_membership_context_v1(
+            conversation_id,
+            roster,
+            membership_epoch,
+            &membership_epoch_hash,
+        )
     }
 
     pub fn inspect_sender_key_message_context_v1(
@@ -6402,6 +8031,224 @@ impl VeilClient {
         self.resolve_public_classified_mutation_v1(result)
     }
 
+    fn validate_direct_v2_outer_context(
+        &self,
+        state: &DirectSessionStateV2,
+        conversation_id: &str,
+        sender_identity_key: &[u8; 32],
+        security: &DirectMessageSecurityContextV2,
+    ) -> Result<(), String> {
+        let peer = state.peer();
+        let local = state.local();
+        if state.context().conversation_id != conversation_id
+            || state.context().canonical_server_origin
+                != self
+                    .authenticated_server_origin
+                    .as_deref()
+                    .ok_or("Direct v2 runtime origin is not authenticated")?
+            || local.account.user_id
+                != self
+                    .authenticated_user_id
+                    .as_deref()
+                    .ok_or("Direct v2 runtime account is not authenticated")?
+            || peer.account.identity_key != *sender_identity_key
+            || peer.account.user_id != security.sender_user_id
+            || peer.device.device_id != security.sender_device_id
+            || peer.device.binding_version != security.sender_binding_version
+            || peer.device.identity_key != security.sender_device_identity_key
+            || peer.device.signing_key != security.sender_device_signing_key
+            || peer.device.capabilities != security.sender_device_capabilities
+            || peer.device.status != security.sender_device_binding_status
+            || peer.device.account_signature != security.sender_account_signature
+            || local.device.device_id != security.target_device_id
+            || local.device.binding_version != security.target_binding_version
+            || state.session_id() != security.direct_session_id
+            || self.dm_conversations.get(conversation_id) != Some(sender_identity_key)
+        {
+            return Err("Direct v2 outer context differs from the sticky session".to_string());
+        }
+        Ok(())
+    }
+
+    fn decrypt_direct_v2_classified(
+        &mut self,
+        sender_identity_key: &[u8; 32],
+        conversation_id: &str,
+        header: &[u8],
+        ciphertext: &[u8],
+        security_context: Option<&MessageSecurityContextV1>,
+    ) -> Result<DecryptedPayload, DirectHistoryMutationError> {
+        let Some(MessageSecurityContextV1::DirectV2(security)) = security_context else {
+            return Err(DirectHistoryMutationError::rejected(
+                "Direct v2 message is missing its exact device/session context",
+            ));
+        };
+        let (wire_prefix_len, ratchet_offset, agreement) = match header[0] {
+            HEADER_INITIAL_V2 => {
+                if header.len() != 1 + 32 + 32 + 4 + 4 + 41 {
+                    return Err(DirectHistoryMutationError::rejected(
+                        "invalid Direct v2 initial header length",
+                    ));
+                }
+                let mut ephemeral_public = [0u8; 32];
+                ephemeral_public.copy_from_slice(&header[33..65]);
+                let signed_prekey_id =
+                    u32::from_be_bytes(header[65..69].try_into().expect("fixed Direct v2 SPK"));
+                let one_time_prekey_raw =
+                    u32::from_be_bytes(header[69..73].try_into().expect("fixed Direct v2 OPK"));
+                (
+                    73,
+                    73,
+                    Some(DirectInitialKeyAgreementV2 {
+                        ephemeral_public,
+                        signed_prekey_id,
+                        one_time_prekey_id: (one_time_prekey_raw != u32::MAX)
+                            .then_some(one_time_prekey_raw),
+                    }),
+                )
+            }
+            HEADER_RATCHET_V2 => {
+                if header.len() != 1 + 32 + 41 {
+                    return Err(DirectHistoryMutationError::rejected(
+                        "invalid Direct v2 ratchet header length",
+                    ));
+                }
+                (33, 33, None)
+            }
+            _ => {
+                return Err(DirectHistoryMutationError::rejected(
+                    "internal Direct v2 header dispatch mismatch",
+                ));
+            }
+        };
+        let embedded_session_id: [u8; 32] = header[1..33]
+            .try_into()
+            .expect("validated Direct v2 session id length");
+        if embedded_session_id != security.direct_session_id {
+            return Err(DirectHistoryMutationError::rejected(
+                "Direct v2 header and outer session commitments disagree",
+            ));
+        }
+        let ratchet_header = MessageHeader::from_bytes(&header[ratchet_offset..])
+            .map_err(DirectHistoryMutationError::rejected)?;
+
+        let existing_state = self.direct_v2_sessions.get(sender_identity_key).cloned();
+        if let Some(state) = existing_state {
+            self.validate_direct_v2_outer_context(
+                &state,
+                conversation_id,
+                sender_identity_key,
+                security,
+            )
+            .map_err(DirectHistoryMutationError::rejected)?;
+            let current = self
+                .ratchet_sessions
+                .get(sender_identity_key)
+                .ok_or_else(|| {
+                    DirectHistoryMutationError::storage(
+                        "Direct v2 sticky binding has no ratchet session",
+                    )
+                })?;
+            let associated_data = state
+                .transcript()
+                .message_associated_data(
+                    &state.peer().device.device_id,
+                    &state.local().device.device_id,
+                    &header[..wire_prefix_len],
+                )
+                .map_err(DirectHistoryMutationError::rejected)?;
+            let mut candidate = current.clone();
+            let plaintext = candidate
+                .decrypt_with_ad(&ratchet_header, ciphertext, &associated_data)
+                .map_err(DirectHistoryMutationError::rejected)?;
+            if let Some(db) = self.db.as_ref() {
+                persist_existing_ratchet_transition_v1(
+                    db,
+                    sender_identity_key,
+                    current,
+                    &candidate,
+                )
+                .map_err(DirectHistoryMutationError::storage)?;
+            }
+            self.ratchet_sessions
+                .insert(*sender_identity_key, candidate);
+            return self.process_ratchet_plaintext_classified_v1(sender_identity_key, plaintext);
+        }
+
+        if self.ratchet_sessions.contains_key(sender_identity_key) {
+            return Err(DirectHistoryMutationError::rejected(
+                "Direct v2 cannot replace an unbound legacy ratchet session",
+            ));
+        }
+        let agreement = agreement.ok_or_else(|| {
+            DirectHistoryMutationError::rejected(
+                "Direct v2 ratchet header arrived before an authenticated initial packet",
+            )
+        })?;
+        let state = self
+            .direct_v2_responder_state(conversation_id, sender_identity_key, agreement, security)
+            .map_err(DirectHistoryMutationError::rejected)?;
+        self.validate_direct_v2_outer_context(
+            &state,
+            conversation_id,
+            sender_identity_key,
+            security,
+        )
+        .map_err(DirectHistoryMutationError::rejected)?;
+        let (x3dh_result, spk_secret, spk_public) = self
+            .build_responder_x3dh(
+                sender_identity_key,
+                &agreement.ephemeral_public,
+                agreement.signed_prekey_id,
+                agreement.one_time_prekey_id,
+            )
+            .map_err(DirectHistoryMutationError::rejected)?;
+        let mut session_secret = state
+            .transcript()
+            .derive_session_secret(&x3dh_result.shared_secret, &x3dh_result.associated_data)
+            .map_err(DirectHistoryMutationError::rejected)?;
+        let mut candidate =
+            RatchetSession::init_responder(&session_secret, &spk_secret, &spk_public);
+        session_secret.zeroize();
+        let associated_data = state
+            .transcript()
+            .message_associated_data(
+                &state.peer().device.device_id,
+                &state.local().device.device_id,
+                &header[..wire_prefix_len],
+            )
+            .map_err(DirectHistoryMutationError::rejected)?;
+        let plaintext = candidate
+            .decrypt_with_ad(&ratchet_header, ciphertext, &associated_data)
+            .map_err(DirectHistoryMutationError::rejected)?;
+        if let Some(db) = self.db.as_ref() {
+            let data = Zeroizing::new(candidate.serialize().map_err(|error| {
+                DirectHistoryMutationError::storage(format!(
+                    "serialize Direct v2 responder ratchet: {error}"
+                ))
+            })?);
+            let binding = state
+                .to_store_blob()
+                .map_err(DirectHistoryMutationError::rejected)?;
+            db.commit_initial_ratchet_session_v2(
+                sender_identity_key,
+                &data,
+                agreement.one_time_prekey_id,
+                &binding,
+            )
+            .map_err(DirectHistoryMutationError::storage)?;
+        }
+        if let Some(id) = agreement.one_time_prekey_id {
+            if let Some(mut secret) = self.otk_secrets.remove(&id) {
+                secret.zeroize();
+            }
+        }
+        self.direct_v2_sessions.insert(*sender_identity_key, state);
+        self.ratchet_sessions
+            .insert(*sender_identity_key, candidate);
+        self.process_ratchet_plaintext_classified_v1(sender_identity_key, plaintext)
+    }
+
     fn decrypt_from_with_security_context_classified_v1(
         &mut self,
         sender_identity_key: &[u8; 32],
@@ -6419,8 +8266,31 @@ impl VeilClient {
                 "rejected unencrypted message: missing E2E header",
             ));
         }
+        if self.direct_v2_sessions.contains_key(sender_identity_key)
+            && matches!(header[0], HEADER_INITIAL | HEADER_RATCHET)
+        {
+            return Err(DirectHistoryMutationError::rejected(
+                "Direct v1 downgrade rejected for a sticky Direct v2 session",
+            ));
+        }
+        if matches!(
+            security_context,
+            Some(MessageSecurityContextV1::DirectV2(_))
+        ) && !matches!(header[0], HEADER_INITIAL_V2 | HEADER_RATCHET_V2)
+        {
+            return Err(DirectHistoryMutationError::rejected(
+                "Direct v2 outer context is attached to a different wire profile",
+            ));
+        }
 
         match header[0] {
+            HEADER_INITIAL_V2 | HEADER_RATCHET_V2 => self.decrypt_direct_v2_classified(
+                sender_identity_key,
+                conversation_id,
+                header,
+                ciphertext,
+                security_context,
+            ),
             HEADER_INITIAL => {
                 // Parse X3DH init header
                 if header.len() != 1 + 32 + 4 + 4 + 41 {
@@ -6628,6 +8498,11 @@ impl VeilClient {
         if header.is_empty() || ciphertext.is_empty() {
             return Err(DirectHistoryMutationError::rejected(
                 "Direct history ciphertext is empty",
+            ));
+        }
+        if self.direct_v2_sessions.contains_key(sender_identity_key) {
+            return Err(DirectHistoryMutationError::rejected(
+                "legacy Direct history cannot mutate a sticky Direct v2 session",
             ));
         }
 
@@ -7216,6 +9091,22 @@ impl VeilClient {
         if pinned_target != target || target.device_id == self.device_id {
             return Err("target device tuple is stale or resolves to this device".to_string());
         }
+        let (membership_epoch, membership_epoch_hash) = if roster.membership_activated {
+            let head = self
+                .membership_epoch_heads
+                .get(conversation_id)
+                .ok_or("verified membership epoch is unavailable for SKDM distribution")?;
+            if head.epoch != roster.membership_epoch
+                || head.hash != roster.membership_epoch_hash
+                || head.roster_version != roster.version
+                || head.roster_commitment != roster.commitment
+            {
+                return Err("verified membership epoch does not match the SKDM roster".to_string());
+            }
+            (head.epoch, head.hash)
+        } else {
+            (0, [0u8; 32])
+        };
         if !self.sender_keys.has_outgoing(conversation_id) {
             self.rotate_sender_key(conversation_id)?;
         }
@@ -7246,6 +9137,8 @@ impl VeilClient {
                     target_binding_version: target.binding_version,
                     roster_version: target.roster_version,
                     roster_commitment: target.roster_commitment,
+                    membership_epoch,
+                    membership_epoch_hash,
                     envelope_commitment: cached.envelope_commitment,
                 };
                 if cached.target_account_identity_key != target.account_identity_key
@@ -7254,6 +9147,8 @@ impl VeilClient {
                     || cached.sender_device_identity_key != local.binding().device_identity_key
                     || cached.sender_binding_version != local.binding().version
                     || cached.roster_commitment != target.roster_commitment
+                    || cached.membership_epoch != membership_epoch
+                    || cached.membership_epoch_hash != membership_epoch_hash
                 {
                     distribution.zeroize();
                     return Err("persisted exact-device SKDM route tuple changed".to_string());
@@ -7298,6 +9193,8 @@ impl VeilClient {
             target_binding_version: target.binding_version,
             roster_version: target.roster_version,
             roster_commitment: target.roster_commitment,
+            membership_epoch,
+            membership_epoch_hash,
             envelope_commitment,
         };
         let persisted = PendingSenderKeyDeviceEnvelopeV1 {
@@ -7312,6 +9209,8 @@ impl VeilClient {
             sender_binding_version: local.binding().version,
             roster_version: target.roster_version,
             roster_commitment: target.roster_commitment,
+            membership_epoch,
+            membership_epoch_hash,
             envelope_commitment,
             sealed_envelope: sealed,
         };
@@ -7382,6 +9281,8 @@ impl VeilClient {
                     sender_device_capabilities: local.binding().capabilities,
                     sender_device_binding_status: u32::from(local.binding().status),
                     sender_account_signature: local.binding().account_signature.to_vec(),
+                    membership_epoch: pending.membership_epoch,
+                    membership_epoch_hash: pending.membership_epoch_hash.to_vec(),
                 },
             )),
         };
@@ -7449,6 +9350,8 @@ impl VeilClient {
                 target_binding_version: route.target_binding_version,
                 roster_version: route.roster_version,
                 roster_commitment: route.roster_commitment,
+                membership_epoch: route.membership_epoch,
+                membership_epoch_hash: route.membership_epoch_hash,
                 envelope_commitment: route.envelope_commitment,
                 historical_sender_binding: Some(HistoricalDeviceBindingProofV1 {
                     sender_account_signing_key: route.sender_account_signing_key,
@@ -7471,6 +9374,8 @@ impl VeilClient {
             target_device_id: route.target_device_id,
             generation: authenticated.generation,
             roster_version: route.roster_version,
+            membership_epoch: route.membership_epoch,
+            membership_epoch_hash: route.membership_epoch_hash,
             envelope_commitment: route.envelope_commitment,
         })
     }
@@ -7501,6 +9406,23 @@ impl VeilClient {
             return Err(
                 "sender-key conversation is not an authenticated group/channel".to_string(),
             );
+        }
+        if (route.membership_epoch == 0) != (route.membership_epoch_hash == [0u8; 32]) {
+            return Err("SKDM membership coordinate is partial".to_string());
+        }
+        if mode == SenderKeyDistributionModeV1::Retained
+            && route.membership_epoch != 0
+            && !self
+                .db
+                .as_ref()
+                .ok_or("durable database is required for retained membership validation")?
+                .membership_epoch_matches_pin_v1(
+                    &route.conversation_id,
+                    route.membership_epoch,
+                    &route.membership_epoch_hash,
+                )?
+        {
+            return Err("retained SKDM membership epoch is not durably pinned".to_string());
         }
         let metadata = veil_crypto::sender_key::inspect_skdm_metadata(sealed_wire)?;
         let computed_envelope_commitment: [u8; 32] = Sha256::digest(sealed_wire).into();
@@ -7588,6 +9510,12 @@ impl VeilClient {
             );
         }
         if mode == SenderKeyDistributionModeV1::Live {
+            self.require_live_membership_context_v1(
+                &route.conversation_id,
+                current_roster,
+                route.membership_epoch,
+                &route.membership_epoch_hash,
+            )?;
             if route.target_binding_version != local.binding().version
                 || route.roster_version != current_roster.version
                 || route.roster_commitment != current_roster.commitment
@@ -7670,6 +9598,8 @@ impl VeilClient {
                         generation: receipt.generation,
                         roster_version: receipt.roster_version,
                         envelope_commitment: receipt.envelope_commitment.to_vec(),
+                        membership_epoch: receipt.membership_epoch,
+                        membership_epoch_hash: receipt.membership_epoch_hash.to_vec(),
                     },
                 )),
             })
@@ -8141,6 +10071,7 @@ impl VeilClient {
         sender_identity_key: &[u8; 32],
         author_snapshot: &AccountSnapshot,
         author_context: MessageAuthorContext,
+        security_context: Option<&MessageSecurityContextV1>,
         header: &[u8],
         ciphertext: &[u8],
         server_timestamp: Option<i64>,
@@ -8154,7 +10085,7 @@ impl VeilClient {
             Some(author_snapshot),
             Some(author_context),
             false,
-            None,
+            security_context,
             None,
             header,
             ciphertext,
@@ -8217,12 +10148,27 @@ impl VeilClient {
                 "inbound E2E header conflicts with the pinned conversation type",
             ));
         }
-        if sender_key_mode != security_context.is_some() {
-            return Err(DirectHistoryMutationError::rejected(
-                "inbound message security context conflicts with the conversation type",
-            ));
+        match (sender_key_mode, security_context) {
+            (
+                true,
+                Some(
+                    MessageSecurityContextV1::SenderKeyV5(_)
+                    | MessageSecurityContextV1::SenderKeyV6(_),
+                ),
+            )
+            | (false, None)
+            | (false, Some(MessageSecurityContextV1::DirectV2(_))) => {}
+            _ => {
+                return Err(DirectHistoryMutationError::rejected(
+                    "inbound message security context conflicts with the conversation type",
+                ));
+            }
         }
-        if let Some(security_context) = security_context {
+        if let Some(
+            security_context @ (MessageSecurityContextV1::SenderKeyV5(_)
+            | MessageSecurityContextV1::SenderKeyV6(_)),
+        ) = security_context
+        {
             self.validate_sender_key_message_context_v1(
                 conversation_id,
                 sender_identity_key,
@@ -8305,13 +10251,34 @@ impl VeilClient {
                         }
                     }
                 }
-                AtomicReceiveDecryptMode::DirectHistory => client
-                    .decrypt_direct_history_text_classified(
-                        sender_identity_key,
-                        conversation_id,
-                        header,
-                        ciphertext,
-                    )?,
+                AtomicReceiveDecryptMode::DirectHistory => {
+                    if matches!(
+                        security_context,
+                        Some(MessageSecurityContextV1::DirectV2(_))
+                    ) {
+                        match client.decrypt_from_with_security_context_classified_v1(
+                            sender_identity_key,
+                            conversation_id,
+                            header,
+                            ciphertext,
+                            security_context,
+                        )? {
+                            DecryptedPayload::Text(plaintext) => plaintext,
+                            DecryptedPayload::Control => {
+                                return Err(DirectHistoryMutationError::rejected(
+                                    "control frame is not valid in Direct history",
+                                ));
+                            }
+                        }
+                    } else {
+                        client.decrypt_direct_history_text_classified(
+                            sender_identity_key,
+                            conversation_id,
+                            header,
+                            ciphertext,
+                        )?
+                    }
+                }
             });
             let (plaintext, private_attachments) = if attachments.is_empty() {
                 if crate::attachments::is_attachment_payload_v1(&decrypted) {
@@ -9248,6 +11215,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn direct_identity_qr_v1_is_canonical_bounded_and_exact() {
+        let fingerprint_hex = "ab".repeat(32);
+        let payload = direct_identity_qr_payload_v1(&fingerprint_hex).unwrap();
+        assert_eq!(
+            payload,
+            format!("veil-identity:account-v2:{fingerprint_hex}")
+        );
+        assert_eq!(payload.len(), 89);
+        assert_eq!(
+            direct_identity_qr_fingerprint_v1(&payload).unwrap(),
+            [0xab; 32]
+        );
+
+        assert!(direct_identity_qr_payload_v1(&"AB".repeat(32)).is_err());
+        assert!(direct_identity_qr_payload_v1(&"ab".repeat(31)).is_err());
+        for malformed in [
+            format!("veil-identity:account-v1:{fingerprint_hex}"),
+            format!("veil-identity:account-v2:{}", "AB".repeat(32)),
+            format!("veil-identity:account-v2:{fingerprint_hex}\n"),
+            format!("veil-identity:account-v2:{fingerprint_hex}\0"),
+            format!("veіl-identity:account-v2:{fingerprint_hex}"),
+            format!("veil-identity:account-v2:{}", "ab".repeat(31)),
+        ] {
+            assert!(direct_identity_qr_fingerprint_v1(&malformed).is_err());
+        }
+    }
+
+    #[test]
     fn mobile_connect_preserves_typed_connection_stop_reasons() {
         for (connection_stop, mobile_stop) in [
             (
@@ -9444,6 +11439,11 @@ mod tests {
             ready: true,
             member_user_ids: members,
             devices: entries,
+            crypto_profile: "sender_key_v5".to_string(),
+            membership_activated: false,
+            membership_ready: true,
+            membership_epoch: 0,
+            membership_epoch_hash: [0u8; 32],
         };
         candidate.roster_commitment = test_roster_commitment(&candidate);
         candidate
@@ -9604,6 +11604,8 @@ mod tests {
             sender_account_signature: local.account_signature,
             roster_version: target.roster_version,
             roster_commitment: target.roster_commitment,
+            membership_epoch: key.membership_epoch,
+            membership_epoch_hash: key.membership_epoch_hash,
             sender_binding_version: local.version,
             target_binding_version: target.binding_version,
             envelope_commitment: key.envelope_commitment,
@@ -9626,6 +11628,8 @@ mod tests {
             target_binding_version: 1,
             roster_version: 1,
             roster_commitment: [0xA1; 32],
+            membership_epoch: 0,
+            membership_epoch_hash: [0u8; 32],
             envelope_commitment: [0xB2; 32],
         }
     }
@@ -9734,7 +11738,8 @@ mod tests {
             assert!(healthy.acknowledged);
             assert_eq!(healthy.request_body, first_publication.request_body);
 
-            // Below the low-water mark, allocate a fresh monotonic batch.
+            // Below the low-water mark, retain the acknowledged SPK and
+            // allocate only fresh monotonic OPKs.
             let second = client
                 .prepare_own_prekey_publication_after_count(
                     PREKEY_ORIGIN_A,
@@ -9747,12 +11752,12 @@ mod tests {
                 )
                 .unwrap();
             assert!(!second.acknowledged);
-            assert_eq!(
-                second.signed_prekey_id,
-                first_publication.signed_prekey_id + 1
-            );
+            assert_eq!(second.signed_prekey_id, first_publication.signed_prekey_id);
             assert_eq!(own_prekey_opk_ids(&second), (21..=40).collect::<Vec<_>>());
             assert_ne!(second.request_body, first_publication.request_body);
+            assert_eq!(client.spk_next_id, 2);
+            assert_eq!(client.otk_next_id, 41);
+            assert_eq!(client.spk_secrets.len(), 1);
 
             let mut wrong_digest = second.body_sha256;
             wrong_digest[0] ^= 1;
@@ -9815,9 +11820,13 @@ mod tests {
                     &own_prekey_count_response(first_device_id, 0, None),
                 )
                 .unwrap();
-            assert_eq!(third.signed_prekey_id, second.signed_prekey_id + 1);
+            assert_eq!(
+                third.signed_prekey_id,
+                first_publication.signed_prekey_id + 1
+            );
             assert_eq!(own_prekey_opk_ids(&third), (41..=60).collect::<Vec<_>>());
             assert_ne!(third.request_body, second.request_body);
+            assert_eq!(client.spk_secrets.len(), 2);
             assert_eq!(
                 client
                     .own_prekey_publication(PREKEY_ORIGIN_A, PREKEY_USER)
@@ -10122,6 +12131,11 @@ mod tests {
             ready: false,
             member_user_ids: vec![user_two, user_one],
             devices: vec![active, legacy, excluded],
+            crypto_profile: "sender_key_v5".to_string(),
+            membership_activated: false,
+            membership_ready: true,
+            membership_epoch: 0,
+            membership_epoch_hash: [0u8; 32],
         };
         assert_eq!(
             hex::encode(test_roster_commitment(&candidate)),
@@ -10153,6 +12167,287 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("db-wal"));
         let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn membership_epoch_activation_is_automatic_and_blocks_live_v5_downgrade() {
+        let origin = "https://membership.example.test:443";
+        let local_user = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000111").unwrap();
+        let conversation = "00000000-0000-4000-8000-000000000abc";
+        let mut client = memory_client_with_device(
+            IdentityKeyPair::generate(),
+            local_user,
+            [0x31; 16],
+            [0x79; 32],
+        );
+        client.authenticated_server_origin = Some(origin.to_string());
+        client.mark_channel_conversation(conversation);
+        let local_entry = roster_entry(
+            *local_user.as_bytes(),
+            client.identity.as_ref().unwrap(),
+            client.device_identity.as_ref().unwrap().binding(),
+        );
+        let legacy = candidate_with_commitment(conversation, 1, vec![local_entry]);
+        client.install_device_roster_v1(legacy.clone()).unwrap();
+
+        let local_binding = client.device_identity.as_ref().unwrap().binding().clone();
+        let v5 = MessageSecurityContextV1::SenderKeyV5(SenderKeyMessageSecurityContextV1 {
+            roster_version: legacy.roster_version,
+            roster_commitment: legacy.roster_commitment,
+            sender_device_id: local_binding.device_id,
+            target_device_id: local_binding.device_id,
+            sender_binding_version: local_binding.version,
+        });
+        client
+            .validate_live_sender_key_security_context_v1(conversation, &v5)
+            .unwrap();
+
+        let owner = MembershipPolicySignerV1 {
+            account_id: *local_user.as_bytes(),
+            account_signing_key: client.signing_key().unwrap(),
+        };
+        let prepared = client
+            .prepare_membership_epoch_bootstrap_v1(
+                conversation,
+                veil_crypto::membership::MEMBERSHIP_CONVERSATION_KIND_GROUP_V1,
+                legacy.roster_version,
+                legacy.roster_commitment,
+                owner,
+            )
+            .unwrap();
+        assert_ne!(prepared.epoch.mutation_nonce, [0u8; 32]);
+        assert!(client
+            .prepare_membership_epoch_bootstrap_v1(
+                &conversation.to_ascii_uppercase(),
+                veil_crypto::membership::MEMBERSHIP_CONVERSATION_KIND_GROUP_V1,
+                legacy.roster_version,
+                legacy.roster_commitment,
+                owner,
+            )
+            .unwrap_err()
+            .contains("not canonical"));
+
+        let mut activated = legacy;
+        activated.crypto_profile = "sender_key_v6".to_string();
+        activated.membership_activated = true;
+        activated.membership_epoch = prepared.epoch.epoch;
+        activated.membership_epoch_hash = prepared.epoch_hash;
+        client.install_device_roster_v1(activated.clone()).unwrap();
+        client
+            .install_membership_epoch_chain_v1(MembershipEpochChainCandidateV1 {
+                canonical_origin: origin.to_string(),
+                conversation_id: conversation.to_string(),
+                head_epoch: prepared.epoch.epoch,
+                head_hash: prepared.epoch_hash,
+                records: vec![MembershipEpochRecordCandidateV1 {
+                    epoch: prepared.epoch.clone(),
+                    epoch_hash: prepared.epoch_hash,
+                    signatures: prepared.signatures.clone(),
+                    bootstrap_owner: Some(owner),
+                }],
+            })
+            .unwrap();
+
+        let v6 = MessageSecurityContextV1::SenderKeyV6(SenderKeyMessageSecurityContextV6 {
+            roster_version: activated.roster_version,
+            roster_commitment: activated.roster_commitment,
+            sender_device_id: local_binding.device_id,
+            target_device_id: local_binding.device_id,
+            sender_binding_version: local_binding.version,
+            membership_epoch: prepared.epoch.epoch,
+            membership_epoch_hash: prepared.epoch_hash,
+        });
+        client
+            .validate_live_sender_key_security_context_v1(conversation, &v6)
+            .unwrap();
+        assert!(client
+            .validate_live_sender_key_security_context_v1(conversation, &v5)
+            .unwrap_err()
+            .contains("membership epoch"));
+        let mut stale = v6;
+        let MessageSecurityContextV1::SenderKeyV6(stale_context) = &mut stale else {
+            unreachable!();
+        };
+        stale_context.membership_epoch_hash[0] ^= 1;
+        assert!(client
+            .validate_live_sender_key_security_context_v1(conversation, &stale)
+            .is_err());
+
+        let next = client
+            .prepare_membership_epoch_transition_v1(
+                &prepared.epoch,
+                activated.roster_version + 1,
+                [0xA1; 32],
+            )
+            .unwrap();
+        assert_eq!(next.epoch.epoch, 2);
+        assert_eq!(next.epoch.predecessor_hash, prepared.epoch_hash);
+        assert_eq!(next.epoch.successor_policy, prepared.epoch.successor_policy);
+    }
+
+    #[test]
+    fn sender_key_v6_roundtrip_keeps_legacy_history_but_never_reuses_v5_generation() {
+        let origin = "https://membership-roundtrip.example.test:443";
+        let sender_user = uuid::Uuid::from_bytes([0x41; 16]);
+        let recipient_user = uuid::Uuid::from_bytes([0x42; 16]);
+        let conversation = "00000000-0000-4000-8000-000000000abd";
+        let mut sender = memory_client_with_device(
+            IdentityKeyPair::generate(),
+            sender_user,
+            [0x43; 16],
+            [0x44; 32],
+        );
+        let mut recipient = memory_client_with_device(
+            IdentityKeyPair::generate(),
+            recipient_user,
+            [0x45; 16],
+            [0x46; 32],
+        );
+        for client in [&mut sender, &mut recipient] {
+            client.authenticated_server_origin = Some(origin.to_string());
+            client.mark_channel_conversation(conversation);
+        }
+        let entries = vec![
+            roster_entry(
+                *sender_user.as_bytes(),
+                sender.identity.as_ref().unwrap(),
+                sender.device_identity.as_ref().unwrap().binding(),
+            ),
+            roster_entry(
+                *recipient_user.as_bytes(),
+                recipient.identity.as_ref().unwrap(),
+                recipient.device_identity.as_ref().unwrap().binding(),
+            ),
+        ];
+        let legacy = candidate_with_commitment(conversation, 1, entries);
+        sender.install_device_roster_v1(legacy.clone()).unwrap();
+        recipient.install_device_roster_v1(legacy.clone()).unwrap();
+        let legacy_target = sender
+            .sender_key_device_targets(conversation)
+            .unwrap()
+            .into_iter()
+            .find(|target| target.device_id == recipient.device_id)
+            .unwrap();
+        let (legacy_key, legacy_wire) = sender
+            .prepare_sender_key_device_envelope(&legacy_target)
+            .unwrap();
+        let legacy_route = route_for_test(&sender, &legacy_target, &legacy_key);
+        recipient
+            .process_sender_key_distribution_v1(&legacy_wire, &legacy_route)
+            .unwrap();
+        sender.mark_sender_key_distributed(conversation).unwrap();
+        let (legacy_ciphertext, legacy_header) = sender
+            .encrypt_outgoing(conversation, "legacy history")
+            .unwrap();
+        let legacy_context =
+            MessageSecurityContextV1::SenderKeyV5(SenderKeyMessageSecurityContextV1 {
+                roster_version: legacy_route.roster_version,
+                roster_commitment: legacy_route.roster_commitment,
+                sender_device_id: legacy_route.sender_device_id,
+                target_device_id: legacy_route.target_device_id,
+                sender_binding_version: legacy_route.sender_binding_version,
+            });
+
+        let owner = MembershipPolicySignerV1 {
+            account_id: *sender_user.as_bytes(),
+            account_signing_key: sender.signing_key().unwrap(),
+        };
+        let prepared = sender
+            .prepare_membership_epoch_bootstrap_v1(
+                conversation,
+                veil_crypto::membership::MEMBERSHIP_CONVERSATION_KIND_GROUP_V1,
+                legacy.roster_version,
+                legacy.roster_commitment,
+                owner,
+            )
+            .unwrap();
+        let mut activated = legacy;
+        activated.crypto_profile = "sender_key_v6".to_string();
+        activated.membership_activated = true;
+        activated.membership_epoch = 1;
+        activated.membership_epoch_hash = prepared.epoch_hash;
+        let chain = MembershipEpochChainCandidateV1 {
+            canonical_origin: origin.to_string(),
+            conversation_id: conversation.to_string(),
+            head_epoch: 1,
+            head_hash: prepared.epoch_hash,
+            records: vec![MembershipEpochRecordCandidateV1 {
+                epoch: prepared.epoch,
+                epoch_hash: prepared.epoch_hash,
+                signatures: prepared.signatures,
+                bootstrap_owner: Some(owner),
+            }],
+        };
+        for client in [&mut sender, &mut recipient] {
+            client.install_device_roster_v1(activated.clone()).unwrap();
+            client
+                .install_membership_epoch_chain_v1(chain.clone())
+                .unwrap();
+        }
+
+        assert!(recipient
+            .validate_live_sender_key_security_context_v1(conversation, &legacy_context)
+            .unwrap_err()
+            .contains("membership epoch"));
+        match recipient
+            .decrypt_from_with_security_context(
+                &legacy_route.sender_account_identity_key,
+                conversation,
+                &legacy_header,
+                &legacy_ciphertext,
+                Some(&legacy_context),
+            )
+            .unwrap()
+        {
+            DecryptedPayload::Text(text) => assert_eq!(text, b"legacy history"),
+            DecryptedPayload::Control => panic!("legacy history decoded as control"),
+        }
+
+        let v6_target = sender
+            .sender_key_device_targets(conversation)
+            .unwrap()
+            .into_iter()
+            .find(|target| target.device_id == recipient.device_id)
+            .unwrap();
+        let (v6_key, v6_wire) = sender
+            .prepare_sender_key_device_envelope(&v6_target)
+            .unwrap();
+        assert!(v6_key.generation > legacy_key.generation);
+        assert_eq!(v6_key.membership_epoch, 1);
+        assert_eq!(v6_key.membership_epoch_hash, prepared.epoch_hash);
+        let v6_route = route_for_test(&sender, &v6_target, &v6_key);
+        recipient
+            .process_sender_key_distribution_v1(&v6_wire, &v6_route)
+            .unwrap();
+        sender.mark_sender_key_distributed(conversation).unwrap();
+        let (v6_ciphertext, v6_header) = sender
+            .encrypt_outgoing(conversation, "epoch protected")
+            .unwrap();
+        let v6_context = MessageSecurityContextV1::SenderKeyV6(SenderKeyMessageSecurityContextV6 {
+            roster_version: v6_route.roster_version,
+            roster_commitment: v6_route.roster_commitment,
+            sender_device_id: v6_route.sender_device_id,
+            target_device_id: v6_route.target_device_id,
+            sender_binding_version: v6_route.sender_binding_version,
+            membership_epoch: v6_route.membership_epoch,
+            membership_epoch_hash: v6_route.membership_epoch_hash,
+        });
+        recipient
+            .validate_live_sender_key_security_context_v1(conversation, &v6_context)
+            .unwrap();
+        match recipient
+            .decrypt_from_with_security_context(
+                &v6_route.sender_account_identity_key,
+                conversation,
+                &v6_header,
+                &v6_ciphertext,
+                Some(&v6_context),
+            )
+            .unwrap()
+        {
+            DecryptedPayload::Text(text) => assert_eq!(text, b"epoch protected"),
+            DecryptedPayload::Control => panic!("Sender-Key v6 text decoded as control"),
+        }
     }
 
     #[test]
@@ -10241,6 +12536,8 @@ mod tests {
             conversation_id: conversation.to_string(),
             generation: first_key.generation,
             roster_version: first_key.roster_version,
+            membership_epoch: first_key.membership_epoch,
+            membership_epoch_hash: first_key.membership_epoch_hash,
             envelope_commitment: first_key.envelope_commitment,
         };
         wrong_ack.envelope_commitment[0] ^= 1;
@@ -10267,6 +12564,8 @@ mod tests {
                     conversation_id: conversation.to_string(),
                     generation: last_key.generation,
                     roster_version: last_key.roster_version,
+                    membership_epoch: last_key.membership_epoch,
+                    membership_epoch_hash: last_key.membership_epoch_hash,
                     envelope_commitment: last_key.envelope_commitment,
                 }),
             )
@@ -11010,6 +13309,8 @@ mod tests {
                     conversation_id: acked_receipt.conversation_id.clone(),
                     generation: acked_receipt.generation,
                     roster_version: acked_receipt.roster_version,
+                    membership_epoch: acked_receipt.membership_epoch,
+                    membership_epoch_hash: acked_receipt.membership_epoch_hash,
                     envelope_commitment: acked_receipt.envelope_commitment,
                 }),
             )
@@ -14314,6 +16615,7 @@ mod tests {
                     &sender_identity_key,
                     &author,
                     MessageAuthorContext::DirectoryMemberAtObservation,
+                    None,
                     header,
                     ciphertext,
                     Some(rest_timestamp_ms),
@@ -15239,6 +17541,56 @@ mod tests {
         drop(recovering);
         remove_test_database(&corrupt_path);
         remove_test_database(&recovered_path);
+    }
+
+    #[test]
+    fn initialization_rejects_corrupt_local_prekey_keypairs_and_signatures() {
+        for (variant, mutation) in [
+            (
+                "signed-public",
+                "UPDATE local_prekeys SET public_key = zeroblob(32) WHERE key_type = 0",
+            ),
+            (
+                "signed-signature",
+                "UPDATE local_prekeys SET signature = zeroblob(64) WHERE key_type = 0",
+            ),
+            (
+                "one-time-public",
+                "UPDATE local_prekeys SET public_key = zeroblob(32) WHERE key_type = 1",
+            ),
+            (
+                "one-time-signature",
+                "UPDATE local_prekeys SET signature = zeroblob(64) WHERE key_type = 1",
+            ),
+        ] {
+            let mnemonic = generate_mnemonic().to_string();
+            let path = std::env::temp_dir().join(format!(
+                "veil-corrupt-local-prekey-{variant}-{}.db",
+                uuid::Uuid::new_v4()
+            ));
+            remove_test_database(&path);
+            {
+                let mut seeded = VeilClient::new();
+                seeded.init_with_mnemonic(&mnemonic, &path).unwrap();
+                seeded.generate_prekeys().unwrap();
+                seeded.db().unwrap().conn().execute(mutation, []).unwrap();
+            }
+
+            let mut recovering = VeilClient::new();
+            let error = recovering.init_with_mnemonic(&mnemonic, &path).unwrap_err();
+            assert!(
+                error.contains("public key differs from its secret")
+                    || error.contains("failed domain verification")
+                    || error.contains("unexpectedly contains a signature"),
+                "variant={variant} error={error}"
+            );
+            assert!(recovering.identity.is_none());
+            assert!(recovering.device_identity.is_none());
+            assert!(recovering.db().is_none());
+            assert!(recovering.spk_secrets.is_empty());
+            assert!(recovering.otk_secrets.is_empty());
+            remove_test_database(&path);
+        }
     }
 
     #[tokio::test]
@@ -16767,6 +19119,172 @@ mod tests {
             DecryptedPayload::Text(text) => assert_eq!(text, b"third"),
             DecryptedPayload::Control => panic!("text decoded as control frame"),
         }
+    }
+
+    #[test]
+    fn direct_v2_roundtrip_binds_origin_accounts_devices_session_and_rejects_downgrade() {
+        let origin = "https://direct-v2.example.test:443";
+        let conversation_id = "550e8400-e29b-41d4-a716-446655440210";
+        let alice_user = uuid::Uuid::parse_str("550e8400-e29b-41d4-a716-446655440211").unwrap();
+        let bob_user = uuid::Uuid::parse_str("550e8400-e29b-41d4-a716-446655440212").unwrap();
+        let alice_account = IdentityKeyPair::from_mnemonic(
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+        )
+        .unwrap();
+        let bob_account = IdentityKeyPair::from_mnemonic(
+            "legal winner thank year wave sausage worth useful legal winner thank yellow",
+        )
+        .unwrap();
+        let alice_key = alice_account.x25519_public_bytes();
+        let alice_signing = alice_account.ed25519_public_bytes();
+        let bob_key = bob_account.x25519_public_bytes();
+        let bob_signing = bob_account.ed25519_public_bytes();
+        let mut alice =
+            memory_client_with_device(alice_account, alice_user, [0xa1; 16], [0x31; 32]);
+        let mut bob = memory_client_with_device(bob_account, bob_user, [0xb1; 16], [0x41; 32]);
+        for client in [&mut alice, &mut bob] {
+            client.authenticated_server_origin = Some(origin.to_string());
+        }
+        alice.known_user_keys.insert(bob_user.to_string(), bob_key);
+        alice.trusted_signing_keys.insert(bob_key, bob_signing);
+        alice
+            .dm_conversations
+            .insert(conversation_id.to_string(), bob_key);
+        bob.known_user_keys
+            .insert(alice_user.to_string(), alice_key);
+        bob.trusted_signing_keys.insert(alice_key, alice_signing);
+        bob.dm_conversations
+            .insert(conversation_id.to_string(), alice_key);
+
+        let bob_prekeys = bob.generate_prekeys().unwrap();
+        let (one_time_prekey, one_time_prekey_id) = bob_prekeys.otk_publics[0];
+        let bundle = x3dh::PreKeyBundle {
+            identity_key: bob_key,
+            signing_key: bob_signing,
+            signed_prekey: bob_prekeys.spk_public,
+            signed_prekey_signature: bob_prekeys.spk_signature,
+            signed_prekey_id: bob_prekeys.spk_id,
+            one_time_prekey: Some(one_time_prekey),
+            one_time_prekey_id: Some(one_time_prekey_id),
+        };
+        let bob_binding = bob.device_identity.as_ref().unwrap().binding().clone();
+        let context = alice
+            .direct_v2_initiator_context(
+                conversation_id,
+                &bob_user.to_string(),
+                bob_key,
+                bob_signing,
+                DirectDeviceCoordinateV2 {
+                    device_id: bob_binding.device_id,
+                    binding_version: bob_binding.version,
+                    capabilities: bob_binding.capabilities,
+                    status: bob_binding.status,
+                    identity_key: bob_binding.device_identity_key,
+                    signing_key: bob_binding.device_signing_key,
+                    account_signature: bob_binding.account_signature,
+                },
+            )
+            .unwrap();
+        alice
+            .establish_session_classified_v2(&bob_key, &bundle, context)
+            .unwrap();
+        let session_id = alice.direct_v2_sessions.get(&bob_key).unwrap().session_id();
+        let alice_binding = alice.device_identity.as_ref().unwrap().binding().clone();
+        let alice_to_bob = MessageSecurityContextV1::DirectV2(DirectMessageSecurityContextV2 {
+            sender_user_id: alice_user.to_string(),
+            sender_device_id: alice_binding.device_id,
+            sender_binding_version: alice_binding.version,
+            sender_device_identity_key: alice_binding.device_identity_key,
+            sender_device_signing_key: alice_binding.device_signing_key,
+            sender_device_capabilities: alice_binding.capabilities,
+            sender_device_binding_status: alice_binding.status,
+            sender_account_signature: alice_binding.account_signature,
+            target_device_id: bob_binding.device_id,
+            target_binding_version: bob_binding.version,
+            direct_session_id: session_id,
+        });
+        let (ciphertext, header) = alice.encrypt_outgoing(conversation_id, "v2 first").unwrap();
+        assert_eq!(header[0], HEADER_INITIAL_V2);
+        assert_eq!(&header[1..33], session_id.as_slice());
+        match bob
+            .decrypt_from_with_security_context(
+                &alice_key,
+                conversation_id,
+                &header,
+                &ciphertext,
+                Some(&alice_to_bob),
+            )
+            .unwrap()
+        {
+            DecryptedPayload::Text(plaintext) => assert_eq!(plaintext, b"v2 first"),
+            DecryptedPayload::Control => panic!("Direct v2 text decoded as control"),
+        }
+        assert_eq!(
+            bob.direct_v2_sessions.get(&alice_key).unwrap().session_id(),
+            session_id
+        );
+        assert!(bob
+            .db()
+            .unwrap()
+            .load_all_direct_session_bindings_v2()
+            .unwrap()
+            .iter()
+            .any(|binding| binding.session_id == session_id));
+
+        let bob_to_alice = MessageSecurityContextV1::DirectV2(DirectMessageSecurityContextV2 {
+            sender_user_id: bob_user.to_string(),
+            sender_device_id: bob_binding.device_id,
+            sender_binding_version: bob_binding.version,
+            sender_device_identity_key: bob_binding.device_identity_key,
+            sender_device_signing_key: bob_binding.device_signing_key,
+            sender_device_capabilities: bob_binding.capabilities,
+            sender_device_binding_status: bob_binding.status,
+            sender_account_signature: bob_binding.account_signature,
+            target_device_id: alice_binding.device_id,
+            target_binding_version: alice_binding.version,
+            direct_session_id: session_id,
+        });
+        let (reply_ciphertext, reply_header) =
+            bob.encrypt_outgoing(conversation_id, "v2 reply").unwrap();
+        assert_eq!(reply_header[0], HEADER_RATCHET_V2);
+        match alice
+            .decrypt_from_with_security_context(
+                &bob_key,
+                conversation_id,
+                &reply_header,
+                &reply_ciphertext,
+                Some(&bob_to_alice),
+            )
+            .unwrap()
+        {
+            DecryptedPayload::Text(plaintext) => assert_eq!(plaintext, b"v2 reply"),
+            DecryptedPayload::Control => panic!("Direct v2 reply decoded as control"),
+        }
+
+        let mut substituted_context = alice_to_bob.clone();
+        let MessageSecurityContextV1::DirectV2(substituted) = &mut substituted_context else {
+            unreachable!();
+        };
+        substituted.target_binding_version += 1;
+        assert!(bob
+            .decrypt_from_with_security_context(
+                &alice_key,
+                conversation_id,
+                &header,
+                &ciphertext,
+                Some(&substituted_context),
+            )
+            .is_err());
+        assert!(bob
+            .decrypt_from_with_security_context(
+                &alice_key,
+                conversation_id,
+                &[HEADER_RATCHET],
+                b"legacy downgrade",
+                None,
+            )
+            .unwrap_err()
+            .contains("downgrade"));
     }
 
     #[test]

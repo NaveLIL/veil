@@ -203,7 +203,7 @@ const DEFAULT_SERVER_ENDPOINTS = {
   // A packaged client must never silently target an unrelated public service.
   // Production builds provide VITE_VEIL_{WS,HTTP}_URL explicitly; the safe
   // fallback is the loopback gateway used by the local Compose setup.
-  ws: "ws://127.0.0.1:9080/ws",
+  ws: "ws://127.0.0.1:9080/v3/events",
   http: "http://127.0.0.1:9080",
 } as const;
 const SERVER_ENDPOINTS_STORAGE_KEY = "veil.server-endpoints.v1";
@@ -359,7 +359,7 @@ export function nodeAccessEndpointsFromOrigin(canonicalOrigin: string): ServerEn
   }
   const ws = new URL(http.toString());
   ws.protocol = "wss:";
-  ws.pathname = "/ws";
+  ws.pathname = "/v3/events";
   return {
     ws: ws.toString(),
     http: http.toString().replace(/\/$/, ""),
@@ -393,6 +393,12 @@ function normalizeServerEndpoints(wsRaw: string, httpRaw: string): ServerEndpoin
     if ((!securePair && !localPair) || ws.host !== http.host) return null;
     if (ws.username || ws.password || ws.search || ws.hash) return null;
     if (http.username || http.password || http.search || http.hash) return null;
+    if (http.pathname !== "/") return null;
+    // One-way local configuration migration. An exact historical /ws value
+    // is credential-free and origin-equivalent, so rewrite only its path;
+    // arbitrary aliases remain rejected.
+    if (ws.pathname === "/ws") ws.pathname = "/v3/events";
+    if (ws.pathname !== "/v3/events") return null;
 
     return {
       ws: ws.toString(),

@@ -16,6 +16,7 @@
     "android": "expo run:android",
     "ios": "expo run:ios",
     "native:android": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-android-native.ps1",
+    "verify:uniffi-production-surface": "node scripts/verify-uniffi-production-surface.mjs",
     "verify:android-production-bundle": "node scripts/verify-android-production-bundle.mjs",
     "verify:android-tester-apk": "node scripts/verify-android-tester-apk.mjs",
     "test:android-tester-apk-verifier": "node --test scripts/verify-android-tester-apk.test.mjs",
@@ -23,10 +24,12 @@
     "test": "jest"
   },
   "dependencies": {
+    "@babel/runtime": "^7.29.2",
     "@react-navigation/native": "^7",
     "@react-navigation/native-stack": "^7",
     "expo": "~53.0.0",
     "expo-blur": "~14.1.5",
+    "expo-camera": "~16.1.11",
     "expo-linear-gradient": "~14.1.5",
     "expo-secure-store": "~14.2.4",
     "expo-status-bar": "~2.2.0",
@@ -36,6 +39,7 @@
     "react-native": "0.79.6",
     "react-native-gesture-handler": "~2.24.0",
     "react-native-pager-view": "6.7.1",
+    "react-native-qrcode-svg": "6.3.21",
     "react-native-reanimated": "~3.17.0",
     "react-native-safe-area-context": "5.4.0",
     "react-native-screens": "~4.11.0",
@@ -61,7 +65,7 @@
       "^lucide-react-native$": "<rootDir>/node_modules/lucide-react-native/dist/cjs/lucide-react-native.js"
     },
     "transformIgnorePatterns": [
-      "node_modules[\\\\/](?!(?:\\.pnpm[\\\\/][^\\\\/]+[\\\\/]node_modules[\\\\/])?(?:(?:jest-)?react-native(?:[\\\\/]|$)|@react-native(?:[\\\\/]|$)|expo[^\\\\/]*(?:[\\\\/]|$)|@expo(?:nent)?(?:[\\\\/]|$)|react-navigation(?:[\\\\/]|$)|@react-navigation(?:[\\\\/]|$)|react-native-svg(?:[\\\\/]|$)|lucide-react-native(?:[\\\\/]|$)))"
+      "node_modules[\\\\/](?!(?:\\.pnpm[\\\\/][^\\\\/]+[\\\\/]node_modules[\\\\/])?(?:(?:jest-)?react-native(?:[\\\\/]|$)|@react-native(?:[\\\\/]|$)|expo[^\\\\/]*(?:[\\\\/]|$)|@expo(?:nent)?(?:[\\\\/]|$)|react-navigation(?:[\\\\/]|$)|@react-navigation(?:[\\\\/]|$)|react-native-reanimated(?:[\\\\/]|$)|react-native-svg(?:[\\\\/]|$)|lucide-react-native(?:[\\\\/]|$)))"
     ]
   },
   "pnpm": {

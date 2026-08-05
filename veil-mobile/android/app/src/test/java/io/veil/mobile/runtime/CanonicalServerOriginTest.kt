@@ -10,7 +10,7 @@ class CanonicalServerOriginTest {
     val origin = CanonicalServerOrigin.parse("https://CHAT.Example")
 
     assertEquals("https://chat.example:443", origin.value)
-    assertEquals("wss://chat.example:443/ws", origin.websocketUrl)
+    assertEquals("wss://chat.example:443/v3/events", origin.websocketUrl)
   }
 
   @Test
@@ -18,7 +18,7 @@ class CanonicalServerOriginTest {
     val origin = CanonicalServerOrigin.parse("https://[2001:db8:0:0:0:0:0:1]")
 
     assertEquals("https://[2001:db8::1]:443", origin.value)
-    assertEquals("wss://[2001:db8::1]:443/ws", origin.websocketUrl)
+    assertEquals("wss://[2001:db8::1]:443/v3/events", origin.websocketUrl)
   }
 
   @Test

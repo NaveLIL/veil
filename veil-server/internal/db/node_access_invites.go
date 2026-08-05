@@ -140,6 +140,9 @@ func (db *DB) CreateUserWithNodeAccessInvite(ctx context.Context, token, identit
 	if err != nil {
 		return nil, fmt.Errorf("create invited user: %w", err)
 	}
+	if err := db.appendIdentityTransparencyAccountTx(ctx, tx, &user); err != nil {
+		return nil, fmt.Errorf("append invited user transparency event: %w", err)
+	}
 
 	tag, err := tx.Exec(ctx,
 		`UPDATE node_access_invites

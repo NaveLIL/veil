@@ -15,6 +15,7 @@ import java.nio.CharBuffer
 import java.nio.charset.CharacterCodingException
 import java.nio.charset.CodingErrorAction
 import java.nio.charset.StandardCharsets
+import java.security.MessageDigest
 import java.util.UUID
 import java.util.concurrent.CopyOnWriteArraySet
 import java.util.concurrent.Executors
@@ -25,11 +26,17 @@ import java.util.concurrent.TimeUnit
 import uniffi.veil_ffi.MobileAuthenticatedBinding
 import uniffi.veil_ffi.MobileConnectCancellation
 import uniffi.veil_ffi.MobileConnectFailureReason
+import uniffi.veil_ffi.MobileContactRequest
+import uniffi.veil_ffi.MobileContactSearchResult
+import uniffi.veil_ffi.MobileDirectConversationInstallOutcome
+import uniffi.veil_ffi.MobileDirectCreatedConversation
 import uniffi.veil_ffi.MobileDirectConversationData
 import uniffi.veil_ffi.MobileDirectDirectoryPageData
 import uniffi.veil_ffi.MobileDirectHistoryNext
 import uniffi.veil_ffi.MobileDirectHistoryOutcome
 import uniffi.veil_ffi.MobileDirectHistoryProgress
+import uniffi.veil_ffi.MobileDirectIdentityVerification
+import uniffi.veil_ffi.MobileDirectIdentityVerificationState
 import uniffi.veil_ffi.MobileDirectLiveBufferProgress
 import uniffi.veil_ffi.MobileDirectLiveReplayProgress
 import uniffi.veil_ffi.MobileDirectMessageData
@@ -46,6 +53,8 @@ import uniffi.veil_ffi.MobileDirectSyncLease
 import uniffi.veil_ffi.MobileDirectTextSendOutcome
 import uniffi.veil_ffi.MobileReconnectTarget
 import uniffi.veil_ffi.MobileRetryableReason
+import uniffi.veil_ffi.MobileWsEventsCallback
+import uniffi.veil_ffi.MobileWsEventsController
 import uniffi.veil_ffi.RestSignatureData
 import uniffi.veil_ffi.VeilException
 import uniffi.veil_ffi.VeilMobileSession
@@ -336,6 +345,44 @@ internal data class NativeDirectRestRequest(
       "body=[REDACTED], responseLimitBytes=$responseLimitBytes)"
 }
 
+/** One exact REST request prepared and signed by the authenticated Rust core. */
+internal data class NativeContactRequest(
+  val method: String,
+  val requestTarget: String,
+  val body: ByteArray,
+  val signature: NativeRestSignature,
+) {
+  override fun toString(): String =
+    "NativeContactRequest(method=$method, requestTarget=[REDACTED], " +
+      "body=[REDACTED], signature=[REDACTED])"
+}
+
+/** Validated public contact result; key bytes never cross the React bridge. */
+internal data class NativeContactSearchResult(
+  val userId: String,
+  val username: String,
+  val identityKey: ByteArray,
+  val signingKey: ByteArray,
+) {
+  override fun toString(): String =
+    "NativeContactSearchResult(userId=[REDACTED], username=[REDACTED], keys=[REDACTED])"
+}
+
+/** Strict create-DM response retained inside the native runtime. */
+internal data class NativeDirectCreatedConversation(
+  val conversationId: String,
+  val peerIdentityKey: ByteArray,
+  val peerSigningKey: ByteArray,
+) {
+  override fun toString(): String =
+    "NativeDirectCreatedConversation(conversationId=[REDACTED], peerKeys=[REDACTED])"
+}
+
+internal enum class NativeDirectConversationInstallOutcome {
+  INSTALLED,
+  ALREADY_INSTALLED,
+}
+
 /** Only the terminal publication bit crosses out of the native install call. */
 internal data class NativeDirectOwnPreKeyProgress(
   val publicationComplete: Boolean,
@@ -450,8 +497,33 @@ private fun unavailableDirectMessageProjection() = NativeDirectMessageProjection
   messages = emptyList(),
 )
 
+internal enum class NativeDirectIdentityVerificationState {
+  NOT_COMPARED,
+  VERIFIED_ON_THIS_DEVICE,
+  IDENTITY_CHANGED,
+}
+
+/** Exact account-v2 safety number approved for React Native publication. */
+internal data class NativeDirectIdentityVerification(
+  val canonicalServerOrigin: String,
+  val peerUserId: String,
+  val peerIdentityKeyHex: String,
+  val peerSigningKeyHex: String,
+  val fingerprintVersion: String,
+  val fingerprintEmoji: String,
+  val fingerprintHex: String,
+  val qrPayload: String,
+  val state: NativeDirectIdentityVerificationState,
+) {
+  override fun toString(): String =
+    "NativeDirectIdentityVerification(origin=$canonicalServerOrigin, peerUserId=[REDACTED], " +
+      "fingerprintVersion=$fingerprintVersion, fingerprint=[REDACTED], state=$state)"
+}
+
 private const val MAX_DIRECT_MESSAGE_TEXT_BYTES = 32 * 1024
 private const val MAX_DIRECT_PROJECTION_TEXT_BYTES = 1024 * 1024
+private val EXACT_LOWER_HEX_32 = Regex("^[0-9a-f]{64}$")
+private const val DIRECT_IDENTITY_QR_PREFIX_V1 = "veil-identity:account-v2:"
 
 /** Short-lived, explicitly wiped owner for one native Direct send intent. */
 internal class OwnedDirectPlaintext private constructor(
@@ -543,6 +615,28 @@ internal fun NativeDirectMessageProjection.isStructurallySafe(): Boolean {
   }
 }
 
+internal fun NativeDirectIdentityVerification.isStructurallySafe(
+  expectedOrigin: String,
+  expectedPeerUserId: String,
+): Boolean =
+  canonicalServerOrigin == expectedOrigin &&
+    peerUserId == expectedPeerUserId &&
+    isCanonicalDirectUuid(peerUserId) &&
+    EXACT_LOWER_HEX_32.matches(peerIdentityKeyHex) &&
+    EXACT_LOWER_HEX_32.matches(peerSigningKeyHex) &&
+    fingerprintVersion == "account_v2" &&
+    EXACT_LOWER_HEX_32.matches(fingerprintHex) &&
+    qrPayload == DIRECT_IDENTITY_QR_PREFIX_V1 + fingerprintHex &&
+    fingerprintEmoji.boundedUtf8Length(1024)?.let { it > 0 } == true
+
+private fun isCanonicalDirectUuid(value: String): Boolean = try {
+  val parsed = UUID.fromString(value)
+  (parsed.mostSignificantBits != 0L || parsed.leastSignificantBits != 0L) &&
+    parsed.toString() == value
+} catch (_: IllegalArgumentException) {
+  false
+}
+
 internal fun <Handle : AutoCloseable, Output> mapAndCloseAllNativeHandles(
   handles: List<Handle>,
   mapper: (Handle) -> Output,
@@ -618,12 +712,15 @@ internal fun interface NativeDirectSessionActionCallback {
 
 /** Signed REST headers produced by the authenticated native session. */
 internal data class NativeRestSignature(
+  val version: String,
   val userId: String,
   val timestampMs: String,
-  val signatureBase64: String,
+  val nonceBase64url: String,
+  val signatureBase64url: String,
 ) {
   override fun toString(): String =
-    "NativeRestSignature(userId=$userId, timestampMs=$timestampMs, signatureBase64=[REDACTED])"
+    "NativeRestSignature(version=$version, userId=$userId, timestampMs=$timestampMs, " +
+      "nonceBase64url=[REDACTED], signatureBase64url=[REDACTED])"
 }
 
 internal data class VeilMobileRuntimeSnapshot(
@@ -670,6 +767,12 @@ internal fun interface NativeConnectCancellationFactory {
 
 internal interface NativeMobileSession : AutoCloseable {
   fun mobileReconnectTarget(): NativeMobileReconnectTarget?
+
+  fun startBackgroundEvents(
+    deviceName: String,
+    clientVersion: String,
+    callback: MobileWsEventsCallback,
+  ): MobileWsEventsController
 
   fun connect(
     websocketUrl: String,
@@ -718,6 +821,18 @@ internal interface NativeMobileSession : AutoCloseable {
 
   fun projectDirectMessages(conversationId: String): NativeDirectMessageProjection
 
+  fun directIdentityVerification(conversationId: String): NativeDirectIdentityVerification?
+
+  fun confirmDirectIdentityVerification(
+    conversationId: String,
+    expectedFingerprintHex: String,
+  ): NativeDirectIdentityVerification?
+
+  fun confirmDirectIdentityVerificationQr(
+    conversationId: String,
+    scannedQrPayload: String,
+  ): NativeDirectIdentityVerification? = null
+
   fun directSendReadiness(
     leaseToken: String,
     conversationId: String,
@@ -742,6 +857,22 @@ internal interface NativeMobileSession : AutoCloseable {
   ): NativeDirectPreKeyInstall
 
   fun cancelDirectSync(leaseToken: String)
+
+  fun prepareContactSearchRequest(username: String): NativeContactRequest
+
+  fun parseContactSearchResponse(response: ByteArray): NativeContactSearchResult
+
+  fun prepareCreateDirectRequest(peerUserId: String): NativeContactRequest
+
+  fun parseCreateDirectResponse(response: ByteArray): NativeDirectCreatedConversation
+
+  fun installDirectConversation(
+    leaseToken: String,
+    conversationId: String,
+    peerUserId: String,
+    peerIdentityKey: ByteArray,
+    peerSigningKey: ByteArray,
+  ): NativeDirectConversationInstallOutcome
 
   /** Sign the exact native outstanding request bound to both capabilities. */
   fun signDirectRestRequest(
@@ -828,6 +959,8 @@ internal class VeilMobileRuntime internal constructor(
   private var reconnectBackoffScope: ReconnectBackoffScope? = null
   private var activeDirectBootstrap: ActiveDirectBootstrap? = null
   private var activeDirectSync: ActiveDirectSync? = null
+  private var verifiedContact: VerifiedContact? = null
+  private var pendingContactOperation: PendingContactOperation? = null
 
   private data class ActiveConnect(
     val session: NativeMobileSession,
@@ -954,6 +1087,34 @@ internal class VeilMobileRuntime internal constructor(
         "canonicalServerOrigin=$canonicalServerOrigin, " +
         "userId=$userId, leaseToken=[REDACTED], conversations=${conversations.size})"
   }
+
+  private class VerifiedContact(
+    val sync: ActiveDirectSync,
+    val userId: String,
+    val username: String,
+    val identityKey: ByteArray,
+    val signingKey: ByteArray,
+  ) {
+    fun clear() {
+      identityKey.fill(0)
+      signingKey.fill(0)
+    }
+
+    override fun toString(): String = "VerifiedContact(metadata=[REDACTED], keys=[REDACTED])"
+  }
+
+  private sealed interface PendingContactOperation {
+    val sync: ActiveDirectSync
+  }
+
+  private data class PendingContactSearch(
+    override val sync: ActiveDirectSync,
+  ) : PendingContactOperation
+
+  private data class PendingDirectCreate(
+    override val sync: ActiveDirectSync,
+    val peerUserId: String,
+  ) : PendingContactOperation
 
   private class PendingDirectRequest(
     val requestToken: String,
@@ -1333,6 +1494,354 @@ internal class VeilMobileRuntime internal constructor(
   ) {
     synchronized(stateLock) {
       publisher(unavailableDirectMessageProjection())
+    }
+  }
+
+  /**
+   * Publish or explicitly confirm one account-v2 safety number under the exact
+   * Direct generation shown by the caller. A stale lifecycle or malformed
+   * native record is represented only as `null`.
+   */
+  fun publishDirectIdentityVerification(
+    rawConversationId: String,
+    expectedDirectGeneration: Long,
+    expectedFingerprintHex: String?,
+    publisher: (NativeDirectIdentityVerification?) -> Unit,
+  ) = publishDirectIdentityVerificationInternal(
+    rawConversationId,
+    expectedDirectGeneration,
+    expectedFingerprintHex,
+    null,
+    publisher,
+  )
+
+  /** Confirm only an exact versioned QR payload under the same lifecycle gate. */
+  fun publishDirectIdentityVerificationQr(
+    rawConversationId: String,
+    expectedDirectGeneration: Long,
+    scannedQrPayload: String,
+    publisher: (NativeDirectIdentityVerification?) -> Unit,
+  ) = publishDirectIdentityVerificationInternal(
+    rawConversationId,
+    expectedDirectGeneration,
+    null,
+    scannedQrPayload,
+    publisher,
+  )
+
+  private fun publishDirectIdentityVerificationInternal(
+    rawConversationId: String,
+    expectedDirectGeneration: Long,
+    expectedFingerprintHex: String?,
+    scannedQrPayload: String?,
+    publisher: (NativeDirectIdentityVerification?) -> Unit,
+  ) {
+    val conversationId = try {
+      UUID.fromString(rawConversationId).toString()
+    } catch (_: IllegalArgumentException) {
+      synchronized(stateLock) { publisher(null) }
+      return
+    }
+    if (
+      conversationId != rawConversationId ||
+      expectedDirectGeneration < 1L ||
+      expectedFingerprintHex?.let { !EXACT_LOWER_HEX_32.matches(it) } == true ||
+      scannedQrPayload?.let {
+        it.length != DIRECT_IDENTITY_QR_PREFIX_V1.length + 64 ||
+          !it.startsWith(DIRECT_IDENTITY_QR_PREFIX_V1) ||
+          !EXACT_LOWER_HEX_32.matches(it.removePrefix(DIRECT_IDENTITY_QR_PREFIX_V1))
+      } == true ||
+      (expectedFingerprintHex != null && scannedQrPayload != null)
+    ) {
+      synchronized(stateLock) { publisher(null) }
+      return
+    }
+
+    val target = synchronized(stateLock) {
+      val active = session
+      val currentBinding = binding
+      val sync = activeDirectSync
+      if (
+        !foreground ||
+        active == null ||
+        currentBinding == null ||
+        sync == null ||
+        sync.generation != expectedDirectGeneration ||
+        !isCurrentDirectSyncLocked(sync) ||
+        sync.session !== active ||
+        sessionState != NativeSessionState.OPEN ||
+        connectionState != NativeConnectionState.CONNECTED ||
+        !directoryReady ||
+        !sync.conversations.containsKey(conversationId) ||
+        directConversations.none { it.conversationId == conversationId }
+      ) {
+        null
+      } else {
+        DirectProjectionTarget(active, lifecycleEpoch, currentBinding, sync)
+      }
+    }
+    if (target == null) {
+      synchronized(stateLock) { publisher(null) }
+      return
+    }
+
+    val verification = try {
+      if (expectedFingerprintHex != null) {
+        target.session.confirmDirectIdentityVerification(
+          conversationId,
+          expectedFingerprintHex,
+        )
+      } else if (scannedQrPayload != null) {
+        target.session.confirmDirectIdentityVerificationQr(
+          conversationId,
+          scannedQrPayload,
+        )
+      } else {
+        target.session.directIdentityVerification(conversationId)
+      }
+    } catch (_: Throwable) {
+      null
+    }
+    val expectedPeerUserId = target.directSync.conversations[conversationId]?.peerUserId
+    val structurallySafe = expectedPeerUserId != null && verification?.isStructurallySafe(
+      target.binding.canonicalServerOrigin,
+      expectedPeerUserId,
+    ) == true
+    synchronized(stateLock) {
+      val selected = if (
+        structurallySafe &&
+        foreground &&
+        session === target.session &&
+        lifecycleEpoch == target.lifecycleEpoch &&
+        binding == target.binding &&
+        activeDirectSync === target.directSync &&
+        target.directSync.generation == expectedDirectGeneration &&
+        isCurrentDirectSyncLocked(target.directSync) &&
+        sessionState == NativeSessionState.OPEN &&
+        connectionState == NativeConnectionState.CONNECTED &&
+        directoryReady &&
+        target.directSync.conversations[conversationId]?.peerUserId == expectedPeerUserId &&
+        directConversations.any { it.conversationId == conversationId }
+      ) {
+        verification
+      } else {
+        null
+      }
+      publisher(selected)
+    }
+  }
+
+  /** Prepare one account/origin-bound exact contact lookup under the Ready lease. */
+  fun prepareContactSearchRequest(username: String): NativeContactRequest {
+    val sync = synchronized(stateLock) {
+      val selected = currentContactSyncLocked()
+        ?: throw VeilMobileRuntimeException("E_VEIL_DIRECT", "Direct messaging is unavailable")
+      clearVerifiedContactLocked()
+      pendingContactOperation = PendingContactSearch(selected)
+      selected
+    }
+    val prepared = try {
+      sync.session.prepareContactSearchRequest(username)
+    } catch (error: Throwable) {
+      synchronized(stateLock) {
+        if ((pendingContactOperation as? PendingContactSearch)?.sync === sync) {
+          pendingContactOperation = null
+        }
+      }
+      throw error
+    }
+    val accepted = synchronized(stateLock) {
+      currentContactSyncLocked() === sync &&
+        (pendingContactOperation as? PendingContactSearch)?.sync === sync &&
+        prepared.method == HTTP_GET_METHOD &&
+        prepared.requestTarget.startsWith(CONTACT_SEARCH_TARGET_PREFIX) &&
+        prepared.body.isEmpty() &&
+        prepared.signature.version == REST_AUTH_VERSION &&
+        prepared.signature.userId == sync.userId
+    }
+    if (!accepted) {
+      prepared.body.fill(0)
+      synchronized(stateLock) {
+        if ((pendingContactOperation as? PendingContactSearch)?.sync === sync) {
+          pendingContactOperation = null
+        }
+      }
+      throw VeilMobileRuntimeException("E_VEIL_DIRECT", "Direct messaging is unavailable")
+    }
+    return prepared
+  }
+
+  /** Parse and retain the exact peer keys without publishing them to React Native. */
+  fun parseContactSearchResponse(response: ByteArray): NativeContactSearchResult {
+    val sync = synchronized(stateLock) {
+      val pending = pendingContactOperation as? PendingContactSearch
+      val selected = currentContactSyncLocked()
+      if (pending == null || selected !== pending.sync) null else selected
+    } ?: run {
+      response.fill(0)
+      throw VeilMobileRuntimeException("E_VEIL_DIRECT", "Direct messaging is unavailable")
+    }
+    val parsed = sync.session.parseContactSearchResponse(response)
+    val accepted = synchronized(stateLock) {
+      val pending = pendingContactOperation as? PendingContactSearch
+      if (currentContactSyncLocked() !== sync || pending?.sync !== sync) {
+        false
+      } else {
+        clearVerifiedContactLocked()
+        verifiedContact = VerifiedContact(
+          sync = sync,
+          userId = parsed.userId,
+          username = parsed.username,
+          identityKey = parsed.identityKey,
+          signingKey = parsed.signingKey,
+        )
+        pendingContactOperation = null
+        true
+      }
+    }
+    if (!accepted) {
+      parsed.identityKey.fill(0)
+      parsed.signingKey.fill(0)
+      throw VeilMobileRuntimeException("E_VEIL_DIRECT", "Direct messaging is unavailable")
+    }
+    return parsed
+  }
+
+  /** Prepare create-DM only for the peer keys pinned by the latest exact lookup. */
+  fun prepareCreateDirectRequest(peerUserId: String): NativeContactRequest {
+    val selection = synchronized(stateLock) {
+      val sync = currentContactSyncLocked()
+      val contact = verifiedContact
+      if (sync == null || contact == null || contact.sync !== sync || contact.userId != peerUserId) {
+        null
+      } else {
+        pendingContactOperation = PendingDirectCreate(sync, peerUserId)
+        Pair(sync, contact)
+      }
+    } ?: throw VeilMobileRuntimeException("E_VEIL_DIRECT", "Direct messaging is unavailable")
+    val (sync, _) = selection
+    val prepared = try {
+      sync.session.prepareCreateDirectRequest(peerUserId)
+    } catch (error: Throwable) {
+      synchronized(stateLock) {
+        if ((pendingContactOperation as? PendingDirectCreate)?.sync === sync) {
+          pendingContactOperation = null
+        }
+      }
+      throw error
+    }
+    val accepted = synchronized(stateLock) {
+      val pending = pendingContactOperation as? PendingDirectCreate
+      val contact = verifiedContact
+      currentContactSyncLocked() === sync &&
+        pending?.sync === sync &&
+        pending.peerUserId == peerUserId &&
+        contact?.sync === sync &&
+        contact.userId == peerUserId &&
+        prepared.method == HTTP_POST_METHOD &&
+        prepared.requestTarget == CREATE_DIRECT_TARGET &&
+        prepared.body.isNotEmpty() &&
+        prepared.body.size <= MAX_CONTACT_REQUEST_BODY_BYTES &&
+        prepared.signature.version == REST_AUTH_VERSION &&
+        prepared.signature.userId == sync.userId
+    }
+    if (!accepted) {
+      prepared.body.fill(0)
+      synchronized(stateLock) {
+        if ((pendingContactOperation as? PendingDirectCreate)?.sync === sync) {
+          pendingContactOperation = null
+        }
+      }
+      throw VeilMobileRuntimeException("E_VEIL_DIRECT", "Direct messaging is unavailable")
+    }
+    return prepared
+  }
+
+  /**
+   * Parse, cross-check, durably install, and publish one create-DM response.
+   * The response-supplied keys must exactly match the independent contact
+   * lookup, so neither endpoint can silently substitute the peer identity.
+   */
+  fun completeCreateDirectResponse(response: ByteArray): String {
+    val selection = synchronized(stateLock) {
+      val pending = pendingContactOperation as? PendingDirectCreate
+      val sync = currentContactSyncLocked()
+      val contact = verifiedContact
+      if (
+        pending == null || sync == null || pending.sync !== sync ||
+        contact == null || contact.sync !== sync || contact.userId != pending.peerUserId
+      ) {
+        null
+      } else {
+        Pair(sync, contact)
+      }
+    } ?: run {
+      response.fill(0)
+      throw VeilMobileRuntimeException("E_VEIL_DIRECT", "Direct messaging is unavailable")
+    }
+    val (sync, contact) = selection
+    val created = sync.session.parseCreateDirectResponse(response)
+    try {
+      if (
+        !MessageDigest.isEqual(contact.identityKey, created.peerIdentityKey) ||
+        !MessageDigest.isEqual(contact.signingKey, created.peerSigningKey)
+      ) {
+        throw VeilMobileRuntimeException("E_VEIL_DIRECT", "The peer identity changed during setup")
+      }
+      val stillCurrent = synchronized(stateLock) {
+        val pending = pendingContactOperation as? PendingDirectCreate
+        currentContactSyncLocked() === sync &&
+          pending?.sync === sync &&
+          pending.peerUserId == contact.userId &&
+          verifiedContact === contact
+      }
+      if (!stillCurrent) {
+        throw VeilMobileRuntimeException("E_VEIL_DIRECT", "Direct messaging is unavailable")
+      }
+      sync.session.installDirectConversation(
+        leaseToken = sync.leaseToken,
+        conversationId = created.conversationId,
+        peerUserId = contact.userId,
+        peerIdentityKey = contact.identityKey.copyOf(),
+        peerSigningKey = contact.signingKey.copyOf(),
+      )
+      val installed = synchronized(stateLock) {
+        val pending = pendingContactOperation as? PendingDirectCreate
+        if (
+          currentContactSyncLocked() !== sync || pending?.sync !== sync ||
+          pending.peerUserId != contact.userId || verifiedContact !== contact
+        ) {
+          false
+        } else {
+          val conversation = NativeDirectConversationInstall(
+            conversationId = created.conversationId,
+            name = contact.username,
+            peerUserId = contact.userId,
+            peerUsername = contact.username,
+            needsPreKey = true,
+          )
+          val previous = sync.conversations[created.conversationId]
+          check(previous == null || previous.peerUserId == contact.userId) {
+            "native Direct create collided with another peer"
+          }
+          check(previous != null || sync.conversations.size < MAX_DIRECT_CONVERSATIONS) {
+            "native Direct conversation bound exhausted"
+          }
+          sync.conversations[created.conversationId] = conversation
+          directConversations = sync.conversations.values.sortedBy { it.conversationId }
+          pendingContactOperation = null
+          clearVerifiedContactLocked()
+          true
+        }
+      }
+      if (!installed) {
+        throw VeilMobileRuntimeException("E_VEIL_DIRECT", "Direct messaging is unavailable")
+      }
+      publishSnapshot()
+      return created.conversationId
+    } finally {
+      created.peerIdentityKey.fill(0)
+      created.peerSigningKey.fill(0)
     }
   }
 
@@ -3595,6 +4104,26 @@ internal class VeilMobileRuntime internal constructor(
   }
 
   /** Caller holds [stateLock]. */
+  private fun currentContactSyncLocked(): ActiveDirectSync? {
+    val sync = activeDirectSync ?: return null
+    return sync.takeIf {
+      isCurrentDirectSyncLocked(it) &&
+        directoryReady &&
+        ownPreKeyState == NativeOwnPreKeyState.PUBLISHED &&
+        directDirectoryState == NativeDirectDirectoryState.SYNCHRONIZED &&
+        directHistoryState == NativeDirectHistoryState.SYNCHRONIZED &&
+        it.pendingRequest == null &&
+        it.directSessionAction == null
+    }
+  }
+
+  /** Caller holds [stateLock]. */
+  private fun clearVerifiedContactLocked() {
+    verifiedContact?.clear()
+    verifiedContact = null
+  }
+
+  /** Caller holds [stateLock]. */
   private fun hasTerminalErrorLocked(): Boolean =
     sessionState == NativeSessionState.ERROR ||
       connectionState == NativeConnectionState.ERROR ||
@@ -3653,6 +4182,8 @@ internal class VeilMobileRuntime internal constructor(
   ): DetachedDirectSync? {
     val selected = activeDirectSync
     activeDirectSync = null
+    pendingContactOperation = null
+    clearVerifiedContactLocked()
     val pendingCall = selected?.pendingRequest?.call
     val directAction = selected?.directSessionAction
     // Cancel under the same lock that revokes the generation. This closes the
@@ -4118,18 +4649,36 @@ internal class VeilMobileRuntime internal constructor(
   fun startBackgroundEvents(
     deviceName: String,
     clientVersion: String,
-    callback: io.veil.mobile.MobileWsEventsCallback,
-  ): io.veil.mobile.MobileWsEventsController? {
+    callback: MobileWsEventsCallback,
+  ): MobileWsEventsController? {
     return synchronized(stateLock) {
       session?.startBackgroundEvents(deviceName, clientVersion, callback)
+    }
+  }
+
+  /** Wake the single serialized Direct event consumer without exposing raw
+   * authenticated event data to Android or JavaScript. */
+  fun onBackgroundEventsReady() {
+    execute {
+      val sync = synchronized(stateLock) {
+        activeDirectSync?.takeIf { current ->
+          isCurrentDirectSyncLocked(current) && directoryReady
+        }
+      }
+      if (sync != null) runContinuousDirectLiveReplay(sync)
     }
   }
 
   companion object {
     private const val HTTP_GET_METHOD = "GET"
     private const val HTTP_POST_METHOD = "POST"
+    private const val REST_AUTH_VERSION = "2"
+    private const val CONTACT_SEARCH_TARGET_PREFIX = "/v1/users/search?username="
+    private const val CREATE_DIRECT_TARGET = "/v1/conversations/dm"
+    private const val MAX_CONTACT_REQUEST_BODY_BYTES = 4 * 1024
     private const val OWN_PREKEY_UPLOAD_TARGET = "/v1/prekeys"
-    private val PEER_PREKEY_TARGET = Regex("^/v1/prekeys/[0-9a-f]{64}$")
+    private val PEER_PREKEY_TARGET =
+      Regex("^/v1/prekeys/[0-9a-f]{64}\\?transparency_from_size=(0|[1-9][0-9]{0,18})$")
     private const val MAX_OWN_PREKEY_REQUESTS = 2
     private const val SECURE_DIRECT_BOOTSTRAP_ERROR = "Unable to complete the secure Direct bootstrap"
     private const val MAX_DIRECT_CONVERSATIONS = 10_000
@@ -4189,6 +4738,12 @@ private class UniFfiMobileSession(
 ) : NativeMobileSession {
   override fun mobileReconnectTarget(): NativeMobileReconnectTarget? =
     delegate.mobileReconnectTarget()?.toNativeMobileReconnectTarget()
+
+  override fun startBackgroundEvents(
+    deviceName: String,
+    clientVersion: String,
+    callback: MobileWsEventsCallback,
+  ): MobileWsEventsController = delegate.startBackgroundEvents(deviceName, clientVersion, callback)
 
   override fun connect(
     websocketUrl: String,
@@ -4269,6 +4824,24 @@ private class UniFfiMobileSession(
   override fun projectDirectMessages(conversationId: String): NativeDirectMessageProjection =
     delegate.projectDirectMessages(conversationId).toNativeDirectMessageProjection()
 
+  override fun directIdentityVerification(conversationId: String):
+    NativeDirectIdentityVerification? =
+    delegate.directIdentityVerification(conversationId)?.toNativeDirectIdentityVerification()
+
+  override fun confirmDirectIdentityVerification(
+    conversationId: String,
+    expectedFingerprintHex: String,
+  ): NativeDirectIdentityVerification? =
+    delegate.confirmDirectIdentityVerification(conversationId, expectedFingerprintHex)
+      ?.toNativeDirectIdentityVerification()
+
+  override fun confirmDirectIdentityVerificationQr(
+    conversationId: String,
+    scannedQrPayload: String,
+  ): NativeDirectIdentityVerification? =
+    delegate.confirmDirectIdentityVerificationQr(conversationId, scannedQrPayload)
+      ?.toNativeDirectIdentityVerification()
+
   override fun directSendReadiness(
     leaseToken: String,
     conversationId: String,
@@ -4296,6 +4869,45 @@ private class UniFfiMobileSession(
   ): NativeDirectPreKeyInstall =
     delegate.installDirectPrekeyBundle(leaseToken, requestToken, conversationId, response)
       .toNativeDirectPreKeyInstall()
+
+  override fun prepareContactSearchRequest(username: String): NativeContactRequest =
+    delegate.prepareContactSearchRequest(username).toNativeContactRequest()
+
+  override fun parseContactSearchResponse(response: ByteArray): NativeContactSearchResult =
+    try {
+      delegate.parseContactSearchResponse(response).toNativeContactSearchResult()
+    } finally {
+      response.fill(0)
+    }
+
+  override fun prepareCreateDirectRequest(peerUserId: String): NativeContactRequest =
+    delegate.prepareCreateDirectRequest(peerUserId).toNativeContactRequest()
+
+  override fun parseCreateDirectResponse(response: ByteArray): NativeDirectCreatedConversation =
+    try {
+      delegate.parseCreateDirectResponse(response).toNativeDirectCreatedConversation()
+    } finally {
+      response.fill(0)
+    }
+
+  override fun installDirectConversation(
+    leaseToken: String,
+    conversationId: String,
+    peerUserId: String,
+    peerIdentityKey: ByteArray,
+    peerSigningKey: ByteArray,
+  ): NativeDirectConversationInstallOutcome = try {
+    delegate.installDirectConversation(
+      leaseToken,
+      conversationId,
+      peerUserId,
+      peerIdentityKey,
+      peerSigningKey,
+    ).toNativeDirectConversationInstallOutcome()
+  } finally {
+    peerIdentityKey.fill(0)
+    peerSigningKey.fill(0)
+  }
 
   override fun cancelDirectSync(leaseToken: String) {
     delegate.cancelDirectSync(leaseToken)
@@ -4456,6 +5068,26 @@ private fun MobileDirectMessageData.toNativeDirectMessageView(): NativeDirectMes
     },
   )
 
+internal fun MobileDirectIdentityVerification.toNativeDirectIdentityVerification():
+  NativeDirectIdentityVerification = NativeDirectIdentityVerification(
+  canonicalServerOrigin = canonicalServerOrigin,
+  peerUserId = peerUserId,
+  peerIdentityKeyHex = peerIdentityKeyHex,
+  peerSigningKeyHex = peerSigningKeyHex,
+  fingerprintVersion = fingerprintVersion,
+  fingerprintEmoji = fingerprintEmoji,
+  fingerprintHex = fingerprintHex,
+  qrPayload = qrPayload,
+  state = when (state) {
+    MobileDirectIdentityVerificationState.NOT_COMPARED ->
+      NativeDirectIdentityVerificationState.NOT_COMPARED
+    MobileDirectIdentityVerificationState.VERIFIED_ON_THIS_DEVICE ->
+      NativeDirectIdentityVerificationState.VERIFIED_ON_THIS_DEVICE
+    MobileDirectIdentityVerificationState.IDENTITY_CHANGED ->
+      NativeDirectIdentityVerificationState.IDENTITY_CHANGED
+  },
+)
+
 internal fun MobileDirectPreKeyResult.toNativeDirectPreKeyInstall(): NativeDirectPreKeyInstall =
   NativeDirectPreKeyInstall(
     status = when (status) {
@@ -4484,11 +5116,53 @@ internal fun MobileDirectTextSendOutcome.toNativeDirectTextSendOutcome(): Native
     MobileDirectTextSendOutcome.UNAVAILABLE -> NativeDirectTextSendOutcome.UNAVAILABLE
   }
 
+internal fun MobileContactRequest.toNativeContactRequest(): NativeContactRequest {
+  val ownedBody = body.copyOf()
+  body.fill(0)
+  return NativeContactRequest(
+    method = method,
+    requestTarget = target,
+    body = ownedBody,
+    signature = signatureData.toNativeRestSignature(),
+  )
+}
+
+internal fun MobileContactSearchResult.toNativeContactSearchResult(): NativeContactSearchResult =
+  NativeContactSearchResult(
+    userId = userId,
+    username = username,
+    identityKey = identityKey.copyOf(),
+    signingKey = signingKey.copyOf(),
+  ).also {
+    identityKey.fill(0)
+    signingKey.fill(0)
+  }
+
+internal fun MobileDirectCreatedConversation.toNativeDirectCreatedConversation():
+  NativeDirectCreatedConversation =
+  NativeDirectCreatedConversation(
+    conversationId = conversationId,
+    peerIdentityKey = peerIdentityKey.copyOf(),
+    peerSigningKey = peerSigningKey.copyOf(),
+  ).also {
+    peerIdentityKey.fill(0)
+    peerSigningKey.fill(0)
+  }
+
+internal fun MobileDirectConversationInstallOutcome.toNativeDirectConversationInstallOutcome():
+  NativeDirectConversationInstallOutcome = when (this) {
+  MobileDirectConversationInstallOutcome.INSTALLED -> NativeDirectConversationInstallOutcome.INSTALLED
+  MobileDirectConversationInstallOutcome.ALREADY_INSTALLED ->
+    NativeDirectConversationInstallOutcome.ALREADY_INSTALLED
+}
+
 internal fun RestSignatureData.toNativeRestSignature(): NativeRestSignature =
   NativeRestSignature(
+    version = version,
     userId = userId,
     timestampMs = timestampMs,
-    signatureBase64 = signatureBase64,
+    nonceBase64url = nonceBase64url,
+    signatureBase64url = signatureBase64url,
   )
 
 private fun NativeMobileSession.closeQuietly() {

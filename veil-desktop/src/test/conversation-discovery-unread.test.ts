@@ -15,7 +15,7 @@ const CIRCLE_ID = "550e8400-e29b-41d4-a716-446655440010";
 const OTHER_ID = "550e8400-e29b-41d4-a716-446655440020";
 
 beforeEach(() => {
-  vi.stubEnv("VITE_VEIL_WS_URL", "ws://127.0.0.1:9080/ws");
+  vi.stubEnv("VITE_VEIL_WS_URL", "ws://127.0.0.1:9080/v3/events");
   vi.stubEnv("VITE_VEIL_HTTP_URL", "http://127.0.0.1:9080");
   mocks.handlers.clear();
   mocks.listen.mockReset();

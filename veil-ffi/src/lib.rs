@@ -1,3 +1,4 @@
+use base64::Engine as _;
 use bip39::Mnemonic;
 use rand::{rngs::OsRng, seq::SliceRandom, RngCore};
 use std::{
@@ -5,15 +6,14 @@ use std::{
     future::Future,
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
-    time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::Notify;
-use veil_crypto::{
-    aead, fingerprint, kdf, keys, ratchet, share, signature, x3dh, IdentityKeyPair, RatchetSession,
-};
+#[cfg(test)]
+use veil_crypto::{fingerprint, signature};
+use veil_crypto::{keys, IdentityKeyPair};
 use zeroize::{Zeroize, Zeroizing};
 
 uniffi::setup_scaffolding!();
@@ -57,54 +57,17 @@ pub enum VeilError {
 
 // ── Record types (plain data, serialized across FFI) ────────
 
-#[derive(uniffi::Record)]
-pub struct AeadResult {
-    pub ciphertext: Vec<u8>,
-    pub nonce: Vec<u8>,
-}
-
-#[derive(uniffi::Record)]
-pub struct FingerprintResult {
-    pub emoji: String,
-    pub hex: String,
-}
-
-#[derive(uniffi::Record)]
-pub struct RatchetMessage {
-    pub header: Vec<u8>,
-    pub ciphertext: Vec<u8>,
-}
-
-#[derive(uniffi::Record)]
-pub struct ShareBundle {
-    pub ciphertext: Vec<u8>,
-    pub content_key: Vec<u8>,
-    pub wrapped_key: Option<Vec<u8>>,
-    pub salt: Option<Vec<u8>>,
-}
-
-#[derive(uniffi::Record)]
-pub struct X3dhResultData {
-    pub shared_secret: Vec<u8>,
-    pub ephemeral_public: Vec<u8>,
-    pub associated_data: Vec<u8>,
+#[cfg(test)]
+#[derive(Debug)]
+struct FingerprintResult {
+    emoji: String,
+    hex: String,
 }
 
 #[derive(uniffi::Record)]
 pub struct KeyBundleData {
     pub identity_key: Vec<u8>,
     pub signing_key: Vec<u8>,
-}
-
-#[derive(uniffi::Record)]
-pub struct PreKeyBundleData {
-    pub identity_key: Vec<u8>,
-    pub signing_key: Vec<u8>,
-    pub signed_prekey: Vec<u8>,
-    pub signed_prekey_signature: Vec<u8>,
-    pub signed_prekey_id: u32,
-    pub one_time_prekey: Option<Vec<u8>>,
-    pub one_time_prekey_id: Option<u32>,
 }
 
 #[derive(Clone, Eq, PartialEq, uniffi::Record)]
@@ -230,12 +193,16 @@ pub struct MobileContactSearchResult {
 /// treated as hostile, mirroring the bounded-response rule used by every
 /// other mobile Direct route.
 const MOBILE_DIRECT_CREATE_RESPONSE_LIMIT: usize = 4 * 1024;
+const MOBILE_CONTACT_SEARCH_RESPONSE_LIMIT: usize = 16 * 1024;
 
-/// Parsed result of one POST /v1/dms response. Only the canonical
-/// conversation ID crosses the FFI boundary; the raw body is wiped.
+/// Parsed result of one POST /v1/conversations/dm response. Peer keys are
+/// returned only so the platform runtime can compare them with the separately
+/// authenticated contact lookup before installing the conversation.
 #[derive(Debug, uniffi::Record)]
 pub struct MobileDirectCreatedConversation {
     pub conversation_id: String,
+    pub peer_identity_key: Vec<u8>,
+    pub peer_signing_key: Vec<u8>,
 }
 
 /// Terminal outcome of registering one created Direct conversation under
@@ -490,6 +457,30 @@ pub enum MobileDirectSendReadiness {
     Unavailable,
 }
 
+/// Device-local result of comparing one exact account-v2 safety number.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, uniffi::Enum)]
+pub enum MobileDirectIdentityVerificationState {
+    NotCompared,
+    VerifiedOnThisDevice,
+    IdentityChanged,
+}
+
+/// Public comparison material for one exact authenticated Direct route. No
+/// device secret, ratchet key, prekey, signature capability, or raw DB handle
+/// crosses this boundary.
+#[derive(Debug, uniffi::Record)]
+pub struct MobileDirectIdentityVerification {
+    pub canonical_server_origin: String,
+    pub peer_user_id: String,
+    pub peer_identity_key_hex: String,
+    pub peer_signing_key_hex: String,
+    pub fingerprint_version: String,
+    pub fingerprint_emoji: String,
+    pub fingerprint_hex: String,
+    pub qr_payload: String,
+    pub state: MobileDirectIdentityVerificationState,
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq, uniffi::Enum)]
 pub enum MobileDirectMessageDirection {
     Incoming,
@@ -559,6 +550,33 @@ fn unavailable_mobile_direct_message_projection() -> MobileDirectMessageProjecti
     MobileDirectMessageProjection {
         availability: MobileDirectMessageProjectionAvailability::Unavailable,
         messages: Vec::new(),
+    }
+}
+
+fn mobile_direct_identity_verification(
+    view: veil_client::api::DirectIdentityVerificationV2,
+) -> MobileDirectIdentityVerification {
+    let state = match view.proof {
+        veil_client::api::DirectIdentityVerificationProofV2::NotCompared => {
+            MobileDirectIdentityVerificationState::NotCompared
+        }
+        veil_client::api::DirectIdentityVerificationProofV2::VerifiedOnThisDevice => {
+            MobileDirectIdentityVerificationState::VerifiedOnThisDevice
+        }
+        veil_client::api::DirectIdentityVerificationProofV2::IdentityChanged => {
+            MobileDirectIdentityVerificationState::IdentityChanged
+        }
+    };
+    MobileDirectIdentityVerification {
+        canonical_server_origin: view.canonical_server_origin,
+        peer_user_id: view.peer_user_id,
+        peer_identity_key_hex: hex::encode(view.peer_identity_key),
+        peer_signing_key_hex: hex::encode(view.peer_signing_key),
+        fingerprint_version: "account_v2".to_string(),
+        fingerprint_emoji: view.fingerprint_emoji,
+        fingerprint_hex: view.fingerprint_hex,
+        qr_payload: view.qr_payload,
+        state,
     }
 }
 
@@ -634,6 +652,30 @@ fn mobile_direct_projection_scope(
     matches.then_some((self_identity_key, peer.identity_key))
 }
 
+fn exact_mobile_direct_identity_verification(
+    client: &veil_client::api::VeilClient,
+    state: &MobileDirectSyncState,
+    conversation_id: &str,
+) -> Option<veil_client::api::DirectIdentityVerificationV2> {
+    if mobile_direct_projection_availability(
+        client.direct_conversation_availability_v1(conversation_id),
+    ) != MobileDirectMessageProjectionAvailability::Available
+        || state.blocked_conversations.contains_key(conversation_id)
+        || mobile_direct_projection_scope(client, state, conversation_id).is_none()
+    {
+        return None;
+    }
+    let peer = state.peers.get(conversation_id)?;
+    let view = client
+        .direct_identity_verification_v2(conversation_id)
+        .ok()?;
+    (view.canonical_server_origin == state.epoch.binding.canonical_server_origin
+        && view.peer_user_id == peer.user_id
+        && view.peer_identity_key == peer.identity_key
+        && view.peer_signing_key == peer.signing_key)
+        .then_some(view)
+}
+
 /// The caller must hold `direct_sync -> binding -> client`; all authority
 /// checks themselves stay centralized here so a future atomic send cannot
 /// accidentally omit the exact token, Ready phase, or epoch binding.
@@ -679,6 +721,63 @@ fn mobile_direct_prekey_unavailable_error() -> VeilError {
     }
 }
 
+/// Mobile witness trust is compiled into the native library so JavaScript and
+/// a compromised Node cannot replace it at runtime. Ordinary self-hosted
+/// builds leave both values absent and retain the unwitnessed compatibility
+/// path; a partially configured release fails closed on every prekey install.
+fn mobile_transparency_witness_policy_v1(
+) -> Result<Option<veil_client::transparency::TransparencyWitnessPolicyV1>, VeilError> {
+    const KEYS: Option<&str> = option_env!("VEIL_IDENTITY_TRANSPARENCY_WITNESS_KEYS");
+    const QUORUM: Option<&str> = option_env!("VEIL_IDENTITY_TRANSPARENCY_WITNESS_QUORUM");
+    let (keys, quorum) = match (KEYS, QUORUM) {
+        (None, None) | (Some(""), Some("")) => return Ok(None),
+        (Some(keys), Some(quorum)) if !keys.is_empty() && !quorum.is_empty() => (keys, quorum),
+        _ => {
+            return Err(VeilError::Session {
+                msg: "mobile transparency witness policy is incomplete".to_string(),
+            });
+        }
+    };
+    if keys.len() > 32 * 65 - 1 {
+        return Err(VeilError::Session {
+            msg: "mobile transparency witness policy is oversized".to_string(),
+        });
+    }
+    let threshold = quorum.parse::<u16>().map_err(|_| VeilError::Session {
+        msg: "mobile transparency witness quorum is invalid".to_string(),
+    })?;
+    if threshold.to_string() != quorum {
+        return Err(VeilError::Session {
+            msg: "mobile transparency witness quorum is non-canonical".to_string(),
+        });
+    }
+    let mut parsed = Vec::new();
+    for encoded in keys.split(',') {
+        if encoded.len() != 64 {
+            return Err(VeilError::Session {
+                msg: "mobile transparency witness key is invalid".to_string(),
+            });
+        }
+        let decoded = hex::decode(encoded).map_err(|_| VeilError::Session {
+            msg: "mobile transparency witness key is invalid".to_string(),
+        })?;
+        if hex::encode(&decoded) != encoded {
+            return Err(VeilError::Session {
+                msg: "mobile transparency witness key is non-canonical".to_string(),
+            });
+        }
+        let key: [u8; 32] = decoded.try_into().map_err(|_| VeilError::Session {
+            msg: "mobile transparency witness key length is invalid".to_string(),
+        })?;
+        parsed.push(key);
+    }
+    veil_client::transparency::TransparencyWitnessPolicyV1::new(threshold, parsed)
+        .map(Some)
+        .map_err(|_| VeilError::Session {
+            msg: "mobile transparency witness policy is invalid".to_string(),
+        })
+}
+
 /// Revoke one already-locked mobile Direct epoch after transport loss or a
 /// native invariant failure. Callers must retain `direct_sync -> binding ->
 /// client` while invoking this helper.
@@ -721,9 +820,11 @@ fn mobile_direct_live_buffer_error(error: veil_client::api::DirectLiveBufferErro
 
 #[derive(Debug, uniffi::Record)]
 pub struct RestSignatureData {
+    pub version: String,
     pub user_id: String,
     pub timestamp_ms: String,
-    pub signature_base64: String,
+    pub nonce_base64url: String,
+    pub signature_base64url: String,
 }
 
 // ── VeilIdentity (opaque object) ────────────────────────────
@@ -740,14 +841,6 @@ impl VeilIdentity {
         Arc::new(Self {
             inner: IdentityKeyPair::generate(),
         })
-    }
-
-    #[uniffi::constructor]
-    /// Compatibility constructor for non-mobile callers. Android must use
-    /// `from_mnemonic_bytes` so its decrypted mnemonic never becomes a JVM
-    /// `String`.
-    pub fn from_mnemonic(mnemonic: String) -> Result<Arc<Self>, VeilError> {
-        Self::from_mnemonic_bytes(mnemonic.into_bytes())
     }
 
     #[uniffi::constructor]
@@ -768,10 +861,6 @@ impl VeilIdentity {
 
     pub fn signing_key(&self) -> Vec<u8> {
         self.inner.ed25519_public_bytes().to_vec()
-    }
-
-    pub fn sign(&self, message: Vec<u8>) -> Vec<u8> {
-        signature::sign(&self.inner, &message).to_vec()
     }
 
     pub fn to_key_bundle(&self) -> KeyBundleData {
@@ -1183,6 +1272,48 @@ pub struct MobileWsEventsController {
     network_hint: Arc<Notify>,
 }
 
+/// Session-owned registration for exactly one background supervisor. Keeping
+/// the cancellation capability in `VeilMobileSession` means logout and a
+/// foreground connection attempt can revoke the socket even if Kotlin loses
+/// its controller object during an Android lifecycle transition.
+struct MobileBackgroundEventsRegistration {
+    active: Arc<AtomicBool>,
+    cancel_slot: Arc<Mutex<Option<tokio::sync::watch::Sender<bool>>>>,
+}
+
+impl Drop for MobileBackgroundEventsRegistration {
+    fn drop(&mut self) {
+        match self.cancel_slot.lock() {
+            Ok(mut slot) => *slot = None,
+            Err(poisoned) => *poisoned.into_inner() = None,
+        }
+        self.active.store(false, Ordering::Release);
+    }
+}
+
+/// Clears the exact client-side background authentication binding on every
+/// session exit, including future cancellation or task abort.
+struct MobileBackgroundClientBinding {
+    client: Arc<Mutex<veil_client::api::VeilClient>>,
+    canonical_server_origin: String,
+    user_id: String,
+}
+
+impl Drop for MobileBackgroundClientBinding {
+    fn drop(&mut self) {
+        let deactivate = |client: &mut veil_client::api::VeilClient| {
+            client.deactivate_background_events_v3_binding(
+                &self.canonical_server_origin,
+                &self.user_id,
+            );
+        };
+        match self.client.lock() {
+            Ok(mut client) => deactivate(&mut client),
+            Err(poisoned) => deactivate(&mut poisoned.into_inner()),
+        }
+    }
+}
+
 #[uniffi::export]
 impl MobileWsEventsController {
     /// Sticky, idempotent stop. The supervisor exits Cancelled; a session in
@@ -1277,22 +1408,15 @@ pub struct VeilMobileSession {
     runtime: tokio::runtime::Runtime,
     binding: Mutex<Option<MobileAuthenticatedEpoch>>,
     direct_sync: Mutex<Option<MobileDirectSyncState>>,
+    background_events_active: Arc<AtomicBool>,
+    background_events_cancel: Arc<Mutex<Option<tokio::sync::watch::Sender<bool>>>>,
     next_binding_generation: AtomicU64,
-    last_rest_timestamp_ms: AtomicI64,
     #[cfg(test)]
     direct_post_sign_pre_postflight_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 #[uniffi::export]
 impl VeilMobileSession {
-    #[uniffi::constructor]
-    /// Compatibility constructor for non-mobile callers. Android must pass
-    /// decrypted mnemonic bytes to `from_mnemonic_bytes` and clear its own
-    /// `ByteArray` immediately after this call.
-    pub fn from_mnemonic(mnemonic: String, database_path: String) -> Result<Arc<Self>, VeilError> {
-        Self::from_mnemonic_bytes(mnemonic.into_bytes(), database_path)
-    }
-
     #[uniffi::constructor]
     pub fn from_mnemonic_bytes(
         mnemonic_utf8: Vec<u8>,
@@ -1331,8 +1455,9 @@ impl VeilMobileSession {
             runtime,
             binding: Mutex::new(None),
             direct_sync: Mutex::new(None),
+            background_events_active: Arc::new(AtomicBool::new(false)),
+            background_events_cancel: Arc::new(Mutex::new(None)),
             next_binding_generation: AtomicU64::new(0),
-            last_rest_timestamp_ms: AtomicI64::new(0),
             #[cfg(test)]
             direct_post_sign_pre_postflight_hook: Mutex::new(None),
         }))
@@ -1448,10 +1573,9 @@ impl VeilMobileSession {
     /// Preconditions (mirrors the Kotlin host contract in ws_events_v3.rs):
     ///   - mobile_reconnect_target() returned Some(target); its canonical
     ///     origin selects the endpoint. Absent target => do not call this.
-    ///   - Exactly one controller per session at a time. Callers stop() the
-    ///     previous controller and wait for on_terminal before starting a
-    ///     new one. [VERIFY] add a guard field if double-start must be a
-    ///     hard error rather than a documented contract.
+    ///   - Exactly one controller per session at a time. Native code enforces
+    ///     this as a hard invariant and owns a cancellation capability so a
+    ///     foreground connect, disconnect or logout revokes the controller.
     ///
     /// The returned controller owns no client lock; all waits happen off the
     /// mutex, so lifecycle calls can never deadlock the serialized runtime.
@@ -1482,19 +1606,21 @@ impl VeilMobileSession {
                 msg: "no persisted reconnect target; authenticate first".to_string(),
             })?;
 
-        // Exact endpoint spelling: origin is canonical (scheme https),
-        // the events transport is wss on the same authority.
-        // [VERIFY] against WsAuthV3Target::parse - it validates the ORIGINAL
-        // spelling before Url normalization, so build, never normalize.
+        // Exact endpoint spelling: map the already-canonical REST scheme to
+        // its WebSocket counterpart and preserve the exact authority. This
+        // keeps loopback development on ws:// while production remains wss://.
         let canonical_origin = target.canonical_server_origin.clone();
-        let websocket_url = format!(
-            "wss://{}/v3/events",
-            canonical_origin
-                .strip_prefix("https://")
-                .ok_or_else(|| VeilError::Session {
-                    msg: "reconnect target origin is not https".to_string(),
-                })?
-        );
+        let websocket_url = canonical_origin
+            .strip_prefix("https://")
+            .map(|authority| format!("wss://{authority}/v3/events"))
+            .or_else(|| {
+                canonical_origin
+                    .strip_prefix("http://")
+                    .map(|authority| format!("ws://{authority}/v3/events"))
+            })
+            .ok_or_else(|| VeilError::Session {
+                msg: "reconnect target origin has no supported transport".to_string(),
+            })?;
 
         // Clone signing material under a short client lock. Private keys
         // stay inside this process; only the clone crosses into the task.
@@ -1517,9 +1643,34 @@ impl VeilMobileSession {
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
         let network_hint = Arc::new(Notify::new());
         let controller = Arc::new(MobileWsEventsController {
-            cancel: cancel_tx,
+            cancel: cancel_tx.clone(),
             network_hint: Arc::clone(&network_hint),
         });
+
+        if self
+            .background_events_active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(VeilError::Session {
+                msg: "a background events controller is already active".to_string(),
+            });
+        }
+        match self.background_events_cancel.lock() {
+            Ok(mut slot) => *slot = Some(cancel_tx),
+            Err(poisoned) => {
+                *poisoned.into_inner() = None;
+                self.background_events_active
+                    .store(false, Ordering::Release);
+                return Err(VeilError::Session {
+                    msg: "lock background events registration".to_string(),
+                });
+            }
+        }
+        let registration = MobileBackgroundEventsRegistration {
+            active: Arc::clone(&self.background_events_active),
+            cancel_slot: Arc::clone(&self.background_events_cancel),
+        };
 
         // The session handler drains one authenticated connection into the
         // existing pipeline. It takes the client mutex only per event batch,
@@ -1527,11 +1678,35 @@ impl VeilMobileSession {
         let session_client = self.client.clone();
         let session_callback = Arc::clone(&callback);
         let session_cancel = cancel_rx.clone();
+        let session_origin = config.canonical_origin.clone();
         let handle_session = move |mut session: veil_client::ws_events_v3::WsEventsV3Connection| {
             let client = session_client.clone();
             let callback = Arc::clone(&session_callback);
             let mut cancel = session_cancel.clone();
+            let canonical_server_origin = session_origin.clone();
             async move {
+                let authenticated_user_id = session.authenticated_user_id().to_string();
+                {
+                    let mut client = match client.lock() {
+                        Ok(client) => client,
+                        Err(error) => {
+                            eprintln!("lock background client binding failed: {error}");
+                            return veil_client::ws_events_v3::WsSessionStopV3::FailClosed;
+                        }
+                    };
+                    if let Err(msg) = client.activate_background_events_v3_binding(
+                        &canonical_server_origin,
+                        &authenticated_user_id,
+                    ) {
+                        eprintln!("background authentication binding failed: {msg}");
+                        return veil_client::ws_events_v3::WsSessionStopV3::FailClosed;
+                    }
+                }
+                let _binding = MobileBackgroundClientBinding {
+                    client: client.clone(),
+                    canonical_server_origin,
+                    user_id: authenticated_user_id,
+                };
                 // Retained SKDM buffer first - it precedes the AuthResultV3
                 // barrier on the wire and must precede live events in the DB.
                 let mut has_retained = false;
@@ -1560,7 +1735,7 @@ impl VeilMobileSession {
                                 return veil_client::ws_events_v3::WsSessionStopV3::RetryableTransport;
                             }
                         }
-                        event = session.events.recv() => {
+                        event = session.recv_event() => {
                             match event {
                                 Some(event) => {
                                     if let Err(msg) = ingest_one(&client, event) {
@@ -1590,6 +1765,7 @@ impl VeilMobileSession {
 
         let exit_callback = Arc::clone(&callback);
         self.runtime.spawn(async move {
+            let registration = registration;
             let exit = veil_client::ws_events_v3::run_ws_events_v3(
                 &config,
                 &account,
@@ -1599,6 +1775,9 @@ impl VeilMobileSession {
                 network_hint,
             )
             .await;
+            // Publish inactive before the terminal callback so a deliberate
+            // host restart from that callback cannot race the stale task.
+            drop(registration);
             exit_callback.on_terminal(match exit {
                 veil_client::ws_events_v3::WsEventsV3SupervisorExit::Cancelled => {
                     MobileWsEventsExit::Cancelled
@@ -2707,6 +2886,150 @@ impl VeilMobileSession {
         )
     }
 
+    /// Return an account-v2 safety number for exactly one Ready Direct route.
+    /// Every stale, blocked, revoked, or scope-mismatched state collapses to
+    /// `None`, preventing the platform layer from enumerating denied routes.
+    pub fn direct_identity_verification(
+        &self,
+        conversation_id: String,
+    ) -> Result<Option<MobileDirectIdentityVerification>, VeilError> {
+        let conversation_id =
+            require_canonical_user_id("Direct conversation ID", &conversation_id)?;
+        let sync = self
+            .direct_sync
+            .lock()
+            .map_err(|error| VeilError::Session {
+                msg: format!("lock mobile Direct sync: {error}"),
+            })?;
+        let Some(state) = sync.as_ref() else {
+            return Ok(None);
+        };
+        if state.phase != MobileDirectSyncPhase::Ready || !state.outbox_replay_complete {
+            return Ok(None);
+        }
+        let binding = self.binding.lock().map_err(|error| VeilError::Session {
+            msg: format!("lock mobile binding: {error}"),
+        })?;
+        if binding.as_ref() != Some(&state.epoch) {
+            return Ok(None);
+        }
+        let client = self.client.lock().map_err(|error| VeilError::Session {
+            msg: format!("lock mobile client: {error}"),
+        })?;
+        Ok(
+            exact_mobile_direct_identity_verification(&client, state, &conversation_id)
+                .map(mobile_direct_identity_verification),
+        )
+    }
+
+    /// Persist an explicit account-v2 comparison for one Ready Direct route.
+    /// The displayed fingerprint is accepted only in its canonical lowercase
+    /// form and rechecked against native state while all lifecycle guards and
+    /// the client remain locked in the documented order.
+    pub fn confirm_direct_identity_verification(
+        &self,
+        conversation_id: String,
+        expected_fingerprint_hex: String,
+    ) -> Result<Option<MobileDirectIdentityVerification>, VeilError> {
+        let conversation_id =
+            require_canonical_user_id("Direct conversation ID", &conversation_id)?;
+        let expected_fingerprint =
+            require_lower_hex_32("Direct identity fingerprint", &expected_fingerprint_hex)?;
+        let sync = self
+            .direct_sync
+            .lock()
+            .map_err(|error| VeilError::Session {
+                msg: format!("lock mobile Direct sync: {error}"),
+            })?;
+        let Some(state) = sync.as_ref() else {
+            return Ok(None);
+        };
+        if state.phase != MobileDirectSyncPhase::Ready || !state.outbox_replay_complete {
+            return Ok(None);
+        }
+        let binding = self.binding.lock().map_err(|error| VeilError::Session {
+            msg: format!("lock mobile binding: {error}"),
+        })?;
+        if binding.as_ref() != Some(&state.epoch) {
+            return Ok(None);
+        }
+        let client = self.client.lock().map_err(|error| VeilError::Session {
+            msg: format!("lock mobile client: {error}"),
+        })?;
+        if exact_mobile_direct_identity_verification(&client, state, &conversation_id).is_none() {
+            return Ok(None);
+        }
+        let view = client
+            .confirm_direct_identity_verification_v2(&conversation_id, &expected_fingerprint)
+            .map_err(|msg| VeilError::Session { msg })?;
+        let Some(peer) = state.peers.get(&conversation_id) else {
+            return Ok(None);
+        };
+        if view.canonical_server_origin != state.epoch.binding.canonical_server_origin
+            || view.peer_user_id != peer.user_id
+            || view.peer_identity_key != peer.identity_key
+            || view.peer_signing_key != peer.signing_key
+        {
+            return Ok(None);
+        }
+        Ok(Some(mobile_direct_identity_verification(view)))
+    }
+
+    /// Persist an explicit account-v2 comparison from one exact, bounded QR
+    /// payload. The client parses the versioned payload and repeats the fresh
+    /// route derivation plus constant-time digest comparison before writing.
+    pub fn confirm_direct_identity_verification_qr(
+        &self,
+        conversation_id: String,
+        scanned_qr_payload: String,
+    ) -> Result<Option<MobileDirectIdentityVerification>, VeilError> {
+        let conversation_id =
+            require_canonical_user_id("Direct conversation ID", &conversation_id)?;
+        if scanned_qr_payload.len() != 89 || !scanned_qr_payload.is_ascii() {
+            return Err(VeilError::InvalidInput {
+                msg: "Direct identity QR payload is invalid".to_string(),
+            });
+        }
+        let sync = self
+            .direct_sync
+            .lock()
+            .map_err(|error| VeilError::Session {
+                msg: format!("lock mobile Direct sync: {error}"),
+            })?;
+        let Some(state) = sync.as_ref() else {
+            return Ok(None);
+        };
+        if state.phase != MobileDirectSyncPhase::Ready || !state.outbox_replay_complete {
+            return Ok(None);
+        }
+        let binding = self.binding.lock().map_err(|error| VeilError::Session {
+            msg: format!("lock mobile binding: {error}"),
+        })?;
+        if binding.as_ref() != Some(&state.epoch) {
+            return Ok(None);
+        }
+        let client = self.client.lock().map_err(|error| VeilError::Session {
+            msg: format!("lock mobile client: {error}"),
+        })?;
+        if exact_mobile_direct_identity_verification(&client, state, &conversation_id).is_none() {
+            return Ok(None);
+        }
+        let view = client
+            .confirm_direct_identity_verification_qr_v1(&conversation_id, &scanned_qr_payload)
+            .map_err(|msg| VeilError::Session { msg })?;
+        let Some(peer) = state.peers.get(&conversation_id) else {
+            return Ok(None);
+        };
+        if view.canonical_server_origin != state.epoch.binding.canonical_server_origin
+            || view.peer_user_id != peer.user_id
+            || view.peer_identity_key != peer.identity_key
+            || view.peer_signing_key != peer.signing_key
+        {
+            return Ok(None);
+        }
+        Ok(Some(mobile_direct_identity_verification(view)))
+    }
+
     /// Return a bounded UI projection for exactly one authenticated Direct.
     ///
     /// The caller supplies the conversation id it is about to render. Native
@@ -2887,6 +3210,11 @@ impl VeilMobileSession {
             .get(&conversation_id)
             .cloned()
             .expect("prekey readiness preflighted the peer");
+        let transparency_from_size = client
+            .identity_transparency_request_from_size_v1()
+            .map_err(|_| VeilError::Session {
+                msg: "mobile Direct transparency pin is unavailable".to_string(),
+            })?;
         if let Some(request) = state.outstanding_request.as_ref() {
             if request.kind
                 == (MobileDirectOutstandingRequestKind::PeerPreKey {
@@ -2905,7 +3233,11 @@ impl VeilMobileSession {
             },
             token: new_mobile_sync_token(),
             method: "GET",
-            target: format!("/v1/prekeys/{}", hex::encode(peer.identity_key)),
+            target: format!(
+                "/v1/prekeys/{}?transparency_from_size={}",
+                hex::encode(peer.identity_key),
+                transparency_from_size,
+            ),
             body: Zeroizing::new(Vec::new()),
             response_limit_bytes: veil_client::direct::DIRECT_PREKEY_RESPONSE_LIMIT as u32,
             peer_prekey_signature_released: false,
@@ -3016,13 +3348,15 @@ impl VeilMobileSession {
                 return Err(mobile_direct_prekey_unavailable_error());
             }
         };
-        let result =
-            match veil_client::direct::install_authenticated_direct_prekey_bundle_classified_v1(
+        let witness_policy = mobile_transparency_witness_policy_v1()?;
+        let result = match veil_client::direct::install_authenticated_direct_prekey_bundle_classified_with_security_policy_v1(
                 &mut client,
                 &peer.user_id,
                 peer.identity_key,
                 peer.signing_key,
                 response.as_slice(),
+                None,
+                witness_policy.as_ref(),
             ) {
                 Ok(result) => result,
                 Err(veil_client::direct::DirectPreKeyInstallErrorV1::Rejected(_)) => {
@@ -3199,9 +3533,21 @@ impl VeilMobileSession {
         Ok(signature)
     }
 
-    pub fn prepare_contact_search_request(&self, username: String) -> Result<MobileContactRequest, VeilError> {
+    pub fn prepare_contact_search_request(
+        &self,
+        username: String,
+    ) -> Result<MobileContactRequest, VeilError> {
+        if username.is_empty() || username.len() > 128 || username.chars().any(char::is_control) {
+            return Err(VeilError::InvalidInput {
+                msg: "contact username is empty, oversized, or contains control characters"
+                    .to_string(),
+            });
+        }
         let epoch = self.authenticated_epoch()?;
-        let target = format!("/v1/users/search?username={}", url::form_urlencoded::byte_serialize(username.as_bytes()).collect::<String>());
+        let target = format!(
+            "/v1/users/search?username={}",
+            url::form_urlencoded::byte_serialize(username.as_bytes()).collect::<String>()
+        );
         let body = Vec::new();
         let sig = self.sign_rest_request_internal(&epoch, "GET", &target, &body)?;
         Ok(MobileContactRequest {
@@ -3213,26 +3559,18 @@ impl VeilMobileSession {
         })
     }
 
-    pub fn prepare_friend_request(&self, peer_user_id: String) -> Result<MobileContactRequest, VeilError> {
+    pub fn prepare_create_direct_request(
+        &self,
+        peer_user_id: String,
+    ) -> Result<MobileContactRequest, VeilError> {
+        let peer_user_id = require_canonical_user_id("Direct peer user ID", &peer_user_id)?;
         let epoch = self.authenticated_epoch()?;
-        let target = format!("/v1/users/{}/friends", url::form_urlencoded::byte_serialize(peer_user_id.as_bytes()).collect::<String>());
-        let body = Vec::new();
-        let sig = self.sign_rest_request_internal(&epoch, "PUT", &target, &body)?;
-        Ok(MobileContactRequest {
-            token: "friend-request".to_string(),
-            method: "PUT".to_string(),
-            target,
-            body,
-            signature_data: sig,
-        })
-    }
-
-    pub fn prepare_create_direct_request(&self, peer_user_id: String) -> Result<MobileContactRequest, VeilError> {
-        let epoch = self.authenticated_epoch()?;
-        let target = "/v1/dms".to_string();
+        let target = "/v1/conversations/dm".to_string();
         let body = serde_json::json!({
             "peer_user_id": peer_user_id
-        }).to_string().into_bytes();
+        })
+        .to_string()
+        .into_bytes();
         let sig = self.sign_rest_request_internal(&epoch, "POST", &target, &body)?;
         Ok(MobileContactRequest {
             token: "create-direct".to_string(),
@@ -3243,35 +3581,64 @@ impl VeilMobileSession {
         })
     }
 
-    pub fn parse_contact_search_response(&self, response: Vec<u8>) -> Result<MobileContactSearchResult, VeilError> {
+    pub fn parse_contact_search_response(
+        &self,
+        response: Vec<u8>,
+    ) -> Result<MobileContactSearchResult, VeilError> {
         let _epoch = self.authenticated_epoch()?;
-        let parsed: serde_json::Value = serde_json::from_slice(&response).map_err(|e| VeilError::InvalidInput {
-            msg: format!("Invalid JSON response: {}", e),
-        })?;
-        
-        let user_id = parsed["id"].as_str().unwrap_or_default().to_string();
-        let username = parsed["username"].as_str().unwrap_or_default().to_string();
-        let identity_key_hex = parsed["identity_key"].as_str().unwrap_or_default();
-        let signing_key_hex = parsed["signing_key"].as_str().unwrap_or_default();
-        
-        if user_id.is_empty() || username.is_empty() || identity_key_hex.is_empty() || signing_key_hex.is_empty() {
-            return Err(VeilError::InvalidInput { msg: "Missing fields in search response".to_string() });
+        let response = Zeroizing::new(response);
+        if response.is_empty() || response.len() > MOBILE_CONTACT_SEARCH_RESPONSE_LIMIT {
+            return Err(VeilError::InvalidInput {
+                msg: "contact-search response exceeds the native limit".to_string(),
+            });
         }
-        
-        let identity_key = hex::decode(identity_key_hex).map_err(|_| VeilError::InvalidInput { msg: "Invalid hex for identity_key".to_string() })?;
-        let signing_key = hex::decode(signing_key_hex).map_err(|_| VeilError::InvalidInput { msg: "Invalid hex for signing_key".to_string() })?;
-        
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct ContactSearchResponse<'a> {
+            user_id: &'a str,
+            username: &'a str,
+            identity_key: &'a str,
+            signing_key: &'a str,
+        }
+        let parsed: ContactSearchResponse<'_> = serde_json::from_slice(response.as_slice())
+            .map_err(|_| VeilError::InvalidInput {
+                msg: "invalid contact-search JSON response".to_string(),
+            })?;
+        let user_id = require_canonical_user_id("contact user ID", parsed.user_id)?;
+        if parsed.username.is_empty()
+            || parsed.username.len() > 128
+            || parsed.username.chars().any(char::is_control)
+        {
+            return Err(VeilError::InvalidInput {
+                msg: "invalid contact username".to_string(),
+            });
+        }
+        let identity_key = Zeroizing::new(hex::decode(parsed.identity_key).map_err(|_| {
+            VeilError::InvalidInput {
+                msg: "invalid contact identity key".to_string(),
+            }
+        })?);
+        let signing_key = Zeroizing::new(hex::decode(parsed.signing_key).map_err(|_| {
+            VeilError::InvalidInput {
+                msg: "invalid contact signing key".to_string(),
+            }
+        })?);
+        let (identity_key, signing_key) = require_account_key_pair(
+            "contact public identity",
+            identity_key.as_slice(),
+            signing_key.as_slice(),
+        )?;
+
         Ok(MobileContactSearchResult {
             user_id,
-            username,
-            identity_key,
-            signing_key,
+            username: parsed.username.to_string(),
+            identity_key: identity_key.to_vec(),
+            signing_key: signing_key.to_vec(),
         })
     }
 
-    /// Parse one bounded POST /v1/dms response. Accepts either
-    /// `conversation_id` or `id` as the canonical UUID field and rejects
-    /// everything else. The server-controlled body is wiped on every path.
+    /// Parse one bounded POST /v1/conversations/dm response using the exact
+    /// server contract. The server-controlled body is wiped on every path.
     pub fn parse_create_direct_response(
         &self,
         response: Vec<u8>,
@@ -3285,21 +3652,45 @@ impl VeilMobileSession {
                 msg: "mobile Direct create response exceeds the native limit".to_string(),
             });
         }
-        let parsed: serde_json::Value =
-            serde_json::from_slice(response.as_slice()).map_err(|error| {
-                VeilError::InvalidInput {
-                    msg: format!("invalid create-DM JSON response: {error}"),
-                }
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct CreateDirectResponse<'a> {
+            conversation_id: &'a str,
+            created: bool,
+            peer_identity_key: &'a str,
+            peer_signing_key: &'a str,
+        }
+        let parsed: CreateDirectResponse<'_> = serde_json::from_slice(response.as_slice())
+            .map_err(|_| VeilError::InvalidInput {
+                msg: "invalid create-DM JSON response".to_string(),
             })?;
-        let raw_id = parsed
-            .get("conversation_id")
-            .and_then(serde_json::Value::as_str)
-            .or_else(|| parsed.get("id").and_then(serde_json::Value::as_str))
-            .ok_or_else(|| VeilError::InvalidInput {
-                msg: "create-DM response is missing a conversation ID".to_string(),
-            })?;
-        let conversation_id = require_canonical_user_id("Direct conversation ID", raw_id)?;
-        Ok(MobileDirectCreatedConversation { conversation_id })
+        let conversation_id =
+            require_canonical_user_id("Direct conversation ID", parsed.conversation_id)?;
+        let peer_identity_key = Zeroizing::new(
+            base64::engine::general_purpose::STANDARD
+                .decode(parsed.peer_identity_key)
+                .map_err(|_| VeilError::InvalidInput {
+                    msg: "invalid create-DM peer identity key".to_string(),
+                })?,
+        );
+        let peer_signing_key = Zeroizing::new(
+            base64::engine::general_purpose::STANDARD
+                .decode(parsed.peer_signing_key)
+                .map_err(|_| VeilError::InvalidInput {
+                    msg: "invalid create-DM peer signing key".to_string(),
+                })?,
+        );
+        let (peer_identity_key, peer_signing_key) = require_account_key_pair(
+            "create-DM peer public identity",
+            peer_identity_key.as_slice(),
+            peer_signing_key.as_slice(),
+        )?;
+        let _created = parsed.created;
+        Ok(MobileDirectCreatedConversation {
+            conversation_id,
+            peer_identity_key: peer_identity_key.to_vec(),
+            peer_signing_key: peer_signing_key.to_vec(),
+        })
     }
 
     /// Register one freshly created Direct conversation under the exact
@@ -3412,9 +3803,17 @@ impl VeilMobileSession {
     }
 
     pub fn disconnect(&self) -> Result<(), VeilError> {
+        self.stop_background_events();
         clear_mobile_direct_sync_fail_closed(&self.direct_sync);
         let _client = invalidate_mobile_session(&self.binding, &self.client)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+impl VeilMobileSession {
+    fn from_mnemonic(mnemonic: String, database_path: String) -> Result<Arc<Self>, VeilError> {
+        Self::from_mnemonic_bytes(mnemonic.into_bytes(), database_path)
     }
 }
 
@@ -3471,43 +3870,36 @@ impl VeilMobileSession {
         target: &str,
         body: &[u8],
     ) -> Result<RestSignatureData, VeilError> {
-        use base64::Engine;
-        use sha2::{Digest, Sha256};
-
-        let origin = require_canonical_server_origin(&expected_epoch.binding.canonical_server_origin)?;
+        require_canonical_server_origin(&expected_epoch.binding.canonical_server_origin)?;
         if self.authenticated_epoch()? != *expected_epoch {
             return Err(VeilError::Session {
                 msg: "mobile binding changed before signing request".to_string(),
             });
         }
-        let timestamp_ms = self.next_rest_timestamp_ms()?;
-        let authority = origin
-            .strip_prefix("https://")
-            .or_else(|| origin.strip_prefix("http://"))
-            .ok_or_else(|| VeilError::InvalidInput {
-                msg: "canonical origin has no supported scheme".to_string(),
-            })?;
-        let canonical = format!(
-            "veil-rest-v1\n{method}\n{authority}\n{target}\n{timestamp_ms}\n{}",
-            hex::encode(Sha256::digest(body)),
-        );
-        let signature = self
+        let headers = self
             .client
             .lock()
             .map_err(|error| VeilError::Session {
                 msg: format!("lock mobile client: {error}"),
             })?
-            .sign_message(canonical.as_bytes())
+            .prepare_authenticated_rest_headers_v2(method, target, body)
             .map_err(|msg| VeilError::Session { msg })?;
         if self.authenticated_epoch()? != *expected_epoch {
             return Err(VeilError::Session {
                 msg: "mobile binding changed while signing request".to_string(),
             });
         }
+        if headers.user_id() != expected_epoch.binding.user_id {
+            return Err(VeilError::Session {
+                msg: "mobile REST signer account changed".to_string(),
+            });
+        }
         Ok(RestSignatureData {
-            user_id: expected_epoch.binding.user_id.clone(),
-            timestamp_ms: timestamp_ms.to_string(),
-            signature_base64: base64::engine::general_purpose::STANDARD.encode(signature),
+            version: headers.version().to_owned(),
+            user_id: headers.user_id().to_owned(),
+            timestamp_ms: headers.timestamp_ms().to_owned(),
+            nonce_base64url: headers.nonce().to_owned(),
+            signature_base64url: headers.signature().to_owned(),
         })
     }
 
@@ -3523,7 +3915,12 @@ impl VeilMobileSession {
                 msg: "REST request body exceeds the mobile signing limit".to_string(),
             });
         }
-        self.sign_rest_request_internal(expected_epoch, method, &request.target, request.body.as_slice())
+        self.sign_rest_request_internal(
+            expected_epoch,
+            method,
+            &request.target,
+            request.body.as_slice(),
+        )
     }
 
     fn connect_inner(
@@ -3535,6 +3932,7 @@ impl VeilMobileSession {
     ) -> Result<MobileAuthenticatedBinding, VeilError> {
         let node_access_pass = guard_mobile_node_access_pass(node_access_pass)?;
         validate_mobile_endpoint_pair(&websocket_url, &canonical_server_origin)?;
+        self.stop_background_events();
         // Starting a new authentication attempt invalidates the previous
         // account/origin epoch before locking or touching the network. The
         // previous transport is closed under the client lock so no old event
@@ -3621,34 +4019,6 @@ impl VeilMobileSession {
         }
     }
 
-    fn next_rest_timestamp_ms(&self) -> Result<i64, VeilError> {
-        let now: i64 = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|_| VeilError::Session {
-                msg: "system clock is before Unix epoch".to_string(),
-            })?
-            .as_millis()
-            .try_into()
-            .map_err(|_| VeilError::Session {
-                msg: "system clock exceeds signed millisecond range".to_string(),
-            })?;
-        let mut previous = self.last_rest_timestamp_ms.load(Ordering::Acquire);
-        loop {
-            let next = now.max(previous.checked_add(1).ok_or_else(|| VeilError::Session {
-                msg: "REST timestamp allocator exhausted".to_string(),
-            })?);
-            match self.last_rest_timestamp_ms.compare_exchange_weak(
-                previous,
-                next,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return Ok(next),
-                Err(actual) => previous = actual,
-            }
-        }
-    }
-
     fn authenticated_epoch(&self) -> Result<MobileAuthenticatedEpoch, VeilError> {
         self.binding
             .lock()
@@ -3671,142 +4041,37 @@ impl VeilMobileSession {
                 msg: "mobile authenticated generation exhausted".to_string(),
             })
     }
-}
 
-// ── VeilRatchet (opaque object wrapping mutable RatchetSession) ──
-
-#[derive(uniffi::Object)]
-pub struct VeilRatchet {
-    session: Mutex<RatchetSession>,
-}
-
-#[uniffi::export]
-impl VeilRatchet {
-    #[uniffi::constructor]
-    pub fn init_initiator(
-        shared_secret: Vec<u8>,
-        peer_ratchet_key: Vec<u8>,
-    ) -> Result<Arc<Self>, VeilError> {
-        let ss = to_32(&shared_secret)?;
-        let prk = to_32(&peer_ratchet_key)?;
-        Ok(Arc::new(Self {
-            session: Mutex::new(RatchetSession::init_initiator(&ss, &prk)),
-        }))
-    }
-
-    #[uniffi::constructor]
-    pub fn init_responder(
-        shared_secret: Vec<u8>,
-        our_spk_secret: Vec<u8>,
-        our_spk_public: Vec<u8>,
-    ) -> Result<Arc<Self>, VeilError> {
-        let ss = to_32(&shared_secret)?;
-        let pub_key = to_32(&our_spk_public)?;
-        Ok(Arc::new(Self {
-            session: Mutex::new(RatchetSession::init_responder(
-                &ss,
-                &our_spk_secret,
-                &pub_key,
-            )),
-        }))
-    }
-
-    #[uniffi::constructor]
-    pub fn deserialize(json: String) -> Result<Arc<Self>, VeilError> {
-        let json = Zeroizing::new(json.into_bytes());
-        let session =
-            RatchetSession::deserialize(&json).map_err(|msg| VeilError::Session { msg })?;
-        Ok(Arc::new(Self {
-            session: Mutex::new(session),
-        }))
-    }
-
-    pub fn encrypt(&self, plaintext: Vec<u8>) -> Result<RatchetMessage, VeilError> {
-        let mut s = self
-            .session
-            .lock()
-            .map_err(|e| VeilError::Session { msg: e.to_string() })?;
-        let (header, ciphertext) = s
-            .encrypt(&plaintext)
-            .map_err(|e| VeilError::Crypto { msg: e })?;
-        Ok(RatchetMessage {
-            header: header.to_bytes(),
-            ciphertext,
-        })
-    }
-
-    pub fn decrypt(
-        &self,
-        header_bytes: Vec<u8>,
-        ciphertext: Vec<u8>,
-    ) -> Result<Vec<u8>, VeilError> {
-        let header = ratchet::MessageHeader::from_bytes(&header_bytes)
-            .map_err(|e| VeilError::InvalidInput { msg: e })?;
-        let mut s = self
-            .session
-            .lock()
-            .map_err(|e| VeilError::Session { msg: e.to_string() })?;
-        s.decrypt(&header, &ciphertext)
-            .map_err(|e| VeilError::Crypto { msg: e })
-    }
-
-    pub fn serialize(&self) -> Result<String, VeilError> {
-        let s = self
-            .session
-            .lock()
-            .map_err(|e| VeilError::Session { msg: e.to_string() })?;
-        String::from_utf8(s.serialize().map_err(|msg| VeilError::Session { msg })?)
-            .map_err(|e| VeilError::Session { msg: e.to_string() })
+    fn stop_background_events(&self) {
+        let send_cancel = |slot: &Option<tokio::sync::watch::Sender<bool>>| {
+            if let Some(cancel) = slot {
+                let _ = cancel.send(true);
+            }
+        };
+        match self.background_events_cancel.lock() {
+            Ok(slot) => send_cancel(&slot),
+            Err(poisoned) => send_cancel(&poisoned.into_inner()),
+        }
     }
 }
 
 // ── Free functions ──────────────────────────────────────────
 
-#[uniffi::export]
-pub fn generate_mnemonic() -> String {
+#[cfg(test)]
+fn generate_mnemonic() -> String {
     keys::generate_mnemonic().to_string()
 }
 
-#[uniffi::export]
-pub fn validate_mnemonic(mnemonic: String) -> bool {
-    keys::validate_mnemonic(&mnemonic)
-}
-
-#[uniffi::export]
-pub fn aead_encrypt(key: Vec<u8>, plaintext: Vec<u8>) -> Result<AeadResult, VeilError> {
-    let k = to_32(&key)?;
-    let (ct, nonce) = aead::encrypt(&k, &plaintext).map_err(|e| VeilError::Crypto { msg: e })?;
-    Ok(AeadResult {
-        ciphertext: ct,
-        nonce: nonce.to_vec(),
-    })
-}
-
-#[uniffi::export]
-pub fn aead_decrypt(
-    key: Vec<u8>,
-    ciphertext: Vec<u8>,
-    nonce: Vec<u8>,
-) -> Result<Vec<u8>, VeilError> {
-    let k = to_32(&key)?;
-    let n = to_24(&nonce)?;
-    aead::decrypt(&k, &ciphertext, &n).map_err(|e| VeilError::Crypto { msg: e })
-}
-
-#[uniffi::export]
-pub fn ed25519_verify(
-    public_key: Vec<u8>,
-    message: Vec<u8>,
-    sig: Vec<u8>,
-) -> Result<bool, VeilError> {
+#[cfg(test)]
+fn ed25519_verify(public_key: Vec<u8>, message: Vec<u8>, sig: Vec<u8>) -> Result<bool, VeilError> {
     let pk = to_32(&public_key)?;
     let s = to_64(&sig)?;
     Ok(signature::verify(&pk, &message, &s))
 }
 
-#[uniffi::export]
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
-pub fn generate_account_fingerprint_v2(
+fn generate_account_fingerprint_v2(
     canonical_server_origin: String,
     user_id_a: String,
     identity_key_a: Vec<u8>,
@@ -3838,87 +4103,6 @@ pub fn generate_account_fingerprint_v2(
     Ok(FingerprintResult { emoji, hex })
 }
 
-#[uniffi::export]
-pub fn derive_key_from_pin(pin: String, salt: Vec<u8>) -> Result<Vec<u8>, VeilError> {
-    let s = to_32(&salt)?;
-    let key = kdf::derive_key_from_pin(&pin, &s).map_err(|e| VeilError::Crypto { msg: e })?;
-    Ok(key.to_vec())
-}
-
-#[uniffi::export]
-pub fn derive_key_from_password(password: String, salt: Vec<u8>) -> Result<Vec<u8>, VeilError> {
-    let s = to_32(&salt)?;
-    let key =
-        kdf::derive_key_from_password(&password, &s).map_err(|e| VeilError::Crypto { msg: e })?;
-    Ok(key.to_vec())
-}
-
-#[uniffi::export]
-pub fn encrypt_share(payload: Vec<u8>, password: Option<String>) -> Result<ShareBundle, VeilError> {
-    let bundle = share::encrypt_share(&payload, password.as_deref())
-        .map_err(|e| VeilError::Crypto { msg: e })?;
-    Ok(ShareBundle {
-        ciphertext: bundle.ciphertext.clone(),
-        content_key: bundle.content_key.to_vec(),
-        wrapped_key: bundle.wrapped_key.clone(),
-        salt: bundle.salt.map(|s| s.to_vec()),
-    })
-}
-
-#[uniffi::export]
-pub fn decrypt_share(
-    ciphertext: Vec<u8>,
-    content_key: Option<Vec<u8>>,
-    password: Option<String>,
-    wrapped_key: Option<Vec<u8>>,
-    salt: Option<Vec<u8>>,
-) -> Result<Vec<u8>, VeilError> {
-    let ck: Option<[u8; 32]> = match content_key {
-        Some(ref v) => Some(to_32(v)?),
-        None => None,
-    };
-    let s: Option<[u8; 32]> = match salt {
-        Some(ref sv) => Some(to_32(sv)?),
-        None => None,
-    };
-    share::decrypt_share(
-        &ciphertext,
-        ck.as_ref(),
-        password.as_deref(),
-        wrapped_key.as_deref(),
-        s.as_ref(),
-    )
-    .map_err(|e| VeilError::Crypto { msg: e })
-}
-
-#[uniffi::export]
-pub fn x3dh_initiate(
-    identity: &VeilIdentity,
-    peer_bundle: PreKeyBundleData,
-) -> Result<X3dhResultData, VeilError> {
-    let bundle = x3dh::PreKeyBundle {
-        identity_key: to_32(&peer_bundle.identity_key)?,
-        signing_key: to_32(&peer_bundle.signing_key)?,
-        signed_prekey: to_32(&peer_bundle.signed_prekey)?,
-        signed_prekey_signature: to_64(&peer_bundle.signed_prekey_signature)?,
-        signed_prekey_id: peer_bundle.signed_prekey_id,
-        one_time_prekey: match peer_bundle.one_time_prekey {
-            Some(ref k) => Some(to_32(k)?),
-            None => None,
-        },
-        one_time_prekey_id: peer_bundle.one_time_prekey_id,
-    };
-
-    let result =
-        x3dh::initiate(&identity.inner, &bundle).map_err(|e| VeilError::Crypto { msg: e })?;
-
-    Ok(X3dhResultData {
-        shared_secret: result.shared_secret.to_vec(),
-        ephemeral_public: result.ephemeral_public.to_vec(),
-        associated_data: result.associated_data.to_vec(),
-    })
-}
-
 // ── Helpers ─────────────────────────────────────────────────
 
 fn to_32(data: &[u8]) -> Result<[u8; 32], VeilError> {
@@ -3927,16 +4111,29 @@ fn to_32(data: &[u8]) -> Result<[u8; 32], VeilError> {
     })
 }
 
-fn to_24(data: &[u8]) -> Result<[u8; 24], VeilError> {
-    data.try_into().map_err(|_| VeilError::InvalidInput {
-        msg: format!("expected 24 bytes, got {}", data.len()),
-    })
-}
-
+#[cfg(test)]
 fn to_64(data: &[u8]) -> Result<[u8; 64], VeilError> {
     data.try_into().map_err(|_| VeilError::InvalidInput {
         msg: format!("expected 64 bytes, got {}", data.len()),
     })
+}
+
+fn require_lower_hex_32(label: &str, value: &str) -> Result<[u8; 32], VeilError> {
+    if value.len() != 64 || value.bytes().any(|byte| !byte.is_ascii_hexdigit()) {
+        return Err(VeilError::InvalidInput {
+            msg: format!("{label} must be exactly 64 lowercase hexadecimal characters"),
+        });
+    }
+    let mut decoded = [0u8; 32];
+    hex::decode_to_slice(value, &mut decoded).map_err(|_| VeilError::InvalidInput {
+        msg: format!("{label} must be exactly 64 lowercase hexadecimal characters"),
+    })?;
+    if hex::encode(decoded) != value {
+        return Err(VeilError::InvalidInput {
+            msg: format!("{label} must be exactly 64 lowercase hexadecimal characters"),
+        });
+    }
+    Ok(decoded)
 }
 
 fn require_canonical_user_id(label: &str, value: &str) -> Result<String, VeilError> {
@@ -4059,10 +4256,10 @@ fn validate_mobile_endpoint_pair(
         || websocket.password().is_some()
         || websocket.query().is_some()
         || websocket.fragment().is_some()
-        || websocket.path() != "/ws"
+        || websocket.path() != "/v3/events"
     {
         return Err(VeilError::InvalidInput {
-            msg: "mobile WebSocket URL must be an exact /ws endpoint without credentials, query, or fragment"
+            msg: "mobile WebSocket URL must be an exact /v3/events endpoint without credentials, query, or fragment"
                 .to_string(),
         });
     }
@@ -4373,117 +4570,90 @@ mod tests {
 
     #[test]
     fn parse_create_direct_response_accepts_canonical_id_and_rejects_noise() {
-        let session = mobile_test_authenticated_session(); // существующий хелпер
+        let (session, path, _token) = mobile_test_session_with_sync(1);
         let id = "6f9619ff-8b86-d011-b42d-00cf4fc964ff";
+        let peer = IdentityKeyPair::generate();
+        let peer_identity =
+            base64::engine::general_purpose::STANDARD.encode(peer.x25519_public_bytes());
+        let peer_signing =
+            base64::engine::general_purpose::STANDARD.encode(peer.ed25519_public_bytes());
         let ok = session
             .parse_create_direct_response(
-                format!("{{\"conversation_id\":\"{id}\"}}").into_bytes(),
+                serde_json::json!({
+                    "conversation_id": id,
+                    "created": true,
+                    "peer_identity_key": peer_identity,
+                    "peer_signing_key": peer_signing,
+                })
+                .to_string()
+                .into_bytes(),
             )
             .expect("canonical create response parses");
         assert_eq!(ok.conversation_id, id);
-        assert!(session.parse_create_direct_response(b"{}".to_vec()).is_err());
+        assert_eq!(ok.peer_identity_key, peer.x25519_public_bytes());
+        assert_eq!(ok.peer_signing_key, peer.ed25519_public_bytes());
+        assert!(session
+            .parse_create_direct_response(b"{}".to_vec())
+            .is_err());
         assert!(session
             .parse_create_direct_response(b"{\"conversation_id\":\"nope\"}".to_vec())
             .is_err());
         assert!(session
             .parse_create_direct_response(vec![b'x'; 5 * 1024])
             .is_err());
+        drop(session);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn contact_search_response_requires_exact_contract_and_valid_account_keys() {
+        let (session, path, _token) = mobile_test_session_with_sync(1);
+        let peer = IdentityKeyPair::generate();
+        let user_id = "550e8400-e29b-41d4-a716-446655440001";
+        let response = serde_json::json!({
+            "user_id": user_id,
+            "username": "alice",
+            "identity_key": hex::encode(peer.x25519_public_bytes()),
+            "signing_key": hex::encode(peer.ed25519_public_bytes()),
+        });
+
+        let parsed = session
+            .parse_contact_search_response(response.to_string().into_bytes())
+            .expect("exact contact response parses");
+        assert_eq!(parsed.user_id, user_id);
+        assert_eq!(parsed.identity_key, peer.x25519_public_bytes());
+        assert_eq!(parsed.signing_key, peer.ed25519_public_bytes());
+
+        let mut legacy = response.clone();
+        let legacy_user_id = legacy.get("user_id").cloned().unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .insert("id".to_string(), legacy_user_id);
+        legacy.as_object_mut().unwrap().remove("user_id");
+        assert!(session
+            .parse_contact_search_response(legacy.to_string().into_bytes())
+            .is_err());
+
+        let mut weak = response;
+        weak.as_object_mut().unwrap().insert(
+            "signing_key".to_string(),
+            serde_json::Value::String(hex::encode([0u8; 32])),
+        );
+        assert!(session
+            .parse_contact_search_response(weak.to_string().into_bytes())
+            .is_err());
+        assert!(session
+            .parse_contact_search_response(vec![b'x'; MOBILE_CONTACT_SEARCH_RESPONSE_LIMIT + 1])
+            .is_err());
+
+        drop(session);
+        let _ = std::fs::remove_file(path);
     }
     use bip39::Language;
     use prost::Message as ProstMessage;
     use sha2::{Digest, Sha256};
     use veil_client::protocol::proto;
-
-    #[test]
-    fn standalone_ratchet_ffi_uses_bounded_strict_persisted_state_contract() {
-        let peer = IdentityKeyPair::generate();
-        let ratchet =
-            VeilRatchet::init_initiator(vec![0x41; 32], peer.x25519_public_bytes().to_vec())
-                .unwrap();
-        let mut serialized = ratchet.serialize().unwrap();
-        let restored = VeilRatchet::deserialize(serialized.clone()).unwrap();
-        assert_eq!(restored.serialize().unwrap(), serialized);
-
-        let mut malformed = serialized.replacen(
-            "\"skipped_keys\":{}",
-            "\"skipped_keys\":{\"malformed\":\"AA==\"}",
-            1,
-        );
-        assert!(VeilRatchet::deserialize(malformed.clone()).is_err());
-        assert!(VeilRatchet::deserialize(" ".repeat(1024 * 1024 + 1)).is_err());
-
-        let responder_identity = IdentityKeyPair::generate();
-        let responder_spk = x3dh::SignedPreKey::generate(&responder_identity, 7);
-        let shared_secret = vec![0x52; 32];
-        let initiator = VeilRatchet::init_initiator(
-            shared_secret.clone(),
-            responder_spk.public.as_bytes().to_vec(),
-        )
-        .unwrap();
-        let responder = VeilRatchet::init_responder(
-            shared_secret,
-            responder_spk.secret.to_bytes().to_vec(),
-            responder_spk.public.as_bytes().to_vec(),
-        )
-        .unwrap();
-        let initial = initiator.encrypt(b"initial".to_vec()).unwrap();
-        assert_eq!(
-            responder
-                .decrypt(initial.header, initial.ciphertext)
-                .unwrap(),
-            b"initial"
-        );
-        let late_one = initiator.encrypt(b"late-one".to_vec()).unwrap();
-        let late_two = initiator.encrypt(b"late-two".to_vec()).unwrap();
-        let late_three = initiator.encrypt(b"late-three".to_vec()).unwrap();
-        assert_eq!(
-            responder
-                .decrypt(late_three.header, late_three.ciphertext)
-                .unwrap(),
-            b"late-three"
-        );
-
-        let mut canonical_nonempty = responder.serialize().unwrap();
-        let marker = "\"skipped_keys\":{";
-        let body_start = canonical_nonempty.find(marker).unwrap() + marker.len();
-        let body_end = body_start + canonical_nonempty[body_start..].find('}').unwrap();
-        let mut skipped_entries: Vec<_> = canonical_nonempty[body_start..body_end]
-            .split(',')
-            .collect();
-        assert_eq!(skipped_entries.len(), 2);
-        skipped_entries.reverse();
-        let mut legacy_order = Zeroizing::new(String::with_capacity(canonical_nonempty.len()));
-        legacy_order.push_str(&canonical_nonempty[..body_start]);
-        for (index, entry) in skipped_entries.into_iter().enumerate() {
-            if index != 0 {
-                legacy_order.push(',');
-            }
-            legacy_order.push_str(entry);
-        }
-        legacy_order.push_str(&canonical_nonempty[body_end..]);
-        assert_ne!(legacy_order.as_str(), canonical_nonempty);
-
-        let restored_nonempty = VeilRatchet::deserialize(legacy_order.to_string()).unwrap();
-        let mut recanonical = restored_nonempty.serialize().unwrap();
-        assert_eq!(recanonical, canonical_nonempty);
-        assert_eq!(
-            restored_nonempty
-                .decrypt(late_one.header, late_one.ciphertext)
-                .unwrap(),
-            b"late-one"
-        );
-        assert_eq!(
-            restored_nonempty
-                .decrypt(late_two.header, late_two.ciphertext)
-                .unwrap(),
-            b"late-two"
-        );
-
-        recanonical.zeroize();
-        canonical_nonempty.zeroize();
-        malformed.zeroize();
-        serialized.zeroize();
-    }
 
     #[test]
     fn mobile_live_retryability_is_a_positive_typed_allowlist() {
@@ -4706,6 +4876,8 @@ mod tests {
                     roster_version: None,
                     envelope_commitment: None,
                     client_message_id: self.client_message_id.clone(),
+                    membership_epoch: None,
+                    membership_epoch_hash: None,
                 })),
             }
             .encode_to_vec()
@@ -4892,7 +5064,7 @@ mod tests {
         let token = "ab".repeat(32);
         (
             VeilMobileSession {
-                client: Mutex::new(client),
+                client: Arc::new(Mutex::new(client)),
                 runtime,
                 binding: Mutex::new(Some(epoch.clone())),
                 direct_sync: Mutex::new(Some(MobileDirectSyncState {
@@ -4911,8 +5083,9 @@ mod tests {
                     outbox_replay_cursor: None,
                     outbox_replay_complete: false,
                 })),
+                background_events_active: Arc::new(AtomicBool::new(false)),
+                background_events_cancel: Arc::new(Mutex::new(None)),
                 next_binding_generation: AtomicU64::new(generation),
-                last_rest_timestamp_ms: AtomicI64::new(0),
                 direct_post_sign_pre_postflight_hook: Mutex::new(None),
             },
             path,
@@ -5220,12 +5393,6 @@ mod tests {
     }
 
     #[test]
-    fn test_generate_and_validate_mnemonic() {
-        let m = generate_mnemonic();
-        assert!(validate_mnemonic(m));
-    }
-
-    #[test]
     fn recovery_dictionary_contract_is_pinned() {
         let canonical = Language::English.word_list().join("\n");
         assert_eq!(Language::English.word_list().len(), 2048);
@@ -5448,12 +5615,18 @@ mod tests {
     }
 
     #[test]
-    fn mnemonic_byte_constructor_matches_legacy_identity_constructor() {
+    fn mnemonic_byte_constructor_matches_crypto_identity_derivation() {
         let mnemonic = generate_mnemonic();
-        let legacy = VeilIdentity::from_mnemonic(mnemonic.clone()).unwrap();
+        let expected = IdentityKeyPair::from_mnemonic(&mnemonic).unwrap();
         let from_bytes = VeilIdentity::from_mnemonic_bytes(mnemonic.into_bytes()).unwrap();
-        assert_eq!(legacy.identity_key(), from_bytes.identity_key());
-        assert_eq!(legacy.signing_key(), from_bytes.signing_key());
+        assert_eq!(
+            expected.x25519_public_bytes().as_slice(),
+            from_bytes.identity_key()
+        );
+        assert_eq!(
+            expected.ed25519_public_bytes().as_slice(),
+            from_bytes.signing_key()
+        );
     }
 
     #[test]
@@ -5538,6 +5711,97 @@ mod tests {
     }
 
     #[test]
+    fn background_binding_requires_exact_durable_origin_and_account() {
+        let mnemonic = generate_mnemonic();
+        let path = std::env::temp_dir().join(format!(
+            "veil-ffi-background-binding-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let session =
+            VeilMobileSession::from_mnemonic(mnemonic, path.to_string_lossy().into_owned())
+                .unwrap();
+        let origin = "https://node.example.test:443";
+        let user_id = "550e8400-e29b-41d4-a716-446655440001";
+        {
+            let mut client = session.client.lock().unwrap();
+            let identity_key = client.identity_key().unwrap();
+            let signing_key = client.signing_key().unwrap();
+            client
+                .db()
+                .unwrap()
+                .bind_authenticated_self_and_select_mobile_reconnect_target_v1(
+                    origin,
+                    user_id,
+                    &identity_key,
+                    &signing_key,
+                )
+                .unwrap();
+
+            assert!(client.background_events_v3_material().is_ok());
+            assert!(client
+                .activate_background_events_v3_binding("https://other.example.test:443", user_id,)
+                .is_err());
+            assert!(client
+                .activate_background_events_v3_binding(
+                    origin,
+                    "550e8400-e29b-41d4-a716-446655440002",
+                )
+                .is_err());
+            assert!(client.authenticated_user_id().is_err());
+
+            client
+                .activate_background_events_v3_binding(origin, user_id)
+                .unwrap();
+            assert_eq!(client.authenticated_user_id().unwrap(), user_id);
+            assert!(client.background_events_v3_material().is_err());
+            client.deactivate_background_events_v3_binding(
+                origin,
+                "550e8400-e29b-41d4-a716-446655440002",
+            );
+            assert_eq!(client.authenticated_user_id().unwrap(), user_id);
+            client.deactivate_background_events_v3_binding(origin, user_id);
+            assert!(client.authenticated_user_id().is_err());
+        }
+        drop(session);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn session_owned_background_registration_is_unique_and_cancelled_by_lifecycle() {
+        let mnemonic = generate_mnemonic();
+        let path = std::env::temp_dir().join(format!(
+            "veil-ffi-background-registration-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let session =
+            VeilMobileSession::from_mnemonic(mnemonic, path.to_string_lossy().into_owned())
+                .unwrap();
+        let (cancel, receiver) = tokio::sync::watch::channel(false);
+        assert!(session
+            .background_events_active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok());
+        assert!(session
+            .background_events_active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err());
+        *session.background_events_cancel.lock().unwrap() = Some(cancel);
+        let registration = MobileBackgroundEventsRegistration {
+            active: Arc::clone(&session.background_events_active),
+            cancel_slot: Arc::clone(&session.background_events_cancel),
+        };
+
+        session.stop_background_events();
+        assert!(*receiver.borrow());
+        drop(registration);
+        assert!(!session.background_events_active.load(Ordering::Acquire));
+        assert!(session.background_events_cancel.lock().unwrap().is_none());
+
+        drop(session);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn mobile_reconnect_target_revalidates_mobile_origin_and_account_keys_fail_closed() {
         let mnemonic = generate_mnemonic();
         let insecure_path = std::env::temp_dir().join(format!(
@@ -5612,19 +5876,10 @@ mod tests {
     }
 
     #[test]
-    fn test_aead_roundtrip() {
-        let key = vec![42u8; 32];
-        let plain = b"hello veil".to_vec();
-        let enc = aead_encrypt(key.clone(), plain.clone()).unwrap();
-        let dec = aead_decrypt(key, enc.ciphertext, enc.nonce).unwrap();
-        assert_eq!(dec, plain);
-    }
-
-    #[test]
-    fn test_sign_verify() {
+    fn test_public_signature_verification() {
         let id = VeilIdentity::generate();
         let msg = b"test message".to_vec();
-        let sig = id.sign(msg.clone());
+        let sig = signature::sign(&id.inner, &msg).to_vec();
         assert!(ed25519_verify(id.signing_key(), msg, sig).unwrap());
     }
 
@@ -5730,19 +5985,21 @@ mod tests {
     #[test]
     fn mobile_endpoint_pair_is_exact_origin_scoped() {
         assert!(validate_mobile_endpoint_pair(
-            "wss://chat.example.test/ws",
+            "wss://chat.example.test/v3/events",
             "https://chat.example.test:443",
         )
         .is_ok());
-        assert!(
-            validate_mobile_endpoint_pair("ws://127.0.0.1:9080/ws", "http://127.0.0.1:9080",)
-                .is_ok()
-        );
+        assert!(validate_mobile_endpoint_pair(
+            "ws://127.0.0.1:9080/v3/events",
+            "http://127.0.0.1:9080",
+        )
+        .is_ok());
         for websocket in [
-            "wss://other.example.test/ws",
+            "wss://other.example.test/v3/events",
             "wss://chat.example.test/other",
-            "wss://chat.example.test/ws?origin=other",
-            "ws://chat.example.test/ws",
+            "wss://chat.example.test/v3/events?origin=other",
+            "ws://chat.example.test/v3/events",
+            "wss://chat.example.test/ws",
         ] {
             assert!(
                 validate_mobile_endpoint_pair(websocket, "https://chat.example.test:443",).is_err()
@@ -7428,6 +7685,100 @@ mod tests {
                 .unwrap(),
             before
         );
+
+        drop(session);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn mobile_direct_identity_verification_is_exact_explicit_and_stale_safe() {
+        let (session, path, token) = mobile_test_session_with_sync(237);
+        let (conversation_id, _peer) = mobile_test_install_ready_direct_with_peer(&session, &token);
+
+        let initial = session
+            .direct_identity_verification(conversation_id.clone())
+            .unwrap()
+            .expect("Ready exact Direct must expose its account-v2 safety number");
+        assert_eq!(initial.fingerprint_version, "account_v2");
+        assert_eq!(initial.fingerprint_hex.len(), 64);
+        assert!(!initial.fingerprint_emoji.is_empty());
+        assert_eq!(
+            initial.qr_payload,
+            format!("veil-identity:account-v2:{}", initial.fingerprint_hex)
+        );
+        assert_eq!(initial.qr_payload.len(), 89);
+        assert_eq!(
+            initial.state,
+            MobileDirectIdentityVerificationState::NotCompared
+        );
+
+        let mismatch = session
+            .confirm_direct_identity_verification(conversation_id.clone(), "00".repeat(32))
+            .unwrap_err();
+        assert!(mismatch.to_string().contains("stale or mismatched"));
+        assert_eq!(
+            session
+                .direct_identity_verification(conversation_id.clone())
+                .unwrap()
+                .unwrap()
+                .state,
+            MobileDirectIdentityVerificationState::NotCompared,
+            "a mismatched safety number must not create a local proof"
+        );
+        assert!(session
+            .confirm_direct_identity_verification(conversation_id.clone(), "AA".repeat(32))
+            .unwrap_err()
+            .to_string()
+            .contains("lowercase hexadecimal"));
+        assert!(session
+            .confirm_direct_identity_verification_qr(
+                conversation_id.clone(),
+                format!("veil-identity:account-v1:{}", initial.fingerprint_hex),
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("QR payload is invalid"));
+        assert!(session
+            .confirm_direct_identity_verification_qr(
+                conversation_id.clone(),
+                format!("veil-identity:account-v2:{}", "00".repeat(32)),
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("stale or mismatched"));
+        assert_eq!(
+            session
+                .direct_identity_verification(conversation_id.clone())
+                .unwrap()
+                .unwrap()
+                .state,
+            MobileDirectIdentityVerificationState::NotCompared,
+            "malformed or mismatched QR input must not create a local proof"
+        );
+
+        let verified = session
+            .confirm_direct_identity_verification_qr(
+                conversation_id.clone(),
+                initial.qr_payload.clone(),
+            )
+            .unwrap()
+            .expect("unchanged Ready route must accept its exact displayed digest");
+        assert_eq!(
+            verified.state,
+            MobileDirectIdentityVerificationState::VerifiedOnThisDevice
+        );
+        assert_eq!(verified.fingerprint_hex, initial.fingerprint_hex);
+
+        session.direct_sync.lock().unwrap().as_mut().unwrap().phase =
+            MobileDirectSyncPhase::HistorySynchronizedAwaitingLive;
+        assert!(session
+            .direct_identity_verification(conversation_id.clone())
+            .unwrap()
+            .is_none());
+        assert!(session
+            .confirm_direct_identity_verification_qr(conversation_id, verified.qr_payload)
+            .unwrap()
+            .is_none());
 
         drop(session);
         let _ = std::fs::remove_file(path);

@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/NaveLIL/veil/veil-server/internal/authmw"
 	"github.com/NaveLIL/veil/veil-server/internal/db"
 	tusd "github.com/tus/tusd/v2/pkg/handler"
 )
@@ -316,9 +317,8 @@ func keyFromString(s string) ([]byte, error) {
 	return []byte(s), nil
 }
 
-// TestServiceTokenEndpoint exercises the /v1/uploads/token issuer
-// without a signed-mw wrapper (we pass nil so the endpoint reads
-// X-Veil-User directly — the same pattern push uses).
+// TestServiceTokenEndpoint exercises the /v1/uploads/token issuer without a
+// signed-mw wrapper by publishing an explicit verified test principal.
 func TestServiceTokenEndpoint(t *testing.T) {
 	cfg := defaultCfg()
 	cfg.LocalDir = t.TempDir()
@@ -331,7 +331,7 @@ func TestServiceTokenEndpoint(t *testing.T) {
 	svc.RegisterRoutes(mux, nil, nil)
 
 	req := httptest.NewRequest("POST", "/v1/uploads/token", strings.NewReader(""))
-	req.Header.Set("X-Veil-User", "alice")
+	req = req.WithContext(authmw.ContextWithVerifiedUserIDForTesting(req.Context(), "alice"))
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 	if rec.Code != 200 {

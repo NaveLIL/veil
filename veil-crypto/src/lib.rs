@@ -22,11 +22,13 @@ pub mod chunked_aead;
 pub mod fingerprint;
 pub mod kdf;
 pub mod keys;
+pub mod membership;
 pub mod public_key;
 pub mod ratchet;
 pub mod sender_key;
 pub mod share;
 pub mod signature;
+pub mod transparency;
 mod x25519;
 pub mod x3dh;
 

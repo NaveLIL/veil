@@ -55,10 +55,28 @@ the `.proto` source and regenerated Go diff in the same change.
 
 ### WebSocket authentication versions
 
-`AuthChallengeV3`, `AuthResponseV3`, and `AuthResultV3` are an additive,
-versioned foundation only. Their Envelope tags are 14, 15, and 16; legacy auth
-keeps tags 10, 11, and 12. The current `/ws` endpoint still speaks only the
-legacy exchange. Generated support for the v3 messages does not advertise or
-activate them, and clients must never attempt an automatic v3-to-v2 fallback.
-A separately reviewed endpoint or subprotocol negotiation is required before
-runtime activation.
+`AuthChallengeV3`, `AuthResponseV3`, and `AuthResultV3` are the active native
+authentication exchange on exact `/v3/events`. Their Envelope tags are 14, 15,
+and 16; legacy auth keeps tags 10, 11, and 12 solely for the server-operated
+emergency compatibility endpoint. `/ws` is disabled by default, requires the
+explicit `VEIL_ALLOW_LEGACY_WS_V2=true` operator flag, and is never selected by
+an automatic client downgrade. WS v3 binds canonical Node origin, account,
+device, client metadata, registration intent, challenge, and optional Node
+Access Pass into one signed attempt. Commands, ACKs, and events then share the
+same authenticated socket and sequence epoch.
+
+Signed HTTP routes use REST authentication v2. Its transcript binds canonical
+origin, account, method, raw request target, timestamp, nonce, and body digest;
+replay state is durable in PostgreSQL. REST v1 parse failures never fall back
+from a route configured as v2-only.
+
+### Direct cryptographic profiles
+
+Direct v2 is an additive profile inside the `veil.v1` namespace. A v2
+`SendMessage` carries `crypto_profile = "direct_v2"`, era `1`, the exact target
+device and binding version, and the Direct transcript commitment. The gateway
+derives the sender device from the authenticated WS v3 principal and persists
+the full routing context. `MessageEvent` returns that context so the receiver
+can reconstruct the same origin/account/device/session transcript before
+decrypting. Once a conversation has a durable v2 commitment, missing or legacy
+profile fields are a rejected downgrade, never inferred compatibility.

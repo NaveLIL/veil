@@ -208,6 +208,9 @@ jobs:
 
       - name: Build Rust libraries and regenerate UniFFI bindings
         shell: pwsh
+        env:
+          VEIL_IDENTITY_TRANSPARENCY_WITNESS_KEYS: ${{ vars.VEIL_IDENTITY_TRANSPARENCY_WITNESS_KEYS }}
+          VEIL_IDENTITY_TRANSPARENCY_WITNESS_QUORUM: ${{ vars.VEIL_IDENTITY_TRANSPARENCY_WITNESS_QUORUM }}
         run: |
           & ./veil-mobile/scripts/build-android-native.ps1 `
             -CargoTargetDir (Join-Path $env:RUNNER_TEMP "veil-mobile-tester-rust-target")
@@ -222,6 +225,10 @@ jobs:
             echo "UniFFI Kotlin bindings are stale. Regenerate and commit them." >&2
             exit 1
           fi
+
+      - name: Verify production UniFFI surface
+        working-directory: veil-mobile
+        run: pnpm verify:uniffi-production-surface
 
       - name: Test and lint release-like tester policy
         working-directory: veil-mobile/android

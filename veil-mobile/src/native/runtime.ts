@@ -88,6 +88,21 @@ export interface DirectMessageProjection {
   messages: DirectMessageView[];
 }
 
+export type DirectIdentityVerificationState =
+  | "not_compared"
+  | "verified_on_this_device"
+  | "identity_changed";
+
+export interface DirectIdentityVerification {
+  canonicalServerOrigin: string;
+  peerUserId: string;
+  fingerprintVersion: "account_v2";
+  fingerprintEmoji: string;
+  fingerprintHex: string;
+  qrPayload: string;
+  state: DirectIdentityVerificationState;
+}
+
 export type DirectTextSendFailure = "rejected" | "unavailable";
 
 /** Opaque failure category for a payload-free native Direct send. */
@@ -109,9 +124,11 @@ export class DirectTextSendError extends Error {
 }
 
 export interface NativeRestSignatureData {
+  version: "2";
   userId: string;
   timestampMs: string;
-  signatureBase64: string;
+  nonceBase64url: string;
+  signatureBase64url: string;
 }
 
 export interface NativeContactRequest {
@@ -124,8 +141,6 @@ export interface NativeContactRequest {
 export interface NativeContactSearchResult {
   userId: string;
   username: string;
-  identityKeyBase64: string;
-  signingKeyBase64: string;
 }
 
 interface VeilMobileRuntimeNative {
@@ -138,17 +153,29 @@ interface VeilMobileRuntimeNative {
   lockSession(): Promise<unknown>;
   cancelPendingAccessPass(flowId: string): Promise<unknown>;
   projectDirectMessages(conversationId: string): Promise<unknown>;
+  getDirectIdentityVerification(
+    conversationId: string,
+    expectedDirectGeneration: number,
+  ): Promise<unknown>;
+  confirmDirectIdentityVerification(
+    conversationId: string,
+    expectedDirectGeneration: number,
+    expectedFingerprintHex: string,
+  ): Promise<unknown>;
+  confirmDirectIdentityVerificationQr(
+    conversationId: string,
+    expectedDirectGeneration: number,
+    scannedQrPayload: string,
+  ): Promise<unknown>;
   sendDirectText(
     conversationId: string,
     expectedDirectGeneration: number,
     text: string,
   ): Promise<unknown>;
   prepareContactSearch(username: string): Promise<NativeContactRequest>;
-  prepareFriendRequest(peerUserId: string): Promise<NativeContactRequest>;
   prepareCreateDirect(peerUserId: string): Promise<NativeContactRequest>;
   parseContactSearchResponse(responseBase64: string): Promise<NativeContactSearchResult>;
-  parseCreateDirectResponse(responseBase64: string): Promise<{ conversationId: string, createdAt: string }>;
-  installDirectConversation(peerUserId: string, conversationId: string, createdAt: string): Promise<"installed" | "already_exists">;
+  parseCreateDirectResponse(responseBase64: string): Promise<{ conversationId: string }>;
   addListener(eventName: string): void;
   removeListeners(count: number): void;
 }
@@ -176,6 +203,9 @@ const nilUuid = "00000000-0000-0000-0000-000000000000";
 const canonicalOriginPattern = /^(https|http):\/\/(\[[0-9a-f:]+\]|[a-z0-9.-]+):([1-9][0-9]{0,4})$/;
 const exactFlowId = /^[0-9a-f]{64}$/;
 const exactTokenRef = /^[0-9a-f]{12}$/;
+const exactLowerHex32 = /^[0-9a-f]{64}$/;
+const DIRECT_IDENTITY_QR_PREFIX_V1 = "veil-identity:account-v2:";
+const exactDirectIdentityQrPayloadV1 = /^veil-identity:account-v2:[0-9a-f]{64}$/;
 const MAX_DIRECT_CONVERSATIONS = 10_000;
 const MAX_DIRECT_NAME_BYTES = 256;
 const MAX_DIRECT_USERNAME_BYTES = 128;
@@ -553,6 +583,39 @@ function directMessageProjection(value: unknown): DirectMessageProjection {
   return { availability: "available", messages };
 }
 
+function directIdentityVerification(value: unknown): DirectIdentityVerification | null {
+  if (!value || typeof value !== "object") return null;
+  const record = value as Record<string, unknown>;
+  if (
+    typeof record.canonicalServerOrigin !== "string" ||
+    !isCanonicalOrigin(record.canonicalServerOrigin) ||
+    typeof record.peerUserId !== "string" ||
+    !isCanonicalUuid(record.peerUserId) ||
+    record.fingerprintVersion !== "account_v2" ||
+    typeof record.fingerprintEmoji !== "string" ||
+    boundedUtf8Length(record.fingerprintEmoji, 1024) === null ||
+    record.fingerprintEmoji.length === 0 ||
+    containsControl(record.fingerprintEmoji) ||
+    typeof record.fingerprintHex !== "string" ||
+    !exactLowerHex32.test(record.fingerprintHex) ||
+    typeof record.qrPayload !== "string" ||
+    !exactDirectIdentityQrPayloadV1.test(record.qrPayload) ||
+    record.qrPayload !== DIRECT_IDENTITY_QR_PREFIX_V1 + record.fingerprintHex ||
+    !["not_compared", "verified_on_this_device", "identity_changed"].includes(
+      record.state as string,
+    )
+  ) return null;
+  return {
+    canonicalServerOrigin: record.canonicalServerOrigin,
+    peerUserId: record.peerUserId,
+    fingerprintVersion: "account_v2",
+    fingerprintEmoji: record.fingerprintEmoji,
+    fingerprintHex: record.fingerprintHex,
+    qrPayload: record.qrPayload,
+    state: record.state as DirectIdentityVerificationState,
+  };
+}
+
 type OwnDataPropertyRead =
   | { kind: "absent" }
   | { kind: "data"; value: unknown }
@@ -675,20 +738,14 @@ const VeilRuntime = {
   prepareContactSearch: async (username: string): Promise<NativeContactRequest> =>
     requireRuntime().prepareContactSearch(username),
 
-  prepareFriendRequest: async (peerUserId: string): Promise<NativeContactRequest> =>
-    requireRuntime().prepareFriendRequest(peerUserId),
-
   prepareCreateDirect: async (peerUserId: string): Promise<NativeContactRequest> =>
     requireRuntime().prepareCreateDirect(peerUserId),
 
   parseContactSearchResponse: async (responseBase64: string): Promise<NativeContactSearchResult> =>
     requireRuntime().parseContactSearchResponse(responseBase64),
 
-  parseCreateDirectResponse: async (responseBase64: string): Promise<{ conversationId: string, createdAt: string }> =>
+  parseCreateDirectResponse: async (responseBase64: string): Promise<{ conversationId: string }> =>
     requireRuntime().parseCreateDirectResponse(responseBase64),
-
-  installDirectConversation: async (peerUserId: string, conversationId: string, createdAt: string): Promise<"installed" | "already_exists"> =>
-    requireRuntime().installDirectConversation(peerUserId, conversationId, createdAt),
 
   cancelPendingAccessPass: async (flowId: string): Promise<boolean> =>
     await requireRuntime().cancelPendingAccessPass(flowId) === true,
@@ -698,6 +755,72 @@ const VeilRuntime = {
       return directMessageProjection(await requireRuntime().projectDirectMessages(conversationId));
     } catch {
       return unavailableDirectProjection();
+    }
+  },
+  getDirectIdentityVerification: async (
+    conversationId: string,
+    expectedDirectGeneration: number,
+  ): Promise<DirectIdentityVerification | null> => {
+    if (
+      !isCanonicalUuid(conversationId)
+      || !Number.isSafeInteger(expectedDirectGeneration)
+      || expectedDirectGeneration < 1
+    ) return null;
+    try {
+      return directIdentityVerification(
+        await requireRuntime().getDirectIdentityVerification(
+          conversationId,
+          expectedDirectGeneration,
+        ),
+      );
+    } catch {
+      return null;
+    }
+  },
+  confirmDirectIdentityVerification: async (
+    conversationId: string,
+    expectedDirectGeneration: number,
+    expectedFingerprintHex: string,
+  ): Promise<DirectIdentityVerification | null> => {
+    if (
+      !isCanonicalUuid(conversationId)
+      || !Number.isSafeInteger(expectedDirectGeneration)
+      || expectedDirectGeneration < 1
+      || !exactLowerHex32.test(expectedFingerprintHex)
+    ) return null;
+    try {
+      return directIdentityVerification(
+        await requireRuntime().confirmDirectIdentityVerification(
+          conversationId,
+          expectedDirectGeneration,
+          expectedFingerprintHex,
+        ),
+      );
+    } catch {
+      return null;
+    }
+  },
+  confirmDirectIdentityVerificationQr: async (
+    conversationId: string,
+    expectedDirectGeneration: number,
+    scannedQrPayload: string,
+  ): Promise<DirectIdentityVerification | null> => {
+    if (
+      !isCanonicalUuid(conversationId)
+      || !Number.isSafeInteger(expectedDirectGeneration)
+      || expectedDirectGeneration < 1
+      || !exactDirectIdentityQrPayloadV1.test(scannedQrPayload)
+    ) return null;
+    try {
+      return directIdentityVerification(
+        await requireRuntime().confirmDirectIdentityVerificationQr(
+          conversationId,
+          expectedDirectGeneration,
+          scannedQrPayload,
+        ),
+      );
+    } catch {
+      return null;
     }
   },
   sendDirectText: async (

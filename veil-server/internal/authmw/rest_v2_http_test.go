@@ -226,6 +226,29 @@ func TestRESTAuthV2HTTPBoundaryUsesRawTargetAndRestoresExactChunkedBody(t *testi
 	assertRESTAuthV2ProofHeadersScrubbed(t, request)
 }
 
+func TestRESTAuthV2AllowedBodyPolicyOwnsExactBoundedMediaTypes(t *testing.T) {
+	input := []string{"image/jpeg", "image/png"}
+	policy, err := NewRESTAuthV2AllowedBodyHTTPPolicy(input, 2<<20)
+	if err != nil || !policy.valid() || !policy.allowsMediaType("image/jpeg") || !policy.allowsMediaType("image/png") {
+		t.Fatalf("valid media allowlist rejected: policy=%+v err=%v", policy, err)
+	}
+	input[0] = "application/octet-stream"
+	if policy.allowsMediaType("application/octet-stream") || !policy.allowsMediaType("image/jpeg") {
+		t.Fatal("caller mutation changed the owned media allowlist")
+	}
+	for _, invalid := range [][]string{
+		nil,
+		{"image/jpeg", "image/jpeg"},
+		{"image/jpeg; charset=binary"},
+		{"Image/JPEG"},
+		{"image/jpeg", "image/png", "image/webp", "image/gif", "image/avif", "image/bmp", "image/tiff", "image/svg+xml", "application/octet-stream"},
+	} {
+		if candidate, candidateErr := NewRESTAuthV2AllowedBodyHTTPPolicy(invalid, 2<<20); candidateErr == nil || candidate.valid() {
+			t.Fatalf("invalid media allowlist accepted: %#v", invalid)
+		}
+	}
+}
+
 func TestRESTAuthV2HTTPBoundaryNeverReconstructsTargetFromURLOrHost(t *testing.T) {
 	harness := newRESTV2HTTPHarness(t, nil)
 	policy := RESTAuthV2BodylessHTTPPolicy()

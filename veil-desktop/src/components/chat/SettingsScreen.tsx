@@ -1115,7 +1115,7 @@ export const SettingsScreen: Component = () => {
             style={S.input}
             value={wsUrl()}
             onInput={(e) => setWsUrl(e.currentTarget.value)}
-            placeholder="wss://veil.erez.pro/ws"
+            placeholder="wss://veil.erez.pro/v3/events"
           />
         </div>
 

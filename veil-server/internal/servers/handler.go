@@ -24,11 +24,12 @@ import (
 
 // Handler exposes REST endpoints for Spaces/Rooms/roles/Veil Links.
 type Handler struct {
-	svc           *Service
-	mw            *authmw.Middleware
-	rl            *authmw.RateLimit
-	veilPreviewRL *authmw.RateLimit
-	veilJoinRL    *authmw.RateLimit
+	svc            *Service
+	mw             *authmw.Middleware
+	restDispatcher *authmw.RESTAuthVersionDispatcher
+	rl             *authmw.RateLimit
+	veilPreviewRL  *authmw.RateLimit
+	veilJoinRL     *authmw.RateLimit
 }
 
 // NewHandler builds a handler. The middleware and rate limiter may be nil; in
@@ -46,22 +47,32 @@ func (h *Handler) SetVeilLinkRateLimits(preview, join *authmw.RateLimit) {
 	h.veilJoinRL = join
 }
 
+// SetRESTAuthVersionDispatcher activates explicit REST authentication version
+// selection for every signed Space, Room, role, and Veil Link route.
+func (h *Handler) SetRESTAuthVersionDispatcher(dispatcher *authmw.RESTAuthVersionDispatcher) {
+	h.restDispatcher = dispatcher
+}
+
 func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
-	signed := func(f http.HandlerFunc) http.HandlerFunc {
+	signed := func(policy authmw.RESTAuthV2HTTPPolicy, f http.HandlerFunc) http.HandlerFunc {
 		if h.rl != nil {
 			f = h.rl.Wrap(f)
 		}
-		if h.mw != nil {
+		if h.restDispatcher != nil {
+			f = h.restDispatcher.RequireSigned(policy, f)
+		} else if h.mw != nil {
 			// Verify first; the limiter keys from verified principal context.
 			f = h.mw.RequireSigned(f)
 		}
 		return f
 	}
-	signedWith := func(f http.HandlerFunc, limiter *authmw.RateLimit) http.HandlerFunc {
+	signedWith := func(policy authmw.RESTAuthV2HTTPPolicy, f http.HandlerFunc, limiter *authmw.RateLimit) http.HandlerFunc {
 		if limiter != nil {
 			f = limiter.Wrap(f)
 		}
-		if h.mw != nil {
+		if h.restDispatcher != nil {
+			f = h.restDispatcher.RequireSigned(policy, f)
+		} else if h.mw != nil {
 			f = h.mw.RequireSigned(f)
 		}
 		return f
@@ -72,51 +83,56 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 		}
 		return f
 	}
+	jsonPolicy, err := authmw.NewRESTAuthV2JSONHTTPPolicy(64 * 1024)
+	if err != nil {
+		panic("invalid servers REST v2 JSON policy")
+	}
+	bodylessPolicy := authmw.RESTAuthV2BodylessHTTPPolicy()
 
 	// Servers
-	mux.HandleFunc("POST /v1/servers", signed(h.CreateServer))
-	mux.HandleFunc("GET /v1/servers", signed(h.ListServers))
-	mux.HandleFunc("GET /v1/servers/{serverID}", signed(h.GetServer))
-	mux.HandleFunc("PATCH /v1/servers/{serverID}", signed(h.UpdateServer))
-	mux.HandleFunc("DELETE /v1/servers/{serverID}", signed(h.DeleteServer))
-	mux.HandleFunc("POST /v1/servers/{serverID}/leave", signed(h.LeaveServer))
+	mux.HandleFunc("POST /v1/servers", signed(jsonPolicy, h.CreateServer))
+	mux.HandleFunc("GET /v1/servers", signed(bodylessPolicy, h.ListServers))
+	mux.HandleFunc("GET /v1/servers/{serverID}", signed(bodylessPolicy, h.GetServer))
+	mux.HandleFunc("PATCH /v1/servers/{serverID}", signed(jsonPolicy, h.UpdateServer))
+	mux.HandleFunc("DELETE /v1/servers/{serverID}", signed(bodylessPolicy, h.DeleteServer))
+	mux.HandleFunc("POST /v1/servers/{serverID}/leave", signed(bodylessPolicy, h.LeaveServer))
 
 	// Members
-	mux.HandleFunc("GET /v1/servers/{serverID}/members", signed(h.ListMembers))
-	mux.HandleFunc("DELETE /v1/servers/{serverID}/members/{userID}", signed(h.KickMember))
-	mux.HandleFunc("GET /v1/servers/{serverID}/bans", signed(h.ListBans))
-	mux.HandleFunc("PUT /v1/servers/{serverID}/bans/{userID}", signed(h.BanMember))
-	mux.HandleFunc("DELETE /v1/servers/{serverID}/bans/{userID}", signed(h.UnbanMember))
+	mux.HandleFunc("GET /v1/servers/{serverID}/members", signed(bodylessPolicy, h.ListMembers))
+	mux.HandleFunc("DELETE /v1/servers/{serverID}/members/{userID}", signed(jsonPolicy, h.KickMember))
+	mux.HandleFunc("GET /v1/servers/{serverID}/bans", signed(bodylessPolicy, h.ListBans))
+	mux.HandleFunc("PUT /v1/servers/{serverID}/bans/{userID}", signed(jsonPolicy, h.BanMember))
+	mux.HandleFunc("DELETE /v1/servers/{serverID}/bans/{userID}", signed(bodylessPolicy, h.UnbanMember))
 
 	// Channels
-	mux.HandleFunc("GET /v1/servers/{serverID}/channels", signed(h.ListChannels))
-	mux.HandleFunc("POST /v1/servers/{serverID}/channels", signed(h.CreateChannel))
-	mux.HandleFunc("POST /v1/servers/{serverID}/channels/reorder", signed(h.ReorderChannels))
-	mux.HandleFunc("PATCH /v1/channels/{channelID}", signed(h.UpdateChannel))
-	mux.HandleFunc("DELETE /v1/channels/{channelID}", signed(h.DeleteChannel))
-	mux.HandleFunc("GET /v1/channels/{channelID}/overwrites", signed(h.ListChannelOverwrites))
-	mux.HandleFunc("PUT /v1/channels/{channelID}/overwrites", signed(h.UpsertChannelOverwrite))
-	mux.HandleFunc("DELETE /v1/channels/{channelID}/overwrites/{targetType}/{targetID}", signed(h.DeleteChannelOverwrite))
+	mux.HandleFunc("GET /v1/servers/{serverID}/channels", signed(bodylessPolicy, h.ListChannels))
+	mux.HandleFunc("POST /v1/servers/{serverID}/channels", signed(jsonPolicy, h.CreateChannel))
+	mux.HandleFunc("POST /v1/servers/{serverID}/channels/reorder", signed(jsonPolicy, h.ReorderChannels))
+	mux.HandleFunc("PATCH /v1/channels/{channelID}", signed(jsonPolicy, h.UpdateChannel))
+	mux.HandleFunc("DELETE /v1/channels/{channelID}", signed(bodylessPolicy, h.DeleteChannel))
+	mux.HandleFunc("GET /v1/channels/{channelID}/overwrites", signed(bodylessPolicy, h.ListChannelOverwrites))
+	mux.HandleFunc("PUT /v1/channels/{channelID}/overwrites", signed(jsonPolicy, h.UpsertChannelOverwrite))
+	mux.HandleFunc("DELETE /v1/channels/{channelID}/overwrites/{targetType}/{targetID}", signed(bodylessPolicy, h.DeleteChannelOverwrite))
 
 	// Roles
-	mux.HandleFunc("GET /v1/servers/{serverID}/roles", signed(h.ListRoles))
-	mux.HandleFunc("POST /v1/servers/{serverID}/roles", signed(h.CreateRole))
-	mux.HandleFunc("PATCH /v1/servers/{serverID}/roles/{roleID}", signed(h.UpdateRole))
-	mux.HandleFunc("DELETE /v1/servers/{serverID}/roles/{roleID}", signed(h.DeleteRole))
-	mux.HandleFunc("PUT /v1/servers/{serverID}/members/{userID}/roles/{roleID}", signed(h.AssignRole))
-	mux.HandleFunc("DELETE /v1/servers/{serverID}/members/{userID}/roles/{roleID}", signed(h.UnassignRole))
+	mux.HandleFunc("GET /v1/servers/{serverID}/roles", signed(bodylessPolicy, h.ListRoles))
+	mux.HandleFunc("POST /v1/servers/{serverID}/roles", signed(jsonPolicy, h.CreateRole))
+	mux.HandleFunc("PATCH /v1/servers/{serverID}/roles/{roleID}", signed(jsonPolicy, h.UpdateRole))
+	mux.HandleFunc("DELETE /v1/servers/{serverID}/roles/{roleID}", signed(bodylessPolicy, h.DeleteRole))
+	mux.HandleFunc("PUT /v1/servers/{serverID}/members/{userID}/roles/{roleID}", signed(bodylessPolicy, h.AssignRole))
+	mux.HandleFunc("DELETE /v1/servers/{serverID}/members/{userID}/roles/{roleID}", signed(bodylessPolicy, h.UnassignRole))
 
 	// Veil Link v1. Public preview sees selector-only metadata; secret-bearing
 	// preview/join and all management operations are request-signed.
 	mux.HandleFunc("GET /assets/veil-link-bg-v1-38824a5f41228389.jpg", h.VeilLinkBackground)
-	mux.HandleFunc("POST /v1/servers/{serverID}/veil-links", signed(h.CreateInvite))
-	mux.HandleFunc("GET /v1/servers/{serverID}/veil-links", signed(h.ListInvites))
-	mux.HandleFunc("DELETE /v1/servers/{serverID}/veil-links/{inviteID}", signed(h.RevokeInvite))
-	mux.HandleFunc("DELETE /v1/servers/{serverID}/veil-links", signed(h.RevokeAllInvites))
+	mux.HandleFunc("POST /v1/servers/{serverID}/veil-links", signed(jsonPolicy, h.CreateInvite))
+	mux.HandleFunc("GET /v1/servers/{serverID}/veil-links", signed(bodylessPolicy, h.ListInvites))
+	mux.HandleFunc("DELETE /v1/servers/{serverID}/veil-links/{inviteID}", signed(bodylessPolicy, h.RevokeInvite))
+	mux.HandleFunc("DELETE /v1/servers/{serverID}/veil-links", signed(bodylessPolicy, h.RevokeAllInvites))
 	mux.HandleFunc("GET /v1/veil-links/{selector}", publicWith(h.PreviewInvite, h.veilPreviewRL))
 	mux.HandleFunc("GET /join/v1/{selector}", publicWith(h.VeilLinkPortal, h.veilPreviewRL))
-	mux.HandleFunc("POST /v1/veil-links/{selector}/preview", signedWith(h.AuthenticatedPreviewInvite, h.veilPreviewRL))
-	mux.HandleFunc("POST /v1/veil-links/{selector}/join", signedWith(h.UseInvite, h.veilJoinRL))
+	mux.HandleFunc("POST /v1/veil-links/{selector}/preview", signedWith(jsonPolicy, h.AuthenticatedPreviewInvite, h.veilPreviewRL))
+	mux.HandleFunc("POST /v1/veil-links/{selector}/join", signedWith(jsonPolicy, h.UseInvite, h.veilJoinRL))
 }
 
 // ─── Helpers ─────────────────────────────────────────
@@ -130,8 +146,8 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 func errResp(msg string) map[string]string { return map[string]string{"error": msg} }
 
 func requireUser(w http.ResponseWriter, r *http.Request) string {
-	uid := r.Header.Get("X-User-ID")
-	if uid == "" {
+	uid, ok := authmw.VerifiedUserID(r.Context())
+	if !ok {
 		writeJSON(w, http.StatusUnauthorized, errResp("X-User-ID header required"))
 	}
 	return uid

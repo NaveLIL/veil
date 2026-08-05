@@ -29,7 +29,7 @@ const (
 // or partially initialized policy. The zero value is invalid and fails closed.
 type RESTAuthV2HTTPPolicy struct {
 	bodyMode     restAuthV2HTTPBodyMode
-	mediaType    string
+	mediaTypes   []string
 	maxBodyBytes int64
 }
 
@@ -44,12 +44,33 @@ func RESTAuthV2BodylessHTTPPolicy() RESTAuthV2HTTPPolicy {
 // canonical media type and a route-specific maximum no greater than the shared
 // signed REST ceiling. Parameters and aliases are not accepted at runtime.
 func NewRESTAuthV2FixedBodyHTTPPolicy(mediaType string, maxBodyBytes int64) (RESTAuthV2HTTPPolicy, error) {
-	if !canonicalRESTAuthV2MediaType(mediaType) || maxBodyBytes < 1 || maxBodyBytes > RESTAuthV2MaxBodyBytes {
+	return NewRESTAuthV2AllowedBodyHTTPPolicy([]string{mediaType}, maxBodyBytes)
+}
+
+// NewRESTAuthV2AllowedBodyHTTPPolicy requires a non-empty body with exactly
+// one Content-Type from a small, route-owned allowlist. It is intended for
+// binary formats such as avatar uploads where changing the representation
+// would degrade existing functionality. Parameters and duplicate aliases are
+// rejected rather than normalized.
+func NewRESTAuthV2AllowedBodyHTTPPolicy(mediaTypes []string, maxBodyBytes int64) (RESTAuthV2HTTPPolicy, error) {
+	if len(mediaTypes) == 0 || len(mediaTypes) > 8 || maxBodyBytes < 1 || maxBodyBytes > RESTAuthV2MaxBodyBytes {
 		return RESTAuthV2HTTPPolicy{}, ErrRESTAuthV2HTTPConfiguration
+	}
+	owned := make([]string, len(mediaTypes))
+	seen := make(map[string]struct{}, len(mediaTypes))
+	for index, mediaType := range mediaTypes {
+		if !canonicalRESTAuthV2MediaType(mediaType) {
+			return RESTAuthV2HTTPPolicy{}, ErrRESTAuthV2HTTPConfiguration
+		}
+		if _, duplicate := seen[mediaType]; duplicate {
+			return RESTAuthV2HTTPPolicy{}, ErrRESTAuthV2HTTPConfiguration
+		}
+		seen[mediaType] = struct{}{}
+		owned[index] = mediaType
 	}
 	return RESTAuthV2HTTPPolicy{
 		bodyMode:     restAuthV2HTTPBodyRequired,
-		mediaType:    mediaType,
+		mediaTypes:   owned,
 		maxBodyBytes: maxBodyBytes,
 	}, nil
 }
@@ -62,10 +83,23 @@ func NewRESTAuthV2JSONHTTPPolicy(maxBodyBytes int64) (RESTAuthV2HTTPPolicy, erro
 func (policy RESTAuthV2HTTPPolicy) valid() bool {
 	switch policy.bodyMode {
 	case restAuthV2HTTPBodyForbidden:
-		return policy.mediaType == "" && policy.maxBodyBytes == 0
+		return len(policy.mediaTypes) == 0 && policy.maxBodyBytes == 0
 	case restAuthV2HTTPBodyRequired:
-		return canonicalRESTAuthV2MediaType(policy.mediaType) &&
-			policy.maxBodyBytes >= 1 && policy.maxBodyBytes <= RESTAuthV2MaxBodyBytes
+		if len(policy.mediaTypes) == 0 || len(policy.mediaTypes) > 8 ||
+			policy.maxBodyBytes < 1 || policy.maxBodyBytes > RESTAuthV2MaxBodyBytes {
+			return false
+		}
+		seen := make(map[string]struct{}, len(policy.mediaTypes))
+		for _, mediaType := range policy.mediaTypes {
+			if !canonicalRESTAuthV2MediaType(mediaType) {
+				return false
+			}
+			if _, duplicate := seen[mediaType]; duplicate {
+				return false
+			}
+			seen[mediaType] = struct{}{}
+		}
+		return true
 	default:
 		return false
 	}
@@ -103,7 +137,8 @@ func NewRESTAuthV2HTTPBoundary(
 }
 
 // RequireSigned adapts one exact HTTP request into the transport-neutral v2
-// verifier. It has no live call site in this checkpoint.
+// verifier. Live routes reach this boundary through the explicit version
+// dispatcher, which owns the temporary compatibility policy.
 func (boundary *RESTAuthV2HTTPBoundary) RequireSigned(
 	policy RESTAuthV2HTTPPolicy,
 	next http.HandlerFunc,
@@ -212,7 +247,7 @@ func validateRESTAuthV2HTTPMetadata(request *http.Request, policy RESTAuthV2HTTP
 			return restAuthV2HTTPUnsupportedRepresentation
 		}
 	case restAuthV2HTTPBodyRequired:
-		if !contentTypePresent || len(contentTypes) != 1 || contentTypes[0] != policy.mediaType {
+		if !contentTypePresent || len(contentTypes) != 1 || !policy.allowsMediaType(contentTypes[0]) {
 			return restAuthV2HTTPUnsupportedRepresentation
 		}
 		if request.ContentLength > policy.maxBodyBytes {
@@ -225,6 +260,15 @@ func validateRESTAuthV2HTTPMetadata(request *http.Request, policy RESTAuthV2HTTP
 		return restAuthV2HTTPInvalid
 	}
 	return nil
+}
+
+func (policy RESTAuthV2HTTPPolicy) allowsMediaType(value string) bool {
+	for _, mediaType := range policy.mediaTypes {
+		if value == mediaType {
+			return true
+		}
+	}
+	return false
 }
 
 func (boundary *RESTAuthV2HTTPBoundary) readAndRestoreBody(

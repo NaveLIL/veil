@@ -1,5 +1,5 @@
-import React, { useCallback, useEffect, useRef, useState } from "react";
-import { Animated, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
+import React, { useEffect, useRef, useState } from "react";
+import { Animated, BackHandler, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import type { NativeStackScreenProps } from "@react-navigation/native-stack";
 import {
   ChevronRight,
@@ -24,10 +24,7 @@ import Reanimated, {
   withDelay,
   Easing,
   interpolateColor,
-  interpolate,
-  Extrapolation,
 } from "react-native-reanimated";
-import { BackHandler } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 type Props = NativeStackScreenProps<DesignPreviewStackParamList, "Home">;
@@ -88,7 +85,7 @@ export default function DesignPreviewHomeScreen({ navigation }: Props) {
         headerY.value = withDelay(60, withTiming(0, { duration: 120, easing: Easing.out(Easing.ease) }));
       }
     }
-  }, [isSearching, reducedMotion]);
+  }, [headerOpacity, headerY, isSearching, panelOpacity, reducedMotion, searchProgress]);
 
   useEffect(() => {
     const backAction = () => {
@@ -106,6 +103,11 @@ export default function DesignPreviewHomeScreen({ navigation }: Props) {
     if (newDest === activeTab) return;
     if (isSearching) setIsSearching(false);
     setActiveTab(newDest);
+    if (reducedMotion) {
+      contentProgress.setValue(1);
+      setDestination(newDest);
+      return;
+    }
     Animated.timing(contentProgress, {
       toValue: 0,
       duration: 100,

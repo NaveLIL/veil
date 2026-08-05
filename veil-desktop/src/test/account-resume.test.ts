@@ -11,7 +11,7 @@ vi.mock("@tauri-apps/api/event", () => ({ listen: mocks.listen }));
 beforeEach(() => {
   // Keep this renderer-session test independent from the endpoint baked into
   // a release build. Its native mock authenticates the loopback Node.
-  vi.stubEnv("VITE_VEIL_WS_URL", "ws://127.0.0.1:9080/ws");
+  vi.stubEnv("VITE_VEIL_WS_URL", "ws://127.0.0.1:9080/v3/events");
   vi.stubEnv("VITE_VEIL_HTTP_URL", "http://127.0.0.1:9080");
 });
 

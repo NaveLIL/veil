@@ -5,8 +5,6 @@
 //! frozen account and device proofs, and validates a future v3 result. The
 //! legacy live `/ws` authentication path remains unchanged.
 
-
-
 use std::fmt;
 
 use ed25519_dalek::Signer;
@@ -74,7 +72,9 @@ impl fmt::Display for WsAuthV3Error {
 
 impl std::error::Error for WsAuthV3Error {}
 
-/// An exact `/ws` endpoint paired with one already-canonical Node origin.
+pub(crate) const WS_AUTH_V3_PATH: &str = "/v3/events";
+
+/// An exact `/v3/events` endpoint paired with one already-canonical Node origin.
 ///
 /// Validation happens against the original spelling before `url::Url` can
 /// normalize it. Consequently uppercase hosts, trailing dots, leading-zero
@@ -111,11 +111,11 @@ impl WsAuthV3Target {
             })
             .ok_or(WsAuthV3Error::InvalidTarget)?;
 
-        let explicit = format!("{websocket_scheme}://{authority}/ws");
+        let explicit = format!("{websocket_scheme}://{authority}{WS_AUTH_V3_PATH}");
         let default_suffix = format!(":{default_port}");
         let implicit_default = authority
             .strip_suffix(&default_suffix)
-            .map(|host| format!("{websocket_scheme}://{host}/ws"));
+            .map(|host| format!("{websocket_scheme}://{host}{WS_AUTH_V3_PATH}"));
         if websocket_url != explicit
             && implicit_default
                 .as_deref()
@@ -130,7 +130,7 @@ impl WsAuthV3Target {
         if parsed.scheme() != websocket_scheme
             || !parsed.username().is_empty()
             || parsed.password().is_some()
-            || parsed.path() != "/ws"
+            || parsed.path() != WS_AUTH_V3_PATH
             || parsed.query().is_some()
             || parsed.fragment().is_some()
             || parsed.host_str() != origin.host_str()
@@ -151,6 +151,7 @@ impl WsAuthV3Target {
         &self.websocket_url
     }
 
+    #[cfg(test)]
     pub(crate) fn canonical_origin(&self) -> &CanonicalNodeOriginV1 {
         &self.canonical_origin
     }
@@ -160,7 +161,11 @@ impl WsAuthV3Target {
 /// of a Pass is never used to infer whether account creation was intended.
 pub(crate) enum WsRegistrationModeV3<'a> {
     Existing,
+    // Retained for the reviewed enrollment proof path; production activation
+    // remains intentionally limited to existing-account reconnects.
+    #[allow(dead_code)]
     Open,
+    #[allow(dead_code)]
     Pass(&'a [u8; 32]),
 }
 
@@ -534,7 +539,7 @@ mod tests {
                 server_ephemeral: server_public.as_bytes().to_vec(),
                 canonical_node_origin: ORIGIN.to_owned(),
             },
-            target: WsAuthV3Target::parse("wss://chat.example.test/ws", ORIGIN).unwrap(),
+            target: WsAuthV3Target::parse("wss://chat.example.test/v3/events", ORIGIN).unwrap(),
         }
     }
 
@@ -753,25 +758,25 @@ mod tests {
     }
 
     #[test]
-    fn exact_target_accepts_only_origin_preserving_ws_spellings() {
+    fn exact_target_accepts_only_origin_preserving_v3_event_spellings() {
         for (websocket, origin) in [
-            ("wss://chat.example.test:443/ws", ORIGIN),
-            ("wss://chat.example.test/ws", ORIGIN),
+            ("wss://chat.example.test:443/v3/events", ORIGIN),
+            ("wss://chat.example.test/v3/events", ORIGIN),
             (
-                "wss://chat.example.test:8443/ws",
+                "wss://chat.example.test:8443/v3/events",
                 "https://chat.example.test:8443",
             ),
             (
-                "wss://xn--bcher-kva.example:443/ws",
+                "wss://xn--bcher-kva.example:443/v3/events",
                 "https://xn--bcher-kva.example:443",
             ),
-            ("ws://localhost:80/ws", "http://localhost:80"),
-            ("ws://localhost/ws", "http://localhost:80"),
-            ("ws://127.0.0.1:8080/ws", "http://127.0.0.1:8080"),
-            ("ws://[::1]:8080/ws", "http://[::1]:8080"),
+            ("ws://localhost:80/v3/events", "http://localhost:80"),
+            ("ws://localhost/v3/events", "http://localhost:80"),
+            ("ws://127.0.0.1:8080/v3/events", "http://127.0.0.1:8080"),
+            ("ws://[::1]:8080/v3/events", "http://[::1]:8080"),
         ] {
             let target = WsAuthV3Target::parse(websocket, origin).unwrap();
-            assert_eq!(target.websocket_url().path(), "/ws");
+            assert_eq!(target.websocket_url().path(), WS_AUTH_V3_PATH);
             assert_eq!(
                 target.websocket_url().port_or_known_default(),
                 Url::parse(origin).unwrap().port_or_known_default()
@@ -783,26 +788,30 @@ mod tests {
     #[test]
     fn exact_target_rejects_normalization_aliases_and_origin_mismatches() {
         for (websocket, origin) in [
-            ("wss://Chat.example.test:443/ws", ORIGIN),
-            ("wss://chat.example.test.:443/ws", ORIGIN),
-            ("wss://chat.example.test:0443/ws", ORIGIN),
-            ("wss://user@chat.example.test:443/ws", ORIGIN),
-            ("wss://chat.example.test:443/ws?", ORIGIN),
-            ("wss://chat.example.test:443/ws#fragment", ORIGIN),
-            ("wss://chat.example.test:443/ws/", ORIGIN),
-            ("wss://chat.example.test:443/WS", ORIGIN),
-            ("wss://chat.example.test:443/%77s", ORIGIN),
-            ("wss://chat.example.test:8443/ws", ORIGIN),
-            ("ws://chat.example.test:443/ws", ORIGIN),
+            ("wss://Chat.example.test:443/v3/events", ORIGIN),
+            ("wss://chat.example.test.:443/v3/events", ORIGIN),
+            ("wss://chat.example.test:0443/v3/events", ORIGIN),
+            ("wss://user@chat.example.test:443/v3/events", ORIGIN),
+            ("wss://chat.example.test:443/v3/events?", ORIGIN),
+            ("wss://chat.example.test:443/v3/events#fragment", ORIGIN),
+            ("wss://chat.example.test:443/v3/events/", ORIGIN),
+            ("wss://chat.example.test:443/V3/events", ORIGIN),
+            ("wss://chat.example.test:443/%76%33/events", ORIGIN),
+            ("wss://chat.example.test:443/ws", ORIGIN),
+            ("wss://chat.example.test:8443/v3/events", ORIGIN),
+            ("ws://chat.example.test:443/v3/events", ORIGIN),
             (
-                "wss://bücher.example:443/ws",
+                "wss://bücher.example:443/v3/events",
                 "https://xn--bcher-kva.example:443",
             ),
             (
-                "ws://chat.example.test:80/ws",
+                "ws://chat.example.test:80/v3/events",
                 "http://chat.example.test:80",
             ),
-            ("wss://xn--a-ecp.ru:443/ws", "https://xn--a-ecp.ru:443"),
+            (
+                "wss://xn--a-ecp.ru:443/v3/events",
+                "https://xn--a-ecp.ru:443",
+            ),
         ] {
             assert!(
                 WsAuthV3Target::parse(websocket, origin).is_err(),

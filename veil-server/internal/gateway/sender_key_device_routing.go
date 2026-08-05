@@ -9,6 +9,7 @@ import (
 	"log"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/NaveLIL/veil/veil-server/internal/db"
@@ -23,6 +24,14 @@ func (c *Client) handleSenderKeyDist(ctx context.Context, seq uint64, skd *pb.Se
 
 func (c *Client) pendingSenderKeyEnvelopes(ctx context.Context) ([][]byte, error) {
 	return c.buildPendingDeviceSenderKeyEnvelopes(ctx)
+}
+
+func membershipEpochPointerV1(epoch uint64) *uint64 {
+	if epoch == 0 {
+		return nil
+	}
+	value := epoch
+	return &value
 }
 
 func (c *Client) handleDeviceSenderKeyDist(ctx context.Context, seq uint64, skd *pb.SenderKeyDistribution) {
@@ -66,6 +75,31 @@ func (c *Client) handleDeviceSenderKeyDist(ctx context.Context, seq uint64, skd 
 		))
 		return
 	}
+	membershipRecord, membershipErr := c.hub.chatSvc.DB().MembershipEpochForRosterForRequesterV1(
+		ctx, skd.ConversationId, c.userID, roster.Version, roster.Commitment,
+	)
+	switch {
+	case errors.Is(membershipErr, pgx.ErrNoRows):
+		if skd.MembershipEpoch != 0 || len(skd.MembershipEpochHash) != 0 {
+			c.sendPublicError(seq, 409, publicerr.New(
+				409, "membership_epoch_changed", "signed membership changed; refresh and redistribute", db.ErrMembershipEpochRosterStale,
+			))
+			return
+		}
+	case membershipErr != nil:
+		c.sendPublicError(seq, 409, publicerr.New(
+			409, "membership_epoch_changed", "signed membership changed; refresh and redistribute", membershipErr,
+		))
+		return
+	default:
+		if membershipRecord == nil || skd.MembershipEpoch != membershipRecord.Epoch.Number ||
+			!bytes.Equal(skd.MembershipEpochHash, membershipRecord.Hash[:]) {
+			c.sendPublicError(seq, 409, publicerr.New(
+				409, "membership_epoch_changed", "signed membership changed; refresh and redistribute", db.ErrMembershipEpochRosterStale,
+			))
+			return
+		}
+	}
 	source, err := findRosterDeviceByDatabaseID(roster, c.deviceID)
 	if err != nil || !bytes.Equal(source.device.DeviceKey, c.deviceKey) ||
 		!bytes.Equal(skd.SenderDeviceId, source.device.DeviceKey) ||
@@ -99,11 +133,12 @@ func (c *Client) handleDeviceSenderKeyDist(ctx context.Context, seq uint64, skd 
 		return
 	}
 
-	if err := c.hub.chatSvc.DB().StoreDeviceSenderKey(
+	if err := c.hub.chatSvc.DB().StoreDeviceSenderKeyForMembership(
 		ctx, skd.ConversationId, c.deviceID, target.device.DeviceID,
 		skd.SenderKeyMessage, skd.Generation,
 		roster.Version, roster.Commitment[:],
 		source.device.Binding.Version, target.device.Binding.Version,
+		skd.MembershipEpoch, skd.MembershipEpochHash,
 	); err != nil {
 		switch {
 		case errors.Is(err, db.ErrSenderKeyConversationType):
@@ -160,6 +195,8 @@ func (c *Client) handleDeviceSenderKeyDist(ctx context.Context, seq uint64, skd 
 		SenderDeviceCapabilities:  source.device.Binding.Capabilities,
 		SenderDeviceBindingStatus: uint32(source.device.Binding.Status),
 		SenderAccountSignature:    append([]byte(nil), source.device.Binding.AccountSignature...),
+		MembershipEpoch:           skd.MembershipEpoch,
+		MembershipEpochHash:       append([]byte(nil), skd.MembershipEpochHash...),
 	}
 	fwd := &pb.Envelope{
 		Timestamp: uint64(time.Now().UnixNano()),
@@ -172,19 +209,21 @@ func (c *Client) handleDeviceSenderKeyDist(ctx context.Context, seq uint64, skd 
 	}
 
 	envelopeCommitment := sha256.Sum256(skd.SenderKeyMessage)
-	if err := c.hub.chatSvc.DB().WithCurrentSenderKeyRoute(
+	if err := c.hub.chatSvc.DB().WithCurrentSenderKeyRouteForMembership(
 		ctx, skd.ConversationId, c.deviceID, target.device.DeviceID,
 		roster.Version, roster.Commitment[:],
 		source.device.Binding.Version, target.device.Binding.Version,
+		skd.MembershipEpoch, skd.MembershipEpochHash,
 		func() error {
 			c.hub.enqueueToDevice(target.device.DeviceID, data)
 			return nil
 		},
 	); err != nil {
 		if errors.Is(err, db.ErrSenderKeyRosterChanged) {
-			if discardErr := c.hub.chatSvc.DB().DiscardDeviceSenderKey(
+			if discardErr := c.hub.chatSvc.DB().DiscardDeviceSenderKeyForMembership(
 				ctx, skd.ConversationId, c.deviceID, target.device.DeviceID,
 				skd.Generation, roster.Version, envelopeCommitment[:],
+				skd.MembershipEpoch, skd.MembershipEpochHash,
 			); discardErr != nil {
 				log.Printf(
 					"sender-key stale route cleanup failed: owner_device_ref=%s target_device_ref=%s",
@@ -216,6 +255,8 @@ func (c *Client) handleDeviceSenderKeyDist(ctx context.Context, seq uint64, skd 
 			SenderKeyGeneration: &generation,
 			RosterVersion:       &rosterVersion,
 			EnvelopeCommitment:  append([]byte(nil), envelopeCommitment[:]...),
+			MembershipEpoch:     membershipEpochPointerV1(skd.MembershipEpoch),
+			MembershipEpochHash: append([]byte(nil), skd.MembershipEpochHash...),
 		}},
 	})
 }
@@ -322,7 +363,8 @@ func (c *Client) encodePendingSenderKeyConversation(ctx context.Context, rows []
 			row.Generation == 0 || len(row.EncryptedKey) == 0 ||
 			row.RosterVersion == 0 || len(row.RosterCommitment) != 32 ||
 			row.OwnerBindingVersion == 0 || row.TargetBindingVersion == 0 ||
-			len(row.EnvelopeCommitment) != 32 {
+			len(row.EnvelopeCommitment) != 32 ||
+			!validMembershipCoordinateForWireV1(row.MembershipEpoch, row.MembershipEpochHash) {
 			return nil, 0, db.ErrSenderKeyLegacyState
 		}
 		envelopeCommitment := sha256.Sum256(row.EncryptedKey)
@@ -385,6 +427,8 @@ func (c *Client) encodePendingSenderKeyConversation(ctx context.Context, rows []
 				SenderDeviceCapabilities:  ownerBinding.Capabilities,
 				SenderDeviceBindingStatus: uint32(ownerBinding.Status),
 				SenderAccountSignature:    append([]byte(nil), ownerBinding.AccountSignature...),
+				MembershipEpoch:           row.MembershipEpoch,
+				MembershipEpochHash:       append([]byte(nil), row.MembershipEpochHash...),
 			}},
 		}
 		data, err := proto.Marshal(env)
@@ -399,6 +443,11 @@ func (c *Client) encodePendingSenderKeyConversation(ctx context.Context, rows []
 		encoded = append(encoded, data)
 	}
 	return encoded, encryptedBytes, nil
+}
+
+func validMembershipCoordinateForWireV1(epoch uint64, hash []byte) bool {
+	return epoch == 0 && len(hash) == 0 || epoch > 0 && epoch <= uint64(^uint64(0)>>1) &&
+		len(hash) == sha256.Size && !bytes.Equal(hash, make([]byte, sha256.Size))
 }
 
 func (c *Client) logIsolatedSenderKeyConversation(conversationID, reason string) {

@@ -22,6 +22,7 @@ export default function DirectConversationScreen({ navigation, route }: Props) {
     (state) => state.directMembersByConversation[conversationId]?.peer ?? null,
   );
   const selectedDmId = useChatStore((state) => state.selectedDmId);
+  const directGeneration = useChatStore((state) => state.directGeneration);
   const [identitySelection, setIdentitySelection] = useState<{
     conversationId: string;
     profile: Member;
@@ -104,6 +105,10 @@ export default function DirectConversationScreen({ navigation, route }: Props) {
         profile={identityProfile}
         contextLabel="Direct conversation"
         returnLabel="Direct"
+        directVerification={identityProfile && directGeneration !== null ? {
+          conversationId,
+          directGeneration,
+        } : undefined}
         onClose={closeIdentity}
       />
     </View>

@@ -1,11 +1,17 @@
 # ADR-0003: Origin-bound transport authentication
 
-- Status: Accepted contract; runtime activation pending
+- Status: Accepted and activated on live client/server paths
 - Date: 2026-07-20
 - Scope: WebSocket authentication v3 and signed REST authentication v2
 - Owners: Veil client, server, desktop, Android, protocol, and operations maintainers
 
 ## Context
+
+> Activation update (2026-08-04): desktop and Android select exact
+> `/v3/events`; the gateway's signed handlers select REST v2 only; `/ws` is
+> fail-closed by default and may be restored solely by the explicit emergency
+> `VEIL_ALLOW_LEGACY_WS_V2=true` operator flag. Clients never auto-downgrade.
+> Hostile two-Node and independent-audit evidence remain release gates.
 
 The deployed Preview authentication paths are versioned, but their signed
 transcripts do not cryptographically identify the exact Veil Node origin.
@@ -321,8 +327,9 @@ production downgrade removal, and the two-Node relay matrix pass.
 - Registration policy and Pass presence become explicit authenticated intent.
 - REST identity, target, freshness, and body commitment share one bounded binary
   grammar across native clients and the server.
-- Existing Preview runtime remains compatible until a deliberate cutover; the
-  pure checkpoint alone is not a production security claim.
+- The deliberate Preview cutover is active. Legacy WS compatibility is an
+  explicit, server-only emergency rollback switch; it is never negotiated or
+  selected by a client after a v3 endpoint has been configured.
 - Any future field with authorization or parser semantics requires explicit
   contract review instead of relying on an unsigned header or protobuf field.
 

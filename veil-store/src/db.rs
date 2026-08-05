@@ -20,6 +20,8 @@ pub struct LocalPreKey {
     pub signature: Option<[u8; 64]>,
 }
 
+type PersistedLocalSignedPreKeyRow = (Vec<u8>, Vec<u8>, Option<Vec<u8>>, u8);
+
 /// Durable, origin-scoped exact-byte outbox for one X3DH publication.
 ///
 /// The body contains public material only, but it remains inside SQLCipher so
@@ -193,6 +195,19 @@ pub struct RatchetSessionWithRevisionV1 {
     pub revision: u64,
 }
 
+/// Public, non-secret Direct v2 session coordinates stored beside one ratchet.
+/// `binding_data` is a strictly parsed client-owned record; SQLCipher treats it
+/// as opaque bytes but independently pins the session and device identifiers
+/// needed to detect row substitution before hydration.
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
+pub struct DirectSessionBindingBlobV2 {
+    pub peer_identity_key: [u8; 32],
+    pub session_id: [u8; 32],
+    pub local_device_id: [u8; 16],
+    pub peer_device_id: [u8; 16],
+    pub binding_data: Vec<u8>,
+}
+
 /// One immutable reservation from the SQLCipher-backed prekey allocator.
 ///
 /// Reservations are committed before key generation. Consequently a crash or
@@ -206,12 +221,69 @@ pub struct LocalPreKeyIdReservationV1 {
     pub next_one_time_prekey_id: u32,
 }
 
+/// One immutable reservation for an OPK-only inventory refill. The current
+/// signed prekey stays pinned, so delayed initial messages remain decryptable
+/// while replenishment advances only the one-time-key namespace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LocalOneTimePreKeyIdReservationV1 {
+    pub one_time_prekey_start_id: u32,
+    pub next_one_time_prekey_id: u32,
+}
+
+/// Exact Node-signed proof accepted into SQLCipher only after signature,
+/// inclusion, pinned-log and append-only consistency checks all pass.
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
+pub struct IdentityTransparencyProofV1 {
+    pub canonical_server_origin: String,
+    pub log_id: [u8; 32],
+    pub node_signing_key: [u8; 32],
+    pub tree_size: u64,
+    pub root_hash: [u8; 32],
+    pub issued_at_ms: u64,
+    pub tree_head_signature: [u8; 64],
+    pub canonical_event: Vec<u8>,
+    pub leaf_index: u64,
+    pub inclusion_proof: Vec<[u8; 32]>,
+    pub consistency_from: u64,
+    pub consistency_proof: Vec<[u8; 32]>,
+    /// Hash of the independently configured witness key set and threshold.
+    /// All-zero with quorum zero means no witness policy was configured.
+    pub witness_policy_hash: [u8; 32],
+    pub witness_quorum: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IdentityTransparencyAcceptanceV1 {
+    FirstContactPinned,
+    CurrentHeadConfirmed,
+    AppendOnlyAdvancePinned,
+    /// SQLCipher was behind a valid OS-secure monotonic anchor and has been
+    /// advanced to an exact Node-signed head extending that stronger anchor.
+    RollbackAnchorRecovered,
+}
+
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
+pub struct IdentityTransparencyPinnedHeadV1 {
+    pub canonical_server_origin: String,
+    pub log_id: [u8; 32],
+    pub node_signing_key: [u8; 32],
+    pub tree_size: u64,
+    pub root_hash: [u8; 32],
+    pub issued_at_ms: u64,
+    pub tree_head_signature: [u8; 64],
+    pub witness_policy_hash: [u8; 32],
+    /// Zero until a separately configured independent witness quorum has
+    /// confirmed this exact head. Node signatures alone are never counted.
+    pub witness_quorum: u32,
+}
+
 const LOCAL_PREKEY_PUBLICATION_BODY_LIMIT: usize = 64 * 1024;
 const LOCAL_PREKEY_PUBLICATION_BATCH_SIZE: usize = 20;
 pub const DIRECT_MESSAGE_OUTBOX_MAX_PAYLOAD_BYTES_V1: usize = 256 * 1024;
 pub const DIRECT_MESSAGE_OUTBOX_MAX_PENDING_V1: usize = 256;
 pub const DIRECT_MESSAGE_OUTBOX_MAX_LOAD_V1: usize = 256;
 const DIRECT_MESSAGE_RATCHET_MAX_BYTES_V1: usize = 1024 * 1024;
+const DIRECT_SESSION_BINDING_MAX_BYTES_V2: usize = 4096;
 const DIRECT_MESSAGE_RATCHET_MAX_BYTES_SQLITE_V1: i64 = 1024 * 1024;
 const DIRECT_MESSAGE_RATCHET_UPDATED_AT_MAX_CHARS_SQLITE_V1: i64 = 64;
 /// Maximum number of durable pairwise ratchets hydrated into one native epoch.
@@ -415,6 +487,186 @@ fn validate_ratchet_session_blob_v1(session_data: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_direct_session_binding_blob_v2(
+    peer_identity_key: &[u8; 32],
+    binding: &DirectSessionBindingBlobV2,
+) -> Result<(), String> {
+    if binding.peer_identity_key != *peer_identity_key
+        || binding.peer_identity_key == [0u8; 32]
+        || binding.session_id == [0u8; 32]
+        || binding.local_device_id == [0u8; 16]
+        || binding.peer_device_id == [0u8; 16]
+        || binding.local_device_id == binding.peer_device_id
+        || binding.binding_data.is_empty()
+        || binding.binding_data.len() > DIRECT_SESSION_BINDING_MAX_BYTES_V2
+    {
+        return Err("Direct v2 session binding is malformed".to_string());
+    }
+    Ok(())
+}
+
+fn insert_direct_session_binding_v2(
+    connection: &Connection,
+    binding: &DirectSessionBindingBlobV2,
+) -> Result<(), String> {
+    validate_direct_session_binding_blob_v2(&binding.peer_identity_key, binding)?;
+    connection
+        .execute(
+            "INSERT INTO direct_session_bindings_v2
+               (peer_identity_key, wire_version, session_id, local_device_id,
+                peer_device_id, binding_data)
+             VALUES (?1, 2, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                binding.peer_identity_key.as_slice(),
+                binding.session_id.as_slice(),
+                binding.local_device_id.as_slice(),
+                binding.peer_device_id.as_slice(),
+                &binding.binding_data,
+            ],
+        )
+        .map(|_| ())
+        .map_err(|error| format!("insert Direct v2 session binding: {error}"))
+}
+
+fn create_direct_session_binding_table_v2(connection: &Connection) -> Result<(), String> {
+    connection
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS direct_session_bindings_v2 (
+                peer_identity_key BLOB NOT NULL PRIMARY KEY
+                    CHECK(typeof(peer_identity_key) = 'blob' AND length(peer_identity_key) = 32)
+                    REFERENCES ratchet_sessions(peer_identity_key)
+                    ON UPDATE RESTRICT ON DELETE CASCADE,
+                wire_version INTEGER NOT NULL DEFAULT 2 CHECK(wire_version = 2),
+                session_id BLOB NOT NULL
+                    CHECK(typeof(session_id) = 'blob' AND length(session_id) = 32),
+                local_device_id BLOB NOT NULL
+                    CHECK(typeof(local_device_id) = 'blob' AND length(local_device_id) = 16),
+                peer_device_id BLOB NOT NULL
+                    CHECK(typeof(peer_device_id) = 'blob' AND length(peer_device_id) = 16),
+                binding_data BLOB NOT NULL
+                    CHECK(typeof(binding_data) = 'blob' AND length(binding_data) BETWEEN 1 AND 4096),
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                CHECK(local_device_id <> peer_device_id)
+            ) WITHOUT ROWID;",
+        )
+        .map_err(|error| format!("create Direct v2 binding schema: {error}"))
+}
+
+fn validate_direct_session_binding_schema_v2(connection: &Connection) -> Result<(), String> {
+    let (without_rowid, strict, sql): (i64, i64, String) = connection
+        .query_row(
+            "SELECT table_list.wr, table_list.strict, schema.sql
+             FROM pragma_table_list AS table_list
+             JOIN sqlite_schema AS schema ON schema.name = table_list.name
+             WHERE table_list.schema = 'main'
+               AND table_list.type = 'table'
+               AND table_list.name = 'direct_session_bindings_v2'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(|error| format!("inspect Direct v2 binding table: {error}"))?;
+    if without_rowid != 1 || strict != 0 {
+        return Err("Direct v2 binding table kind is unsupported".to_string());
+    }
+    let normalized = normalize_ratchet_session_ddl_v1(&sql)?;
+    for required in [
+        "typeof(peer_identity_key)='blob'",
+        "length(peer_identity_key)=32",
+        "references ratchet_sessions(peer_identity_key)",
+        "on update restrict on delete cascade",
+        "check(wire_version=2)",
+        "typeof(session_id)='blob'",
+        "length(session_id)=32",
+        "typeof(local_device_id)='blob'",
+        "length(local_device_id)=16",
+        "typeof(peer_device_id)='blob'",
+        "length(peer_device_id)=16",
+        "typeof(binding_data)='blob'",
+        "length(binding_data)between 1 and 4096",
+        "check(local_device_id<>peer_device_id)",
+    ] {
+        if !normalized.contains(required) {
+            return Err(format!(
+                "Direct v2 binding table DDL is missing required invariant {required}"
+            ));
+        }
+    }
+    let columns: Vec<(String, String, i64, i64, i64)> = {
+        let mut statement = connection
+            .prepare(
+                "SELECT name, lower(type), \"notnull\", pk, hidden
+                 FROM pragma_table_xinfo('direct_session_bindings_v2')
+                 ORDER BY cid",
+            )
+            .map_err(|error| format!("inspect Direct v2 binding columns: {error}"))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })
+            .map_err(|error| format!("query Direct v2 binding columns: {error}"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("read Direct v2 binding columns: {error}"))?
+    };
+    let expected = [
+        ("peer_identity_key", "blob", 1, 1, 0),
+        ("wire_version", "integer", 1, 0, 0),
+        ("session_id", "blob", 1, 0, 0),
+        ("local_device_id", "blob", 1, 0, 0),
+        ("peer_device_id", "blob", 1, 0, 0),
+        ("binding_data", "blob", 1, 0, 0),
+        ("created_at", "text", 1, 0, 0),
+    ];
+    if columns.len() != expected.len()
+        || columns.iter().zip(expected).any(
+            |((name, kind, not_null, primary_key, hidden), expected)| {
+                name != expected.0
+                    || kind != expected.1
+                    || *not_null != expected.2
+                    || *primary_key != expected.3
+                    || *hidden != expected.4
+            },
+        )
+    {
+        return Err("Direct v2 binding table columns are unsupported".to_string());
+    }
+    let foreign_keys: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_foreign_key_list('direct_session_bindings_v2')
+             WHERE lower(\"table\") = 'ratchet_sessions'
+               AND \"from\" = 'peer_identity_key' AND \"to\" = 'peer_identity_key'
+               AND upper(on_update) = 'RESTRICT' AND upper(on_delete) = 'CASCADE'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("inspect Direct v2 binding foreign key: {error}"))?;
+    let all_foreign_keys: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_foreign_key_list('direct_session_bindings_v2')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("count Direct v2 binding foreign keys: {error}"))?;
+    let external_objects: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_schema
+             WHERE lower(tbl_name) = 'direct_session_bindings_v2'
+               AND type IN ('trigger', 'view')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("inspect Direct v2 binding schema objects: {error}"))?;
+    if foreign_keys != 1 || all_foreign_keys != 1 || external_objects != 0 {
+        return Err("Direct v2 binding table dependencies are unsupported".to_string());
+    }
+    Ok(())
+}
+
 fn validate_ratchet_session_load_preflight_v1(
     row_count: i64,
     total_session_bytes: i64,
@@ -575,6 +827,119 @@ fn validate_local_prekey_publication_input(
     if signed_count != 1 || one_time_count != LOCAL_PREKEY_PUBLICATION_BATCH_SIZE {
         return Err("local prekey publication batch shape is invalid".to_string());
     }
+    Ok(())
+}
+
+fn validate_local_prekey_refill_input(
+    signed_prekey: &LocalPreKey,
+    one_time_prekeys: &[LocalPreKey],
+    publication: &LocalPreKeyPublicationV1,
+) -> Result<(), String> {
+    validate_local_prekey_publication_record(publication)?;
+    if publication.acknowledged {
+        return Err("a newly generated prekey refill cannot be acknowledged".to_string());
+    }
+    if signed_prekey.key_type != 0
+        || signed_prekey.protocol_key_id != publication.signed_prekey_id
+        || signed_prekey.protocol_key_id == 0
+        || signed_prekey.secret_key == [0u8; 32]
+        || signed_prekey.public_key == [0u8; 32]
+        || signed_prekey
+            .signature
+            .is_none_or(|signature| signature == [0u8; 64])
+    {
+        return Err("local prekey refill SPK is invalid or differs from its outbox".to_string());
+    }
+    if one_time_prekeys.len() != LOCAL_PREKEY_PUBLICATION_BATCH_SIZE {
+        return Err("local prekey refill must contain 20 OPKs".to_string());
+    }
+    let mut seen = HashSet::with_capacity(one_time_prekeys.len());
+    for key in one_time_prekeys {
+        if key.key_type != 1
+            || key.protocol_key_id == 0
+            || !seen.insert(key.protocol_key_id)
+            || key.secret_key == [0u8; 32]
+            || key.public_key == [0u8; 32]
+            || key.signature.is_some()
+        {
+            return Err("local prekey refill contains an invalid or duplicate OPK".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn validate_local_prekey_publication_scope_on(
+    tx: &Transaction<'_>,
+    publication: &LocalPreKeyPublicationV1,
+) -> Result<(), String> {
+    let authenticated = load_authenticated_self_binding(tx, &publication.canonical_server_origin)?
+        .ok_or("authenticated self binding is unavailable for prekey publication")?;
+    if authenticated.user_id != publication.user_id {
+        return Err("prekey publication user differs from authenticated self".to_string());
+    }
+
+    let persisted_device: Vec<u8> = tx
+        .query_row(
+            "SELECT device_id FROM device_identity_v1 WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| format!("load local device for prekey publication: {e}"))?;
+    if persisted_device.as_slice() != publication.device_id.as_slice() {
+        return Err("prekey publication device differs from the local installation".to_string());
+    }
+
+    let existing_pending: Option<u8> = tx
+        .query_row(
+            "SELECT acknowledged FROM local_prekey_publications_v1
+             WHERE canonical_server_origin = ?1 AND user_id = ?2 AND device_id = ?3",
+            rusqlite::params![
+                publication.canonical_server_origin,
+                publication.user_id,
+                publication.device_id.as_slice(),
+            ],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| format!("load existing local prekey publication: {e}"))?;
+    if existing_pending == Some(0) {
+        return Err(
+            "an unacknowledged prekey publication already exists for this node".to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn save_local_prekey_publication_outbox_on(
+    tx: &Transaction<'_>,
+    publication: &LocalPreKeyPublicationV1,
+) -> Result<(), String> {
+    tx.execute(
+        "INSERT INTO local_prekey_publications_v1
+           (canonical_server_origin, user_id, device_id, signed_prekey_id,
+            one_time_prekey_count, request_body, body_sha256, acknowledged,
+            created_at, acknowledged_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, datetime('now'), NULL, datetime('now'))
+         ON CONFLICT(canonical_server_origin, user_id, device_id) DO UPDATE SET
+            signed_prekey_id=excluded.signed_prekey_id,
+            one_time_prekey_count=excluded.one_time_prekey_count,
+            request_body=excluded.request_body,
+            body_sha256=excluded.body_sha256,
+            acknowledged=0,
+            created_at=datetime('now'),
+            acknowledged_at=NULL,
+            updated_at=datetime('now')",
+        rusqlite::params![
+            publication.canonical_server_origin,
+            publication.user_id,
+            publication.device_id.as_slice(),
+            i64::from(publication.signed_prekey_id),
+            i64::from(publication.one_time_prekey_count),
+            publication.request_body.as_slice(),
+            publication.body_sha256.as_slice(),
+        ],
+    )
+    .map_err(|e| format!("save local prekey publication outbox: {e}"))?;
     Ok(())
 }
 
@@ -1931,6 +2296,26 @@ pub struct DeviceRosterSnapshotV1<'a> {
     pub bindings: &'a [DeviceBindingPinV1],
 }
 
+pub struct MembershipEpochPinV1 {
+    pub conversation_id: String,
+    pub epoch: u64,
+    pub epoch_hash: [u8; 32],
+    pub predecessor_hash: [u8; 32],
+    pub roster_version: u64,
+    pub roster_commitment: [u8; 32],
+    pub canonical_unsigned: Vec<u8>,
+    pub bootstrap_owner_id: Option<[u8; 16]>,
+    pub bootstrap_owner_signing_key: Option<[u8; 32]>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MembershipEpochPinnedHeadV1 {
+    pub epoch: u64,
+    pub epoch_hash: [u8; 32],
+    pub roster_version: u64,
+    pub roster_commitment: [u8; 32],
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HistoricalDeviceBindingProofV1 {
     pub sender_account_signing_key: [u8; 32],
@@ -1951,6 +2336,8 @@ pub struct IncomingSenderKeyRouteV1 {
     pub target_binding_version: u64,
     pub roster_version: u64,
     pub roster_commitment: [u8; 32],
+    pub membership_epoch: u64,
+    pub membership_epoch_hash: [u8; 32],
     pub envelope_commitment: [u8; 32],
     /// `None` exists only for routes installed by an interim development
     /// schema. Any newly received SKDM must atomically upgrade it to `Some`.
@@ -1970,6 +2357,8 @@ pub struct PendingSenderKeyDeviceEnvelopeV1 {
     pub sender_binding_version: u64,
     pub roster_version: u64,
     pub roster_commitment: [u8; 32],
+    pub membership_epoch: u64,
+    pub membership_epoch_hash: [u8; 32],
     pub envelope_commitment: [u8; 32],
     pub sealed_envelope: Vec<u8>,
 }
@@ -1979,6 +2368,140 @@ fn fixed_bytes<const N: usize>(label: &str, value: Vec<u8>) -> Result<[u8; N], S
     value
         .try_into()
         .map_err(|_| format!("invalid persisted {label} length: expected {N}, got {actual}"))
+}
+
+fn valid_membership_coordinate_v1(epoch: u64, hash: &[u8; 32]) -> bool {
+    epoch == 0 && *hash == [0u8; 32] || epoch > 0 && epoch <= i64::MAX as u64 && *hash != [0u8; 32]
+}
+
+fn load_identity_transparency_head_on(
+    conn: &Connection,
+    canonical_server_origin: &str,
+) -> Result<Option<IdentityTransparencyPinnedHeadV1>, String> {
+    let row = conn
+        .query_row(
+            "SELECT log_id, node_signing_key, tree_size, root_hash,
+                    issued_at_ms, tree_head_signature, witness_policy_hash,
+                    witness_quorum
+             FROM identity_transparency_heads_v1
+             WHERE canonical_server_origin = ?1",
+            rusqlite::params![canonical_server_origin],
+            |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, Vec<u8>>(5)?,
+                    row.get::<_, Vec<u8>>(6)?,
+                    row.get::<_, i64>(7)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| format!("load identity transparency head: {error}"))?;
+    let Some((
+        log_id,
+        node_key,
+        tree_size,
+        root_hash,
+        issued_at_ms,
+        signature,
+        witness_policy_hash,
+        witness_quorum,
+    )) = row
+    else {
+        return Ok(None);
+    };
+    if tree_size <= 0 || issued_at_ms <= 0 || !(0..=32).contains(&witness_quorum) {
+        return Err("persisted identity transparency head is malformed".to_string());
+    }
+    Ok(Some(IdentityTransparencyPinnedHeadV1 {
+        canonical_server_origin: canonical_server_origin.to_string(),
+        log_id: fixed_bytes("identity transparency log id", log_id)?,
+        node_signing_key: fixed_bytes("identity transparency Node signing key", node_key)?,
+        tree_size: u64::try_from(tree_size)
+            .map_err(|_| "persisted identity transparency tree size is invalid".to_string())?,
+        root_hash: fixed_bytes("identity transparency root hash", root_hash)?,
+        issued_at_ms: u64::try_from(issued_at_ms)
+            .map_err(|_| "persisted identity transparency issue time is invalid".to_string())?,
+        tree_head_signature: fixed_bytes("identity transparency signature", signature)?,
+        witness_policy_hash: fixed_bytes(
+            "identity transparency witness policy hash",
+            witness_policy_hash,
+        )?,
+        witness_quorum: u32::try_from(witness_quorum)
+            .map_err(|_| "persisted identity transparency witness quorum is invalid".to_string())?,
+    }))
+}
+
+fn validate_identity_transparency_anchor_v1(
+    expected_origin: &str,
+    anchor: &IdentityTransparencyPinnedHeadV1,
+) -> Result<(), String> {
+    use veil_crypto::transparency::{
+        log_id_v1, TransparencyTreeHeadV1, MAX_TRANSPARENCY_TREE_SIZE_V1,
+    };
+
+    if anchor.canonical_server_origin != expected_origin
+        || anchor.tree_size == 0
+        || anchor.tree_size > MAX_TRANSPARENCY_TREE_SIZE_V1
+        || anchor.issued_at_ms == 0
+        || anchor.issued_at_ms > i64::MAX as u64
+        || anchor.witness_quorum > 32
+        || (anchor.witness_policy_hash == [0u8; 32]) != (anchor.witness_quorum == 0)
+        || log_id_v1(expected_origin, &anchor.node_signing_key)? != anchor.log_id
+    {
+        return Err("identity transparency rollback anchor is invalid".to_string());
+    }
+    let head = TransparencyTreeHeadV1 {
+        log_id: anchor.log_id,
+        tree_size: anchor.tree_size,
+        root_hash: anchor.root_hash,
+        issued_at_ms: anchor.issued_at_ms,
+    };
+    if !head.verify_node_signature(
+        expected_origin,
+        &anchor.node_signing_key,
+        &anchor.tree_head_signature,
+    ) {
+        return Err("identity transparency rollback anchor signature is invalid".to_string());
+    }
+    Ok(())
+}
+
+fn record_identity_transparency_alarm_on(
+    tx: &Transaction<'_>,
+    alarm_kind: i64,
+    pinned: &IdentityTransparencyPinnedHeadV1,
+    observed: &IdentityTransparencyProofV1,
+) -> Result<(), String> {
+    tx.execute(
+        "INSERT OR IGNORE INTO identity_transparency_alarms_v1
+           (canonical_server_origin, alarm_kind,
+            pinned_log_id, pinned_node_signing_key, pinned_tree_size, pinned_root_hash,
+            observed_log_id, observed_node_signing_key, observed_tree_size,
+            observed_root_hash, observed_tree_head_signature)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        rusqlite::params![
+            observed.canonical_server_origin,
+            alarm_kind,
+            pinned.log_id.as_slice(),
+            pinned.node_signing_key.as_slice(),
+            i64::try_from(pinned.tree_size)
+                .map_err(|_| "pinned identity transparency size is invalid".to_string())?,
+            pinned.root_hash.as_slice(),
+            observed.log_id.as_slice(),
+            observed.node_signing_key.as_slice(),
+            i64::try_from(observed.tree_size)
+                .map_err(|_| "observed identity transparency size is invalid".to_string())?,
+            observed.root_hash.as_slice(),
+            observed.tree_head_signature.as_slice(),
+        ],
+    )
+    .map_err(|error| format!("record identity transparency alarm: {error}"))?;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2314,6 +2837,62 @@ impl VeilDb {
                 PRIMARY KEY (canonical_server_origin, user_id)
             );
 
+            -- Per-origin transparency trust-on-first-use anchor. Witness
+            -- quorum starts at zero and cannot be inferred from a Node's own
+            -- signature. All values are public, but SQLCipher protects the
+            -- user's browsing/social graph and rollback history.
+            CREATE TABLE IF NOT EXISTS identity_transparency_heads_v1 (
+                canonical_server_origin TEXT PRIMARY KEY
+                    CHECK(length(canonical_server_origin) BETWEEN 1 AND 512),
+                log_id BLOB NOT NULL CHECK(length(log_id) = 32),
+                node_signing_key BLOB NOT NULL CHECK(length(node_signing_key) = 32),
+                tree_size INTEGER NOT NULL CHECK(tree_size BETWEEN 1 AND 9223372036854775807),
+                root_hash BLOB NOT NULL CHECK(length(root_hash) = 32),
+                issued_at_ms INTEGER NOT NULL CHECK(issued_at_ms > 0),
+                tree_head_signature BLOB NOT NULL CHECK(length(tree_head_signature) = 64),
+                witness_policy_hash BLOB NOT NULL DEFAULT X'0000000000000000000000000000000000000000000000000000000000000000'
+                    CHECK(length(witness_policy_hash) = 32),
+                witness_quorum INTEGER NOT NULL DEFAULT 0 CHECK(witness_quorum BETWEEN 0 AND 32),
+                first_seen_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            ) WITHOUT ROWID;
+
+            -- Permanent local evidence of a Node-signed log replacement,
+            -- rollback, same-size split view, or non-append-only advance.
+            CREATE TABLE IF NOT EXISTS identity_transparency_alarms_v1 (
+                alarm_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                canonical_server_origin TEXT NOT NULL
+                    CHECK(length(canonical_server_origin) BETWEEN 1 AND 512),
+                alarm_kind INTEGER NOT NULL CHECK(alarm_kind BETWEEN 1 AND 4),
+                pinned_log_id BLOB NOT NULL CHECK(length(pinned_log_id) = 32),
+                pinned_node_signing_key BLOB NOT NULL CHECK(length(pinned_node_signing_key) = 32),
+                pinned_tree_size INTEGER NOT NULL CHECK(pinned_tree_size > 0),
+                pinned_root_hash BLOB NOT NULL CHECK(length(pinned_root_hash) = 32),
+                observed_log_id BLOB NOT NULL CHECK(length(observed_log_id) = 32),
+                observed_node_signing_key BLOB NOT NULL CHECK(length(observed_node_signing_key) = 32),
+                observed_tree_size INTEGER NOT NULL CHECK(observed_tree_size > 0),
+                observed_root_hash BLOB NOT NULL CHECK(length(observed_root_hash) = 32),
+                observed_tree_head_signature BLOB NOT NULL CHECK(length(observed_tree_head_signature) = 64),
+                detected_at TEXT NOT NULL DEFAULT (datetime('now')),
+                UNIQUE (
+                    canonical_server_origin, alarm_kind,
+                    pinned_log_id, pinned_tree_size, pinned_root_hash,
+                    observed_log_id, observed_tree_size, observed_root_hash
+                )
+            );
+
+            CREATE TRIGGER IF NOT EXISTS identity_transparency_alarms_no_update_v1
+            BEFORE UPDATE ON identity_transparency_alarms_v1
+            BEGIN
+                SELECT RAISE(ABORT, 'identity transparency alarm history is immutable');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS identity_transparency_alarms_no_delete_v1
+            BEFORE DELETE ON identity_transparency_alarms_v1
+            BEGIN
+                SELECT RAISE(ABORT, 'identity transparency alarm history is immutable');
+            END;
+
             -- Durable binding between this SQLCipher identity and the account
             -- assigned by each authenticated server origin. The first
             -- successful WebSocket authentication pins all account
@@ -2391,6 +2970,28 @@ impl VeilDb {
                 header_data BLOB NOT NULL,
                 updated_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
+
+            -- Direct v2 is a sticky upgrade for an established pairwise
+            -- ratchet. The opaque canonical record is encrypted by SQLCipher;
+            -- duplicated fixed-size commitments make malformed or substituted
+            -- rows rejectable before the client publishes a session.
+            CREATE TABLE IF NOT EXISTS direct_session_bindings_v2 (
+                peer_identity_key BLOB NOT NULL PRIMARY KEY
+                    CHECK(typeof(peer_identity_key) = 'blob' AND length(peer_identity_key) = 32)
+                    REFERENCES ratchet_sessions(peer_identity_key)
+                    ON UPDATE RESTRICT ON DELETE CASCADE,
+                wire_version INTEGER NOT NULL DEFAULT 2 CHECK(wire_version = 2),
+                session_id BLOB NOT NULL
+                    CHECK(typeof(session_id) = 'blob' AND length(session_id) = 32),
+                local_device_id BLOB NOT NULL
+                    CHECK(typeof(local_device_id) = 'blob' AND length(local_device_id) = 16),
+                peer_device_id BLOB NOT NULL
+                    CHECK(typeof(peer_device_id) = 'blob' AND length(peer_device_id) = 16),
+                binding_data BLOB NOT NULL
+                    CHECK(typeof(binding_data) = 'blob' AND length(binding_data) BETWEEN 1 AND 4096),
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                CHECK(local_device_id <> peer_device_id)
+            ) WITHOUT ROWID;
 
             -- Durable exact-byte FIFO for Direct sends. Acknowledged rows keep
             -- the compact identity/digest/result receipt forever, while the
@@ -2498,6 +3099,52 @@ impl VeilDb {
                 canonical_snapshot BLOB NOT NULL CHECK(length(canonical_snapshot) BETWEEN 1 AND 1048576),
                 updated_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
+
+            CREATE TABLE IF NOT EXISTS conversation_membership_epoch_history_v1 (
+                conversation_id TEXT NOT NULL,
+                epoch BLOB NOT NULL CHECK(length(epoch) = 8),
+                epoch_hash BLOB NOT NULL CHECK(length(epoch_hash) = 32),
+                predecessor_hash BLOB NOT NULL CHECK(length(predecessor_hash) = 32),
+                roster_version BLOB NOT NULL CHECK(length(roster_version) = 8),
+                roster_commitment BLOB NOT NULL CHECK(length(roster_commitment) = 32),
+                canonical_unsigned BLOB NOT NULL
+                    CHECK(length(canonical_unsigned) BETWEEN 1 AND 65536),
+                bootstrap_owner_id BLOB,
+                bootstrap_owner_signing_key BLOB,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (conversation_id, epoch),
+                UNIQUE (conversation_id, epoch_hash),
+                CHECK(
+                    (epoch = x'0000000000000001'
+                     AND length(bootstrap_owner_id) = 16
+                     AND length(bootstrap_owner_signing_key) = 32)
+                    OR
+                    (epoch <> x'0000000000000001'
+                     AND bootstrap_owner_id IS NULL
+                     AND bootstrap_owner_signing_key IS NULL)
+                )
+            );
+
+            CREATE TABLE IF NOT EXISTS conversation_membership_epoch_heads_v1 (
+                conversation_id TEXT PRIMARY KEY,
+                epoch BLOB NOT NULL CHECK(length(epoch) = 8),
+                epoch_hash BLOB NOT NULL CHECK(length(epoch_hash) = 32),
+                roster_version BLOB NOT NULL CHECK(length(roster_version) = 8),
+                roster_commitment BLOB NOT NULL CHECK(length(roster_commitment) = 32),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE TRIGGER IF NOT EXISTS membership_epoch_history_reject_update_v1
+            BEFORE UPDATE ON conversation_membership_epoch_history_v1
+            BEGIN
+                SELECT RAISE(ABORT, 'membership epoch history is immutable');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS membership_epoch_history_reject_delete_v1
+            BEFORE DELETE ON conversation_membership_epoch_history_v1
+            BEGIN
+                SELECT RAISE(ABORT, 'membership epoch history is immutable');
+            END;
 
             CREATE TABLE IF NOT EXISTS local_prekeys (
                 key_type INTEGER NOT NULL CHECK(key_type IN (0, 1)),
@@ -2618,6 +3265,8 @@ impl VeilDb {
                 target_binding_version BLOB NOT NULL CHECK(length(target_binding_version) = 8),
                 roster_version BLOB NOT NULL CHECK(length(roster_version) = 8),
                 roster_commitment BLOB NOT NULL CHECK(length(roster_commitment) = 32),
+                membership_epoch BLOB CHECK(membership_epoch IS NULL OR length(membership_epoch) = 8),
+                membership_epoch_hash BLOB CHECK(membership_epoch_hash IS NULL OR length(membership_epoch_hash) = 32),
                 envelope_commitment BLOB NOT NULL CHECK(length(envelope_commitment) = 32),
                 installed_at TEXT NOT NULL DEFAULT (datetime('now')),
                 PRIMARY KEY (group_id, sender_identity_key, generation),
@@ -2656,6 +3305,8 @@ impl VeilDb {
                 sender_binding_version BLOB NOT NULL CHECK(length(sender_binding_version) = 8),
                 roster_version BLOB NOT NULL CHECK(length(roster_version) = 8),
                 roster_commitment BLOB NOT NULL CHECK(length(roster_commitment) = 32),
+                membership_epoch BLOB CHECK(membership_epoch IS NULL OR length(membership_epoch) = 8),
+                membership_epoch_hash BLOB CHECK(membership_epoch_hash IS NULL OR length(membership_epoch_hash) = 32),
                 envelope_commitment BLOB NOT NULL CHECK(length(envelope_commitment) = 32),
                 sealed_envelope BLOB NOT NULL CHECK(length(sealed_envelope) BETWEEN 1 AND 4096),
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -2761,11 +3412,14 @@ impl VeilDb {
             .map_err(|e| format!("migrations: {e}"))?;
 
         self.ensure_ratchet_sessions_without_rowid_schema()?;
+        validate_direct_session_binding_schema_v2(&self.conn)?;
         self.ensure_conversation_identity_schema()?;
         self.ensure_conversation_read_state_schema()?;
         self.ensure_network_profile_avatar_schema()?;
         self.ensure_message_author_context_schema()?;
+        self.ensure_identity_transparency_witness_schema()?;
         self.rebuild_interim_sender_key_tables()?;
+        self.ensure_sender_key_membership_context_schema()?;
         self.ensure_sender_key_historical_proof_schema()?;
 
         // Add `crypto_mode` to conversations if missing. Older DBs created
@@ -3027,6 +3681,38 @@ impl VeilDb {
             .map_err(|error| format!("inspect ratchet session table kind: {error}"))?
             .ok_or_else(|| "ratchet session table is absent".to_string())?;
         let schema_shape = classify_ratchet_session_schema_v1(without_rowid, strict, &table_sql)?;
+        if !matches!(
+            schema_shape,
+            RatchetSessionSchemaShapeV1::HardenedWithoutRowid
+        ) {
+            let direct_table_exists: bool = tx
+                .query_row(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM sqlite_schema
+                        WHERE type = 'table' AND lower(name) = 'direct_session_bindings_v2'
+                     )",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|error| format!("inspect pre-upgrade Direct v2 table: {error}"))?;
+            if direct_table_exists {
+                let direct_rows: i64 = tx
+                    .query_row(
+                        "SELECT COUNT(*) FROM direct_session_bindings_v2 LIMIT 1",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| format!("inspect pre-upgrade Direct v2 rows: {error}"))?;
+                if direct_rows != 0 {
+                    return Err(
+                        "legacy ratchet schema unexpectedly contains Direct v2 bindings"
+                            .to_string(),
+                    );
+                }
+                tx.execute_batch("DROP TABLE direct_session_bindings_v2;")
+                    .map_err(|error| format!("drop empty pre-upgrade Direct v2 table: {error}"))?;
+            }
+        }
 
         let mut index_statement = tx
             .prepare(
@@ -3190,6 +3876,7 @@ impl VeilDb {
                  FROM sqlite_schema AS owner
                  JOIN pragma_foreign_key_list(owner.name) AS foreign_key
                  WHERE owner.type = 'table' AND owner.name != 'ratchet_sessions'
+                   AND lower(owner.name) != 'direct_session_bindings_v2'
                    AND lower(foreign_key.\"table\") = 'ratchet_sessions'",
                 [],
                 |row| row.get(0),
@@ -3335,6 +4022,7 @@ impl VeilDb {
                 .map_err(|error| format!("drop legacy ratchet session table: {error}"))?;
         }
 
+        create_direct_session_binding_table_v2(&tx)?;
         Self::install_ratchet_session_capacity_schema_on(&tx, row_count, total_session_bytes)?;
         tx.commit()
             .map_err(|error| format!("commit ratchet session storage schema upgrade: {error}"))
@@ -3623,6 +4311,31 @@ impl VeilDb {
             .map_err(|e| format!("commit message author context schema upgrade: {e}"))
     }
 
+    fn ensure_identity_transparency_witness_schema(&self) -> Result<(), String> {
+        let present: bool = self
+            .conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM pragma_table_info('identity_transparency_heads_v1')
+                    WHERE name = 'witness_policy_hash'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("inspect transparency witness policy column: {error}"))?;
+        if !present {
+            self.conn
+                .execute_batch(
+                    "ALTER TABLE identity_transparency_heads_v1
+                     ADD COLUMN witness_policy_hash BLOB NOT NULL
+                     DEFAULT X'0000000000000000000000000000000000000000000000000000000000000000'
+                     CHECK(length(witness_policy_hash) = 32);",
+                )
+                .map_err(|error| format!("add transparency witness policy column: {error}"))?;
+        }
+        Ok(())
+    }
+
     fn normalized_table_sql(&self, table: &str) -> Result<String, String> {
         let sql: String = self
             .conn
@@ -3688,6 +4401,52 @@ impl VeilDb {
         }
         tx.commit()
             .map_err(|e| format!("commit historical Sender-Key proof schema: {e}"))
+    }
+
+    fn ensure_sender_key_membership_context_schema(&self) -> Result<(), String> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| format!("begin Sender-Key membership schema upgrade: {e}"))?;
+        for table in [
+            "sender_key_incoming_routes_v1",
+            "pending_sender_key_device_envelopes_v1",
+        ] {
+            let has_epoch: bool = tx
+                .query_row(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM pragma_table_info(?1)
+                        WHERE name = 'membership_epoch'
+                     )",
+                    rusqlite::params![table],
+                    |row| row.get(0),
+                )
+                .map_err(|e| format!("inspect {table} membership epoch column: {e}"))?;
+            let has_hash: bool = tx
+                .query_row(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM pragma_table_info(?1)
+                        WHERE name = 'membership_epoch_hash'
+                     )",
+                    rusqlite::params![table],
+                    |row| row.get(0),
+                )
+                .map_err(|e| format!("inspect {table} membership hash column: {e}"))?;
+            if has_epoch != has_hash {
+                return Err(format!("{table} has a partial membership context schema"));
+            }
+            if !has_epoch {
+                tx.execute_batch(&format!(
+                    "ALTER TABLE {table} ADD COLUMN membership_epoch BLOB
+                         CHECK(membership_epoch IS NULL OR length(membership_epoch) = 8);
+                     ALTER TABLE {table} ADD COLUMN membership_epoch_hash BLOB
+                         CHECK(membership_epoch_hash IS NULL OR length(membership_epoch_hash) = 32);"
+                ))
+                .map_err(|e| format!("upgrade {table} membership context: {e}"))?;
+            }
+        }
+        tx.commit()
+            .map_err(|e| format!("commit Sender-Key membership schema upgrade: {e}"))
     }
 
     /// Repair the short-lived development schema that used a route-scoped PK
@@ -7477,6 +8236,45 @@ impl VeilDb {
             .map_err(|e| format!("commit initiator session transaction: {e}"))
     }
 
+    /// Direct v2 variant: commit the ratchet, retransmitted initial header,
+    /// and sticky origin/account/device/session binding in one transaction.
+    pub fn save_initiator_session_v2(
+        &self,
+        peer_identity_key: &[u8; 32],
+        session_data: &[u8],
+        initial_header_data: &[u8],
+        binding: &DirectSessionBindingBlobV2,
+    ) -> Result<(), String> {
+        validate_ratchet_session_blob_v1(session_data)?;
+        validate_direct_session_binding_blob_v2(peer_identity_key, binding)?;
+        if initial_header_data.is_empty()
+            || initial_header_data.len() > DIRECT_SESSION_BINDING_MAX_BYTES_V2
+        {
+            return Err("Direct v2 initial header record is empty or oversized".to_string());
+        }
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|error| format!("begin Direct v2 initiator transaction: {error}"))?;
+        tx.execute(
+            "INSERT INTO ratchet_sessions
+               (peer_identity_key, session_data, revision, updated_at)
+             VALUES (?1, ?2, 0, datetime('now'))",
+            rusqlite::params![peer_identity_key.as_slice(), session_data],
+        )
+        .map_err(|error| format!("insert Direct v2 initiator ratchet: {error}"))?;
+        tx.execute(
+            "INSERT INTO pending_initial_headers
+               (peer_identity_key, header_data, updated_at)
+             VALUES (?1, ?2, datetime('now'))",
+            rusqlite::params![peer_identity_key.as_slice(), initial_header_data],
+        )
+        .map_err(|error| format!("insert Direct v2 initial header: {error}"))?;
+        insert_direct_session_binding_v2(&tx, binding)?;
+        tx.commit()
+            .map_err(|error| format!("commit Direct v2 initiator transaction: {error}"))
+    }
+
     pub fn load_pending_initial_headers(&self) -> Result<Vec<PendingInitialHeaderRow>, String> {
         let mut stmt = self
             .conn
@@ -7695,6 +8493,58 @@ impl VeilDb {
         Ok(result)
     }
 
+    /// Load every sticky Direct v2 binding. The caller must strictly parse the
+    /// opaque record and compare all duplicated coordinates before associating
+    /// it with a ratchet row.
+    pub fn load_all_direct_session_bindings_v2(
+        &self,
+    ) -> Result<Vec<DirectSessionBindingBlobV2>, String> {
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT peer_identity_key, session_id, local_device_id,
+                        peer_device_id, binding_data
+                 FROM direct_session_bindings_v2
+                 WHERE wire_version = 2
+                 ORDER BY peer_identity_key",
+            )
+            .map_err(|error| format!("prepare Direct v2 bindings: {error}"))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, Vec<u8>>(4)?,
+                ))
+            })
+            .map_err(|error| format!("query Direct v2 bindings: {error}"))?;
+        let mut bindings = Vec::new();
+        for row in rows {
+            let (peer, session, local_device, peer_device, binding_data) =
+                row.map_err(|error| format!("read Direct v2 binding: {error}"))?;
+            let binding = DirectSessionBindingBlobV2 {
+                peer_identity_key: peer.try_into().map_err(|value: Vec<u8>| {
+                    format!("invalid Direct v2 peer length: {}", value.len())
+                })?,
+                session_id: session.try_into().map_err(|value: Vec<u8>| {
+                    format!("invalid Direct v2 session length: {}", value.len())
+                })?,
+                local_device_id: local_device.try_into().map_err(|value: Vec<u8>| {
+                    format!("invalid Direct v2 local device length: {}", value.len())
+                })?,
+                peer_device_id: peer_device.try_into().map_err(|value: Vec<u8>| {
+                    format!("invalid Direct v2 peer device length: {}", value.len())
+                })?,
+                binding_data,
+            };
+            validate_direct_session_binding_blob_v2(&binding.peer_identity_key, &binding)?;
+            bindings.push(binding);
+        }
+        Ok(bindings)
+    }
+
     /// Return the stable per-install device ID stored inside SQLCipher, or
     /// atomically initialize it from `proposed` on first use.
     pub fn get_or_create_device_id(&self, proposed: [u8; 16]) -> Result<[u8; 16], String> {
@@ -7878,6 +8728,59 @@ impl VeilDb {
         .map_err(|e| format!("store device binding marker: {e}"))?;
         tx.commit()
             .map_err(|e| format!("commit device identity: {e}"))?;
+        Ok(())
+    }
+
+    /// Advance only the account-signed public binding metadata while keeping
+    /// the per-install private keys byte-identical. The server accepts the
+    /// same contiguous candidate idempotently during WS v3 auth, so a crash
+    /// on either side can safely retry before publishing the new local head.
+    pub fn advance_device_identity_binding_v1(
+        &self,
+        candidate: &LocalDeviceIdentityV1,
+    ) -> Result<(), String> {
+        let current = self
+            .load_device_identity_v1()?
+            .ok_or("device identity is missing during binding advance")?;
+        let expected_version = current
+            .version
+            .checked_add(1)
+            .ok_or("device binding version is exhausted")?;
+        if candidate.device_id != current.device_id
+            || candidate.version != expected_version
+            || candidate.x25519_secret != current.x25519_secret
+            || candidate.ed25519_secret != current.ed25519_secret
+            || candidate.device_identity_key != current.device_identity_key
+            || candidate.device_signing_key != current.device_signing_key
+            || candidate.capabilities | current.capabilities != candidate.capabilities
+            || candidate.capabilities == current.capabilities
+            || candidate.status != current.status
+            || candidate.account_identity_key != current.account_identity_key
+            || candidate.account_signing_key != current.account_signing_key
+            || candidate.account_signature == current.account_signature
+        {
+            return Err("device binding advance changed immutable identity state".to_string());
+        }
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE device_identity_v1
+                 SET version = ?1, capabilities = ?2, account_signature = ?3
+                 WHERE singleton = 1 AND version = ?4 AND capabilities = ?5
+                   AND account_signature = ?6",
+                rusqlite::params![
+                    candidate.version.to_be_bytes().as_slice(),
+                    candidate.capabilities.to_be_bytes().as_slice(),
+                    candidate.account_signature.as_slice(),
+                    current.version.to_be_bytes().as_slice(),
+                    current.capabilities.to_be_bytes().as_slice(),
+                    current.account_signature.as_slice(),
+                ],
+            )
+            .map_err(|e| format!("advance local device binding: {e}"))?;
+        if updated != 1 {
+            return Err("local device binding changed concurrently".to_string());
+        }
         Ok(())
     }
 
@@ -8102,6 +9005,240 @@ impl VeilDb {
         .transpose()
     }
 
+    pub fn load_membership_epoch_head_v1(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<MembershipEpochPinnedHeadV1>, String> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT epoch, epoch_hash, roster_version, roster_commitment
+                 FROM conversation_membership_epoch_heads_v1
+                 WHERE conversation_id = ?1",
+                rusqlite::params![conversation_id],
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, Vec<u8>>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| format!("load membership epoch head: {e}"))?;
+        row.map(|(epoch, hash, roster_version, roster_commitment)| {
+            let epoch = u64::from_be_bytes(fixed_bytes("membership epoch", epoch)?);
+            let roster_version =
+                u64::from_be_bytes(fixed_bytes("membership roster version", roster_version)?);
+            if epoch == 0 || roster_version == 0 {
+                return Err("persisted membership epoch head is invalid".to_string());
+            }
+            Ok(MembershipEpochPinnedHeadV1 {
+                epoch,
+                epoch_hash: fixed_bytes("membership epoch hash", hash)?,
+                roster_version,
+                roster_commitment: fixed_bytes("membership roster commitment", roster_commitment)?,
+            })
+        })
+        .transpose()
+    }
+
+    pub fn membership_epoch_matches_pin_v1(
+        &self,
+        conversation_id: &str,
+        epoch: u64,
+        epoch_hash: &[u8; 32],
+    ) -> Result<bool, String> {
+        if conversation_id.is_empty()
+            || epoch == 0
+            || epoch > i64::MAX as u64
+            || epoch_hash == &[0u8; 32]
+        {
+            return Ok(false);
+        }
+        let stored = self
+            .conn
+            .query_row(
+                "SELECT epoch_hash
+                 FROM conversation_membership_epoch_history_v1
+                 WHERE conversation_id = ?1 AND epoch = ?2",
+                rusqlite::params![conversation_id, epoch.to_be_bytes().as_slice()],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()
+            .map_err(|e| format!("load membership epoch history pin: {e}"))?;
+        match stored {
+            Some(stored) => {
+                Ok(fixed_bytes::<32>("membership epoch history hash", stored)? == *epoch_hash)
+            }
+            None => Ok(false),
+        }
+    }
+
+    /// Commit a completely verified predecessor-linked chain. Existing rows
+    /// must be byte-identical and new rows must extend the durable head by one;
+    /// restoring an older SQLCipher file therefore cannot silently roll back
+    /// a head that remains present in this database.
+    pub fn commit_membership_epoch_chain_v1(
+        &self,
+        records: &[MembershipEpochPinV1],
+    ) -> Result<MembershipEpochPinnedHeadV1, String> {
+        if records.is_empty() || records.len() > 100_000 {
+            return Err("invalid membership epoch chain length".to_string());
+        }
+        let conversation_id = records[0].conversation_id.as_str();
+        if conversation_id.is_empty() {
+            return Err("invalid membership epoch conversation".to_string());
+        }
+        for (index, record) in records.iter().enumerate() {
+            let expected_epoch = u64::try_from(index)
+                .ok()
+                .and_then(|value| value.checked_add(1))
+                .ok_or("membership epoch number overflow")?;
+            if record.conversation_id != conversation_id
+                || record.epoch != expected_epoch
+                || record.epoch > i64::MAX as u64
+                || record.epoch_hash == [0u8; 32]
+                || (record.epoch == 1) != (record.predecessor_hash == [0u8; 32])
+                || record.roster_version == 0
+                || record.roster_version > i64::MAX as u64
+                || record.roster_commitment == [0u8; 32]
+                || record.canonical_unsigned.is_empty()
+                || record.canonical_unsigned.len() > 65_536
+                || (record.epoch == 1)
+                    != (record.bootstrap_owner_id.is_some()
+                        && record.bootstrap_owner_signing_key.is_some())
+                || (index > 0 && record.predecessor_hash != records[index - 1].epoch_hash)
+            {
+                return Err("invalid membership epoch pin".to_string());
+            }
+        }
+
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| format!("begin membership epoch pin transaction: {e}"))?;
+        let existing_head = tx
+            .query_row(
+                "SELECT epoch, epoch_hash FROM conversation_membership_epoch_heads_v1
+                 WHERE conversation_id = ?1",
+                rusqlite::params![conversation_id],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+            )
+            .optional()
+            .map_err(|e| format!("load membership epoch pin head: {e}"))?;
+        if let Some((encoded_epoch, encoded_hash)) = existing_head {
+            let epoch = u64::from_be_bytes(fixed_bytes("membership epoch", encoded_epoch)?);
+            let head = records
+                .get(usize::try_from(epoch.saturating_sub(1)).unwrap_or(usize::MAX))
+                .ok_or("membership epoch rollback rejected")?;
+            if head.epoch_hash.as_slice() != encoded_hash {
+                return Err("membership epoch equivocation rejected".to_string());
+            }
+        }
+
+        for record in records {
+            let existing = tx
+                .query_row(
+                    "SELECT epoch_hash, predecessor_hash, roster_version,
+                            roster_commitment, canonical_unsigned,
+                            bootstrap_owner_id, bootstrap_owner_signing_key
+                     FROM conversation_membership_epoch_history_v1
+                     WHERE conversation_id = ?1 AND epoch = ?2",
+                    rusqlite::params![conversation_id, record.epoch.to_be_bytes().as_slice()],
+                    |row| {
+                        Ok((
+                            row.get::<_, Vec<u8>>(0)?,
+                            row.get::<_, Vec<u8>>(1)?,
+                            row.get::<_, Vec<u8>>(2)?,
+                            row.get::<_, Vec<u8>>(3)?,
+                            row.get::<_, Vec<u8>>(4)?,
+                            row.get::<_, Option<Vec<u8>>>(5)?,
+                            row.get::<_, Option<Vec<u8>>>(6)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(|e| format!("load membership epoch pin: {e}"))?;
+            if let Some(existing) = existing {
+                if existing.0.as_slice() != record.epoch_hash
+                    || existing.1.as_slice() != record.predecessor_hash
+                    || existing.2.as_slice() != record.roster_version.to_be_bytes()
+                    || existing.3.as_slice() != record.roster_commitment
+                    || existing.4.as_slice() != record.canonical_unsigned
+                    || existing.5.as_deref()
+                        != record
+                            .bootstrap_owner_id
+                            .as_ref()
+                            .map(|value| value.as_slice())
+                    || existing.6.as_deref()
+                        != record
+                            .bootstrap_owner_signing_key
+                            .as_ref()
+                            .map(|value| value.as_slice())
+                {
+                    return Err("membership epoch history equivocation rejected".to_string());
+                }
+                continue;
+            }
+            tx.execute(
+                "INSERT INTO conversation_membership_epoch_history_v1
+                    (conversation_id, epoch, epoch_hash, predecessor_hash,
+                     roster_version, roster_commitment, canonical_unsigned,
+                     bootstrap_owner_id, bootstrap_owner_signing_key)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                rusqlite::params![
+                    conversation_id,
+                    record.epoch.to_be_bytes().as_slice(),
+                    record.epoch_hash.as_slice(),
+                    record.predecessor_hash.as_slice(),
+                    record.roster_version.to_be_bytes().as_slice(),
+                    record.roster_commitment.as_slice(),
+                    record.canonical_unsigned.as_slice(),
+                    record
+                        .bootstrap_owner_id
+                        .as_ref()
+                        .map(|value| value.as_slice()),
+                    record
+                        .bootstrap_owner_signing_key
+                        .as_ref()
+                        .map(|value| value.as_slice()),
+                ],
+            )
+            .map_err(|e| format!("pin membership epoch: {e}"))?;
+        }
+        let head = records.last().ok_or("membership epoch head is absent")?;
+        tx.execute(
+            "INSERT INTO conversation_membership_epoch_heads_v1
+                (conversation_id, epoch, epoch_hash, roster_version,
+                 roster_commitment, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'))
+             ON CONFLICT(conversation_id) DO UPDATE SET
+                epoch = excluded.epoch,
+                epoch_hash = excluded.epoch_hash,
+                roster_version = excluded.roster_version,
+                roster_commitment = excluded.roster_commitment,
+                updated_at = datetime('now')",
+            rusqlite::params![
+                conversation_id,
+                head.epoch.to_be_bytes().as_slice(),
+                head.epoch_hash.as_slice(),
+                head.roster_version.to_be_bytes().as_slice(),
+                head.roster_commitment.as_slice(),
+            ],
+        )
+        .map_err(|e| format!("advance membership epoch head: {e}"))?;
+        tx.commit()
+            .map_err(|e| format!("commit membership epoch pins: {e}"))?;
+        Ok(MembershipEpochPinnedHeadV1 {
+            epoch: head.epoch,
+            epoch_hash: head.epoch_hash,
+            roster_version: head.roster_version,
+            roster_commitment: head.roster_commitment,
+        })
+    }
+
     /// Trust-on-authenticated-directory: insert the first observed Ed25519 key
     /// for an X25519 identity and reject any later substitution.
     pub fn pin_trusted_signing_key(
@@ -8238,6 +9375,44 @@ impl VeilDb {
         })
     }
 
+    /// Atomically reserve twenty contiguous OPK ids without advancing the SPK
+    /// allocator. This is used only to refill an acknowledged publication
+    /// whose exact current signed prekey is retained.
+    pub fn reserve_local_one_time_prekey_batch_ids(
+        &self,
+    ) -> Result<LocalOneTimePreKeyIdReservationV1, String> {
+        let tx = begin_immediate(&self.conn, "local one-time prekey id reservation")?;
+        let (signed_prekey_id, one_time_prekey_start_id) =
+            synchronize_local_prekey_allocator_on(&tx)?;
+        let next_one_time_prekey_id = one_time_prekey_start_id
+            .checked_add(LOCAL_PREKEY_PUBLICATION_BATCH_SIZE as u32)
+            .ok_or_else(|| "one-time prekey id exhausted".to_string())?;
+        let changed = tx
+            .execute(
+                "UPDATE local_prekey_allocator_v1
+                 SET next_one_time_prekey_id = ?1,
+                     updated_at = datetime('now')
+                 WHERE singleton = 1
+                   AND next_signed_prekey_id = ?2
+                   AND next_one_time_prekey_id = ?3",
+                rusqlite::params![
+                    i64::from(next_one_time_prekey_id),
+                    i64::from(signed_prekey_id),
+                    i64::from(one_time_prekey_start_id),
+                ],
+            )
+            .map_err(|error| format!("reserve local one-time prekey ids: {error}"))?;
+        if changed != 1 {
+            return Err("local prekey allocator changed during OPK reservation".to_string());
+        }
+        tx.commit()
+            .map_err(|error| format!("commit local one-time prekey id reservation: {error}"))?;
+        Ok(LocalOneTimePreKeyIdReservationV1 {
+            one_time_prekey_start_id,
+            next_one_time_prekey_id,
+        })
+    }
+
     /// Atomically persist a newly generated SPK/OPK batch and its exact-byte
     /// origin-scoped publication outbox. Existing protocol ids are never
     /// overwritten: one id must identify one key for the lifetime of an
@@ -8250,44 +9425,7 @@ impl VeilDb {
         validate_local_prekey_publication_input(keys, publication)?;
 
         let tx = begin_immediate(&self.conn, "local prekey publication transaction")?;
-        let authenticated =
-            load_authenticated_self_binding(&tx, &publication.canonical_server_origin)?
-                .ok_or("authenticated self binding is unavailable for prekey publication")?;
-        if authenticated.user_id != publication.user_id {
-            return Err("prekey publication user differs from authenticated self".to_string());
-        }
-
-        let persisted_device: Vec<u8> = tx
-            .query_row(
-                "SELECT device_id FROM device_identity_v1 WHERE singleton = 1",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(|e| format!("load local device for prekey publication: {e}"))?;
-        if persisted_device.as_slice() != publication.device_id.as_slice() {
-            return Err(
-                "prekey publication device differs from the local installation".to_string(),
-            );
-        }
-
-        let existing_pending: Option<u8> = tx
-            .query_row(
-                "SELECT acknowledged FROM local_prekey_publications_v1
-                 WHERE canonical_server_origin = ?1 AND user_id = ?2 AND device_id = ?3",
-                rusqlite::params![
-                    publication.canonical_server_origin,
-                    publication.user_id,
-                    publication.device_id.as_slice(),
-                ],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|e| format!("load existing local prekey publication: {e}"))?;
-        if existing_pending == Some(0) {
-            return Err(
-                "an unacknowledged prekey publication already exists for this node".to_string(),
-            );
-        }
+        validate_local_prekey_publication_scope_on(&tx, publication)?;
 
         for key in keys {
             let signature = key.signature.as_ref().map(|value| value.as_slice());
@@ -8311,35 +9449,120 @@ impl VeilDb {
             })?;
         }
 
-        tx.execute(
-            "INSERT INTO local_prekey_publications_v1
-               (canonical_server_origin, user_id, device_id, signed_prekey_id,
-                one_time_prekey_count, request_body, body_sha256, acknowledged,
-                created_at, acknowledged_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, datetime('now'), NULL, datetime('now'))
-             ON CONFLICT(canonical_server_origin, user_id, device_id) DO UPDATE SET
-                signed_prekey_id=excluded.signed_prekey_id,
-                one_time_prekey_count=excluded.one_time_prekey_count,
-                request_body=excluded.request_body,
-                body_sha256=excluded.body_sha256,
-                acknowledged=0,
-                created_at=datetime('now'),
-                acknowledged_at=NULL,
-                updated_at=datetime('now')",
-            rusqlite::params![
-                publication.canonical_server_origin,
-                publication.user_id,
-                publication.device_id.as_slice(),
-                i64::from(publication.signed_prekey_id),
-                i64::from(publication.one_time_prekey_count),
-                publication.request_body.as_slice(),
-                publication.body_sha256.as_slice(),
-            ],
-        )
-        .map_err(|e| format!("save local prekey publication outbox: {e}"))?;
+        save_local_prekey_publication_outbox_on(&tx, publication)?;
 
         tx.commit()
             .map_err(|e| format!("commit local prekey publication: {e}"))
+    }
+
+    /// Persist an OPK-only refill and replace the exact-byte publication
+    /// outbox in one transaction. The supplied SPK must already exist as the
+    /// exact live immutable row; it is checked but never reinserted.
+    pub fn save_local_prekey_refill_with_publication(
+        &self,
+        signed_prekey: &LocalPreKey,
+        one_time_prekeys: &[LocalPreKey],
+        publication: &LocalPreKeyPublicationV1,
+    ) -> Result<(), String> {
+        validate_local_prekey_refill_input(signed_prekey, one_time_prekeys, publication)?;
+
+        let tx = begin_immediate(&self.conn, "local prekey refill transaction")?;
+        validate_local_prekey_publication_scope_on(&tx, publication)?;
+
+        let persisted: Option<PersistedLocalSignedPreKeyRow> = tx
+            .query_row(
+                "SELECT secret_key, public_key, signature, consumed
+                 FROM local_prekeys
+                 WHERE key_type = 0 AND protocol_key_id = ?1",
+                rusqlite::params![i64::from(signed_prekey.protocol_key_id)],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()
+            .map_err(|e| format!("load retained local signed prekey: {e}"))?;
+        let Some((secret_key, public_key, signature, consumed)) = persisted else {
+            return Err("retained local signed prekey is unavailable".to_string());
+        };
+        if consumed != 0
+            || secret_key.as_slice() != signed_prekey.secret_key.as_slice()
+            || public_key.as_slice() != signed_prekey.public_key.as_slice()
+            || signature.as_deref()
+                != signed_prekey
+                    .signature
+                    .as_ref()
+                    .map(|value| value.as_slice())
+        {
+            return Err("retained local signed prekey differs from immutable storage".to_string());
+        }
+
+        for key in one_time_prekeys {
+            tx.execute(
+                "INSERT INTO local_prekeys
+                   (key_type, protocol_key_id, secret_key, public_key, signature, consumed)
+                 VALUES (1, ?1, ?2, ?3, NULL, 0)",
+                rusqlite::params![
+                    i64::from(key.protocol_key_id),
+                    key.secret_key.as_slice(),
+                    key.public_key.as_slice(),
+                ],
+            )
+            .map_err(|e| {
+                format!(
+                    "save immutable local refill OPK {}: {e}",
+                    key.protocol_key_id
+                )
+            })?;
+        }
+        save_local_prekey_publication_outbox_on(&tx, publication)?;
+        tx.commit()
+            .map_err(|e| format!("commit local prekey refill: {e}"))
+    }
+
+    /// Load one exact live signed prekey for publication refill. No other
+    /// private prekey material is exposed to the caller.
+    pub fn load_local_signed_prekey(
+        &self,
+        protocol_key_id: u32,
+    ) -> Result<Option<LocalPreKey>, String> {
+        if protocol_key_id == 0 {
+            return Err("local signed prekey id is invalid".to_string());
+        }
+        let raw = self
+            .conn
+            .query_row(
+                "SELECT secret_key, public_key, signature
+                 FROM local_prekeys
+                 WHERE key_type = 0 AND protocol_key_id = ?1 AND consumed = 0",
+                rusqlite::params![i64::from(protocol_key_id)],
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, Option<Vec<u8>>>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| format!("load exact local signed prekey: {e}"))?;
+        raw.map(|(secret, public, signature)| {
+            let secret = Zeroizing::new(secret);
+            let secret_key: [u8; 32] = secret.as_slice().try_into().map_err(|_| {
+                format!(
+                    "invalid local signed prekey secret length for {protocol_key_id}: {}",
+                    secret.len()
+                )
+            })?;
+            Ok(LocalPreKey {
+                key_type: 0,
+                protocol_key_id,
+                secret_key,
+                public_key: fixed_bytes::<32>("local signed prekey public key", public)?,
+                signature: Some(fixed_bytes::<64>(
+                    "local signed prekey signature",
+                    signature.ok_or("local signed prekey signature is missing")?,
+                )?),
+            })
+        })
+        .transpose()
     }
 
     pub fn load_local_prekey_publication(
@@ -8577,6 +9800,66 @@ impl VeilDb {
             .map_err(|e| format!("commit initial ratchet: {e}"))
     }
 
+    /// Direct v2 responder commit. The ratchet, sticky session binding and OPK
+    /// destruction share one savepoint, so no crash can publish a v2 floor
+    /// without the matching state or reuse a consumed private key.
+    pub fn commit_initial_ratchet_session_v2(
+        &self,
+        peer_identity_key: &[u8; 32],
+        session_data: &[u8],
+        one_time_prekey_id: Option<u32>,
+        binding: &DirectSessionBindingBlobV2,
+    ) -> Result<(), String> {
+        validate_ratchet_session_blob_v1(session_data)?;
+        validate_direct_session_binding_blob_v2(peer_identity_key, binding)?;
+        self.conn
+            .execute_batch("SAVEPOINT veil_initial_ratchet_v2")
+            .map_err(|error| format!("begin Direct v2 initial ratchet savepoint: {error}"))?;
+        let operation = (|| {
+            self.conn
+                .execute(
+                    "INSERT INTO ratchet_sessions
+                       (peer_identity_key, session_data, revision, updated_at)
+                     VALUES (?1, ?2, 0, datetime('now'))",
+                    rusqlite::params![peer_identity_key.as_slice(), session_data],
+                )
+                .map_err(|error| format!("insert Direct v2 initial ratchet: {error}"))?;
+            insert_direct_session_binding_v2(&self.conn, binding)?;
+            if let Some(id) = one_time_prekey_id {
+                let changed = self
+                    .conn
+                    .execute(
+                        "UPDATE local_prekeys
+                         SET secret_key = NULL, consumed = 1
+                         WHERE key_type = 1 AND protocol_key_id = ?1 AND consumed = 0",
+                        rusqlite::params![i64::from(id)],
+                    )
+                    .map_err(|error| format!("consume Direct v2 one-time prekey: {error}"))?;
+                if changed != 1 {
+                    return Err(format!(
+                        "one-time prekey {id} was missing or already consumed"
+                    ));
+                }
+            }
+            Ok(())
+        })();
+        if let Err(error) = operation {
+            let rollback = self.conn.execute_batch(
+                "ROLLBACK TO SAVEPOINT veil_initial_ratchet_v2;
+                 RELEASE SAVEPOINT veil_initial_ratchet_v2;",
+            );
+            return Err(match rollback {
+                Ok(()) => error,
+                Err(rollback_error) => {
+                    format!("{error}; Direct v2 initial ratchet rollback failed: {rollback_error}")
+                }
+            });
+        }
+        self.conn
+            .execute_batch("RELEASE SAVEPOINT veil_initial_ratchet_v2")
+            .map_err(|error| format!("commit Direct v2 initial ratchet: {error}"))
+    }
+
     // ─── CRUD: Group Members ──────────────────────────────
 
     pub fn insert_group_member(
@@ -8746,6 +10029,7 @@ impl VeilDb {
             || route.target_binding_version > i64::MAX as u64
             || route.roster_version == 0
             || route.roster_version > i64::MAX as u64
+            || !valid_membership_coordinate_v1(route.membership_epoch, &route.membership_epoch_hash)
             || historical.sender_account_signing_key == [0u8; 32]
             || historical.sender_device_capabilities > i64::MAX as u64
             || !(1..=3).contains(&historical.sender_device_binding_status)
@@ -8908,8 +10192,9 @@ impl VeilDb {
                          sender_account_identity_key, sender_device_id,
                          sender_device_signing_key, sender_binding_version,
                          target_device_id, target_binding_version, roster_version,
-                         roster_commitment, envelope_commitment)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                         roster_commitment, membership_epoch,
+                         membership_epoch_hash, envelope_commitment)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                     rusqlite::params![
                         group_id,
                         sender_identity_key.as_slice(),
@@ -8922,6 +10207,9 @@ impl VeilDb {
                         route.target_binding_version.to_be_bytes().as_slice(),
                         route.roster_version.to_be_bytes().as_slice(),
                         route.roster_commitment.as_slice(),
+                        (route.membership_epoch != 0).then(|| route.membership_epoch.to_be_bytes()),
+                        (route.membership_epoch != 0)
+                            .then_some(route.membership_epoch_hash.as_slice()),
                         route.envelope_commitment.as_slice(),
                     ],
                 )
@@ -8992,7 +10280,8 @@ impl VeilDb {
                 "SELECT r.sender_account_identity_key, r.sender_device_id,
                     r.sender_device_signing_key, r.sender_binding_version,
                     r.target_device_id, r.target_binding_version, r.roster_version,
-                    r.roster_commitment, r.envelope_commitment,
+                    r.roster_commitment, r.membership_epoch,
+                    r.membership_epoch_hash, r.envelope_commitment,
                     p.sender_account_signing_key, p.sender_device_capabilities,
                     p.sender_device_binding_status, p.sender_account_signature,
                     p.target_device_identity_key
@@ -9017,19 +10306,21 @@ impl VeilDb {
                         row.get::<_, Vec<u8>>(5)?,
                         row.get::<_, Vec<u8>>(6)?,
                         row.get::<_, Vec<u8>>(7)?,
-                        row.get::<_, Vec<u8>>(8)?,
+                        row.get::<_, Option<Vec<u8>>>(8)?,
                         row.get::<_, Option<Vec<u8>>>(9)?,
-                        row.get::<_, Option<Vec<u8>>>(10)?,
-                        row.get::<_, Option<i64>>(11)?,
+                        row.get::<_, Vec<u8>>(10)?,
+                        row.get::<_, Option<Vec<u8>>>(11)?,
                         row.get::<_, Option<Vec<u8>>>(12)?,
-                        row.get::<_, Option<Vec<u8>>>(13)?,
+                        row.get::<_, Option<i64>>(13)?,
+                        row.get::<_, Option<Vec<u8>>>(14)?,
+                        row.get::<_, Option<Vec<u8>>>(15)?,
                     ))
                 },
             )
             .optional()
             .map_err(|e| format!("load incoming sender-key route proof: {e}"))?;
         row.map(|row| {
-            Ok(IncomingSenderKeyRouteV1 {
+            let route = IncomingSenderKeyRouteV1 {
                 sender_account_identity_key: fixed_bytes("route sender account identity", row.0)?,
                 sender_device_id: fixed_bytes("route sender device id", row.1)?,
                 sender_device_identity_key: *sender_identity_key,
@@ -9045,8 +10336,19 @@ impl VeilDb {
                 )?),
                 roster_version: u64::from_be_bytes(fixed_bytes("route roster version", row.6)?),
                 roster_commitment: fixed_bytes("route roster commitment", row.7)?,
-                envelope_commitment: fixed_bytes("route envelope commitment", row.8)?,
-                historical_sender_binding: match (row.9, row.10, row.11, row.12, row.13) {
+                membership_epoch: match row.8 {
+                    Some(encoded) => {
+                        u64::from_be_bytes(fixed_bytes("route membership epoch", encoded)?)
+                    }
+                    None => 0,
+                },
+                membership_epoch_hash: row
+                    .9
+                    .map(|encoded| fixed_bytes("route membership epoch hash", encoded))
+                    .transpose()?
+                    .unwrap_or([0u8; 32]),
+                envelope_commitment: fixed_bytes("route envelope commitment", row.10)?,
+                historical_sender_binding: match (row.11, row.12, row.13, row.14, row.15) {
                     (None, None, None, None, None) => None,
                     (Some(signing), Some(capabilities), Some(status), Some(signature), target) => {
                         Some(HistoricalDeviceBindingProofV1 {
@@ -9076,7 +10378,12 @@ impl VeilDb {
                         )
                     }
                 },
-            })
+            };
+            if !valid_membership_coordinate_v1(route.membership_epoch, &route.membership_epoch_hash)
+            {
+                return Err("persisted sender-key membership coordinate is partial".to_string());
+            }
+            Ok(route)
         })
         .transpose()
     }
@@ -9475,6 +10782,10 @@ impl VeilDb {
             || envelope.sender_binding_version > i64::MAX as u64
             || envelope.roster_version == 0
             || envelope.roster_version > i64::MAX as u64
+            || !valid_membership_coordinate_v1(
+                envelope.membership_epoch,
+                &envelope.membership_epoch_hash,
+            )
             || envelope.sealed_envelope.is_empty()
             || envelope.sealed_envelope.len() > 4_096
         {
@@ -9487,9 +10798,9 @@ impl VeilDb {
                  target_device_id, target_device_identity_key,
                  target_binding_version, sender_device_id,
                  sender_device_identity_key, sender_binding_version,
-                 roster_version, roster_commitment, envelope_commitment,
-                 sealed_envelope)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                 roster_version, roster_commitment, membership_epoch,
+                 membership_epoch_hash, envelope_commitment, sealed_envelope)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
                 rusqlite::params![
                     envelope.conversation_id,
                     i64::from(envelope.generation),
@@ -9502,6 +10813,10 @@ impl VeilDb {
                     envelope.sender_binding_version.to_be_bytes().as_slice(),
                     envelope.roster_version.to_be_bytes().as_slice(),
                     envelope.roster_commitment.as_slice(),
+                    (envelope.membership_epoch != 0)
+                        .then(|| envelope.membership_epoch.to_be_bytes()),
+                    (envelope.membership_epoch != 0)
+                        .then_some(envelope.membership_epoch_hash.as_slice()),
                     envelope.envelope_commitment.as_slice(),
                     envelope.sealed_envelope,
                 ],
@@ -9537,6 +10852,8 @@ impl VeilDb {
             Vec<u8>,
             Vec<u8>,
             Vec<u8>,
+            Option<Vec<u8>>,
+            Option<Vec<u8>>,
             Vec<u8>,
             Vec<u8>,
             Vec<u8>,
@@ -9548,6 +10865,7 @@ impl VeilDb {
                 "SELECT target_account_identity_key, target_device_identity_key,
                     sender_device_id, sender_device_identity_key,
                     sender_binding_version, roster_commitment,
+                    membership_epoch, membership_epoch_hash,
                     envelope_commitment, sealed_envelope, target_binding_version,
                     roster_version
              FROM pending_sender_key_device_envelopes_v1
@@ -9570,6 +10888,8 @@ impl VeilDb {
                         row.get(7)?,
                         row.get(8)?,
                         row.get(9)?,
+                        row.get(10)?,
+                        row.get(11)?,
                     ))
                 },
             )
@@ -9577,14 +10897,28 @@ impl VeilDb {
             .map_err(|e| format!("load exact-device sender-key envelope: {e}"))?;
         row.map(|row| {
             let stored_target_version =
-                u64::from_be_bytes(fixed_bytes("cached target binding version", row.8)?);
+                u64::from_be_bytes(fixed_bytes("cached target binding version", row.10)?);
             if stored_target_version != target_binding_version {
                 return Err("cached target binding version mismatch".to_string());
             }
             let stored_roster_version =
-                u64::from_be_bytes(fixed_bytes("cached roster version", row.9)?);
+                u64::from_be_bytes(fixed_bytes("cached roster version", row.11)?);
             if stored_roster_version != roster_version {
                 return Err("cached roster version mismatch".to_string());
+            }
+            let membership_epoch = match row.6 {
+                Some(encoded) => {
+                    u64::from_be_bytes(fixed_bytes("cached membership epoch", encoded)?)
+                }
+                None => 0,
+            };
+            let membership_epoch_hash = row
+                .7
+                .map(|encoded| fixed_bytes("cached membership epoch hash", encoded))
+                .transpose()?
+                .unwrap_or([0u8; 32]);
+            if !valid_membership_coordinate_v1(membership_epoch, &membership_epoch_hash) {
+                return Err("cached membership coordinate is partial".to_string());
             }
             Ok(PendingSenderKeyDeviceEnvelopeV1 {
                 conversation_id: conversation_id.to_string(),
@@ -9601,8 +10935,10 @@ impl VeilDb {
                 )?),
                 roster_version,
                 roster_commitment: fixed_bytes("cached roster commitment", row.5)?,
-                envelope_commitment: fixed_bytes("cached envelope commitment", row.6)?,
-                sealed_envelope: row.7,
+                membership_epoch,
+                membership_epoch_hash,
+                envelope_commitment: fixed_bytes("cached envelope commitment", row.8)?,
+                sealed_envelope: row.9,
             })
         })
         .transpose()
@@ -10149,12 +11485,424 @@ impl VeilDb {
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|e| format!("collect members: {e}"))
     }
+
+    pub fn identity_transparency_pinned_head_v1(
+        &self,
+        canonical_server_origin: &str,
+    ) -> Result<Option<IdentityTransparencyPinnedHeadV1>, String> {
+        validate_canonical_server_origin(canonical_server_origin)?;
+        load_identity_transparency_head_on(&self.conn, canonical_server_origin)
+    }
+
+    /// Verify and atomically pin one exact transparency proof. A signed split
+    /// view or rollback is committed to immutable local alarm history before
+    /// this method returns an error, so callers cannot accidentally erase the
+    /// evidence by rolling back the head update.
+    pub fn verify_and_pin_identity_transparency_proof_v1(
+        &self,
+        proof: &IdentityTransparencyProofV1,
+    ) -> Result<IdentityTransparencyAcceptanceV1, String> {
+        self.verify_and_pin_identity_transparency_proof_with_anchor_v1(proof, None)
+    }
+
+    /// As `verify_and_pin_identity_transparency_proof_v1`, with an additional
+    /// independently persisted OS-secure minimum head. This lets a restored
+    /// older SQLCipher snapshot recover forward but never move below, replace,
+    /// or fork from the stronger anchor.
+    pub fn verify_and_pin_identity_transparency_proof_with_anchor_v1(
+        &self,
+        proof: &IdentityTransparencyProofV1,
+        rollback_anchor: Option<&IdentityTransparencyPinnedHeadV1>,
+    ) -> Result<IdentityTransparencyAcceptanceV1, String> {
+        use veil_crypto::transparency::{
+            log_id_v1, verify_consistency_v1, verify_inclusion_v1, TransparencyTreeHeadV1,
+            MAX_TRANSPARENCY_TREE_SIZE_V1,
+        };
+
+        validate_canonical_server_origin(&proof.canonical_server_origin)?;
+        if proof.tree_size == 0
+            || proof.tree_size > MAX_TRANSPARENCY_TREE_SIZE_V1
+            || proof.issued_at_ms == 0
+            || proof.issued_at_ms > i64::MAX as u64
+            || proof.leaf_index >= proof.tree_size
+            || proof.consistency_from > MAX_TRANSPARENCY_TREE_SIZE_V1
+            || proof.witness_quorum > 32
+            || (proof.witness_policy_hash == [0u8; 32]) != (proof.witness_quorum == 0)
+        {
+            return Err("identity transparency proof coordinates are invalid".to_string());
+        }
+        if log_id_v1(&proof.canonical_server_origin, &proof.node_signing_key)? != proof.log_id {
+            return Err("identity transparency log id is not origin/key bound".to_string());
+        }
+        let observed_head = TransparencyTreeHeadV1 {
+            log_id: proof.log_id,
+            tree_size: proof.tree_size,
+            root_hash: proof.root_hash,
+            issued_at_ms: proof.issued_at_ms,
+        };
+        if !observed_head.verify_node_signature(
+            &proof.canonical_server_origin,
+            &proof.node_signing_key,
+            &proof.tree_head_signature,
+        ) {
+            return Err("identity transparency tree-head signature is invalid".to_string());
+        }
+        if !verify_inclusion_v1(
+            &proof.canonical_event,
+            proof.leaf_index,
+            proof.tree_size,
+            &proof.inclusion_proof,
+            &proof.root_hash,
+        ) {
+            return Err("identity transparency inclusion proof is invalid".to_string());
+        }
+        if let Some(anchor) = rollback_anchor {
+            validate_identity_transparency_anchor_v1(&proof.canonical_server_origin, anchor)?;
+        }
+
+        let tx = begin_immediate(&self.conn, "identity transparency pin transaction")?;
+        let pinned = load_identity_transparency_head_on(&tx, &proof.canonical_server_origin)?;
+        if let (Some(sqlcipher), Some(anchor)) = (pinned.as_ref(), rollback_anchor) {
+            let conflict = sqlcipher.log_id != anchor.log_id
+                || sqlcipher.node_signing_key != anchor.node_signing_key
+                || sqlcipher.tree_size == anchor.tree_size
+                    && (sqlcipher.root_hash != anchor.root_hash
+                        || sqlcipher.witness_policy_hash != [0u8; 32]
+                            && anchor.witness_policy_hash != [0u8; 32]
+                            && sqlcipher.witness_policy_hash != anchor.witness_policy_hash);
+            if conflict {
+                let alarm_kind = if sqlcipher.log_id != anchor.log_id
+                    || sqlcipher.node_signing_key != anchor.node_signing_key
+                {
+                    1
+                } else {
+                    3
+                };
+                record_identity_transparency_alarm_on(&tx, alarm_kind, anchor, proof)?;
+                tx.commit().map_err(|error| {
+                    format!("commit identity transparency local-anchor alarm: {error}")
+                })?;
+                return Err(
+                    "identity transparency SQLCipher pin conflicts with the OS rollback anchor"
+                        .to_string(),
+                );
+            }
+        }
+
+        let required_witness_policy = rollback_anchor
+            .filter(|anchor| anchor.witness_policy_hash != [0u8; 32])
+            .or_else(|| {
+                pinned
+                    .as_ref()
+                    .filter(|head| head.witness_policy_hash != [0u8; 32])
+            });
+        if let Some(required) = required_witness_policy {
+            if proof.witness_policy_hash != required.witness_policy_hash
+                || proof.witness_quorum == 0
+            {
+                record_identity_transparency_alarm_on(&tx, 4, required, proof)?;
+                tx.commit().map_err(|error| {
+                    format!("commit identity transparency witness-downgrade alarm: {error}")
+                })?;
+                return Err(
+                    "identity transparency witness policy downgrade or replacement detected"
+                        .to_string(),
+                );
+            }
+        }
+
+        let rollback_anchor_ahead = rollback_anchor.filter(|anchor| {
+            pinned.as_ref().is_none_or(|sqlcipher| {
+                anchor.tree_size > sqlcipher.tree_size
+                    || anchor.tree_size == sqlcipher.tree_size
+                        && anchor.root_hash == sqlcipher.root_hash
+                        && sqlcipher.witness_policy_hash == [0u8; 32]
+                        && anchor.witness_policy_hash != [0u8; 32]
+            })
+        });
+        if let Some(anchor) = rollback_anchor_ahead {
+            let alarm = if proof.log_id != anchor.log_id
+                || proof.node_signing_key != anchor.node_signing_key
+            {
+                Some((1, "identity transparency log replacement detected"))
+            } else if proof.tree_size < anchor.tree_size {
+                Some((
+                    2,
+                    "identity transparency rollback below the OS anchor detected",
+                ))
+            } else if proof.tree_size == anchor.tree_size && proof.root_hash != anchor.root_hash {
+                Some((
+                    3,
+                    "identity transparency split view against the OS anchor detected",
+                ))
+            } else {
+                None
+            };
+            if let Some((kind, message)) = alarm {
+                record_identity_transparency_alarm_on(&tx, kind, anchor, proof)?;
+                tx.commit().map_err(|error| {
+                    format!("commit identity transparency rollback-anchor alarm: {error}")
+                })?;
+                return Err(message.to_string());
+            }
+            if proof.consistency_from != anchor.tree_size
+                || !verify_consistency_v1(
+                    anchor.tree_size,
+                    proof.tree_size,
+                    &anchor.root_hash,
+                    &proof.root_hash,
+                    &proof.consistency_proof,
+                )
+            {
+                record_identity_transparency_alarm_on(&tx, 4, anchor, proof)?;
+                tx.commit().map_err(|error| {
+                    format!(
+                        "commit identity transparency rollback-anchor consistency alarm: {error}"
+                    )
+                })?;
+                return Err(
+                    "identity transparency proof does not extend the OS rollback anchor"
+                        .to_string(),
+                );
+            }
+            let exact_anchor_quorum = if proof.tree_size == anchor.tree_size
+                && proof.root_hash == anchor.root_hash
+                && proof.witness_policy_hash == anchor.witness_policy_hash
+            {
+                proof.witness_quorum.max(anchor.witness_quorum)
+            } else {
+                proof.witness_quorum
+            };
+            match pinned.as_ref() {
+                Some(sqlcipher) => {
+                    let updated = tx
+                        .execute(
+                            "UPDATE identity_transparency_heads_v1
+                             SET log_id = ?2, node_signing_key = ?3, tree_size = ?4,
+                                 root_hash = ?5, issued_at_ms = ?6,
+                                 tree_head_signature = ?7, witness_policy_hash = ?8,
+                                 witness_quorum = ?9,
+                                 updated_at = datetime('now')
+                             WHERE canonical_server_origin = ?1
+                               AND log_id = ?10 AND node_signing_key = ?11
+                               AND tree_size = ?12 AND root_hash = ?13",
+                            rusqlite::params![
+                                proof.canonical_server_origin,
+                                proof.log_id.as_slice(),
+                                proof.node_signing_key.as_slice(),
+                                i64::try_from(proof.tree_size).map_err(|_| {
+                                    "identity transparency tree size is invalid".to_string()
+                                })?,
+                                proof.root_hash.as_slice(),
+                                i64::try_from(proof.issued_at_ms).map_err(|_| {
+                                    "identity transparency issue time is invalid".to_string()
+                                })?,
+                                proof.tree_head_signature.as_slice(),
+                                proof.witness_policy_hash.as_slice(),
+                                i64::from(exact_anchor_quorum),
+                                sqlcipher.log_id.as_slice(),
+                                sqlcipher.node_signing_key.as_slice(),
+                                i64::try_from(sqlcipher.tree_size).map_err(|_| {
+                                    "pinned identity transparency size is invalid".to_string()
+                                })?,
+                                sqlcipher.root_hash.as_slice(),
+                            ],
+                        )
+                        .map_err(|error| {
+                            format!("recover identity transparency head from OS anchor: {error}")
+                        })?;
+                    if updated != 1 {
+                        return Err(format!(
+                            "identity transparency rollback recovery affected {updated} rows instead of one"
+                        ));
+                    }
+                }
+                None => {
+                    tx.execute(
+                        "INSERT INTO identity_transparency_heads_v1
+                           (canonical_server_origin, log_id, node_signing_key, tree_size,
+                            root_hash, issued_at_ms, tree_head_signature,
+                            witness_policy_hash, witness_quorum)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                        rusqlite::params![
+                            proof.canonical_server_origin,
+                            proof.log_id.as_slice(),
+                            proof.node_signing_key.as_slice(),
+                            i64::try_from(proof.tree_size).map_err(|_| {
+                                "identity transparency tree size is invalid".to_string()
+                            })?,
+                            proof.root_hash.as_slice(),
+                            i64::try_from(proof.issued_at_ms).map_err(|_| {
+                                "identity transparency issue time is invalid".to_string()
+                            })?,
+                            proof.tree_head_signature.as_slice(),
+                            proof.witness_policy_hash.as_slice(),
+                            i64::from(exact_anchor_quorum),
+                        ],
+                    )
+                    .map_err(|error| {
+                        format!("restore identity transparency head from OS anchor: {error}")
+                    })?;
+                }
+            }
+            tx.commit().map_err(|error| {
+                format!("commit identity transparency rollback-anchor recovery: {error}")
+            })?;
+            return Ok(IdentityTransparencyAcceptanceV1::RollbackAnchorRecovered);
+        }
+        let Some(pinned) = pinned else {
+            if proof.consistency_from != 0 || !proof.consistency_proof.is_empty() {
+                return Err("first-contact transparency proof invented a prior anchor".to_string());
+            }
+            tx.execute(
+                "INSERT INTO identity_transparency_heads_v1
+                   (canonical_server_origin, log_id, node_signing_key, tree_size,
+                    root_hash, issued_at_ms, tree_head_signature,
+                    witness_policy_hash, witness_quorum)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                rusqlite::params![
+                    proof.canonical_server_origin,
+                    proof.log_id.as_slice(),
+                    proof.node_signing_key.as_slice(),
+                    i64::try_from(proof.tree_size)
+                        .map_err(|_| "identity transparency tree size is invalid".to_string())?,
+                    proof.root_hash.as_slice(),
+                    i64::try_from(proof.issued_at_ms)
+                        .map_err(|_| "identity transparency issue time is invalid".to_string())?,
+                    proof.tree_head_signature.as_slice(),
+                    proof.witness_policy_hash.as_slice(),
+                    i64::from(proof.witness_quorum),
+                ],
+            )
+            .map_err(|error| format!("pin first identity transparency head: {error}"))?;
+            tx.commit()
+                .map_err(|error| format!("commit first identity transparency head: {error}"))?;
+            return Ok(IdentityTransparencyAcceptanceV1::FirstContactPinned);
+        };
+
+        let alarm =
+            if proof.log_id != pinned.log_id || proof.node_signing_key != pinned.node_signing_key {
+                Some((1, "identity transparency log replacement detected"))
+            } else if proof.tree_size < pinned.tree_size {
+                Some((2, "identity transparency rollback detected"))
+            } else if proof.tree_size == pinned.tree_size && proof.root_hash != pinned.root_hash {
+                Some((3, "identity transparency same-size split view detected"))
+            } else {
+                None
+            };
+        if let Some((kind, message)) = alarm {
+            record_identity_transparency_alarm_on(&tx, kind, &pinned, proof)?;
+            tx.commit()
+                .map_err(|error| format!("commit identity transparency alarm: {error}"))?;
+            return Err(message.to_string());
+        }
+        if proof.tree_size == pinned.tree_size {
+            let witness_upgrade =
+                pinned.witness_policy_hash == [0u8; 32] && proof.witness_policy_hash != [0u8; 32];
+            let stronger_quorum = proof.witness_policy_hash == pinned.witness_policy_hash
+                && proof.witness_quorum > pinned.witness_quorum;
+            if proof.issued_at_ms > pinned.issued_at_ms || witness_upgrade || stronger_quorum {
+                tx.execute(
+                    "UPDATE identity_transparency_heads_v1
+                     SET issued_at_ms = ?2, tree_head_signature = ?3,
+                         witness_policy_hash = ?4, witness_quorum = ?5,
+                         updated_at = datetime('now')
+                     WHERE canonical_server_origin = ?1",
+                    rusqlite::params![
+                        proof.canonical_server_origin,
+                        i64::try_from(proof.issued_at_ms).map_err(|_| {
+                            "identity transparency issue time is invalid".to_string()
+                        })?,
+                        proof.tree_head_signature.as_slice(),
+                        proof.witness_policy_hash.as_slice(),
+                        i64::from(proof.witness_quorum.max(pinned.witness_quorum)),
+                    ],
+                )
+                .map_err(|error| format!("refresh identity transparency head: {error}"))?;
+            }
+            tx.commit()
+                .map_err(|error| format!("commit current identity transparency head: {error}"))?;
+            return Ok(IdentityTransparencyAcceptanceV1::CurrentHeadConfirmed);
+        }
+
+        if proof.consistency_from != pinned.tree_size {
+            return Err(
+                "identity transparency proof does not extend the current SQLCipher pin".to_string(),
+            );
+        }
+
+        if !verify_consistency_v1(
+            pinned.tree_size,
+            proof.tree_size,
+            &pinned.root_hash,
+            &proof.root_hash,
+            &proof.consistency_proof,
+        ) {
+            record_identity_transparency_alarm_on(&tx, 4, &pinned, proof)?;
+            tx.commit().map_err(|error| {
+                format!("commit non-append-only identity transparency alarm: {error}")
+            })?;
+            return Err("identity transparency non-append-only advance detected".to_string());
+        }
+        let advanced_rows = tx
+            .execute(
+                "UPDATE identity_transparency_heads_v1
+             SET tree_size = ?2, root_hash = ?3, issued_at_ms = ?4,
+                  tree_head_signature = ?5, witness_policy_hash = ?6,
+                  witness_quorum = ?7, updated_at = datetime('now')
+             WHERE canonical_server_origin = ?1
+               AND log_id = ?8 AND node_signing_key = ?9
+               AND tree_size = ?10 AND root_hash = ?11",
+                rusqlite::params![
+                    proof.canonical_server_origin,
+                    i64::try_from(proof.tree_size)
+                        .map_err(|_| "identity transparency tree size is invalid".to_string())?,
+                    proof.root_hash.as_slice(),
+                    i64::try_from(proof.issued_at_ms)
+                        .map_err(|_| "identity transparency issue time is invalid".to_string())?,
+                    proof.tree_head_signature.as_slice(),
+                    proof.witness_policy_hash.as_slice(),
+                    i64::from(proof.witness_quorum),
+                    pinned.log_id.as_slice(),
+                    pinned.node_signing_key.as_slice(),
+                    i64::try_from(pinned.tree_size)
+                        .map_err(|_| "pinned identity transparency size is invalid".to_string())?,
+                    pinned.root_hash.as_slice(),
+                ],
+            )
+            .map_err(|error| format!("advance identity transparency head: {error}"))?;
+        if advanced_rows != 1 {
+            return Err(format!(
+                "identity transparency head advance affected {advanced_rows} rows instead of one"
+            ));
+        }
+        tx.commit()
+            .map_err(|error| format!("commit identity transparency head advance: {error}"))?;
+        Ok(IdentityTransparencyAcceptanceV1::AppendOnlyAdvancePinned)
+    }
+
+    pub fn identity_transparency_alarm_count_v1(
+        &self,
+        canonical_server_origin: &str,
+    ) -> Result<u64, String> {
+        validate_canonical_server_origin(canonical_server_origin)?;
+        let count: i64 = self
+            .conn
+            .query_row(
+                "SELECT count(*) FROM identity_transparency_alarms_v1
+                 WHERE canonical_server_origin = ?1",
+                rusqlite::params![canonical_server_origin],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("count identity transparency alarms: {error}"))?;
+        u64::try_from(count).map_err(|_| "identity transparency alarm count is invalid".to_string())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ed25519_dalek::SigningKey;
+    use ed25519_dalek::{Signer, SigningKey};
 
     const ORIGIN_A: &str = "https://alpha.example:443";
     const ORIGIN_B: &str = "https://beta.example:443";
@@ -10292,6 +12040,8 @@ mod tests {
             target_binding_version: 1,
             roster_version: 1,
             roster_commitment: [0x91; 32],
+            membership_epoch: 0,
+            membership_epoch_hash: [0u8; 32],
             envelope_commitment: [0x92; 32],
             historical_sender_binding: Some(HistoricalDeviceBindingProofV1 {
                 sender_account_signing_key: binding.account_signing_key,
@@ -10300,6 +12050,25 @@ mod tests {
                 sender_account_signature: binding.account_signature,
                 target_device_identity_key: Some(target_device_identity_key),
             }),
+        }
+    }
+
+    fn sample_membership_pin(
+        conversation_id: &str,
+        epoch: u64,
+        epoch_hash: [u8; 32],
+        predecessor_hash: [u8; 32],
+    ) -> MembershipEpochPinV1 {
+        MembershipEpochPinV1 {
+            conversation_id: conversation_id.to_string(),
+            epoch,
+            epoch_hash,
+            predecessor_hash,
+            roster_version: epoch,
+            roster_commitment: [0x90u8.wrapping_add(epoch as u8); 32],
+            canonical_unsigned: vec![0xA0u8.wrapping_add(epoch as u8); 64],
+            bootstrap_owner_id: (epoch == 1).then_some([0xB1; 16]),
+            bootstrap_owner_signing_key: (epoch == 1).then_some([0xB2; 32]),
         }
     }
 
@@ -11215,6 +12984,40 @@ mod tests {
     }
 
     #[test]
+    fn device_binding_capability_advance_is_contiguous_and_compare_and_swap() {
+        let db = VeilDb::open_memory(&[0x84u8; 32]).unwrap();
+        let identity = sample_device_identity([0x11; 16]);
+        db.create_device_identity_v1(&identity).unwrap();
+
+        let mut candidate = db.load_device_identity_v1().unwrap().unwrap();
+        candidate.version += 1;
+        candidate.capabilities |= 4;
+        candidate.account_signature[0] ^= 1;
+        db.advance_device_identity_binding_v1(&candidate).unwrap();
+
+        let advanced = db.load_device_identity_v1().unwrap().unwrap();
+        assert_eq!(advanced.version, 2);
+        assert_eq!(advanced.capabilities, 7);
+        assert_eq!(advanced.x25519_secret, identity.x25519_secret);
+        assert_eq!(advanced.ed25519_secret, identity.ed25519_secret);
+        assert_eq!(advanced.device_identity_key, identity.device_identity_key);
+        assert_eq!(advanced.device_signing_key, identity.device_signing_key);
+        assert_eq!(advanced.account_signature, candidate.account_signature);
+
+        assert!(db.advance_device_identity_binding_v1(&candidate).is_err());
+        let mut substitution = db.load_device_identity_v1().unwrap().unwrap();
+        substitution.version += 1;
+        substitution.capabilities |= 8;
+        substitution.account_signature[0] ^= 1;
+        substitution.device_identity_key[0] ^= 1;
+        assert!(db
+            .advance_device_identity_binding_v1(&substitution)
+            .unwrap_err()
+            .contains("immutable identity state"));
+        assert_eq!(db.load_device_identity_v1().unwrap().unwrap().version, 2);
+    }
+
+    #[test]
     fn device_binding_marker_makes_missing_or_mismatched_material_fail_closed() {
         let db = VeilDb::open_memory(&[0x82u8; 32]).unwrap();
         let identity = sample_device_identity([0x20; 16]);
@@ -11274,11 +13077,18 @@ mod tests {
         {
             let db = VeilDb::open(&path, &db_key).unwrap();
             db.create_device_identity_v1(&identity).unwrap();
+            let mut candidate = db.load_device_identity_v1().unwrap().unwrap();
+            candidate.version += 1;
+            candidate.capabilities |= 4;
+            candidate.account_signature[0] ^= 1;
+            db.advance_device_identity_binding_v1(&candidate).unwrap();
         }
         {
             let reopened = VeilDb::open(&path, &db_key).unwrap();
             let loaded = reopened.load_device_identity_v1().unwrap().unwrap();
             assert_eq!(loaded.device_id, identity.device_id);
+            assert_eq!(loaded.version, identity.version + 1);
+            assert_eq!(loaded.capabilities, identity.capabilities | 4);
             assert_eq!(loaded.x25519_secret, identity.x25519_secret);
             assert_eq!(loaded.ed25519_secret, identity.ed25519_secret);
             assert_eq!(loaded.account_signature, identity.account_signature);
@@ -11364,6 +13174,52 @@ mod tests {
             .load_pending_sender_key_envelope("group-cache", 8, &target_a, &sender)
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn exact_device_sender_key_cache_persists_complete_v6_membership_coordinate() {
+        let db = VeilDb::open_memory(&[0x92u8; 32]).unwrap();
+        let envelope = PendingSenderKeyDeviceEnvelopeV1 {
+            conversation_id: "00000000-0000-0000-0000-000000000106".to_string(),
+            generation: 9,
+            target_account_identity_key: [0x10; 32],
+            target_device_id: [0x11; 16],
+            target_device_identity_key: [0x12; 32],
+            target_binding_version: 2,
+            sender_device_id: [0x13; 16],
+            sender_device_identity_key: [0x14; 32],
+            sender_binding_version: 3,
+            roster_version: 4,
+            roster_commitment: [0x15; 32],
+            membership_epoch: 5,
+            membership_epoch_hash: [0x16; 32],
+            envelope_commitment: [0x17; 32],
+            sealed_envelope: b"sealed-v6-envelope".to_vec(),
+        };
+        assert_eq!(
+            db.save_pending_sender_key_device_envelope_v1(&envelope)
+                .unwrap(),
+            envelope.sealed_envelope
+        );
+        assert_eq!(
+            db.load_pending_sender_key_device_envelope_v1(
+                &envelope.conversation_id,
+                envelope.generation,
+                &envelope.target_device_id,
+                envelope.target_binding_version,
+                envelope.roster_version,
+            )
+            .unwrap(),
+            Some(envelope.clone())
+        );
+
+        let mut partial = envelope;
+        partial.generation += 1;
+        partial.membership_epoch_hash = [0u8; 32];
+        assert!(db
+            .save_pending_sender_key_device_envelope_v1(&partial)
+            .unwrap_err()
+            .contains("invalid exact-device"));
     }
 
     #[test]
@@ -11668,6 +13524,65 @@ mod tests {
     }
 
     #[test]
+    fn membership_epoch_chain_is_idempotent_append_only_and_pins_history() {
+        const CONVERSATION: &str = "00000000-0000-0000-0000-000000000102";
+        let db = VeilDb::open_memory(&[0xA6; 32]).unwrap();
+        let epoch_one_hash = [0x11; 32];
+        let epoch_two_hash = [0x22; 32];
+
+        let first = vec![sample_membership_pin(
+            CONVERSATION,
+            1,
+            epoch_one_hash,
+            [0u8; 32],
+        )];
+        let head = db.commit_membership_epoch_chain_v1(&first).unwrap();
+        assert_eq!(head.epoch, 1);
+        assert_eq!(head.epoch_hash, epoch_one_hash);
+        assert_eq!(db.commit_membership_epoch_chain_v1(&first).unwrap(), head);
+        assert!(db
+            .membership_epoch_matches_pin_v1(CONVERSATION, 1, &epoch_one_hash)
+            .unwrap());
+
+        let full = vec![
+            sample_membership_pin(CONVERSATION, 1, epoch_one_hash, [0u8; 32]),
+            sample_membership_pin(CONVERSATION, 2, epoch_two_hash, epoch_one_hash),
+        ];
+        let head = db.commit_membership_epoch_chain_v1(&full).unwrap();
+        assert_eq!(head.epoch, 2);
+        assert_eq!(head.epoch_hash, epoch_two_hash);
+        assert!(db
+            .membership_epoch_matches_pin_v1(CONVERSATION, 1, &epoch_one_hash)
+            .unwrap());
+        assert!(db
+            .membership_epoch_matches_pin_v1(CONVERSATION, 2, &epoch_two_hash)
+            .unwrap());
+        assert!(!db
+            .membership_epoch_matches_pin_v1(CONVERSATION, 2, &[0x23; 32])
+            .unwrap());
+
+        assert!(db
+            .commit_membership_epoch_chain_v1(&first)
+            .unwrap_err()
+            .contains("rollback"));
+        let equivocation = vec![
+            sample_membership_pin(CONVERSATION, 1, [0x12; 32], [0u8; 32]),
+            sample_membership_pin(CONVERSATION, 2, epoch_two_hash, [0x12; 32]),
+        ];
+        assert!(db
+            .commit_membership_epoch_chain_v1(&equivocation)
+            .unwrap_err()
+            .contains("equivocation"));
+        assert_eq!(
+            db.load_membership_epoch_head_v1(CONVERSATION)
+                .unwrap()
+                .unwrap()
+                .epoch_hash,
+            epoch_two_hash
+        );
+    }
+
+    #[test]
     fn device_binding_pin_rejects_key_replacement_rollback_and_revoked_resurrection_atomically() {
         let db = VeilDb::open_memory(&[0xA4; 32]).unwrap();
         let original = sample_binding_pin(0x30, 2, 1);
@@ -11771,7 +13686,9 @@ mod tests {
     fn historical_sender_proof_first_seen_tofu_pins_atomically_and_conflicts_roll_back() {
         let db = VeilDb::open_memory(&[0xB1; 32]).unwrap();
         let binding = sample_binding_pin(0x51, 1, 1);
-        let route = sample_incoming_route(&binding, [0x61; 16], [0x62; 32]);
+        let mut route = sample_incoming_route(&binding, [0x61; 16], [0x62; 32]);
+        route.membership_epoch = 7;
+        route.membership_epoch_hash = [0x67; 32];
         db.save_incoming_sender_key_generation_with_route_v1(
             "historical-tofu",
             &binding.device_identity_key,
@@ -11792,6 +13709,25 @@ mod tests {
             .unwrap(),
             Some(route)
         );
+        let mut partial = sample_incoming_route(&binding, [0x68; 16], [0x69; 32]);
+        partial.membership_epoch = 8;
+        assert!(db
+            .save_incoming_sender_key_generation_with_route_v1(
+                "historical-partial-membership",
+                &binding.device_identity_key,
+                2,
+                0,
+                1,
+                &[0x6A; 32],
+                b"must-not-persist",
+                &partial,
+            )
+            .unwrap_err()
+            .contains("invalid incoming sender-key route proof"));
+        assert!(db
+            .load_incoming_sender_key_generations_for_group("historical-partial-membership")
+            .unwrap()
+            .is_empty());
         assert!(db
             .load_trusted_signing_keys()
             .unwrap()
@@ -14843,6 +16779,100 @@ mod tests {
     }
 
     #[test]
+    fn opk_only_reservation_never_advances_the_signed_prekey_namespace() {
+        let db = VeilDb::open_memory(&[0xA3u8; 32]).unwrap();
+        let initial = db.reserve_local_prekey_batch_ids().unwrap();
+        assert_eq!(initial.signed_prekey_id, 1);
+        assert_eq!(initial.one_time_prekey_start_id, 1);
+
+        let refill = db.reserve_local_one_time_prekey_batch_ids().unwrap();
+        assert_eq!(refill.one_time_prekey_start_id, 21);
+        assert_eq!(refill.next_one_time_prekey_id, 41);
+        assert_eq!(db.synchronize_local_prekey_allocator().unwrap(), (2, 41));
+
+        let next_full = db.reserve_local_prekey_batch_ids().unwrap();
+        assert_eq!(next_full.signed_prekey_id, 2);
+        assert_eq!(next_full.one_time_prekey_start_id, 41);
+    }
+
+    #[test]
+    fn prekey_refill_reuses_only_the_exact_immutable_signed_prekey() {
+        let db = VeilDb::open_memory(&[0xA4u8; 32]).unwrap();
+        let device_id = [0x4Au8; 16];
+        let mut device = sample_device_identity(device_id);
+        device.account_signing_key = test_signing_key(0x6B);
+        db.create_device_identity_v1(&device).unwrap();
+        db.bind_authenticated_self(
+            ORIGIN_A,
+            USER_A,
+            &device.account_identity_key,
+            &device.account_signing_key,
+        )
+        .unwrap();
+
+        let first_keys = sample_prekey_batch(1, 1);
+        let first = sample_prekey_publication(
+            ORIGIN_A,
+            USER_A,
+            device_id,
+            1,
+            br#"{"device_id":"4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a","batch":"first"}"#,
+        );
+        db.save_local_prekeys_with_publication(&first_keys, &first)
+            .unwrap();
+        db.acknowledge_local_prekey_publication(
+            ORIGIN_A,
+            USER_A,
+            &device_id,
+            first.signed_prekey_id,
+            &first.body_sha256,
+        )
+        .unwrap();
+
+        let signed_prekey = db.load_local_signed_prekey(1).unwrap().unwrap();
+        assert_eq!(signed_prekey.secret_key, first_keys[0].secret_key);
+        assert_eq!(signed_prekey.public_key, first_keys[0].public_key);
+        assert_eq!(signed_prekey.signature, first_keys[0].signature);
+
+        let refill_batch = sample_prekey_batch(1, 21);
+        let refill = sample_prekey_publication(
+            ORIGIN_A,
+            USER_A,
+            device_id,
+            1,
+            br#"{"device_id":"4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a","batch":"refill"}"#,
+        );
+        let mut tampered_signed = signed_prekey.clone();
+        tampered_signed.public_key[0] ^= 1;
+        assert!(db
+            .save_local_prekey_refill_with_publication(
+                &tampered_signed,
+                &refill_batch[1..],
+                &refill,
+            )
+            .is_err());
+        assert!(
+            db.load_local_prekey_publication(ORIGIN_A, USER_A, &device_id)
+                .unwrap()
+                .unwrap()
+                .acknowledged
+        );
+        assert_eq!(db.load_local_prekeys().unwrap().len(), 21);
+
+        db.save_local_prekey_refill_with_publication(&signed_prekey, &refill_batch[1..], &refill)
+            .unwrap();
+        let stored = db.load_local_prekeys().unwrap();
+        assert_eq!(stored.iter().filter(|key| key.key_type == 0).count(), 1);
+        assert_eq!(stored.iter().filter(|key| key.key_type == 1).count(), 40);
+        assert!(
+            !db.load_local_prekey_publication(ORIGIN_A, USER_A, &device_id)
+                .unwrap()
+                .unwrap()
+                .acknowledged
+        );
+    }
+
+    #[test]
     fn immutable_prekey_insert_cannot_resurrect_a_consumed_opk() {
         let db = VeilDb::open_memory(&[0x94u8; 32]).unwrap();
         let original_public = [0x32u8; 32];
@@ -15024,6 +17054,100 @@ mod tests {
         assert_eq!(
             db.load_ratchet_session(&peer).unwrap().unwrap(),
             b"ratchet-one"
+        );
+    }
+
+    #[test]
+    fn direct_v2_binding_is_atomic_sticky_and_cascades_with_its_ratchet() {
+        fn binding(peer: [u8; 32], marker: u8) -> DirectSessionBindingBlobV2 {
+            DirectSessionBindingBlobV2 {
+                peer_identity_key: peer,
+                session_id: [marker; 32],
+                local_device_id: [marker.wrapping_add(1); 16],
+                peer_device_id: [marker.wrapping_add(2); 16],
+                binding_data: vec![marker, marker.wrapping_add(3)],
+            }
+        }
+
+        let db = VeilDb::open_memory(&[0x81; 32]).unwrap();
+        let peer = [0x51; 32];
+        let valid = binding(peer, 0x61);
+        let mut malformed = valid.clone();
+        malformed.session_id = [0u8; 32];
+        assert!(db
+            .save_initiator_session_v2(&peer, b"ratchet", b"initial", &malformed)
+            .is_err());
+        assert!(db.load_ratchet_session(&peer).unwrap().is_none());
+        assert!(db.load_pending_initial_headers().unwrap().is_empty());
+        assert!(db.load_all_direct_session_bindings_v2().unwrap().is_empty());
+
+        db.save_initiator_session_v2(&peer, b"ratchet", b"initial", &valid)
+            .unwrap();
+        assert_eq!(db.load_ratchet_session(&peer).unwrap().unwrap(), b"ratchet");
+        assert_eq!(db.load_pending_initial_headers().unwrap().len(), 1);
+        let loaded = db.load_all_direct_session_bindings_v2().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].peer_identity_key, peer);
+        assert_eq!(loaded[0].session_id, valid.session_id);
+        assert_eq!(loaded[0].binding_data, valid.binding_data);
+
+        db.conn
+            .execute(
+                "DELETE FROM ratchet_sessions WHERE peer_identity_key = ?1",
+                rusqlite::params![peer.as_slice()],
+            )
+            .unwrap();
+        assert!(db.load_all_direct_session_bindings_v2().unwrap().is_empty());
+
+        let responder = VeilDb::open_memory(&[0x82; 32]).unwrap();
+        responder
+            .save_local_prekeys(&[LocalPreKey {
+                key_type: 1,
+                protocol_key_id: 19,
+                secret_key: [0x71; 32],
+                public_key: [0x72; 32],
+                signature: None,
+            }])
+            .unwrap();
+        let responder_peer = [0x52; 32];
+        let responder_binding = binding(responder_peer, 0x62);
+        responder
+            .commit_initial_ratchet_session_v2(
+                &responder_peer,
+                b"responder-ratchet",
+                Some(19),
+                &responder_binding,
+            )
+            .unwrap();
+        assert_eq!(responder.load_local_prekeys().unwrap().len(), 0);
+        assert_eq!(
+            responder
+                .load_all_direct_session_bindings_v2()
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let reuse_peer = [0x53; 32];
+        let reuse_binding = binding(reuse_peer, 0x63);
+        assert!(responder
+            .commit_initial_ratchet_session_v2(
+                &reuse_peer,
+                b"must-rollback",
+                Some(19),
+                &reuse_binding,
+            )
+            .is_err());
+        assert!(responder
+            .load_ratchet_session(&reuse_peer)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            responder
+                .load_all_direct_session_bindings_v2()
+                .unwrap()
+                .len(),
+            1
         );
     }
 
@@ -17310,5 +19434,234 @@ mod tests {
         }
 
         remove_sqlcipher_test_files(&path);
+    }
+
+    fn transparency_proof(
+        signing: &SigningKey,
+        events: &[Vec<u8>],
+        leaf_index: usize,
+        consistency_from: usize,
+        issued_at_ms: u64,
+    ) -> IdentityTransparencyProofV1 {
+        use veil_crypto::transparency::{
+            consistency_proof_v1, inclusion_proof_v1, log_id_v1, tree_root_v1,
+            TransparencyTreeHeadV1,
+        };
+
+        let node_signing_key = signing.verifying_key().to_bytes();
+        let log_id = log_id_v1(ORIGIN_A, &node_signing_key).unwrap();
+        let root_hash = tree_root_v1(events).unwrap();
+        let head = TransparencyTreeHeadV1 {
+            log_id,
+            tree_size: events.len() as u64,
+            root_hash,
+            issued_at_ms,
+        };
+        let signature = signing
+            .sign(&head.signing_message(ORIGIN_A).unwrap())
+            .to_bytes();
+        IdentityTransparencyProofV1 {
+            canonical_server_origin: ORIGIN_A.to_string(),
+            log_id,
+            node_signing_key,
+            tree_size: events.len() as u64,
+            root_hash,
+            issued_at_ms,
+            tree_head_signature: signature,
+            canonical_event: events[leaf_index].clone(),
+            leaf_index: leaf_index as u64,
+            inclusion_proof: inclusion_proof_v1(events, leaf_index).unwrap(),
+            consistency_from: consistency_from as u64,
+            consistency_proof: if consistency_from == 0 || consistency_from == events.len() {
+                Vec::new()
+            } else {
+                consistency_proof_v1(events, consistency_from).unwrap()
+            },
+            witness_policy_hash: [0u8; 32],
+            witness_quorum: 0,
+        }
+    }
+
+    fn transparency_anchor_from_proof(
+        proof: &IdentityTransparencyProofV1,
+    ) -> IdentityTransparencyPinnedHeadV1 {
+        IdentityTransparencyPinnedHeadV1 {
+            canonical_server_origin: proof.canonical_server_origin.clone(),
+            log_id: proof.log_id,
+            node_signing_key: proof.node_signing_key,
+            tree_size: proof.tree_size,
+            root_hash: proof.root_hash,
+            issued_at_ms: proof.issued_at_ms,
+            tree_head_signature: proof.tree_head_signature,
+            witness_policy_hash: proof.witness_policy_hash,
+            witness_quorum: proof.witness_quorum,
+        }
+    }
+
+    #[test]
+    fn transparency_pin_is_append_only_and_preserves_signed_alarm_evidence() {
+        let db = VeilDb::open_memory(&[0x5A; 32]).unwrap();
+        let signing = SigningKey::from_bytes(&[0x61; 32]);
+        let mut events = vec![b"account-a".to_vec(), b"device-a-v1".to_vec()];
+
+        let first = transparency_proof(&signing, &events, 0, 0, 1_710_000_000_001);
+        assert_eq!(
+            db.verify_and_pin_identity_transparency_proof_v1(&first)
+                .unwrap(),
+            IdentityTransparencyAcceptanceV1::FirstContactPinned
+        );
+        let pinned = db
+            .identity_transparency_pinned_head_v1(ORIGIN_A)
+            .unwrap()
+            .unwrap();
+        assert_eq!(pinned.tree_size, 2);
+        assert_eq!(pinned.root_hash, first.root_hash);
+        assert_eq!(pinned.witness_quorum, 0);
+
+        let current = transparency_proof(&signing, &events, 1, 2, 1_710_000_000_002);
+        assert_eq!(
+            db.verify_and_pin_identity_transparency_proof_v1(&current)
+                .unwrap(),
+            IdentityTransparencyAcceptanceV1::CurrentHeadConfirmed
+        );
+
+        events.push(b"device-a-v2".to_vec());
+        let advance = transparency_proof(&signing, &events, 2, 2, 1_710_000_000_003);
+        assert_eq!(
+            db.verify_and_pin_identity_transparency_proof_v1(&advance)
+                .unwrap(),
+            IdentityTransparencyAcceptanceV1::AppendOnlyAdvancePinned
+        );
+        assert_eq!(
+            db.identity_transparency_pinned_head_v1(ORIGIN_A)
+                .unwrap()
+                .unwrap()
+                .tree_size,
+            3
+        );
+
+        let rollback = transparency_proof(&signing, &events[..2], 0, 0, 1_710_000_000_004);
+        assert!(db
+            .verify_and_pin_identity_transparency_proof_v1(&rollback)
+            .unwrap_err()
+            .contains("rollback"));
+        assert_eq!(
+            db.identity_transparency_alarm_count_v1(ORIGIN_A).unwrap(),
+            1
+        );
+
+        let split_events = vec![
+            b"account-a".to_vec(),
+            b"device-a-v1".to_vec(),
+            b"attacker-split-leaf".to_vec(),
+        ];
+        let split = transparency_proof(&signing, &split_events, 2, 3, 1_710_000_000_005);
+        assert!(db
+            .verify_and_pin_identity_transparency_proof_v1(&split)
+            .unwrap_err()
+            .contains("split view"));
+        assert_eq!(
+            db.identity_transparency_alarm_count_v1(ORIGIN_A).unwrap(),
+            2
+        );
+
+        events.push(b"account-b".to_vec());
+        let mut non_append_only = transparency_proof(&signing, &events, 3, 3, 1_710_000_000_006);
+        non_append_only.consistency_proof[0][0] ^= 1;
+        assert!(db
+            .verify_and_pin_identity_transparency_proof_v1(&non_append_only)
+            .unwrap_err()
+            .contains("non-append-only"));
+        assert_eq!(
+            db.identity_transparency_alarm_count_v1(ORIGIN_A).unwrap(),
+            3
+        );
+
+        let replacement_signing = SigningKey::from_bytes(&[0x62; 32]);
+        let replacement = transparency_proof(
+            &replacement_signing,
+            &[b"replacement-log".to_vec()],
+            0,
+            0,
+            1_710_000_000_007,
+        );
+        assert!(db
+            .verify_and_pin_identity_transparency_proof_v1(&replacement)
+            .unwrap_err()
+            .contains("replacement"));
+        assert_eq!(
+            db.identity_transparency_alarm_count_v1(ORIGIN_A).unwrap(),
+            4
+        );
+        assert!(db
+            .verify_and_pin_identity_transparency_proof_v1(&replacement)
+            .is_err());
+        assert_eq!(
+            db.identity_transparency_alarm_count_v1(ORIGIN_A).unwrap(),
+            4
+        );
+
+        let final_pin = db
+            .identity_transparency_pinned_head_v1(ORIGIN_A)
+            .unwrap()
+            .unwrap();
+        assert_eq!(final_pin.tree_size, 3);
+        assert_eq!(final_pin.root_hash, advance.root_hash);
+    }
+
+    #[test]
+    fn transparency_os_anchor_recovers_rolled_back_sqlcipher_and_rejects_split_views() {
+        let signing = SigningKey::from_bytes(&[0x63; 32]);
+        let events = vec![
+            b"account-a".to_vec(),
+            b"device-a-v1".to_vec(),
+            b"device-a-v2".to_vec(),
+        ];
+        let db = VeilDb::open_memory(&[0x5B; 32]).unwrap();
+        let old = transparency_proof(&signing, &events[..2], 0, 0, 1_710_000_001_001);
+        db.verify_and_pin_identity_transparency_proof_v1(&old)
+            .unwrap();
+
+        let anchored_proof = transparency_proof(&signing, &events, 2, 3, 1_710_000_001_002);
+        let anchor = transparency_anchor_from_proof(&anchored_proof);
+        assert_eq!(
+            db.verify_and_pin_identity_transparency_proof_with_anchor_v1(
+                &anchored_proof,
+                Some(&anchor),
+            )
+            .unwrap(),
+            IdentityTransparencyAcceptanceV1::RollbackAnchorRecovered
+        );
+        assert_eq!(
+            db.identity_transparency_pinned_head_v1(ORIGIN_A)
+                .unwrap()
+                .unwrap()
+                .tree_size,
+            3
+        );
+
+        let rollback = transparency_proof(&signing, &events[..2], 1, 2, 1_710_000_001_003);
+        assert!(db
+            .verify_and_pin_identity_transparency_proof_with_anchor_v1(&rollback, Some(&anchor),)
+            .unwrap_err()
+            .contains("rollback"));
+
+        let split_db = VeilDb::open_memory(&[0x5C; 32]).unwrap();
+        split_db
+            .verify_and_pin_identity_transparency_proof_v1(&old)
+            .unwrap();
+        let split_events = vec![b"account-a".to_vec(), b"attacker-device".to_vec()];
+        let split_proof = transparency_proof(&signing, &split_events, 1, 2, 1_710_000_001_004);
+        let split_anchor = transparency_anchor_from_proof(&split_proof);
+        assert!(split_db
+            .verify_and_pin_identity_transparency_proof_with_anchor_v1(&old, Some(&split_anchor),)
+            .unwrap_err()
+            .contains("conflicts with the OS rollback anchor"));
+        assert_eq!(
+            split_db
+                .identity_transparency_alarm_count_v1(ORIGIN_A)
+                .unwrap(),
+            1
+        );
     }
 }

@@ -1,6 +1,5 @@
 import React, { useState, useEffect, useMemo } from "react";
 import {
-  ActivityIndicator,
   KeyboardAvoidingView,
   Platform,
   Pressable,
@@ -11,7 +10,7 @@ import {
   Image,
   Dimensions,
 } from "react-native";
-import type { NativeStackScreenProps } from "@react-navigation/native-stack";
+import type { NativeStackNavigationProp } from "@react-navigation/native-stack";
 import { MessageCircle, Search } from "lucide-react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import Animated, {
@@ -34,7 +33,9 @@ import type { AuthenticatedStackParamList } from "./ChatListScreen";
 import { noiseBase64 } from "../components/ui/noiseBase64";
 import { useReducedMotionPreference } from "../hooks/useReducedMotionPreference";
 
-type Props = NativeStackScreenProps<AuthenticatedStackParamList, "ContactSearch">;
+type Props = {
+  navigation: NativeStackNavigationProp<AuthenticatedStackParamList>;
+};
 
 const AnimatedRadialGradient = Animated.createAnimatedComponent(RadialGradient);
 
@@ -74,7 +75,7 @@ export default function ContactSearchScreen({ navigation }: Props) {
         withTiming(1, { duration: 200, easing: Easing.out(Easing.ease) })
       );
     }
-  }, [reducedMotion]);
+  }, [linearProgress, panelProgress, reducedMotion, scrimProgress]);
 
   const close = () => {
     if (closing) return;
@@ -103,9 +104,11 @@ export default function ContactSearchScreen({ navigation }: Props) {
         method: req.method,
         headers: {
           "Accept": "application/json",
-          "X-Veil-User-Id": req.signature.userId,
+          "X-Veil-REST-Auth-Version": req.signature.version,
+          "X-Veil-User": req.signature.userId,
           "X-Veil-Timestamp": req.signature.timestampMs,
-          "X-Veil-Signature": req.signature.signatureBase64,
+          "X-Veil-Nonce": req.signature.nonceBase64url,
+          "X-Veil-Signature": req.signature.signatureBase64url,
         },
       });
 
@@ -149,9 +152,11 @@ export default function ContactSearchScreen({ navigation }: Props) {
         headers: {
           "Content-Type": "application/json",
           "Accept": "application/json",
-          "X-Veil-User-Id": req.signature.userId,
+          "X-Veil-REST-Auth-Version": req.signature.version,
+          "X-Veil-User": req.signature.userId,
           "X-Veil-Timestamp": req.signature.timestampMs,
-          "X-Veil-Signature": req.signature.signatureBase64,
+          "X-Veil-Nonce": req.signature.nonceBase64url,
+          "X-Veil-Signature": req.signature.signatureBase64url,
         },
         body: bodyBytes,
       });
@@ -160,7 +165,14 @@ export default function ContactSearchScreen({ navigation }: Props) {
         throw new Error(`Failed to create Direct: ${response.status}`);
       }
 
-      navigation.goBack();
+      const responseBuffer = await response.arrayBuffer();
+      const responseBytes = new Uint8Array(responseBuffer);
+      let responseBinary = "";
+      for (let i = 0; i < responseBytes.byteLength; i++) {
+        responseBinary += String.fromCharCode(responseBytes[i]);
+      }
+      const parsed = await VeilRuntime.parseCreateDirectResponse(btoa(responseBinary));
+      navigation.navigate("Direct", { conversationId: parsed.conversationId });
     } catch (err: any) {
       setError(err.message || "Failed to start direct message");
     } finally {
@@ -245,11 +257,12 @@ export default function ContactSearchScreen({ navigation }: Props) {
         </Animated.View>
 
         {/* Dithering Noise */}
-        <Image
-          source={{ uri: noiseBase64 }}
-          style={[StyleSheet.absoluteFill, { opacity: 0.025, resizeMode: "repeat" }]}
-          pointerEvents="none"
-        />
+        <View pointerEvents="none" style={StyleSheet.absoluteFill}>
+          <Image
+            source={{ uri: noiseBase64 }}
+            style={[StyleSheet.absoluteFill, { opacity: 0.025, resizeMode: "repeat" }]}
+          />
+        </View>
 
         {/* Dismiss trigger */}
         <Pressable style={StyleSheet.absoluteFill} onPress={close} />
@@ -263,11 +276,11 @@ export default function ContactSearchScreen({ navigation }: Props) {
       >
         <Animated.View style={[styles.panel, panelStyle]} pointerEvents="auto">
           <View style={styles.inputContainer}>
-            <Search size={20} color={colors.textLow} style={styles.searchIcon} />
+            <Search size={20} color={colors.textLo} style={styles.searchIcon} />
             <TextInput
               style={styles.input}
               placeholder="Exact username..."
-              placeholderTextColor={colors.textLow}
+              placeholderTextColor={colors.textLo}
               value={query}
               onChangeText={setQuery}
               autoCapitalize="none"
@@ -360,7 +373,7 @@ const styles = StyleSheet.create({
   },
   hostnameHint: {
     fontSize: 13,
-    color: colors.textLow, // exactly same brightness as placeholder
+    color: colors.textLo, // exactly same brightness as placeholder
     marginLeft: spacing.sm,
   },
   clearBtn: {
@@ -373,7 +386,7 @@ const styles = StyleSheet.create({
     justifyContent: "center",
   },
   clearBtnText: {
-    color: colors.textLow,
+    color: colors.textLo,
     fontSize: 14,
     fontWeight: "bold",
     marginTop: -2,
@@ -384,7 +397,7 @@ const styles = StyleSheet.create({
     justifyContent: "center",
   },
   emptyText: {
-    color: colors.textLow,
+    color: colors.textLo,
     fontSize: 14,
     textAlign: "center",
   },
@@ -408,7 +421,7 @@ const styles = StyleSheet.create({
     fontWeight: "600",
   },
   resultId: {
-    color: colors.textLow,
+    color: colors.textLo,
     fontSize: 12,
     marginTop: 2,
   },

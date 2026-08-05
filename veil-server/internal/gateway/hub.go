@@ -19,6 +19,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
+	"github.com/jackc/pgx/v5"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/NaveLIL/veil/veil-server/internal/auth"
@@ -955,6 +956,52 @@ func (c *Client) handleAuth(ctx context.Context, seq uint64, resp *pb.AuthRespon
 
 // --- Chat ---
 
+func validateDirectV2SendShape(msg *pb.SendMessage) (bool, error) {
+	if msg == nil {
+		return false, chat.ErrInvalidSendMessage
+	}
+	absent := msg.CryptoProfile == "" && msg.CryptoEra == 0 &&
+		len(msg.TargetDeviceId) == 0 && msg.TargetBindingVersion == 0 &&
+		len(msg.DirectSessionId) == 0
+	if absent {
+		return false, nil
+	}
+	if (msg.CryptoProfile == db.MessageCryptoProfileSenderKeyV5 &&
+		msg.CryptoEra == db.MessageCryptoEraSenderKeyV5 ||
+		msg.CryptoProfile == db.MessageCryptoProfileSenderKeyV6 &&
+			msg.CryptoEra == db.MessageCryptoEraSenderKeyV6) &&
+		len(msg.TargetDeviceId) == 0 && msg.TargetBindingVersion == 0 &&
+		len(msg.DirectSessionId) == 0 {
+		return false, nil
+	}
+	if msg.CryptoProfile != db.MessageCryptoProfileDirectV2 ||
+		msg.CryptoEra != db.MessageCryptoEraDirectV2 ||
+		len(msg.TargetDeviceId) != 16 || bytes.Equal(msg.TargetDeviceId, make([]byte, 16)) ||
+		msg.TargetBindingVersion == 0 || msg.TargetBindingVersion > uint64(^uint64(0)>>1) ||
+		len(msg.DirectSessionId) != 32 || bytes.Equal(msg.DirectSessionId, make([]byte, 32)) {
+		return false, chat.ErrInvalidSendMessage
+	}
+	if len(msg.Header) == 0 {
+		return false, chat.ErrInvalidSendMessage
+	}
+	switch msg.Header[0] {
+	case 0x11:
+		if len(msg.Header) != 1+32+32+4+4+41 {
+			return false, chat.ErrInvalidSendMessage
+		}
+	case 0x12:
+		if len(msg.Header) != 1+32+41 {
+			return false, chat.ErrInvalidSendMessage
+		}
+	default:
+		return false, chat.ErrInvalidSendMessage
+	}
+	if !bytes.Equal(msg.Header[1:33], msg.DirectSessionId) {
+		return false, chat.ErrInvalidSendMessage
+	}
+	return true, nil
+}
+
 func (c *Client) handleSendMessage(ctx context.Context, seq uint64, msg *pb.SendMessage) {
 	clientMessageID, validClientMessageID := chat.CanonicalClientMessageID(msg)
 	sender, authenticated := c.snapshotAuthenticatedSender()
@@ -998,9 +1045,16 @@ func (c *Client) handleSendMessage(ctx context.Context, seq uint64, msg *pb.Send
 		c.sendMessageAck(seq, clientMessageID, replay)
 		return
 	}
+	directV2, directShapeErr := validateDirectV2SendShape(msg)
+	if directShapeErr != nil {
+		status, message, reason := classifySendMessageError(directShapeErr)
+		c.sendErrorWithSendMessageContext(seq, uint32(status), message, clientMessageID, reason)
+		return
+	}
 
 	var secureRoster *db.ConversationDeviceRoster
 	var messageSecurity *db.MessageSecurityContext
+	var directSourceBinding, directTargetBinding *db.DeviceBinding
 	if msg != nil && msg.ConversationId != "" {
 		canSend, accessErr := c.hub.chatSvc.DB().CanAccessConversation(
 			ctx, msg.ConversationId, c.userID,
@@ -1026,6 +1080,11 @@ func (c *Client) handleSendMessage(ctx context.Context, seq uint64, msg *pb.Send
 			return
 		}
 		if conversationType == 1 || conversationType == 2 {
+			if directV2 {
+				status, message, reason := classifySendMessageError(chat.ErrInvalidSendMessage)
+				c.sendErrorWithSendMessageContext(seq, uint32(status), message, clientMessageID, reason)
+				return
+			}
 			if !c.perDeviceSecure || c.deviceBindingStatus != db.DeviceBindingActive ||
 				c.deviceBindingVersion == 0 || len(c.deviceKey) != 16 {
 				c.sendMessagePublicError(seq, http.StatusConflict, publicerr.New(
@@ -1052,14 +1111,110 @@ func (c *Client) handleSendMessage(ctx context.Context, seq uint64, msg *pb.Send
 				), clientMessageID, sendMessageReasonDeviceNotEligible)
 				return
 			}
+			cryptoProfile := db.MessageCryptoProfileSenderKeyV5
+			cryptoEra := db.MessageCryptoEraSenderKeyV5
+			var membershipEpoch uint64
+			var membershipEpochHash []byte
+			membershipRecord, membershipErr := c.hub.chatSvc.DB().MembershipEpochForRosterForRequesterV1(
+				ctx, msg.ConversationId, c.userID, secureRoster.Version, secureRoster.Commitment,
+			)
+			switch {
+			case errors.Is(membershipErr, pgx.ErrNoRows):
+				if msg.MembershipEpoch != 0 || len(msg.MembershipEpochHash) != 0 ||
+					(msg.CryptoProfile != "" && msg.CryptoProfile != db.MessageCryptoProfileSenderKeyV5) ||
+					(msg.CryptoProfile == "" && msg.CryptoEra != 0) ||
+					(msg.CryptoProfile == db.MessageCryptoProfileSenderKeyV5 && msg.CryptoEra != db.MessageCryptoEraSenderKeyV5) {
+					status, message, reason := classifySendMessageError(chat.ErrInvalidSendMessage)
+					c.sendErrorWithSendMessageContext(seq, uint32(status), message, clientMessageID, reason)
+					return
+				}
+			case membershipErr != nil:
+				c.sendMessagePublicError(seq, http.StatusConflict, publicerr.New(
+					http.StatusConflict, "membership_epoch_changed", "signed membership changed; refresh the conversation and retry", membershipErr,
+				), clientMessageID, sendMessageReasonSecureRosterChanged)
+				return
+			default:
+				if membershipRecord == nil || msg.CryptoProfile != db.MessageCryptoProfileSenderKeyV6 ||
+					msg.CryptoEra != db.MessageCryptoEraSenderKeyV6 ||
+					msg.MembershipEpoch != membershipRecord.Epoch.Number ||
+					!bytes.Equal(msg.MembershipEpochHash, membershipRecord.Hash[:]) {
+					c.sendMessagePublicError(seq, http.StatusConflict, publicerr.New(
+						http.StatusConflict, "membership_epoch_changed", "signed membership changed; refresh the conversation and retry", db.ErrMembershipEpochRosterStale,
+					), clientMessageID, sendMessageReasonSecureRosterChanged)
+					return
+				}
+				cryptoProfile = db.MessageCryptoProfileSenderKeyV6
+				cryptoEra = db.MessageCryptoEraSenderKeyV6
+				membershipEpoch = membershipRecord.Epoch.Number
+				membershipEpochHash = append([]byte(nil), membershipRecord.Hash[:]...)
+			}
 			messageSecurity = &db.MessageSecurityContext{
-				CryptoProfile:          db.MessageCryptoProfileSenderKeyV5,
-				CryptoEra:              db.MessageCryptoEraSenderKeyV5,
+				CryptoProfile:          cryptoProfile,
+				CryptoEra:              cryptoEra,
 				RosterVersion:          secureRoster.Version,
 				RosterCommitment:       append([]byte(nil), secureRoster.Commitment[:]...),
+				MembershipEpoch:        membershipEpoch,
+				MembershipEpochHash:    membershipEpochHash,
 				SenderDeviceID:         append([]byte(nil), source.device.DeviceKey...),
 				SenderBindingVersion:   source.device.Binding.Version,
 				SenderDeviceDatabaseID: source.device.DeviceID,
+			}
+		} else {
+			if msg.RosterVersion != 0 || len(msg.RosterCommitment) != 0 {
+				status, message, reason := classifySendMessageError(chat.ErrInvalidSendMessage)
+				c.sendErrorWithSendMessageContext(seq, uint32(status), message, clientMessageID, reason)
+				return
+			}
+			if !directV2 && (msg.CryptoProfile != "" || msg.CryptoEra != 0 ||
+				msg.MembershipEpoch != 0 || len(msg.MembershipEpochHash) != 0) {
+				status, message, reason := classifySendMessageError(chat.ErrInvalidSendMessage)
+				c.sendErrorWithSendMessageContext(seq, uint32(status), message, clientMessageID, reason)
+				return
+			}
+			if directV2 {
+				if !c.perDeviceSecure || c.deviceBindingStatus != db.DeviceBindingActive ||
+					c.deviceBindingVersion == 0 || len(c.deviceKey) != 16 {
+					c.sendMessagePublicError(seq, http.StatusConflict, publicerr.New(
+						http.StatusConflict, "device_not_eligible", "device is not eligible for Direct v2 traffic", errDeviceNotEligible,
+					), clientMessageID, sendMessageReasonDeviceNotEligible)
+					return
+				}
+				directSourceBinding, err = c.hub.chatSvc.DB().GetLatestDeviceBinding(ctx, c.deviceID)
+				if err != nil || directSourceBinding.UserID != c.userID ||
+					directSourceBinding.Status != db.DeviceBindingActive ||
+					directSourceBinding.Version != c.deviceBindingVersion ||
+					!bytes.Equal(directSourceBinding.DeviceKey, c.deviceKey) {
+					c.sendMessagePublicError(seq, http.StatusConflict, publicerr.New(
+						http.StatusConflict, "device_not_eligible", "source device binding changed; re-authenticate", errDeviceNotEligible,
+					), clientMessageID, sendMessageReasonDeviceNotEligible)
+					return
+				}
+				directTargetBinding, err = c.hub.chatSvc.DB().GetLatestDeviceBindingByKey(ctx, msg.TargetDeviceId)
+				if err != nil || directTargetBinding.UserID == c.userID ||
+					directTargetBinding.Status != db.DeviceBindingActive ||
+					directTargetBinding.Version != msg.TargetBindingVersion ||
+					!bytes.Equal(directTargetBinding.DeviceKey, msg.TargetDeviceId) {
+					c.sendMessagePublicError(seq, http.StatusConflict, publicerr.New(
+						http.StatusConflict, "device_not_eligible", "target device binding changed; refresh the peer prekey", errDeviceNotEligible,
+					), clientMessageID, sendMessageReasonDeviceNotEligible)
+					return
+				}
+				messageSecurity = &db.MessageSecurityContext{
+					CryptoProfile:             db.MessageCryptoProfileDirectV2,
+					CryptoEra:                 db.MessageCryptoEraDirectV2,
+					SenderDeviceID:            append([]byte(nil), directSourceBinding.DeviceKey...),
+					SenderBindingVersion:      directSourceBinding.Version,
+					SenderDeviceDatabaseID:    directSourceBinding.DeviceID,
+					SenderDeviceIdentityKey:   append([]byte(nil), directSourceBinding.DeviceIdentityKey...),
+					SenderDeviceSigningKey:    append([]byte(nil), directSourceBinding.DeviceSigningKey...),
+					SenderDeviceCapabilities:  directSourceBinding.Capabilities,
+					SenderDeviceBindingStatus: directSourceBinding.Status,
+					SenderAccountSignature:    append([]byte(nil), directSourceBinding.AccountSignature...),
+					TargetDeviceID:            append([]byte(nil), directTargetBinding.DeviceKey...),
+					TargetBindingVersion:      directTargetBinding.Version,
+					TargetDeviceDatabaseID:    directTargetBinding.DeviceID,
+					DirectSessionID:           append([]byte(nil), msg.DirectSessionId...),
+				}
 			}
 		}
 	}
@@ -1108,16 +1263,44 @@ func (c *Client) handleSendMessage(ctx context.Context, seq uint64, msg *pb.Send
 	}
 	if messageSecurity != nil {
 		messageEvent := event.GetMessageEvent()
-		messageEvent.RosterVersion = messageSecurity.RosterVersion
-		messageEvent.RosterCommitment = append([]byte(nil), messageSecurity.RosterCommitment...)
 		messageEvent.SenderDeviceId = append([]byte(nil), messageSecurity.SenderDeviceID...)
 		messageEvent.CryptoProfile = messageSecurity.CryptoProfile
 		messageEvent.CryptoEra = messageSecurity.CryptoEra
 		messageEvent.SenderBindingVersion = messageSecurity.SenderBindingVersion
-		c.hub.fanoutMessageEventToDevices(
-			ctx, eligibleRosterRecipients(secureRoster, c.deviceID), event,
-		)
-		return
+		switch messageSecurity.CryptoProfile {
+		case db.MessageCryptoProfileSenderKeyV5, db.MessageCryptoProfileSenderKeyV6:
+			messageEvent.RosterVersion = messageSecurity.RosterVersion
+			messageEvent.RosterCommitment = append([]byte(nil), messageSecurity.RosterCommitment...)
+			messageEvent.MembershipEpoch = messageSecurity.MembershipEpoch
+			messageEvent.MembershipEpochHash = append([]byte(nil), messageSecurity.MembershipEpochHash...)
+			c.hub.fanoutMessageEventToDevices(
+				ctx, eligibleRosterRecipients(secureRoster, c.deviceID), event,
+			)
+			return
+		case db.MessageCryptoProfileDirectV2:
+			if directSourceBinding == nil || directTargetBinding == nil {
+				log.Printf("Direct v2 committed without live binding snapshot: message_ref=%s", logsafe.Ref("message", result.MessageID))
+				return
+			}
+			messageEvent.TargetDeviceId = append([]byte(nil), messageSecurity.TargetDeviceID...)
+			messageEvent.TargetBindingVersion = messageSecurity.TargetBindingVersion
+			messageEvent.DirectSessionId = append([]byte(nil), messageSecurity.DirectSessionID...)
+			messageEvent.SenderUserId = c.userID
+			messageEvent.SenderDeviceIdentityKey = append([]byte(nil), directSourceBinding.DeviceIdentityKey...)
+			messageEvent.SenderDeviceSigningKey = append([]byte(nil), directSourceBinding.DeviceSigningKey...)
+			messageEvent.SenderDeviceCapabilities = directSourceBinding.Capabilities
+			messageEvent.SenderDeviceBindingStatus = uint32(directSourceBinding.Status)
+			messageEvent.SenderAccountSignature = append([]byte(nil), directSourceBinding.AccountSignature...)
+			data, marshalErr := proto.Marshal(event)
+			if marshalErr != nil {
+				log.Printf("Direct v2 message fanout marshal failed: class=%s", logsafe.ErrorClass(marshalErr))
+				return
+			}
+			if !c.hub.enqueueToDevice(directTargetBinding.DeviceID, data) && c.hub.pushNotifier != nil {
+				c.hub.pushNotifier.NotifyOffline(ctx, directTargetBinding.UserID, event)
+			}
+			return
+		}
 	}
 	eventData, _ := proto.Marshal(event)
 
@@ -1140,6 +1323,11 @@ func (c *Client) sendMessageAck(seq uint64, clientMessageID string, result *chat
 	if result.AckRosterVersion != nil {
 		version := *result.AckRosterVersion
 		ack.RosterVersion = &version
+	}
+	if result.MembershipEpoch != nil {
+		epoch := *result.MembershipEpoch
+		ack.MembershipEpoch = &epoch
+		ack.MembershipEpochHash = append([]byte(nil), result.MembershipHash...)
 	}
 	c.sendEnvelope(&pb.Envelope{
 		Seq:       seq,
