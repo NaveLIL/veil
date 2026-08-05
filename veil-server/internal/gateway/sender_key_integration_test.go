@@ -34,6 +34,107 @@ type gatewayBoundDevice struct {
 	bindingCaps    uint64
 }
 
+func TestDirectMessageUsesAuthenticatedSnapshotAndRejectsUnpersistedSealed(t *testing.T) {
+	h := integrationtest.New(t)
+	ctx := context.Background()
+	alice := h.CreateUser("direct-snapshot-alice")
+	bob := h.CreateUser("direct-snapshot-bob")
+	conversationID, _, err := h.DB.FindOrCreateDM(ctx, alice.ID, bob.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	hub := NewHub(nil, h.Chat)
+	sender := &Client{
+		hub: hub, send: make(chan outboundBatch, 4), authenticated: true,
+		userID: alice.ID, deviceID: "direct-sender-device",
+		username: alice.Username, identityKey: append([]byte(nil), alice.IdentityKey...),
+	}
+	recipient := &Client{
+		hub: hub, send: make(chan outboundBatch, 4), authenticated: true,
+		userID: bob.ID, deviceID: "direct-recipient-device",
+		username: bob.Username, identityKey: append([]byte(nil), bob.IdentityKey...),
+	}
+	hub.mu.Lock()
+	hub.indexClientLocked(sender)
+	hub.indexClientLocked(recipient)
+	hub.mu.Unlock()
+
+	// A directory change after authentication must not alter the identity/name
+	// snapshot attached to this transport's live events.
+	if _, err := h.DB.Pool.Exec(ctx,
+		`UPDATE users SET username = $1 WHERE id = $2::uuid`,
+		"changed-after-authentication", alice.ID,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	header := append([]byte{0x02}, make([]byte, 41)...)
+	directMessage := &pb.SendMessage{
+		ClientMessageId: "11111111-1111-4111-8111-111111111111",
+		ConversationId:  conversationID,
+		Ciphertext:      []byte("opaque-direct-ciphertext"),
+		Header:          header,
+		MsgType:         pb.MessageType_MESSAGE_TYPE_TEXT,
+	}
+	sender.handleSendMessage(ctx, 1, directMessage)
+	ack := receiveGatewayEnvelope(t, sender.send).GetMessageAck()
+	if ack == nil || ack.GetRefSeq() != 1 || ack.GetMessageId() == "" || ack.GetServerTimestamp() == 0 ||
+		ack.GetClientMessageId() != "11111111-1111-4111-8111-111111111111" {
+		t.Fatalf("direct ACK = %v", ack)
+	}
+	event := receiveGatewayEnvelope(t, recipient.send).GetMessageEvent()
+	if event == nil || event.GetEventType() != pb.MessageEvent_NEW ||
+		event.GetMessageId() != ack.GetMessageId() ||
+		event.GetConversationId() != conversationID ||
+		!bytes.Equal(event.GetSenderIdentityKey(), alice.IdentityKey) ||
+		event.GetSenderUsername() != alice.Username ||
+		!bytes.Equal(event.GetCiphertext(), []byte("opaque-direct-ciphertext")) ||
+		!bytes.Equal(event.GetHeader(), header) {
+		t.Fatalf("direct event did not retain authenticated snapshot: %v", event)
+	}
+
+	// An exact retry gets the original durable tuple and must not fan out the
+	// already-delivered live event a second time. The accepted ledger entry is
+	// authoritative even after mutable membership changed.
+	if _, err := h.DB.Pool.Exec(ctx,
+		`DELETE FROM conversation_members
+		 WHERE conversation_id=$1::uuid AND user_id=$2::uuid`,
+		conversationID, alice.ID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	sender.handleSendMessage(ctx, 2, proto.Clone(directMessage).(*pb.SendMessage))
+	replayAck := receiveGatewayEnvelope(t, sender.send).GetMessageAck()
+	if replayAck == nil || replayAck.GetRefSeq() != 2 ||
+		replayAck.GetClientMessageId() != directMessage.ClientMessageId ||
+		replayAck.GetMessageId() != ack.GetMessageId() ||
+		replayAck.GetServerTimestamp() != ack.GetServerTimestamp() {
+		t.Fatalf("direct replay ACK = %v, want original durable tuple %v", replayAck, ack)
+	}
+	requireNoGatewayEnvelope(t, recipient.send)
+
+	// sealed=true cannot be represented by REST history yet. It must produce an
+	// Error without ACK, persistence, or recipient fan-out.
+	sender.handleSendMessage(ctx, 3, &pb.SendMessage{
+		ClientMessageId: "22222222-2222-4222-8222-222222222222",
+		ConversationId:  conversationID,
+		Ciphertext:      []byte("must-not-persist"),
+		Header:          header,
+		MsgType:         pb.MessageType_MESSAGE_TYPE_TEXT,
+		Sealed:          true,
+	})
+	requireGatewayError(t, receiveGatewayEnvelope(t, sender.send), http.StatusBadRequest)
+	requireNoGatewayEnvelope(t, recipient.send)
+	stored, err := h.DB.GetPendingMessages(ctx, conversationID, bob.ID, time.Time{}, "", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stored) != 1 || stored[0].ID != ack.GetMessageId() {
+		t.Fatalf("stored messages after rejected sealed send = %+v", stored)
+	}
+}
+
 func TestSenderKeyPerDeviceRoutingRestoreAndReceipts(t *testing.T) {
 	h := integrationtest.New(t)
 	ctx := context.Background()
@@ -66,9 +167,11 @@ func TestSenderKeyPerDeviceRoutingRestoreAndReceipts(t *testing.T) {
 	senderSecond := gatewayClientForDevice(hub, aliceTwo)
 	targetOne := gatewayClientForDevice(hub, bobOne)
 	targetTwo := gatewayClientForDevice(hub, bobTwo)
+	hub.mu.Lock()
 	for _, client := range []*Client{sender, senderSecond, targetOne, targetTwo} {
-		hub.indexClient(client)
+		hub.indexClientLocked(client)
 	}
+	hub.mu.Unlock()
 
 	// DMs remain exclusively Double Ratchet traffic. Fully bound devices and a
 	// syntactically valid v3 envelope must not accidentally enable Sender Keys.
@@ -167,15 +270,18 @@ func TestSenderKeyPerDeviceRoutingRestoreAndReceipts(t *testing.T) {
 
 	// Group ciphertext fans out to every eligible device, including the
 	// sender's other device, but never echoes to the source device itself.
-	sender.handleSendMessage(ctx, 30, &pb.SendMessage{
+	secureMessage := &pb.SendMessage{
+		ClientMessageId:  "33333333-3333-4333-8333-333333333333",
 		ConversationId:   conversationID,
 		Ciphertext:       []byte("opaque-sender-key-ciphertext"),
 		MsgType:          pb.MessageType_MESSAGE_TYPE_TEXT,
 		RosterVersion:    roster.Version,
 		RosterCommitment: append([]byte(nil), roster.Commitment[:]...),
-	})
+	}
+	sender.handleSendMessage(ctx, 30, secureMessage)
 	messageAck := receiveGatewayEnvelope(t, sender.send)
-	if messageAck.GetMessageAck() == nil || messageAck.GetMessageAck().GetRefSeq() != 30 {
+	if messageAck.GetMessageAck() == nil || messageAck.GetMessageAck().GetRefSeq() != 30 ||
+		messageAck.GetMessageAck().GetClientMessageId() != "33333333-3333-4333-8333-333333333333" {
 		t.Fatalf("message ACK missing: %v", messageAck)
 	}
 	messageID := messageAck.GetMessageAck().GetMessageId()
@@ -183,6 +289,19 @@ func TestSenderKeyPerDeviceRoutingRestoreAndReceipts(t *testing.T) {
 	requireTargetedMessageEvent(t, receiveGatewayEnvelope(t, targetOne.send), aliceOne, bobOne, roster)
 	requireTargetedMessageEvent(t, receiveGatewayEnvelope(t, targetTwo.send), aliceOne, bobTwo, roster)
 	requireNoGatewayEnvelope(t, sender.send)
+
+	sender.handleSendMessage(ctx, 31, proto.Clone(secureMessage).(*pb.SendMessage))
+	secureReplayAck := receiveGatewayEnvelope(t, sender.send).GetMessageAck()
+	if secureReplayAck == nil || secureReplayAck.GetRefSeq() != 31 ||
+		secureReplayAck.GetClientMessageId() != secureMessage.ClientMessageId ||
+		secureReplayAck.GetMessageId() != messageID ||
+		secureReplayAck.GetServerTimestamp() != messageAck.GetMessageAck().GetServerTimestamp() ||
+		secureReplayAck.GetRosterVersion() != roster.Version {
+		t.Fatalf("secure replay ACK=%v, want durable tuple from %v", secureReplayAck, messageAck.GetMessageAck())
+	}
+	requireNoGatewayEnvelope(t, senderSecond.send)
+	requireNoGatewayEnvelope(t, targetOne.send)
+	requireNoGatewayEnvelope(t, targetTwo.send)
 
 	storedMessages, err := h.DB.GetPendingMessages(ctx, conversationID, bob.ID, time.Time{}, "", 10)
 	if err != nil {
@@ -224,12 +343,14 @@ func TestSenderKeyPerDeviceRoutingRestoreAndReceipts(t *testing.T) {
 	// session nor a session whose binding became revoked may replace Sender-Key
 	// ciphertext and trigger account-wide edit fan-out.
 	legacyEditor := &Client{
-		hub: hub, send: make(chan []byte, 4), authenticated: true,
+		hub: hub, send: make(chan outboundBatch, 4), authenticated: true,
 		userID: alice.ID, deviceID: aliceOne.record.ID,
+		username: alice.Username, identityKey: append([]byte(nil), alice.IdentityKey...),
 	}
 	revokedEditor := &Client{
-		hub: hub, send: make(chan []byte, 4), authenticated: true,
+		hub: hub, send: make(chan outboundBatch, 4), authenticated: true,
 		userID: alice.ID, deviceID: aliceOne.record.ID,
+		username: alice.Username, identityKey: append([]byte(nil), alice.IdentityKey...),
 		deviceKey:       append([]byte(nil), aliceOne.record.DeviceKey...),
 		perDeviceSecure: true, deviceBindingVersion: aliceOne.bindingVersion,
 		deviceBindingStatus: db.DeviceBindingRevoked,
@@ -939,6 +1060,7 @@ func TestSecureChannelBlocksLegacyRoster(t *testing.T) {
 	}
 	sender := gatewayClientForDevice(hub, ownerDevice)
 	sender.handleSendMessage(ctx, 70, &pb.SendMessage{
+		ClientMessageId:  "44444444-4444-4444-8444-444444444444",
 		ConversationId:   conversationID,
 		Ciphertext:       []byte("must-not-store"),
 		RosterVersion:    ready.Version,
@@ -1302,11 +1424,12 @@ func storeGatewayBindingVersion(t *testing.T, h *integrationtest.Harness, device
 func gatewayClientForDevice(hub *Hub, device *gatewayBoundDevice) *Client {
 	return &Client{
 		hub:                  hub,
-		send:                 make(chan []byte, 32),
+		send:                 make(chan outboundBatch, 32),
 		authenticated:        true,
 		userID:               device.user.ID,
 		deviceID:             device.record.ID,
 		deviceKey:            append([]byte(nil), device.record.DeviceKey...),
+		username:             device.user.Username,
 		identityKey:          append([]byte(nil), device.user.IdentityKey...),
 		perDeviceSecure:      device.bindingStatus == db.DeviceBindingActive && device.bindingCaps&db.RequiredChannelCapabilities == db.RequiredChannelCapabilities,
 		deviceBindingVersion: device.bindingVersion,
@@ -1392,10 +1515,11 @@ func randomDeviceKey(t *testing.T) []byte {
 	return key
 }
 
-func receiveGatewayEnvelope(t *testing.T, ch <-chan []byte) *pb.Envelope {
+func receiveGatewayEnvelope(t *testing.T, ch <-chan outboundBatch) *pb.Envelope {
 	t.Helper()
 	select {
-	case data := <-ch:
+	case batch := <-ch:
+		data := requireSingleOutboundFrame(t, batch)
 		var envelope pb.Envelope
 		if err := proto.Unmarshal(data, &envelope); err != nil {
 			t.Fatalf("decode gateway envelope: %v", err)
@@ -1407,10 +1531,11 @@ func receiveGatewayEnvelope(t *testing.T, ch <-chan []byte) *pb.Envelope {
 	}
 }
 
-func requireNoGatewayEnvelope(t *testing.T, ch <-chan []byte) {
+func requireNoGatewayEnvelope(t *testing.T, ch <-chan outboundBatch) {
 	t.Helper()
 	select {
-	case data := <-ch:
+	case batch := <-ch:
+		data := requireSingleOutboundFrame(t, batch)
 		var envelope pb.Envelope
 		_ = proto.Unmarshal(data, &envelope)
 		t.Fatalf("unexpected gateway envelope: %v", &envelope)
@@ -1442,6 +1567,8 @@ func requireTargetedMessageEvent(t *testing.T, envelope *pb.Envelope, source, ta
 	t.Helper()
 	event := envelope.GetMessageEvent()
 	if event == nil || event.GetEventType() != pb.MessageEvent_NEW ||
+		!bytes.Equal(event.GetSenderIdentityKey(), source.user.IdentityKey) ||
+		event.GetSenderUsername() != source.user.Username ||
 		!bytes.Equal(event.GetSenderDeviceId(), source.record.DeviceKey) ||
 		!bytes.Equal(event.GetTargetDeviceId(), target.record.DeviceKey) ||
 		event.GetRosterVersion() != roster.Version ||

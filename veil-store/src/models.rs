@@ -169,7 +169,33 @@ pub struct Conversation {
     pub peer_user_id: Option<String>,
     pub name: Option<String>,
     pub last_message_at: Option<String>,
+    /// Device-local unread state, encrypted at rest with the conversation.
+    /// This is deliberately not a cross-device read receipt.
+    pub unread_count: u32,
+    pub last_read_message_id: Option<String>,
     pub created_at: String,
+}
+
+/// One Direct conversation accepted from an authenticated, origin-scoped
+/// server directory page and ready for an atomic SQLCipher batch merge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthenticatedDirectDirectoryEntry {
+    pub conversation_id: String,
+    pub name: String,
+    pub peer_user_id: String,
+    pub peer_identity_key: [u8; 32],
+    pub created_at: String,
+}
+
+/// Exact SQLCipher-backed trust scope used while replaying authenticated
+/// Direct history. Both accounts come from the same origin-scoped directory
+/// transaction as the pinned conversation route; network callers cannot
+/// substitute either key tuple independently.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthenticatedDirectHistoryScopeV1 {
+    pub conversation_id: String,
+    pub self_account: AccountSnapshot,
+    pub peer_account: AccountSnapshot,
 }
 
 /// A decrypted message (stored locally in SQLCipher).

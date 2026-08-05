@@ -69,8 +69,8 @@ func TestServers_RejectRemoteSpaceIcons(t *testing.T) {
 func TestServers_RejectsUnsigned(t *testing.T) {
 	h := New(t)
 	status, _ := h.DoUnsigned(http.MethodPost, "/v1/servers", map[string]string{"name": "x"})
-	if status != http.StatusUnauthorized {
-		t.Fatalf("want 401 for unsigned, got %d", status)
+	if status != http.StatusBadRequest {
+		t.Fatalf("want 400 for missing v2 selector, got %d", status)
 	}
 }
 

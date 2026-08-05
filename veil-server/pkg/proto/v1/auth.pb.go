@@ -183,6 +183,114 @@ func (DeviceBindingStatus) EnumDescriptor() ([]byte, []int) {
 	return file_veil_v1_auth_proto_rawDescGZIP(), []int{2}
 }
 
+// Dedicated WebSocket auth v3 wire foundation. Appended after every legacy
+// declaration so generated descriptor indexes remain stable. The current /ws
+// runtime stays on legacy AuthChallenge/AuthResponse/AuthResult and does not
+// emit or accept these messages before the separately reviewed activation.
+type WsRegistrationIntentV3 int32
+
+const (
+	WsRegistrationIntentV3_WS_REGISTRATION_INTENT_V3_UNSPECIFIED WsRegistrationIntentV3 = 0
+	WsRegistrationIntentV3_WS_REGISTRATION_INTENT_V3_EXISTING    WsRegistrationIntentV3 = 1
+	WsRegistrationIntentV3_WS_REGISTRATION_INTENT_V3_OPEN        WsRegistrationIntentV3 = 2
+	WsRegistrationIntentV3_WS_REGISTRATION_INTENT_V3_PASS        WsRegistrationIntentV3 = 3
+)
+
+// Enum value maps for WsRegistrationIntentV3.
+var (
+	WsRegistrationIntentV3_name = map[int32]string{
+		0: "WS_REGISTRATION_INTENT_V3_UNSPECIFIED",
+		1: "WS_REGISTRATION_INTENT_V3_EXISTING",
+		2: "WS_REGISTRATION_INTENT_V3_OPEN",
+		3: "WS_REGISTRATION_INTENT_V3_PASS",
+	}
+	WsRegistrationIntentV3_value = map[string]int32{
+		"WS_REGISTRATION_INTENT_V3_UNSPECIFIED": 0,
+		"WS_REGISTRATION_INTENT_V3_EXISTING":    1,
+		"WS_REGISTRATION_INTENT_V3_OPEN":        2,
+		"WS_REGISTRATION_INTENT_V3_PASS":        3,
+	}
+)
+
+func (x WsRegistrationIntentV3) Enum() *WsRegistrationIntentV3 {
+	p := new(WsRegistrationIntentV3)
+	*p = x
+	return p
+}
+
+func (x WsRegistrationIntentV3) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (WsRegistrationIntentV3) Descriptor() protoreflect.EnumDescriptor {
+	return file_veil_v1_auth_proto_enumTypes[3].Descriptor()
+}
+
+func (WsRegistrationIntentV3) Type() protoreflect.EnumType {
+	return &file_veil_v1_auth_proto_enumTypes[3]
+}
+
+func (x WsRegistrationIntentV3) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use WsRegistrationIntentV3.Descriptor instead.
+func (WsRegistrationIntentV3) EnumDescriptor() ([]byte, []int) {
+	return file_veil_v1_auth_proto_rawDescGZIP(), []int{3}
+}
+
+type WsAuthFailureReasonV3 int32
+
+const (
+	WsAuthFailureReasonV3_WS_AUTH_FAILURE_REASON_V3_UNSPECIFIED              WsAuthFailureReasonV3 = 0
+	WsAuthFailureReasonV3_WS_AUTH_FAILURE_REASON_V3_AUTHENTICATION_FAILED    WsAuthFailureReasonV3 = 1
+	WsAuthFailureReasonV3_WS_AUTH_FAILURE_REASON_V3_REGISTRATION_CLOSED      WsAuthFailureReasonV3 = 2
+	WsAuthFailureReasonV3_WS_AUTH_FAILURE_REASON_V3_NODE_ACCESS_PASS_INVALID WsAuthFailureReasonV3 = 3
+)
+
+// Enum value maps for WsAuthFailureReasonV3.
+var (
+	WsAuthFailureReasonV3_name = map[int32]string{
+		0: "WS_AUTH_FAILURE_REASON_V3_UNSPECIFIED",
+		1: "WS_AUTH_FAILURE_REASON_V3_AUTHENTICATION_FAILED",
+		2: "WS_AUTH_FAILURE_REASON_V3_REGISTRATION_CLOSED",
+		3: "WS_AUTH_FAILURE_REASON_V3_NODE_ACCESS_PASS_INVALID",
+	}
+	WsAuthFailureReasonV3_value = map[string]int32{
+		"WS_AUTH_FAILURE_REASON_V3_UNSPECIFIED":              0,
+		"WS_AUTH_FAILURE_REASON_V3_AUTHENTICATION_FAILED":    1,
+		"WS_AUTH_FAILURE_REASON_V3_REGISTRATION_CLOSED":      2,
+		"WS_AUTH_FAILURE_REASON_V3_NODE_ACCESS_PASS_INVALID": 3,
+	}
+)
+
+func (x WsAuthFailureReasonV3) Enum() *WsAuthFailureReasonV3 {
+	p := new(WsAuthFailureReasonV3)
+	*p = x
+	return p
+}
+
+func (x WsAuthFailureReasonV3) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (WsAuthFailureReasonV3) Descriptor() protoreflect.EnumDescriptor {
+	return file_veil_v1_auth_proto_enumTypes[4].Descriptor()
+}
+
+func (WsAuthFailureReasonV3) Type() protoreflect.EnumType {
+	return &file_veil_v1_auth_proto_enumTypes[4]
+}
+
+func (x WsAuthFailureReasonV3) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use WsAuthFailureReasonV3.Descriptor instead.
+func (WsAuthFailureReasonV3) EnumDescriptor() ([]byte, []int) {
+	return file_veil_v1_auth_proto_rawDescGZIP(), []int{4}
+}
+
 // Сервер отправляет challenge при подключении
 type AuthChallenge struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
@@ -806,6 +914,307 @@ func (x *RegisterDevice) GetLinkSignature() []byte {
 	return nil
 }
 
+type AuthChallengeV3 struct {
+	state               protoimpl.MessageState `protogen:"open.v1"`
+	ProtocolVersion     uint32                 `protobuf:"varint,1,opt,name=protocol_version,json=protocolVersion,proto3" json:"protocol_version,omitempty"`              // Must be exactly 3 at the future runtime boundary.
+	ServerEphemeral     []byte                 `protobuf:"bytes,2,opt,name=server_ephemeral,json=serverEphemeral,proto3" json:"server_ephemeral,omitempty"`               // X25519 public key, exactly 32 bytes.
+	CanonicalNodeOrigin string                 `protobuf:"bytes,3,opt,name=canonical_node_origin,json=canonicalNodeOrigin,proto3" json:"canonical_node_origin,omitempty"` // Exact configured canonical Node origin.
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
+}
+
+func (x *AuthChallengeV3) Reset() {
+	*x = AuthChallengeV3{}
+	mi := &file_veil_v1_auth_proto_msgTypes[7]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *AuthChallengeV3) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*AuthChallengeV3) ProtoMessage() {}
+
+func (x *AuthChallengeV3) ProtoReflect() protoreflect.Message {
+	mi := &file_veil_v1_auth_proto_msgTypes[7]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use AuthChallengeV3.ProtoReflect.Descriptor instead.
+func (*AuthChallengeV3) Descriptor() ([]byte, []int) {
+	return file_veil_v1_auth_proto_rawDescGZIP(), []int{7}
+}
+
+func (x *AuthChallengeV3) GetProtocolVersion() uint32 {
+	if x != nil {
+		return x.ProtocolVersion
+	}
+	return 0
+}
+
+func (x *AuthChallengeV3) GetServerEphemeral() []byte {
+	if x != nil {
+		return x.ServerEphemeral
+	}
+	return nil
+}
+
+func (x *AuthChallengeV3) GetCanonicalNodeOrigin() string {
+	if x != nil {
+		return x.CanonicalNodeOrigin
+	}
+	return ""
+}
+
+type AuthResponseV3 struct {
+	state                 protoimpl.MessageState `protogen:"open.v1"`
+	ProtocolVersion       uint32                 `protobuf:"varint,1,opt,name=protocol_version,json=protocolVersion,proto3" json:"protocol_version,omitempty"`                    // Must be exactly 3.
+	IdentityKey           []byte                 `protobuf:"bytes,2,opt,name=identity_key,json=identityKey,proto3" json:"identity_key,omitempty"`                                 // Account X25519 public key, exactly 32 bytes.
+	SigningKey            []byte                 `protobuf:"bytes,3,opt,name=signing_key,json=signingKey,proto3" json:"signing_key,omitempty"`                                    // Account Ed25519 public key, exactly 32 bytes.
+	AccountProofSignature []byte                 `protobuf:"bytes,4,opt,name=account_proof_signature,json=accountProofSignature,proto3" json:"account_proof_signature,omitempty"` // Ed25519 signature over the v3 account proof.
+	DeviceId              []byte                 `protobuf:"bytes,5,opt,name=device_id,json=deviceId,proto3" json:"device_id,omitempty"`                                          // Stable device identifier, exactly 16 bytes.
+	DeviceName            string                 `protobuf:"bytes,6,opt,name=device_name,json=deviceName,proto3" json:"device_name,omitempty"`
+	ClientVersion         string                 `protobuf:"bytes,7,opt,name=client_version,json=clientVersion,proto3" json:"client_version,omitempty"`
+	DeviceBinding         *DeviceBindingV1       `protobuf:"bytes,8,opt,name=device_binding,json=deviceBinding,proto3" json:"device_binding,omitempty"`                        // Required and strictly verified before commitment use.
+	DeviceProofSignature  []byte                 `protobuf:"bytes,9,opt,name=device_proof_signature,json=deviceProofSignature,proto3" json:"device_proof_signature,omitempty"` // Ed25519 signature over the chained v3 device proof.
+	RegistrationIntent    WsRegistrationIntentV3 `protobuf:"varint,10,opt,name=registration_intent,json=registrationIntent,proto3,enum=veil.v1.WsRegistrationIntentV3" json:"registration_intent,omitempty"`
+	// Raw 32-byte bearer only for PASS intent. The future runtime must clear
+	// decoded copies promptly and derive the signed origin-scoped commitment.
+	NodeAccessPass []byte `protobuf:"bytes,11,opt,name=node_access_pass,json=nodeAccessPass,proto3" json:"node_access_pass,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
+func (x *AuthResponseV3) Reset() {
+	*x = AuthResponseV3{}
+	mi := &file_veil_v1_auth_proto_msgTypes[8]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *AuthResponseV3) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*AuthResponseV3) ProtoMessage() {}
+
+func (x *AuthResponseV3) ProtoReflect() protoreflect.Message {
+	mi := &file_veil_v1_auth_proto_msgTypes[8]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use AuthResponseV3.ProtoReflect.Descriptor instead.
+func (*AuthResponseV3) Descriptor() ([]byte, []int) {
+	return file_veil_v1_auth_proto_rawDescGZIP(), []int{8}
+}
+
+func (x *AuthResponseV3) GetProtocolVersion() uint32 {
+	if x != nil {
+		return x.ProtocolVersion
+	}
+	return 0
+}
+
+func (x *AuthResponseV3) GetIdentityKey() []byte {
+	if x != nil {
+		return x.IdentityKey
+	}
+	return nil
+}
+
+func (x *AuthResponseV3) GetSigningKey() []byte {
+	if x != nil {
+		return x.SigningKey
+	}
+	return nil
+}
+
+func (x *AuthResponseV3) GetAccountProofSignature() []byte {
+	if x != nil {
+		return x.AccountProofSignature
+	}
+	return nil
+}
+
+func (x *AuthResponseV3) GetDeviceId() []byte {
+	if x != nil {
+		return x.DeviceId
+	}
+	return nil
+}
+
+func (x *AuthResponseV3) GetDeviceName() string {
+	if x != nil {
+		return x.DeviceName
+	}
+	return ""
+}
+
+func (x *AuthResponseV3) GetClientVersion() string {
+	if x != nil {
+		return x.ClientVersion
+	}
+	return ""
+}
+
+func (x *AuthResponseV3) GetDeviceBinding() *DeviceBindingV1 {
+	if x != nil {
+		return x.DeviceBinding
+	}
+	return nil
+}
+
+func (x *AuthResponseV3) GetDeviceProofSignature() []byte {
+	if x != nil {
+		return x.DeviceProofSignature
+	}
+	return nil
+}
+
+func (x *AuthResponseV3) GetRegistrationIntent() WsRegistrationIntentV3 {
+	if x != nil {
+		return x.RegistrationIntent
+	}
+	return WsRegistrationIntentV3_WS_REGISTRATION_INTENT_V3_UNSPECIFIED
+}
+
+func (x *AuthResponseV3) GetNodeAccessPass() []byte {
+	if x != nil {
+		return x.NodeAccessPass
+	}
+	return nil
+}
+
+type AuthResultV3 struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Canonical success has user_id present, per_device_secure=true, a positive
+	// active binding version/status, failure_reason=UNSPECIFIED, and no
+	// error_message. Canonical failure has no user_id, per_device_secure=false,
+	// binding version 0/status UNSPECIFIED, and one known non-zero reason;
+	// error_message is optional untrusted diagnostic text only.
+	// REGISTRATION_CLOSED is valid only for the signed OPEN intent and
+	// NODE_ACCESS_PASS_INVALID only for the signed PASS intent.
+	ProtocolVersion      uint32                `protobuf:"varint,1,opt,name=protocol_version,json=protocolVersion,proto3" json:"protocol_version,omitempty"` // Must be exactly 3.
+	Success              bool                  `protobuf:"varint,2,opt,name=success,proto3" json:"success,omitempty"`
+	UserId               *string               `protobuf:"bytes,3,opt,name=user_id,json=userId,proto3,oneof" json:"user_id,omitempty"`
+	ErrorMessage         *string               `protobuf:"bytes,4,opt,name=error_message,json=errorMessage,proto3,oneof" json:"error_message,omitempty"`
+	PerDeviceSecure      bool                  `protobuf:"varint,5,opt,name=per_device_secure,json=perDeviceSecure,proto3" json:"per_device_secure,omitempty"`
+	DeviceBindingVersion uint64                `protobuf:"varint,6,opt,name=device_binding_version,json=deviceBindingVersion,proto3" json:"device_binding_version,omitempty"`
+	DeviceBindingStatus  DeviceBindingStatus   `protobuf:"varint,7,opt,name=device_binding_status,json=deviceBindingStatus,proto3,enum=veil.v1.DeviceBindingStatus" json:"device_binding_status,omitempty"`
+	FailureReason        WsAuthFailureReasonV3 `protobuf:"varint,8,opt,name=failure_reason,json=failureReason,proto3,enum=veil.v1.WsAuthFailureReasonV3" json:"failure_reason,omitempty"`
+	CanonicalNodeOrigin  string                `protobuf:"bytes,9,opt,name=canonical_node_origin,json=canonicalNodeOrigin,proto3" json:"canonical_node_origin,omitempty"` // Exact configured origin for client comparison.
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
+}
+
+func (x *AuthResultV3) Reset() {
+	*x = AuthResultV3{}
+	mi := &file_veil_v1_auth_proto_msgTypes[9]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *AuthResultV3) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*AuthResultV3) ProtoMessage() {}
+
+func (x *AuthResultV3) ProtoReflect() protoreflect.Message {
+	mi := &file_veil_v1_auth_proto_msgTypes[9]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use AuthResultV3.ProtoReflect.Descriptor instead.
+func (*AuthResultV3) Descriptor() ([]byte, []int) {
+	return file_veil_v1_auth_proto_rawDescGZIP(), []int{9}
+}
+
+func (x *AuthResultV3) GetProtocolVersion() uint32 {
+	if x != nil {
+		return x.ProtocolVersion
+	}
+	return 0
+}
+
+func (x *AuthResultV3) GetSuccess() bool {
+	if x != nil {
+		return x.Success
+	}
+	return false
+}
+
+func (x *AuthResultV3) GetUserId() string {
+	if x != nil && x.UserId != nil {
+		return *x.UserId
+	}
+	return ""
+}
+
+func (x *AuthResultV3) GetErrorMessage() string {
+	if x != nil && x.ErrorMessage != nil {
+		return *x.ErrorMessage
+	}
+	return ""
+}
+
+func (x *AuthResultV3) GetPerDeviceSecure() bool {
+	if x != nil {
+		return x.PerDeviceSecure
+	}
+	return false
+}
+
+func (x *AuthResultV3) GetDeviceBindingVersion() uint64 {
+	if x != nil {
+		return x.DeviceBindingVersion
+	}
+	return 0
+}
+
+func (x *AuthResultV3) GetDeviceBindingStatus() DeviceBindingStatus {
+	if x != nil {
+		return x.DeviceBindingStatus
+	}
+	return DeviceBindingStatus_DEVICE_BINDING_STATUS_UNSPECIFIED
+}
+
+func (x *AuthResultV3) GetFailureReason() WsAuthFailureReasonV3 {
+	if x != nil {
+		return x.FailureReason
+	}
+	return WsAuthFailureReasonV3_WS_AUTH_FAILURE_REASON_V3_UNSPECIFIED
+}
+
+func (x *AuthResultV3) GetCanonicalNodeOrigin() string {
+	if x != nil {
+		return x.CanonicalNodeOrigin
+	}
+	return ""
+}
+
 var File_veil_v1_auth_proto protoreflect.FileDescriptor
 
 const file_veil_v1_auth_proto_rawDesc = "" +
@@ -875,7 +1284,39 @@ const file_veil_v1_auth_proto_rawDesc = "" +
 	"\vdevice_name\x18\x04 \x01(\tR\n" +
 	"deviceName\x12*\n" +
 	"\x0elink_signature\x18\x05 \x01(\fH\x00R\rlinkSignature\x88\x01\x01B\x11\n" +
-	"\x0f_link_signature*\xbc\x01\n" +
+	"\x0f_link_signature\"\x9b\x01\n" +
+	"\x0fAuthChallengeV3\x12)\n" +
+	"\x10protocol_version\x18\x01 \x01(\rR\x0fprotocolVersion\x12)\n" +
+	"\x10server_ephemeral\x18\x02 \x01(\fR\x0fserverEphemeral\x122\n" +
+	"\x15canonical_node_origin\x18\x03 \x01(\tR\x13canonicalNodeOrigin\"\x8f\x04\n" +
+	"\x0eAuthResponseV3\x12)\n" +
+	"\x10protocol_version\x18\x01 \x01(\rR\x0fprotocolVersion\x12!\n" +
+	"\fidentity_key\x18\x02 \x01(\fR\videntityKey\x12\x1f\n" +
+	"\vsigning_key\x18\x03 \x01(\fR\n" +
+	"signingKey\x126\n" +
+	"\x17account_proof_signature\x18\x04 \x01(\fR\x15accountProofSignature\x12\x1b\n" +
+	"\tdevice_id\x18\x05 \x01(\fR\bdeviceId\x12\x1f\n" +
+	"\vdevice_name\x18\x06 \x01(\tR\n" +
+	"deviceName\x12%\n" +
+	"\x0eclient_version\x18\a \x01(\tR\rclientVersion\x12?\n" +
+	"\x0edevice_binding\x18\b \x01(\v2\x18.veil.v1.DeviceBindingV1R\rdeviceBinding\x124\n" +
+	"\x16device_proof_signature\x18\t \x01(\fR\x14deviceProofSignature\x12P\n" +
+	"\x13registration_intent\x18\n" +
+	" \x01(\x0e2\x1f.veil.v1.WsRegistrationIntentV3R\x12registrationIntent\x12(\n" +
+	"\x10node_access_pass\x18\v \x01(\fR\x0enodeAccessPass\"\xe8\x03\n" +
+	"\fAuthResultV3\x12)\n" +
+	"\x10protocol_version\x18\x01 \x01(\rR\x0fprotocolVersion\x12\x18\n" +
+	"\asuccess\x18\x02 \x01(\bR\asuccess\x12\x1c\n" +
+	"\auser_id\x18\x03 \x01(\tH\x00R\x06userId\x88\x01\x01\x12(\n" +
+	"\rerror_message\x18\x04 \x01(\tH\x01R\ferrorMessage\x88\x01\x01\x12*\n" +
+	"\x11per_device_secure\x18\x05 \x01(\bR\x0fperDeviceSecure\x124\n" +
+	"\x16device_binding_version\x18\x06 \x01(\x04R\x14deviceBindingVersion\x12P\n" +
+	"\x15device_binding_status\x18\a \x01(\x0e2\x1c.veil.v1.DeviceBindingStatusR\x13deviceBindingStatus\x12E\n" +
+	"\x0efailure_reason\x18\b \x01(\x0e2\x1e.veil.v1.WsAuthFailureReasonV3R\rfailureReason\x122\n" +
+	"\x15canonical_node_origin\x18\t \x01(\tR\x13canonicalNodeOriginB\n" +
+	"\n" +
+	"\b_user_idB\x10\n" +
+	"\x0e_error_message*\xbc\x01\n" +
 	"\x11AuthFailureReason\x12#\n" +
 	"\x1fAUTH_FAILURE_REASON_UNSPECIFIED\x10\x00\x12-\n" +
 	")AUTH_FAILURE_REASON_AUTHENTICATION_FAILED\x10\x01\x12+\n" +
@@ -890,7 +1331,17 @@ const file_veil_v1_auth_proto_rawDesc = "" +
 	"\x1cDEVICE_BINDING_STATUS_ACTIVE\x10\x01\x12\"\n" +
 	"\x1eDEVICE_BINDING_STATUS_EXCLUDED\x10\x02\x12!\n" +
 	"\x1dDEVICE_BINDING_STATUS_REVOKED\x10\x03\x12(\n" +
-	"$DEVICE_BINDING_STATUS_LEGACY_UNBOUND\x10\x04B2Z0github.com/NaveLIL/veil/veil-server/pkg/proto/v1b\x06proto3"
+	"$DEVICE_BINDING_STATUS_LEGACY_UNBOUND\x10\x04*\xb3\x01\n" +
+	"\x16WsRegistrationIntentV3\x12)\n" +
+	"%WS_REGISTRATION_INTENT_V3_UNSPECIFIED\x10\x00\x12&\n" +
+	"\"WS_REGISTRATION_INTENT_V3_EXISTING\x10\x01\x12\"\n" +
+	"\x1eWS_REGISTRATION_INTENT_V3_OPEN\x10\x02\x12\"\n" +
+	"\x1eWS_REGISTRATION_INTENT_V3_PASS\x10\x03*\xe2\x01\n" +
+	"\x15WsAuthFailureReasonV3\x12)\n" +
+	"%WS_AUTH_FAILURE_REASON_V3_UNSPECIFIED\x10\x00\x123\n" +
+	"/WS_AUTH_FAILURE_REASON_V3_AUTHENTICATION_FAILED\x10\x01\x121\n" +
+	"-WS_AUTH_FAILURE_REASON_V3_REGISTRATION_CLOSED\x10\x02\x126\n" +
+	"2WS_AUTH_FAILURE_REASON_V3_NODE_ACCESS_PASS_INVALID\x10\x03B2Z0github.com/NaveLIL/veil/veil-server/pkg/proto/v1b\x06proto3"
 
 var (
 	file_veil_v1_auth_proto_rawDescOnce sync.Once
@@ -904,32 +1355,41 @@ func file_veil_v1_auth_proto_rawDescGZIP() []byte {
 	return file_veil_v1_auth_proto_rawDescData
 }
 
-var file_veil_v1_auth_proto_enumTypes = make([]protoimpl.EnumInfo, 3)
-var file_veil_v1_auth_proto_msgTypes = make([]protoimpl.MessageInfo, 7)
+var file_veil_v1_auth_proto_enumTypes = make([]protoimpl.EnumInfo, 5)
+var file_veil_v1_auth_proto_msgTypes = make([]protoimpl.MessageInfo, 10)
 var file_veil_v1_auth_proto_goTypes = []any{
 	(AuthFailureReason)(0),              // 0: veil.v1.AuthFailureReason
 	(DeviceCapability)(0),               // 1: veil.v1.DeviceCapability
 	(DeviceBindingStatus)(0),            // 2: veil.v1.DeviceBindingStatus
-	(*AuthChallenge)(nil),               // 3: veil.v1.AuthChallenge
-	(*AuthResponse)(nil),                // 4: veil.v1.AuthResponse
-	(*AuthResult)(nil),                  // 5: veil.v1.AuthResult
-	(*DeviceBindingV1)(nil),             // 6: veil.v1.DeviceBindingV1
-	(*DeviceDirectoryEntry)(nil),        // 7: veil.v1.DeviceDirectoryEntry
-	(*ConversationDeviceDirectory)(nil), // 8: veil.v1.ConversationDeviceDirectory
-	(*RegisterDevice)(nil),              // 9: veil.v1.RegisterDevice
+	(WsRegistrationIntentV3)(0),         // 3: veil.v1.WsRegistrationIntentV3
+	(WsAuthFailureReasonV3)(0),          // 4: veil.v1.WsAuthFailureReasonV3
+	(*AuthChallenge)(nil),               // 5: veil.v1.AuthChallenge
+	(*AuthResponse)(nil),                // 6: veil.v1.AuthResponse
+	(*AuthResult)(nil),                  // 7: veil.v1.AuthResult
+	(*DeviceBindingV1)(nil),             // 8: veil.v1.DeviceBindingV1
+	(*DeviceDirectoryEntry)(nil),        // 9: veil.v1.DeviceDirectoryEntry
+	(*ConversationDeviceDirectory)(nil), // 10: veil.v1.ConversationDeviceDirectory
+	(*RegisterDevice)(nil),              // 11: veil.v1.RegisterDevice
+	(*AuthChallengeV3)(nil),             // 12: veil.v1.AuthChallengeV3
+	(*AuthResponseV3)(nil),              // 13: veil.v1.AuthResponseV3
+	(*AuthResultV3)(nil),                // 14: veil.v1.AuthResultV3
 }
 var file_veil_v1_auth_proto_depIdxs = []int32{
-	6, // 0: veil.v1.AuthResponse.device_binding:type_name -> veil.v1.DeviceBindingV1
-	2, // 1: veil.v1.AuthResult.device_binding_status:type_name -> veil.v1.DeviceBindingStatus
-	0, // 2: veil.v1.AuthResult.failure_reason:type_name -> veil.v1.AuthFailureReason
-	2, // 3: veil.v1.DeviceBindingV1.status:type_name -> veil.v1.DeviceBindingStatus
-	6, // 4: veil.v1.DeviceDirectoryEntry.binding:type_name -> veil.v1.DeviceBindingV1
-	7, // 5: veil.v1.ConversationDeviceDirectory.devices:type_name -> veil.v1.DeviceDirectoryEntry
-	6, // [6:6] is the sub-list for method output_type
-	6, // [6:6] is the sub-list for method input_type
-	6, // [6:6] is the sub-list for extension type_name
-	6, // [6:6] is the sub-list for extension extendee
-	0, // [0:6] is the sub-list for field type_name
+	8,  // 0: veil.v1.AuthResponse.device_binding:type_name -> veil.v1.DeviceBindingV1
+	2,  // 1: veil.v1.AuthResult.device_binding_status:type_name -> veil.v1.DeviceBindingStatus
+	0,  // 2: veil.v1.AuthResult.failure_reason:type_name -> veil.v1.AuthFailureReason
+	2,  // 3: veil.v1.DeviceBindingV1.status:type_name -> veil.v1.DeviceBindingStatus
+	8,  // 4: veil.v1.DeviceDirectoryEntry.binding:type_name -> veil.v1.DeviceBindingV1
+	9,  // 5: veil.v1.ConversationDeviceDirectory.devices:type_name -> veil.v1.DeviceDirectoryEntry
+	8,  // 6: veil.v1.AuthResponseV3.device_binding:type_name -> veil.v1.DeviceBindingV1
+	3,  // 7: veil.v1.AuthResponseV3.registration_intent:type_name -> veil.v1.WsRegistrationIntentV3
+	2,  // 8: veil.v1.AuthResultV3.device_binding_status:type_name -> veil.v1.DeviceBindingStatus
+	4,  // 9: veil.v1.AuthResultV3.failure_reason:type_name -> veil.v1.WsAuthFailureReasonV3
+	10, // [10:10] is the sub-list for method output_type
+	10, // [10:10] is the sub-list for method input_type
+	10, // [10:10] is the sub-list for extension type_name
+	10, // [10:10] is the sub-list for extension extendee
+	0,  // [0:10] is the sub-list for field type_name
 }
 
 func init() { file_veil_v1_auth_proto_init() }
@@ -941,13 +1401,14 @@ func file_veil_v1_auth_proto_init() {
 	file_veil_v1_auth_proto_msgTypes[4].OneofWrappers = []any{}
 	file_veil_v1_auth_proto_msgTypes[5].OneofWrappers = []any{}
 	file_veil_v1_auth_proto_msgTypes[6].OneofWrappers = []any{}
+	file_veil_v1_auth_proto_msgTypes[9].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_veil_v1_auth_proto_rawDesc), len(file_veil_v1_auth_proto_rawDesc)),
-			NumEnums:      3,
-			NumMessages:   7,
+			NumEnums:      5,
+			NumMessages:   10,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

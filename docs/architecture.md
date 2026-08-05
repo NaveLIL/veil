@@ -10,14 +10,14 @@ Veil — native-first E2EE messenger и self-hosted Veil Node. Текущая с
 flowchart LR
     subgraph Device["Пользовательское устройство"]
         UI["Desktop: SolidJS / Tauri"]
-        Mobile["Mobile foundation: React Native"]
+        Mobile["Android Direct Preview: React Native + Kotlin"]
         FFI["Tauri commands / UniFFI"]
         Core["Rust protocol + crypto core"]
         Store["SQLCipher + OS key storage"]
         Search["Tantivy index in process memory"]
 
         UI --> FFI
-        Mobile -. "foundation" .-> FFI
+        Mobile -. "UniFFI" .-> FFI
         FFI --> Core
         Core --> Store
         Core --> Search
@@ -27,12 +27,13 @@ flowchart LR
     Node --> DB["PostgreSQL: accounts, routing state, ciphertext"]
     Node --> Uploads["Upload volume: encrypted chunks"]
     Node --> Push["ntfy / push: generic wake-up"]
-    Browser["Static site, Veil Link, Share Viewer"] --> Node
+    Browser["Static site, Veil Link; Secure Share planned"] --> Node
 ~~~
 
 Veil не имеет полноценного browser client. Web surfaces ограничены сайтом,
-origin-hosted invitation preview и узким one-time Share Viewer; они не получают
-native account session или долговременные E2EE-ключи desktop-клиента.
+origin-hosted invitation preview и будущим узким Secure Share Viewer; они не
+получают native account session или долговременные E2EE-ключи desktop-клиента.
+Текущий share viewer является prototype и не подключён к production gateway.
 
 ## Компоненты репозитория
 
@@ -46,10 +47,10 @@ native account session или долговременные E2EE-ключи deskt
 | **veil-ffi** | UniFFI boundary для native mobile integration |
 | **veil-mls** | Экспериментальный OpenMLS foundation, не включённый в текущий desktop runtime |
 | **veil-desktop** | SolidJS UI и Tauri/Rust application boundary |
-| **veil-mobile** | React Native/Expo foundation; production messaging runtime ещё не завершён |
+| **veil-mobile** | React Native shell + Kotlin/Rust Direct runtime; закрытый Android Preview |
 | **veil-server** | Go gateway, auth, messaging, Spaces/ACL, push, uploads и Veil Link |
 | **veil-proto** | Versioned wire contracts |
-| **veil-share-viewer** | Изолированный WASM viewer для one-time share capability |
+| **veil-share-viewer** | Экспериментальный WASM viewer prototype; production Secure Share не подключён |
 
 Публичный production entry point Node — единый gateway. PostgreSQL migrations
 выполняются отдельным one-shot этапом до запуска gateway; ошибка migration
@@ -60,9 +61,10 @@ native account session или долговременные E2EE-ключи deskt
 ### Устройство
 
 Приватные ключи, ratchet/Sender-Key state и расшифрованное долговременное
-хранилище принадлежат native Rust boundary. Recovery phrase может появляться в
-WebView только в ограниченном onboarding/re-auth flow. JS UI не должен
-становиться универсальным API чтения ключевого материала.
+хранилище принадлежат native Rust boundary. На Android recovery phrase
+отображается только отдельной screenshot-protected native Activity и не входит
+в React Native, clipboard, autofill, accessibility, content capture или
+системный IME. JS UI не должен становиться API чтения ключевого материала.
 
 Отправка E2EE сообщения работает fail closed: отсутствие необходимой сессии,
 roster proof или key distribution не разрешает plaintext либо ослабленный
@@ -76,7 +78,15 @@ membership и delivery state. E2EE не скрывает эту информац
 
 Canonical HTTPS origin входит в identity аккаунта. Одинаковый user ID на двух
 Node не означает одну identity. Wildcard origin, HTTP downgrade и
-автоматическое доверие self-signed сертификату нарушают эту границу.
+автоматическое доверие self-signed сертификату нарушают эту границу. Live
+desktop/Android transport использует exact `/v3/events`: WS v3 подписывает
+canonical origin, account, device и registration intent, а один socket несёт
+commands, ACK и events. Signed HTTP routes принимают REST v2, где transcript
+связывает origin, account, method, raw target, nonce и body hash; replay state
+хранится в PostgreSQL. Legacy `/ws` выключен по умолчанию и доступен только по
+явному аварийному operator flag без client-side downgrade. Disposable
+PostgreSQL two-Node relay/downgrade matrix теперь входит в CI; cross-client,
+physical-device и независимый audit evidence остаются blocking release gate.
 
 ### Локальные данные и поиск
 
@@ -93,12 +103,25 @@ release matrices ещё входят в открытые Preview gates.
 
 ## Crypto и access model
 
-- Direct использует X3DH и Double Ratchet.
-- Circle и text Room используют authenticated Sender Keys v5.
+- Direct использует X3DH и Double Ratchet. Активный Direct v2 связывает
+  canonical origin, account identities, точные device bindings и X3DH
+  transcript в session commitment и запрещает sticky downgrade после первого
+  durable v2 состояния.
+- Circle и text Room используют membership-bound Sender Keys v6 после
+  авторизованной активации; Sender Keys v5 сохраняется только для явной
+  исторической совместимости.
 - Space/Room access задаётся server-side ACL, но presentation metadata не
   участвует в crypto trust.
 - Изменение roster/access требует корректной key rotation/distribution.
-- Key transparency пока отсутствует; текущая модель service-mediated TOFU.
+- Identity Transparency v1 проверяет Node-signed Merkle inclusion/consistency,
+  SQLCipher/desktop OS anchor и опциональный независимый witness quorum/gossip.
+  Never-pinned legacy Node остаётся доступным без transparency claim.
+  Account-v2 safety number можно независимо сравнить и явно отметить как
+  `Verified on this device`; замена identity снимает этот статус.
+- Production UniFFI не экспортирует raw ratchet, AEAD, X3DH, signing, KDF,
+  generic signature verification или caller-assembled fingerprint primitives.
+  Android получает высокоуровневые account/session операции и публикует в JS
+  только необходимую public projection.
 - MLS и calls не являются включёнными пользовательскими функциями Preview.
 
 Точные решения следует сверять с
@@ -121,8 +144,16 @@ reverse proxy. Конкретная схема и rollback gate описаны �
 
 - нет stable release и обещанной обратной совместимости;
 - нет независимого криптографического/security-аудита;
-- mobile production runtime, calls и MLS runtime не завершены;
-- key transparency отсутствует;
+- Android Direct runtime, atomic vault, native recovery, process-local typed
+  terminal failure snapshot и host-tested durable non-secret setup journal/
+  reconciler реализованы, но A04/A05 и cross-client/airplane physical
+  matrix, connected recovery/capture instrumentation, app-wide public failure
+  codes и standalone signing ещё не закрыты; `PublicFailureCodeV1` покрывает
+  Android identity setup/secure runtime gate и host-tested Direct send/delivery
+  action split, но Direct-session-specific outcome, desktop/Go consumers и
+  cross-client conformance открыты; calls и MLS runtime не включены;
+- независимое развёртывание witness-сервисов, Android OS-backed rollback anchor
+  и внешний криптографический аудит остаются release gates;
 - attachment, multi-device и platform signing matrices требуют дальнейшего
   release evidence;
 - доступность публичного Preview не является SLA.

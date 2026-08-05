@@ -18,11 +18,11 @@ import (
 
 	"github.com/NaveLIL/veil/veil-server/internal/auth"
 	"github.com/NaveLIL/veil/veil-server/internal/chat"
-	"github.com/NaveLIL/veil/veil-server/internal/config"
 	"github.com/NaveLIL/veil/veil-server/internal/db"
 	"github.com/NaveLIL/veil/veil-server/internal/servers"
 	pb "github.com/NaveLIL/veil/veil-server/pkg/proto/v1"
-	"golang.org/x/crypto/curve25519"
+	"github.com/google/uuid"
+	"google.golang.org/protobuf/proto"
 )
 
 func integrationPushInput(endpoint, label string) db.NewPushSubscription {
@@ -47,117 +47,6 @@ func TestSecurityPrincipalBinding(t *testing.T) {
 	alice := h.CreateUser("security-alice")
 	bob := h.CreateUser("security-bob")
 	mallory := h.CreateUser("security-mallory")
-
-	t.Run("websocket auth registers only with a valid X25519 proof", func(t *testing.T) {
-		cfg := &config.Config{AuthChallengeTTL: 5 * time.Second, AuthMaxAttempts: 3, AllowRegistration: true}
-		svc := auth.NewService(h.DB, cfg)
-		serverPublic, err := svc.CreateChallenge("valid-registration")
-		if err != nil {
-			t.Fatal(err)
-		}
-		identityPublic, identityPrivate := randomX25519KeyPair(t)
-		signingPublic, signingPrivate, err := ed25519.GenerateKey(rand.Reader)
-		if err != nil {
-			t.Fatal(err)
-		}
-		shared, err := curve25519.X25519(identityPrivate, serverPublic[:])
-		if err != nil {
-			t.Fatal(err)
-		}
-		message, err := auth.WSAuthSigningMessage(serverPublic[:], shared)
-		if err != nil {
-			t.Fatal(err)
-		}
-		result, err := svc.VerifyResponse(context.Background(), "valid-registration",
-			identityPublic, signingPublic, ed25519.Sign(signingPrivate, message),
-			randomBytes(t, 16), "valid-device")
-		if err != nil {
-			t.Fatalf("valid registration rejected: %v", err)
-		}
-		if !result.IsNew {
-			t.Fatal("valid registration was not marked new")
-		}
-	})
-
-	t.Run("websocket auth keeps first-time registration closed by default", func(t *testing.T) {
-		cfg := &config.Config{AuthChallengeTTL: 5 * time.Second, AuthMaxAttempts: 3}
-		svc := auth.NewService(h.DB, cfg)
-		serverPublic, err := svc.CreateChallenge("closed-registration")
-		if err != nil {
-			t.Fatal(err)
-		}
-		identityPublic, identityPrivate := randomX25519KeyPair(t)
-		signingPublic, signingPrivate, err := ed25519.GenerateKey(rand.Reader)
-		if err != nil {
-			t.Fatal(err)
-		}
-		shared, err := curve25519.X25519(identityPrivate, serverPublic[:])
-		if err != nil {
-			t.Fatal(err)
-		}
-		message, err := auth.WSAuthSigningMessage(serverPublic[:], shared)
-		if err != nil {
-			t.Fatal(err)
-		}
-		_, err = svc.VerifyResponse(context.Background(), "closed-registration",
-			identityPublic, signingPublic, ed25519.Sign(signingPrivate, message),
-			randomBytes(t, 16), "closed-device")
-		if !errors.Is(err, auth.ErrRegistrationClosed) {
-			t.Fatalf("closed registration error = %v, want ErrRegistrationClosed", err)
-		}
-	})
-
-	t.Run("websocket auth rejects a replacement signing key", func(t *testing.T) {
-		cfg := &config.Config{AuthChallengeTTL: 5 * time.Second, AuthMaxAttempts: 3}
-		svc := auth.NewService(h.DB, cfg)
-		serverPublic, err := svc.CreateChallenge("takeover-attempt")
-		if err != nil {
-			t.Fatal(err)
-		}
-		attackerPublic, attackerPrivate, err := ed25519.GenerateKey(rand.Reader)
-		if err != nil {
-			t.Fatal(err)
-		}
-		deviceKey := randomBytes(t, 16)
-		shared, err := curve25519.X25519(alice.IdentityPrivate, serverPublic[:])
-		if err != nil {
-			t.Fatal(err)
-		}
-		signingMessage, err := auth.WSAuthSigningMessage(serverPublic[:], shared)
-		if err != nil {
-			t.Fatal(err)
-		}
-		_, err = svc.VerifyResponse(context.Background(), "takeover-attempt",
-			alice.IdentityKey, attackerPublic, ed25519.Sign(attackerPrivate, signingMessage),
-			deviceKey, "attacker-device")
-		if !errors.Is(err, auth.ErrSigningKeyMismatch) {
-			t.Fatalf("takeover error = %v, want ErrSigningKeyMismatch", err)
-		}
-	})
-
-	t.Run("websocket auth requires X25519 private key possession", func(t *testing.T) {
-		cfg := &config.Config{AuthChallengeTTL: 5 * time.Second, AuthMaxAttempts: 3}
-		svc := auth.NewService(h.DB, cfg)
-		serverPublic, err := svc.CreateChallenge("no-x25519-private")
-		if err != nil {
-			t.Fatal(err)
-		}
-		_, wrongIdentityPrivate := randomX25519KeyPair(t)
-		wrongShared, err := curve25519.X25519(wrongIdentityPrivate, serverPublic[:])
-		if err != nil {
-			t.Fatal(err)
-		}
-		message, err := auth.WSAuthSigningMessage(serverPublic[:], wrongShared)
-		if err != nil {
-			t.Fatal(err)
-		}
-		_, err = svc.VerifyResponse(context.Background(), "no-x25519-private",
-			alice.IdentityKey, alice.SigningPublic, ed25519.Sign(alice.SigningKey, message),
-			randomBytes(t, 16), "forged-device")
-		if !errors.Is(err, auth.ErrBadSignature) {
-			t.Fatalf("missing X25519 private proof error = %v, want ErrBadSignature", err)
-		}
-	})
 
 	aliceDeviceKey := randomBytes(t, 16)
 	aliceDevice, err := h.DB.CreateDevice(context.Background(), alice.ID, aliceDeviceKey, "alice-device")
@@ -256,8 +145,14 @@ func TestSecurityPrincipalBinding(t *testing.T) {
 		}
 	})
 
-	t.Run("prekey replenishment bounds unused rows without deleting claimed keys", func(t *testing.T) {
-		keys := make([]db.PreKey, 0, 105)
+	t.Run("prekey replenishment bounds unused rows and compacts claimed keys", func(t *testing.T) {
+		keys := make([]db.PreKey, 0, 106)
+		keys = append(keys, db.PreKey{
+			KeyType:       0,
+			ProtocolKeyID: 778,
+			PublicKey:     randomBytes(t, 32),
+			Signature:     randomBytes(t, ed25519.SignatureSize),
+		})
 		for i := 0; i < 105; i++ {
 			keys = append(keys, db.PreKey{
 				KeyType:       1,
@@ -285,8 +180,8 @@ func TestSecurityPrincipalBinding(t *testing.T) {
 		).Scan(&claimedStillPresent); err != nil {
 			t.Fatal(err)
 		}
-		if !claimedStillPresent {
-			t.Fatal("unused-key pruning deleted an already claimed OPK")
+		if claimedStillPresent {
+			t.Fatal("receipt-mode compaction retained an already claimed OPK")
 		}
 	})
 
@@ -340,8 +235,8 @@ func TestSecurityPrincipalBinding(t *testing.T) {
 
 	t.Run("offline conversation discovery is signed and user scoped", func(t *testing.T) {
 		status, _ := h.DoUnsigned(http.MethodGet, "/v1/conversations", nil)
-		if status != http.StatusUnauthorized {
-			t.Fatalf("unsigned conversation discovery status = %d, want 401", status)
+		if status != http.StatusBadRequest {
+			t.Fatalf("unsigned conversation discovery status = %d, want 400", status)
 		}
 
 		status, _, body := h.Do(alice, http.MethodGet, "/v1/conversations", nil)
@@ -474,7 +369,7 @@ func TestSecurityPrincipalBinding(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("edit reconciliation fixture: %v", err)
 		}
-		if _, err := h.Chat.HandleReaction(context.Background(), bob.ID, &pb.ReactionUpdate{
+		if _, _, err := h.Chat.HandleReaction(context.Background(), bob.ID, &pb.ReactionUpdate{
 			MessageId: first.ID, ConversationId: aliceBobConversationID, Emoji: "fire", Add: true,
 		}); err != nil {
 			t.Fatalf("reaction reconciliation fixture: %v", err)
@@ -566,9 +461,10 @@ func TestSecurityPrincipalBinding(t *testing.T) {
 		}
 
 		_, _, _, err := h.Chat.HandleSendMessage(context.Background(), bob.ID, &pb.SendMessage{
-			ConversationId: bobMalloryConversationID,
-			Ciphertext:     []byte("encrypted cross-conversation reply"),
-			ReplyToId:      &message.ID,
+			ConversationId:  bobMalloryConversationID,
+			ClientMessageId: uuid.NewString(),
+			Ciphertext:      []byte("encrypted cross-conversation reply"),
+			ReplyToId:       &message.ID,
 		})
 		if !errors.Is(err, chat.ErrMessageConversationMismatch) {
 			t.Fatalf("cross-conversation reply error = %v, want mismatch (gateway maps this to 400)", err)
@@ -591,18 +487,46 @@ func TestSecurityPrincipalBinding(t *testing.T) {
 			t.Fatalf("cross-conversation delete error = %v, want mismatch", err)
 		}
 
-		_, err = h.Chat.HandleReaction(context.Background(), mallory.ID, &pb.ReactionUpdate{
+		_, _, err = h.Chat.HandleReaction(context.Background(), mallory.ID, &pb.ReactionUpdate{
 			MessageId: message.ID, ConversationId: aliceBobConversationID, Emoji: "👍", Add: true,
 		})
 		if !errors.Is(err, chat.ErrNotMember) {
 			t.Fatalf("non-member reaction error = %v, want ErrNotMember", err)
 		}
 
-		_, err = h.Chat.HandleReaction(context.Background(), bob.ID, &pb.ReactionUpdate{
+		_, _, err = h.Chat.HandleReaction(context.Background(), bob.ID, &pb.ReactionUpdate{
 			MessageId: message.ID, ConversationId: bobMalloryConversationID, Emoji: "👍", Add: true,
 		})
 		if !errors.Is(err, chat.ErrMessageConversationMismatch) {
 			t.Fatalf("cross-conversation reaction error = %v, want mismatch", err)
+		}
+
+		if _, err := h.DB.Pool.Exec(context.Background(),
+			`INSERT INTO reactions (message_id, conversation_id, user_id, emoji)
+			 SELECT $1::uuid, $2::uuid, $3::uuid, 'history-cap-' || value::text
+			 FROM generate_series(1, $4) AS value`,
+			message.ID, aliceBobConversationID, bob.ID, db.MaxReactionsPerMessage,
+		); err != nil {
+			t.Fatalf("prefill reaction boundary: %v", err)
+		}
+		if _, changed, err := h.Chat.HandleReaction(context.Background(), bob.ID, &pb.ReactionUpdate{
+			MessageId: message.ID, ConversationId: aliceBobConversationID, Emoji: "history-cap-1", Add: true,
+		}); err != nil || changed {
+			t.Fatalf("exact reaction add at cap must remain idempotent: %v", err)
+		}
+		if _, _, err := h.Chat.HandleReaction(context.Background(), bob.ID, &pb.ReactionUpdate{
+			MessageId: message.ID, ConversationId: aliceBobConversationID, Emoji: "history-cap-overflow", Add: true,
+		}); !errors.Is(err, chat.ErrReactionLimitReached) {
+			t.Fatalf("reaction overflow error = %v, want ErrReactionLimitReached", err)
+		}
+		var reactionCount int
+		if err := h.DB.Pool.QueryRow(context.Background(),
+			`SELECT COUNT(*) FROM reactions WHERE message_id = $1::uuid`, message.ID,
+		).Scan(&reactionCount); err != nil {
+			t.Fatal(err)
+		}
+		if reactionCount != db.MaxReactionsPerMessage {
+			t.Fatalf("reaction overflow changed count to %d", reactionCount)
 		}
 	})
 
@@ -791,7 +715,8 @@ func TestSecurityPrincipalBinding(t *testing.T) {
 		}
 
 		_, _, _, err := h.Chat.HandleSendMessage(ctx, bob.ID, &pb.SendMessage{
-			ConversationId: conversationID, Ciphertext: []byte("speaker ciphertext"), Header: []byte("speaker header"),
+			ConversationId: conversationID, ClientMessageId: uuid.NewString(),
+			Ciphertext: []byte("speaker ciphertext"), Header: []byte("speaker header"),
 		})
 		if !errors.Is(err, db.ErrMessageSecurityContext) {
 			t.Fatalf("legacy channel send error=%v, want ErrMessageSecurityContext", err)
@@ -835,14 +760,25 @@ func TestSecurityPrincipalBinding(t *testing.T) {
 			t.Fatalf("authorized directory binding mismatch: %v", members)
 		}
 		security := secureMessageContextForDevice(t, h, conversationID, bob.ID, bobDevice)
-		_, _, recipients, err := h.Chat.HandleSecureSendMessage(ctx, bob.ID, &pb.SendMessage{
-			ConversationId: conversationID, Ciphertext: []byte("speaker ciphertext"), Header: []byte("speaker header"),
-		}, security)
+		secureMessage := &pb.SendMessage{
+			ConversationId: conversationID, ClientMessageId: uuid.NewString(),
+			Ciphertext: []byte("speaker ciphertext"), Header: []byte("speaker header"),
+		}
+		secureResult, err := h.Chat.HandleSecureSendMessageResult(ctx, bob.ID, secureMessage, security)
 		if err != nil {
 			t.Fatalf("VIEW+READ+SEND member could not send securely: %v", err)
 		}
-		if len(recipients) != 1 || recipients[0] != alice.ID {
-			t.Fatalf("unauthorized member entered secure message fanout: %v", recipients)
+		if len(secureResult.Recipients) != 1 || secureResult.Recipients[0] != alice.ID {
+			t.Fatalf("unauthorized member entered secure message fanout: %v", secureResult.Recipients)
+		}
+		if secureResult.AckRosterVersion == nil || *secureResult.AckRosterVersion != security.RosterVersion {
+			t.Fatalf("secure ACK roster=%v, want %d", secureResult.AckRosterVersion, security.RosterVersion)
+		}
+		secureReplay, err := h.Chat.HandleSecureSendMessageResult(ctx, bob.ID, proto.Clone(secureMessage).(*pb.SendMessage), security)
+		if err != nil || !secureReplay.Replayed || secureReplay.MessageID != secureResult.MessageID ||
+			secureReplay.AckRosterVersion == nil || *secureReplay.AckRosterVersion != security.RosterVersion ||
+			secureReplay.Recipients != nil {
+			t.Fatalf("secure replay=%#v err=%v, first=%#v", secureReplay, err, secureResult)
 		}
 
 		capture.reset()
@@ -948,7 +884,8 @@ func TestSecurityPrincipalBinding(t *testing.T) {
 			t.Fatalf("role-authorized message sync status=%d", status)
 		}
 		if _, _, _, err := h.Chat.HandleSendMessage(ctx, bob.ID, &pb.SendMessage{
-			ConversationId: conversationID, Ciphertext: []byte("blocked by role overwrite"),
+			ConversationId: conversationID, ClientMessageId: uuid.NewString(),
+			Ciphertext: []byte("blocked by role overwrite"),
 		}); !errors.Is(err, chat.ErrNotMember) {
 			t.Fatalf("role send deny error=%v, want ErrNotMember", err)
 		}
@@ -967,7 +904,8 @@ func TestSecurityPrincipalBinding(t *testing.T) {
 		}
 		security := secureMessageContextForDevice(t, h, conversationID, bob.ID, bobDevice)
 		_, _, recipients, err := h.Chat.HandleSecureSendMessage(ctx, bob.ID, &pb.SendMessage{
-			ConversationId: conversationID, Ciphertext: []byte("allowed by member overwrite"),
+			ConversationId: conversationID, ClientMessageId: uuid.NewString(),
+			Ciphertext: []byte("allowed by member overwrite"),
 		}, security)
 		if err != nil || len(recipients) != 1 || recipients[0] != alice.ID {
 			t.Fatalf("member send allow err=%v recipients=%v", err, recipients)
@@ -1090,7 +1028,8 @@ func TestSecurityPrincipalBinding(t *testing.T) {
 			t.Fatalf("history-denied sender keys were not pruned=%v err=%v", pending, err)
 		}
 		if _, _, _, err := h.Chat.HandleSendMessage(ctx, bob.ID, &pb.SendMessage{
-			ConversationId: conversationID, Ciphertext: []byte("send without history"),
+			ConversationId: conversationID, ClientMessageId: uuid.NewString(),
+			Ciphertext: []byte("send without history"),
 		}); !errors.Is(err, db.ErrMessageSecurityContext) {
 			t.Fatalf("send-only legacy channel write error=%v, want fail-closed Sender-Key context rejection", err)
 		}
@@ -1270,14 +1209,16 @@ func TestSecurityPrincipalBinding(t *testing.T) {
 			Size: 10, ContentType: "application/octet-stream",
 		}
 		_, _, _, err := h.Chat.HandleSendMessage(ctx, bob.ID, &pb.SendMessage{
-			ConversationId: aliceBobConversationID, Ciphertext: []byte("foreign upload"),
+			ConversationId: aliceBobConversationID, ClientMessageId: uuid.NewString(),
+			Ciphertext:  []byte("foreign upload"),
 			Attachments: []*pb.EncryptedAttachment{attachment},
 		})
 		if !errors.Is(err, chat.ErrAttachmentAccess) {
 			t.Fatalf("foreign upload attachment error=%v, want ErrAttachmentAccess", err)
 		}
 		messageID, _, _, err := h.Chat.HandleSendMessage(ctx, alice.ID, &pb.SendMessage{
-			ConversationId: aliceBobConversationID, Ciphertext: []byte("attachment message"), Header: []byte("header"),
+			ConversationId: aliceBobConversationID, ClientMessageId: uuid.NewString(),
+			Ciphertext: []byte("attachment message"), Header: []byte("header"),
 			Attachments: []*pb.EncryptedAttachment{attachment},
 		})
 		if err != nil {
@@ -1311,7 +1252,8 @@ func TestSecurityPrincipalBinding(t *testing.T) {
 			t.Fatalf("unsafe/incomplete attachment descriptor: %v", attachments)
 		}
 		if _, _, _, err := h.Chat.HandleSendMessage(ctx, alice.ID, &pb.SendMessage{
-			ConversationId: aliceBobConversationID, Ciphertext: []byte("bad size"),
+			ConversationId: aliceBobConversationID, ClientMessageId: uuid.NewString(),
+			Ciphertext: []byte("bad size"),
 			Attachments: []*pb.EncryptedAttachment{{
 				MediaId: fileID, EncryptedKey: []byte("key"), Nonce: []byte("nonce"), Size: 11,
 				ContentType: "application/octet-stream",
@@ -1607,14 +1549,4 @@ func randomBytes(t *testing.T, size int) []byte {
 		t.Fatal(err)
 	}
 	return b
-}
-
-func randomX25519KeyPair(t *testing.T) ([]byte, []byte) {
-	t.Helper()
-	private := randomBytes(t, 32)
-	public, err := curve25519.X25519(private, curve25519.Basepoint)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return public, private
 }

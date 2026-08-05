@@ -203,7 +203,7 @@ const DEFAULT_SERVER_ENDPOINTS = {
   // A packaged client must never silently target an unrelated public service.
   // Production builds provide VITE_VEIL_{WS,HTTP}_URL explicitly; the safe
   // fallback is the loopback gateway used by the local Compose setup.
-  ws: "ws://127.0.0.1:9080/ws",
+  ws: "ws://127.0.0.1:9080/v3/events",
   http: "http://127.0.0.1:9080",
 } as const;
 const SERVER_ENDPOINTS_STORAGE_KEY = "veil.server-endpoints.v1";
@@ -359,7 +359,7 @@ export function nodeAccessEndpointsFromOrigin(canonicalOrigin: string): ServerEn
   }
   const ws = new URL(http.toString());
   ws.protocol = "wss:";
-  ws.pathname = "/ws";
+  ws.pathname = "/v3/events";
   return {
     ws: ws.toString(),
     http: http.toString().replace(/\/$/, ""),
@@ -393,6 +393,12 @@ function normalizeServerEndpoints(wsRaw: string, httpRaw: string): ServerEndpoin
     if ((!securePair && !localPair) || ws.host !== http.host) return null;
     if (ws.username || ws.password || ws.search || ws.hash) return null;
     if (http.username || http.password || http.search || http.hash) return null;
+    if (http.pathname !== "/") return null;
+    // One-way local configuration migration. An exact historical /ws value
+    // is credential-free and origin-equivalent, so rewrite only its path;
+    // arbitrary aliases remain rejected.
+    if (ws.pathname === "/ws") ws.pathname = "/v3/events";
+    if (ws.pathname !== "/v3/events") return null;
 
     return {
       ws: ws.toString(),
@@ -586,11 +592,18 @@ const acknowledgedOutgoingMessageIds = new Map<string, string>();
 const discardedOutgoingMessageIds = new Set<string>();
 const messageLoadGenerations = new Map<string, number>();
 const senderKeyDistributionFlights = new Map<string, Promise<void>>();
+const conversationReadRevisions = new Map<string, number>();
+const conversationReadFlights = new Map<string, Promise<void>>();
 
 function nextMessageLoadGeneration(conversationId: string): number {
   const generation = (messageLoadGenerations.get(conversationId) ?? 0) + 1;
   messageLoadGenerations.set(conversationId, generation);
   return generation;
+}
+
+function activeConversationIsVisible(conversationId: string): boolean {
+  return activeConversationId() === conversationId
+    && (typeof document === "undefined" || document.visibilityState !== "hidden");
 }
 
 function messagePreview(message: Message): string {
@@ -1131,6 +1144,8 @@ function resetOriginScopedUiState(): void {
   acknowledgedOutgoingMessageIds.clear();
   discardedOutgoingMessageIds.clear();
   messageLoadGenerations.clear();
+  conversationReadRevisions.clear();
+  conversationReadFlights.clear();
   setActiveConversationId(null);
   setServers([]);
   setActiveServerId(null);
@@ -1164,6 +1179,8 @@ function beginBindingTransition(serverSettingsFallback: "chat" | "settings" = "c
   setIdentityChangeNotice(null);
   setBindingTransitioning(true);
   setConnected(false);
+  conversationReadRevisions.clear();
+  conversationReadFlights.clear();
   setUserId(null);
   setReconnecting(true);
   setFriends([]);
@@ -1288,6 +1305,43 @@ function upsertConversationCryptoDiagnostic(value: unknown): void {
   }));
 }
 
+export function validatedAvailableConversation(
+  value: unknown,
+  expectedServerOrigin: string,
+): Conversation {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("native conversation discovery payload is invalid");
+  }
+  const candidate = value as Record<string, unknown>;
+  const canonicalUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+  const conversationId = candidate.conversationId;
+  const conversationType = candidate.conversationType;
+  const conversationName = candidate.conversationName;
+  const peerUserId = candidate.conversationPeerUserId;
+  if (
+    typeof conversationId !== "string"
+    || !canonicalUuid.test(conversationId)
+    || !["dm", "group", "channel"].includes(String(conversationType))
+    || typeof conversationName !== "string"
+    || new TextEncoder().encode(conversationName).length > 256
+    || candidate.serverOrigin !== expectedServerOrigin
+    || (peerUserId !== null && peerUserId !== undefined
+      && (typeof peerUserId !== "string" || !canonicalUuid.test(peerUserId)))
+    || (conversationType === "dm" && typeof peerUserId !== "string")
+    || (conversationType !== "dm" && peerUserId !== null && peerUserId !== undefined)
+  ) {
+    throw new Error("native conversation discovery changed its origin or schema");
+  }
+  return {
+    id: conversationId,
+    type: conversationType as Conversation["type"],
+    name: conversationName.trim() || conversationId.slice(0, 8),
+    serverOrigin: expectedServerOrigin,
+    peerUserId: peerUserId as string | undefined,
+    unreadCount: 0,
+  };
+}
+
 export const appStore = {
   screen,
   setScreen,
@@ -1372,6 +1426,7 @@ export const appStore = {
     setActiveServerId(null);
     setActiveChannelId(null);
     setActiveConversationId(id);
+    void appStore.markConversationRead(id);
   },
 
   /**
@@ -1411,15 +1466,77 @@ export const appStore = {
 
   addMessage: (msg: Message) => {
     if (!acceptsSensitiveEvent()) return;
+    // WebSocket replay/reconnect may surface the same durable message again.
+    // Do not duplicate either the visible row or its unread badge.
+    if (messages().some((existing) => existing.id === msg.id)) return;
+    const readNow = !msg.isOwn && activeConversationIsVisible(msg.conversationId);
     setMessages((prev) => [...prev, msg]);
     // Update conversation's last message
     setConversations((prev) =>
       prev.map((c) =>
         c.id === msg.conversationId
-          ? { ...c, lastMessage: msg.text, lastMessageTime: msg.timestamp, unreadCount: msg.isOwn ? c.unreadCount : c.unreadCount + 1 }
+          ? {
+            ...c,
+            lastMessage: msg.text,
+            lastMessageTime: msg.timestamp,
+            unreadCount: msg.isOwn || readNow ? c.unreadCount : c.unreadCount + 1,
+          }
           : c,
       ),
     );
+    if (readNow) void appStore.markConversationRead(msg.conversationId);
+  },
+
+  /**
+   * Clear and durably persist device-local unread state. Multiple live events
+   * coalesce, while a revision arriving during IPC forces one final write so
+   * the SQLCipher cursor cannot lag behind the visible timeline.
+   */
+  markConversationRead: (conversationId: string): Promise<void> => {
+    if (!acceptsSensitiveEvent()) return Promise.resolve();
+    setConversations((previous) => previous.map((conversation) =>
+      conversation.id === conversationId && conversation.unreadCount !== 0
+        ? { ...conversation, unreadCount: 0 }
+        : conversation,
+    ));
+    const scope = authenticatedServerScope();
+    if (!scope) return Promise.resolve();
+
+    conversationReadRevisions.set(
+      conversationId,
+      (conversationReadRevisions.get(conversationId) ?? 0) + 1,
+    );
+    const existing = conversationReadFlights.get(conversationId);
+    if (existing) return existing;
+
+    const sessionEpoch = captureUiSessionEpoch();
+    let flight!: Promise<void>;
+    flight = (async () => {
+      try {
+        while (true) {
+          const revision = conversationReadRevisions.get(conversationId) ?? 0;
+          await invoke("mark_conversation_read", {
+            conversationId,
+            ...authenticatedMutationScopeArgs(scope),
+          });
+          requireCurrentUiSession(sessionEpoch);
+          if (!authenticatedScopesEqual(authenticatedServerScope(), scope)) {
+            throw new StaleUiSessionError();
+          }
+          if ((conversationReadRevisions.get(conversationId) ?? 0) === revision) break;
+        }
+      } catch (error) {
+        if (!(error instanceof StaleUiSessionError)) {
+          console.warn("persist conversation read state failed:", error);
+        }
+      } finally {
+        if (conversationReadFlights.get(conversationId) === flight) {
+          conversationReadFlights.delete(conversationId);
+        }
+      }
+    })();
+    conversationReadFlights.set(conversationId, flight);
+    return flight;
   },
 
   /** Connect to Veil gateway and publish one native-authenticated namespace. */
@@ -1508,6 +1625,10 @@ export const appStore = {
             if (selectedConversation) {
               await appStore.loadMessages(selectedConversation);
               requireCurrentUiSession(sessionEpoch);
+              if (activeConversationIsVisible(selectedConversation)) {
+                await appStore.markConversationRead(selectedConversation);
+                requireCurrentUiSession(sessionEpoch);
+              }
             }
             appStore.requestFriendList();
             appStore.sendPresence(1); // ONLINE
@@ -2246,6 +2367,7 @@ export const appStore = {
         peerUserId?: string;
         peerKey?: string;
         lastMessageAt?: string;
+        unreadCount?: number;
       }>>("get_conversations");
       requireCurrentUiSession(sessionEpoch);
       setConversations(
@@ -2260,7 +2382,11 @@ export const appStore = {
             serverOrigin: c.serverOrigin,
             peerUserId: c.peerUserId,
             peerKey: c.peerKey,
-            unreadCount: 0,
+            unreadCount: Number.isSafeInteger(c.unreadCount)
+              && (c.unreadCount ?? -1) >= 0
+              && (c.unreadCount ?? 0) <= 2_147_483_647
+              ? c.unreadCount!
+              : 0,
             lastMessageTime: c.lastMessageAt ? new Date(c.lastMessageAt).getTime() : undefined,
           })),
       );
@@ -2474,6 +2600,7 @@ export const appStore = {
     if (ch?.conversationId) {
       const convId = ch.conversationId;
       setActiveConversationId(convId);
+      void appStore.markConversationRead(convId);
       let mutationScope: AuthenticatedServerScope | null = null;
       try {
         mutationScope = requirePublishedMutationScope();
@@ -3553,6 +3680,44 @@ export const appStore = {
     );
 
       await register<unknown>(
+      "veil://conversation-available",
+      (event) => {
+        if (!acceptsAuthenticatedEvent(event.payload)) return;
+        const scope = authenticatedServerScope();
+        if (!scope) return;
+        let discovered: Conversation;
+        try {
+          discovered = validatedAvailableConversation(
+            event.payload,
+            scope.canonicalServerOrigin,
+          );
+        } catch (error) {
+          console.error("native conversation discovery failed its renderer schema boundary", error);
+          return;
+        }
+        // Rooms remain owned by the authenticated Space directory. Only
+        // standalone Direct/Circle entries belong in this rail.
+        if (discovered.type === "channel") return;
+        setConversations((previous) => {
+          const existing = previous.find((conversation) => conversation.id === discovered.id);
+          if (!existing) return [...previous, discovered];
+          if (existing.type !== discovered.type) {
+            console.error("native conversation discovery changed a rendered conversation type");
+            return previous;
+          }
+          return previous.map((conversation) => conversation.id === discovered.id
+            ? {
+              ...conversation,
+              name: discovered.name,
+              serverOrigin: discovered.serverOrigin,
+              peerUserId: discovered.peerUserId,
+            }
+            : conversation);
+        });
+      },
+    );
+
+      await register<unknown>(
       "veil://message",
       (event) => {
         if (!acceptsAuthenticatedEvent(event.payload)) return;
@@ -4082,6 +4247,18 @@ export const appStore = {
           const endpoints = nodeAccessEndpointsFromOrigin(value.canonicalOrigin);
           setServerEndpoints(endpoints.ws, endpoints.http);
         }
+      }
+      if (typeof document !== "undefined") {
+        const markVisibleConversationRead = () => {
+          if (document.visibilityState === "hidden") return;
+          const conversationId = activeConversationId();
+          if (conversationId) void appStore.markConversationRead(conversationId);
+        };
+        document.addEventListener("visibilitychange", markVisibleConversationRead);
+        registered.push(() => document.removeEventListener(
+          "visibilitychange",
+          markVisibleConversationRead,
+        ));
       }
       eventListenersInitialized = true;
     } catch (error) {

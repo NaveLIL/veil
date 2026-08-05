@@ -8,7 +8,6 @@ import (
 
 	"google.golang.org/protobuf/proto"
 
-	"github.com/NaveLIL/veil/veil-server/internal/auth"
 	"github.com/NaveLIL/veil/veil-server/internal/publicerr"
 	pb "github.com/NaveLIL/veil/veil-server/pkg/proto/v1"
 )
@@ -17,7 +16,7 @@ const transportSecretCanary = "constraint sender_keys_owner_target_key C:\\veil\
 
 func TestSendPublicErrorDoesNotExposeCause(t *testing.T) {
 	t.Parallel()
-	client := &Client{send: make(chan []byte, 1)}
+	client := &Client{send: make(chan outboundBatch, 1)}
 	client.sendPublicError(71, http.StatusInternalServerError, errors.New(transportSecretCanary))
 	envelope := decodePublicErrorEnvelope(t, <-client.send)
 	got := envelope.GetError()
@@ -29,69 +28,42 @@ func TestSendPublicErrorDoesNotExposeCause(t *testing.T) {
 	}
 }
 
-func TestSendPublicAuthFailureDoesNotExposeCause(t *testing.T) {
+func TestReactionLimitErrorIsStaticAndUnderstandable(t *testing.T) {
 	t.Parallel()
-	client := &Client{send: make(chan []byte, 1)}
-	err := publicerr.New(http.StatusUnauthorized, "authentication_failed", "authentication failed", errors.New(transportSecretCanary))
-	if queueErr := client.sendPublicAuthFailure(72, err); queueErr != nil {
-		t.Fatalf("queue auth failure: %v", queueErr)
+	client := &Client{send: make(chan outboundBatch, 1)}
+	client.sendPublicError(74, http.StatusConflict, publicerr.New(
+		http.StatusConflict,
+		"reaction_limit_reached",
+		"message reaction limit reached",
+		errors.New(transportSecretCanary),
+	))
+	errorEnvelope := decodePublicErrorEnvelope(t, <-client.send).GetError()
+	if errorEnvelope == nil ||
+		errorEnvelope.GetCode() != http.StatusConflict ||
+		errorEnvelope.GetMessage() != "message reaction limit reached" {
+		t.Fatalf("unexpected reaction-limit error: %#v", errorEnvelope)
 	}
-	var envelope pb.Envelope
-	if unmarshalErr := proto.Unmarshal(<-client.send, &envelope); unmarshalErr != nil {
-		t.Fatalf("decode auth failure: %v", unmarshalErr)
-	}
-	result := envelope.GetAuthResult()
-	if result == nil || result.GetSuccess() || result.GetErrorMessage() != "authentication failed" {
-		t.Fatalf("unexpected auth result: %#v", result)
-	}
-	if result.GetFailureReason() != pb.AuthFailureReason_AUTH_FAILURE_REASON_AUTHENTICATION_FAILED {
-		t.Fatalf("failure reason = %v, want generic authentication failure", result.GetFailureReason())
-	}
-	if strings.Contains(result.GetErrorMessage(), transportSecretCanary) {
-		t.Fatal("private cause leaked through unauthenticated handshake")
+	if strings.Contains(errorEnvelope.GetMessage(), transportSecretCanary) {
+		t.Fatal("private reaction-limit cause leaked through WS error")
 	}
 }
 
-func TestMappedAuthFailuresExposeOnlySafeEnrollmentReasons(t *testing.T) {
-	t.Parallel()
-	for name, testCase := range map[string]struct {
-		err    error
-		reason pb.AuthFailureReason
-		text   string
-	}{
-		"registration closed": {
-			err:    auth.ErrRegistrationClosed,
-			reason: pb.AuthFailureReason_AUTH_FAILURE_REASON_REGISTRATION_CLOSED,
-			text:   "registration is closed",
-		},
-		"invalid invite": {
-			err:    auth.ErrInviteInvalid,
-			reason: pb.AuthFailureReason_AUTH_FAILURE_REASON_INVITE_INVALID,
-			text:   "invite is invalid, expired, or already used",
-		},
-	} {
-		t.Run(name, func(t *testing.T) {
-			client := &Client{send: make(chan []byte, 1)}
-			if err := client.sendMappedAuthFailure(73, testCase.err); err != nil {
-				t.Fatal(err)
-			}
-			var envelope pb.Envelope
-			if err := proto.Unmarshal(<-client.send, &envelope); err != nil {
-				t.Fatal(err)
-			}
-			result := envelope.GetAuthResult()
-			if result.GetFailureReason() != testCase.reason || result.GetErrorMessage() != testCase.text {
-				t.Fatalf("unexpected safe enrollment failure: %#v", result)
-			}
-		})
-	}
-}
-
-func decodePublicErrorEnvelope(t *testing.T, data []byte) *pb.Envelope {
+func decodePublicErrorEnvelope(t *testing.T, batch outboundBatch) *pb.Envelope {
 	t.Helper()
 	var envelope pb.Envelope
-	if err := proto.Unmarshal(data, &envelope); err != nil {
+	if err := proto.Unmarshal(requireSingleOutboundFrame(t, batch), &envelope); err != nil {
 		t.Fatalf("decode WS error: %v", err)
 	}
 	return &envelope
+}
+
+func requireSingleOutboundFrame(t *testing.T, batch outboundBatch) []byte {
+	t.Helper()
+	if batch.publication != nil {
+		t.Fatal("ordinary response unexpectedly has a publication gate")
+	}
+	if len(batch.frames) != 1 {
+		t.Fatalf("outbound frames = %d, want 1", len(batch.frames))
+	}
+	return batch.frames[0]
 }

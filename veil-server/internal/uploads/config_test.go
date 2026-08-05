@@ -34,3 +34,30 @@ func TestUploadMaxBytesInvalidOverrideFallsBackSafely(t *testing.T) {
 		)
 	}
 }
+
+func TestUploadForwardedHeadersFollowExplicitProxyTrust(t *testing.T) {
+	t.Setenv("VEIL_TRUST_PROXY_HEADERS", "true")
+
+	cfg := LoadConfigFromEnv()
+	if !cfg.RespectForwardedHeaders {
+		t.Fatal("RespectForwardedHeaders = false, want true for trusted proxy deployment")
+	}
+}
+
+func TestUploadForwardedHeadersFailClosedByDefault(t *testing.T) {
+	t.Setenv("VEIL_TRUST_PROXY_HEADERS", "")
+
+	cfg := LoadConfigFromEnv()
+	if cfg.RespectForwardedHeaders {
+		t.Fatal("RespectForwardedHeaders = true without an explicit trusted proxy")
+	}
+}
+
+func TestUploadForwardedHeadersFailClosedForInvalidSetting(t *testing.T) {
+	t.Setenv("VEIL_TRUST_PROXY_HEADERS", "definitely-not-a-boolean")
+
+	cfg := LoadConfigFromEnv()
+	if cfg.RespectForwardedHeaders {
+		t.Fatal("RespectForwardedHeaders = true for an invalid trust setting")
+	}
+}

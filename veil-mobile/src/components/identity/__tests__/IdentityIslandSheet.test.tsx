@@ -6,10 +6,47 @@ import {
   Animated,
   BackHandler,
   Modal,
+  StyleSheet,
   Text,
 } from "react-native";
 import type { Member } from "../../../stores/chat";
+import VeilRuntime from "../../../native/runtime";
 import { IdentityIslandSheet } from "../IdentityIslandSheet";
+
+const mockCameraPermission = {
+  canAskAgain: true,
+  expires: "never",
+  granted: true,
+  status: "granted",
+};
+const mockRequestCameraPermission = jest.fn(async () => mockCameraPermission);
+
+jest.mock("expo-camera", () => {
+  const ReactModule = jest.requireActual<typeof import("react")>("react");
+  const { View } = jest.requireActual<typeof import("react-native")>("react-native");
+  return {
+    CameraView: (props: Record<string, unknown>) => ReactModule.createElement(View, props),
+    useCameraPermissions: () => [mockCameraPermission, mockRequestCameraPermission, jest.fn()],
+  };
+});
+
+jest.mock("react-native-qrcode-svg", () => {
+  const ReactModule = jest.requireActual<typeof import("react")>("react");
+  const { View } = jest.requireActual<typeof import("react-native")>("react-native");
+  return {
+    __esModule: true,
+    default: (props: Record<string, unknown>) => ReactModule.createElement(View, props),
+  };
+});
+
+jest.mock("../../../native/runtime", () => ({
+  __esModule: true,
+  default: {
+    getDirectIdentityVerification: jest.fn(),
+    confirmDirectIdentityVerification: jest.fn(),
+    confirmDirectIdentityVerificationQr: jest.fn(),
+  },
+}));
 
 jest.mock("react-native", () => {
   const actual = jest.requireActual<typeof import("react-native")>("react-native");
@@ -22,7 +59,7 @@ jest.mock("react-native", () => {
 });
 
 jest.mock("react-native-safe-area-context", () => ({
-  useSafeAreaInsets: () => ({ top: 0, right: 0, bottom: 18, left: 0 }),
+  useSafeAreaInsets: () => ({ top: 0, right: 20, bottom: 18, left: 44 }),
 }));
 
 jest.mock("../UserAvatar", () => {
@@ -62,6 +99,10 @@ describe("IdentityIslandSheet interaction and accessibility boundary", () => {
   let renderer: ReactTestRenderer | undefined;
 
   beforeEach(() => {
+    jest.mocked(VeilRuntime.getDirectIdentityVerification).mockReset();
+    jest.mocked(VeilRuntime.confirmDirectIdentityVerification).mockReset();
+    jest.mocked(VeilRuntime.confirmDirectIdentityVerificationQr).mockReset();
+    mockRequestCameraPermission.mockClear();
     reduceMotion = jest.spyOn(AccessibilityInfo, "isReduceMotionEnabled");
     setAccessibilityFocus = jest.spyOn(AccessibilityInfo, "setAccessibilityFocus").mockImplementation(() => undefined);
     setAccessibilityFocus.mockClear();
@@ -84,13 +125,17 @@ describe("IdentityIslandSheet interaction and accessibility boundary", () => {
     reduceMotionHandler = undefined;
   });
 
-  const renderSheet = async (onClose = jest.fn()) => {
+  const renderSheet = async (
+    onClose = jest.fn(),
+    directVerification?: { conversationId: string; directGeneration: number },
+  ) => {
     await act(async () => {
       renderer = TestRenderer.create(
         <IdentityIslandSheet
           profile={PROFILE}
           contextLabel="Server member"
           returnLabel="Members"
+          directVerification={directVerification}
           onClose={onClose}
         />,
         { createNodeMock: () => 919 },
@@ -99,6 +144,165 @@ describe("IdentityIslandSheet interaction and accessibility boundary", () => {
     await flushEffects();
     return { onClose, root: renderer!.root };
   };
+
+  it("shows and explicitly confirms the exact native account-v2 safety number", async () => {
+    reduceMotion.mockResolvedValue(true);
+    const direct = {
+      conversationId: "30000000-0000-4000-8000-000000000001",
+      directGeneration: 7,
+    };
+    const initial = {
+      canonicalServerOrigin: PROFILE.canonicalServerOrigin,
+      peerUserId: PROFILE.userId,
+      fingerprintVersion: "account_v2" as const,
+      fingerprintEmoji: "🔒🛡️🗝️⚡",
+      fingerprintHex: "ab".repeat(32),
+      qrPayload: `veil-identity:account-v2:${"ab".repeat(32)}`,
+      state: "not_compared" as const,
+    };
+    jest.mocked(VeilRuntime.getDirectIdentityVerification).mockResolvedValue(initial);
+    jest.mocked(VeilRuntime.confirmDirectIdentityVerification).mockResolvedValue({
+      ...initial,
+      state: "verified_on_this_device",
+    });
+
+    const { root } = await renderSheet(jest.fn(), direct);
+    expect(VeilRuntime.getDirectIdentityVerification).toHaveBeenCalledWith(
+      direct.conversationId,
+      direct.directGeneration,
+    );
+    expect(root.findAllByType(Text).some((node) => node.props.children === "Not compared"))
+      .toBe(true);
+    expect(root.findAllByType(Text).some((node) => node.props.children === initial.fingerprintEmoji))
+      .toBe(true);
+
+    await act(async () => {
+      root.findByProps({ testID: "confirm-identity-verification" }).props.onPress();
+      await Promise.resolve();
+    });
+    expect(VeilRuntime.confirmDirectIdentityVerification).toHaveBeenCalledWith(
+      direct.conversationId,
+      direct.directGeneration,
+      initial.fingerprintHex,
+    );
+    expect(root.findAllByType(Text).some(
+      (node) => node.props.children === "Verified on this device",
+    )).toBe(true);
+  }, 15_000);
+
+  it("keeps the camera unmounted until requested and consumes only one exact QR result", async () => {
+    reduceMotion.mockResolvedValue(true);
+    const direct = {
+      conversationId: "30000000-0000-4000-8000-000000000001",
+      directGeneration: 7,
+    };
+    const initial = {
+      canonicalServerOrigin: PROFILE.canonicalServerOrigin,
+      peerUserId: PROFILE.userId,
+      fingerprintVersion: "account_v2" as const,
+      fingerprintEmoji: "🔒🛡️🗝️⚡",
+      fingerprintHex: "ab".repeat(32),
+      qrPayload: `veil-identity:account-v2:${"ab".repeat(32)}`,
+      state: "not_compared" as const,
+    };
+    jest.mocked(VeilRuntime.getDirectIdentityVerification).mockResolvedValue(initial);
+    jest.mocked(VeilRuntime.confirmDirectIdentityVerificationQr).mockResolvedValue({
+      ...initial,
+      state: "verified_on_this_device",
+    });
+
+    const { root } = await renderSheet(jest.fn(), direct);
+    expect(root.findByProps({ testID: "identity-verification-qr" }).props.value)
+      .toBe(initial.qrPayload);
+    expect(root.findAllByProps({ testID: "identity-qr-camera" })).toHaveLength(0);
+    expect(mockRequestCameraPermission).not.toHaveBeenCalled();
+
+    await act(async () => {
+      root.findByProps({ testID: "scan-identity-verification" }).props.onPress();
+      await Promise.resolve();
+    });
+    const camera = root.findByProps({ testID: "identity-qr-camera" });
+    expect(camera.props.barcodeScannerSettings).toEqual({ barcodeTypes: ["qr"] });
+    expect(mockRequestCameraPermission).not.toHaveBeenCalled();
+
+    await act(async () => {
+      camera.props.onBarcodeScanned({ type: "qr", data: initial.qrPayload });
+      camera.props.onBarcodeScanned({ type: "qr", data: initial.qrPayload });
+      await Promise.resolve();
+    });
+    expect(VeilRuntime.confirmDirectIdentityVerificationQr).toHaveBeenCalledTimes(1);
+    expect(VeilRuntime.confirmDirectIdentityVerificationQr).toHaveBeenCalledWith(
+      direct.conversationId,
+      direct.directGeneration,
+      initial.qrPayload,
+    );
+    expect(root.findAllByProps({ testID: "identity-qr-camera" })).toHaveLength(0);
+    expect(root.findAllByType(Text).some(
+      (node) => node.props.children === "Verified on this device",
+    )).toBe(true);
+  });
+
+  it("does not publish verification when native rejects a scanned QR payload", async () => {
+    reduceMotion.mockResolvedValue(true);
+    const initial = {
+      canonicalServerOrigin: PROFILE.canonicalServerOrigin,
+      peerUserId: PROFILE.userId,
+      fingerprintVersion: "account_v2" as const,
+      fingerprintEmoji: "🔒🛡️🗝️⚡",
+      fingerprintHex: "ab".repeat(32),
+      qrPayload: `veil-identity:account-v2:${"ab".repeat(32)}`,
+      state: "identity_changed" as const,
+    };
+    jest.mocked(VeilRuntime.getDirectIdentityVerification).mockResolvedValue(initial);
+    jest.mocked(VeilRuntime.confirmDirectIdentityVerificationQr).mockResolvedValue(null);
+
+    const { root } = await renderSheet(jest.fn(), {
+      conversationId: "30000000-0000-4000-8000-000000000001",
+      directGeneration: 7,
+    });
+    await act(async () => {
+      root.findByProps({ testID: "scan-identity-verification" }).props.onPress();
+      await Promise.resolve();
+    });
+    await act(async () => {
+      root.findByProps({ testID: "identity-qr-camera" }).props.onBarcodeScanned({
+        type: "qr",
+        data: "veil-identity:account-v2:not-the-current-identity",
+      });
+      await Promise.resolve();
+    });
+
+    expect(root.findAllByType(Text).some(
+      (node) => node.props.children === "Verified on this device",
+    )).toBe(false);
+    expect(root.findAll((node) => node.props.accessibilityRole === "alert").some(
+      (node) => String(node.props.children).includes("No verification was recorded"),
+    )).toBe(true);
+  });
+
+  it("never publishes a verification claim returned for another account scope", async () => {
+    reduceMotion.mockResolvedValue(true);
+    jest.mocked(VeilRuntime.getDirectIdentityVerification).mockResolvedValue({
+      canonicalServerOrigin: PROFILE.canonicalServerOrigin,
+      peerUserId: "10000000-0000-4000-8000-000000000099",
+      fingerprintVersion: "account_v2",
+      fingerprintEmoji: "🔒🛡️🗝️⚡",
+      fingerprintHex: "ab".repeat(32),
+      qrPayload: `veil-identity:account-v2:${"ab".repeat(32)}`,
+      state: "verified_on_this_device",
+    });
+
+    const { root } = await renderSheet(jest.fn(), {
+      conversationId: "30000000-0000-4000-8000-000000000001",
+      directGeneration: 7,
+    });
+    expect(root.findAllByType(Text).some(
+      (node) => node.props.children === "Verified on this device",
+    )).toBe(false);
+    expect(root.findAllByType(Text).some(
+      (node) => node.props.children === "Safety number unavailable",
+    )).toBe(true);
+  });
 
   it("renders the server-visible profile disclosure and moves initial accessibility focus into the modal", async () => {
     reduceMotion.mockResolvedValue(true);
@@ -114,6 +318,11 @@ describe("IdentityIslandSheet interaction and accessibility boundary", () => {
     expect(root.findAll((node) =>
       node.props.accessibilityRole === "button" && node.props.accessibilityLabel === "Close identity",
     ).length).toBeGreaterThan(0);
+    expect(StyleSheet.flatten(root.findByProps({ testID: "identity-sheet-header" }).props.style))
+      .toMatchObject({ paddingLeft: 44, paddingRight: 20 });
+    expect(StyleSheet.flatten(
+      root.findByProps({ testID: "identity-sheet-content" }).props.contentContainerStyle,
+    )).toMatchObject({ paddingLeft: 44, paddingRight: 20 });
 
     act(() => root.findByType(Modal).props.onShow());
     expect(setAccessibilityFocus).toHaveBeenCalledTimes(1);

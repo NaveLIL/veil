@@ -10,6 +10,25 @@ import (
 	"testing"
 )
 
+func TestLegacyWebSocketRouteIsPermanentlyRetired(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "http://gateway.test/ws", nil)
+	request.Header.Set("Connection", "Upgrade")
+	request.Header.Set("Upgrade", "websocket")
+
+	retiredWebSocketHandler().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusGone {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusGone)
+	}
+	if recorder.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("Cache-Control = %q, want no-store", recorder.Header().Get("Cache-Control"))
+	}
+	if recorder.Header().Get("Connection") != "close" {
+		t.Fatalf("Connection = %q, want close", recorder.Header().Get("Connection"))
+	}
+}
+
 type pingerFunc func(context.Context) error
 
 func (f pingerFunc) Ping(ctx context.Context) error { return f(ctx) }

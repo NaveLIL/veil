@@ -29,13 +29,14 @@ const headerVeilUser = "X-Veil-Upload-User"
 // handler, the bearer middleware, the token-mint endpoint and the
 // background sweeper.
 type Service struct {
-	cfg       Config
-	tokenKey  []byte
-	store     Store
-	composer  *tusd.StoreComposer
-	tusHandle *tusd.Handler
-	fileStore filestore.FileStore
-	logger    *slog.Logger
+	cfg                Config
+	tokenKey           []byte
+	store              Store
+	composer           *tusd.StoreComposer
+	tusHandle          *tusd.Handler
+	fileStore          filestore.FileStore
+	logger             *slog.Logger
+	restAuthDispatcher *authmw.RESTAuthVersionDispatcher
 }
 
 // New wires a Service. tokenKey is the HMAC secret returned by
@@ -59,11 +60,12 @@ func New(cfg Config, tokenKey []byte, store Store, logger *slog.Logger) (*Servic
 	h := &hooks{store: store, cfg: cfg, logger: logger}
 
 	tusHandle, err := tusd.NewHandler(tusd.Config{
-		BasePath:             cfg.BasePath,
-		StoreComposer:        composer,
-		MaxSize:              cfg.MaxUploadSize,
-		DisableDownload:      true,
-		DisableConcatenation: true,
+		BasePath:                cfg.BasePath,
+		RespectForwardedHeaders: cfg.RespectForwardedHeaders,
+		StoreComposer:           composer,
+		MaxSize:                 cfg.MaxUploadSize,
+		DisableDownload:         true,
+		DisableConcatenation:    true,
 		// tusd's default logger records the raw request path, upload ID,
 		// generated URL and unfiltered storage errors. The gateway access log
 		// already provides bounded route-template observability, while the
@@ -94,22 +96,34 @@ func New(cfg Config, tokenKey []byte, store Store, logger *slog.Logger) (*Servic
 // callers may still mount the routes — every request returns 503.
 func (s *Service) Enabled() bool { return len(s.tokenKey) >= MinTokenKeyLen }
 
+// SetRESTAuthVersionDispatcher activates the REST v2 boundary for the signed
+// token-mint endpoint. Bearer-authenticated tus routes remain unchanged.
+func (s *Service) SetRESTAuthVersionDispatcher(dispatcher *authmw.RESTAuthVersionDispatcher) {
+	s.restAuthDispatcher = dispatcher
+}
+
 // RegisterRoutes mounts:
 //
 //	POST   /v1/uploads/token              — signed (X-Veil triplet)
 //	GET    /v1/uploads/blob/{id}          — bearer (download)
 //	*      /v1/uploads/files/...          — bearer (POST/PATCH/HEAD/DELETE)
 //
-// The signedMw wraps only the token endpoint; tusd's traffic uses the
-// bearer middleware to keep PATCH chunks from needing per-request
-// Ed25519 sigs.
+// The REST v2 dispatcher wraps only the token endpoint; tusd's traffic uses
+// bearer authorization so PATCH chunks do not need account signatures.
 func (s *Service) RegisterRoutes(mux *http.ServeMux, signedMw *authmw.Middleware, rl *authmw.RateLimit) {
 	signed := func(f http.HandlerFunc) http.HandlerFunc {
 		if rl != nil {
 			f = rl.Wrap(f)
 		}
-		if signedMw != nil {
-			f = signedMw.RequireSigned(f)
+		jsonPolicy, err := authmw.NewRESTAuthV2JSONHTTPPolicy(4 << 10)
+		if err != nil {
+			panic("invalid uploads REST v2 JSON policy")
+		}
+		if s.restAuthDispatcher != nil {
+			f = s.restAuthDispatcher.RequireSigned(jsonPolicy, f)
+		} else if signedMw != nil {
+			var unavailable *authmw.RESTAuthVersionDispatcher
+			f = unavailable.RequireSigned(jsonPolicy, f)
 		}
 		return f
 	}
@@ -148,8 +162,8 @@ func (s *Service) handleIssueToken(w http.ResponseWriter, r *http.Request) {
 			map[string]string{"error": "uploads disabled"})
 		return
 	}
-	userID := r.Header.Get("X-Veil-User")
-	if userID == "" {
+	userID, ok := authmw.VerifiedUserID(r.Context())
+	if !ok {
 		writeJSON(w, http.StatusUnauthorized,
 			map[string]string{"error": "unauthenticated"})
 		return

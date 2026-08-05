@@ -2,7 +2,7 @@ use bip39::Mnemonic;
 use ed25519_dalek::{SigningKey as Ed25519SigningKey, VerifyingKey as Ed25519VerifyingKey};
 use rand::rngs::OsRng;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519StaticSecret};
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::kdf;
 
@@ -30,8 +30,8 @@ impl IdentityKeyPair {
     /// Generate a new random identity (for testing or first-time setup before mnemonic backup).
     pub fn generate() -> Self {
         let mnemonic = generate_mnemonic();
-        Self::from_mnemonic(&mnemonic.to_string())
-            .expect("Generated mnemonic should always be valid")
+        let mnemonic_words = Zeroizing::new(mnemonic.to_string());
+        Self::from_mnemonic(&mnemonic_words).expect("Generated mnemonic should always be valid")
     }
 
     /// Derive identity from a BIP39 mnemonic phrase.
@@ -74,6 +74,30 @@ impl IdentityKeyPair {
             ed25519_signing,
             ed25519_verifying,
         })
+    }
+
+    /// Clone the keypair for background tasks.
+    /// This bypasses ZeroizeOnDrop cloning restrictions for when a distinct
+    /// background task requires its own copy of the keys.
+    pub fn clone_for_background(&self) -> Self {
+        let mut x_bytes = self.x25519_secret.to_bytes();
+        let mut e_bytes = self.ed25519_signing.to_bytes();
+
+        let x25519_secret = X25519StaticSecret::from(x_bytes);
+        let x25519_public = X25519PublicKey::from(&x25519_secret);
+
+        let ed25519_signing = Ed25519SigningKey::from_bytes(&e_bytes);
+        let ed25519_verifying = ed25519_signing.verifying_key();
+
+        x_bytes.zeroize();
+        e_bytes.zeroize();
+
+        Self {
+            x25519_secret,
+            x25519_public,
+            ed25519_signing,
+            ed25519_verifying,
+        }
     }
 
     /// X25519 public key bytes (32 bytes). Safe to share.

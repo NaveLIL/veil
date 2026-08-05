@@ -24,11 +24,13 @@ import (
 	"github.com/NaveLIL/veil/veil-server/internal/db"
 	"github.com/NaveLIL/veil/veil-server/internal/gateway"
 	"github.com/NaveLIL/veil/veil-server/internal/httpmw"
+	"github.com/NaveLIL/veil/veil-server/internal/logsafe"
 	"github.com/NaveLIL/veil/veil-server/internal/metrics"
 	"github.com/NaveLIL/veil/veil-server/internal/mls"
 	"github.com/NaveLIL/veil/veil-server/internal/profiles"
 	"github.com/NaveLIL/veil/veil-server/internal/push"
 	"github.com/NaveLIL/veil/veil-server/internal/servers"
+	veiltransparency "github.com/NaveLIL/veil/veil-server/internal/transparency"
 	"github.com/NaveLIL/veil/veil-server/internal/uploads"
 )
 
@@ -57,6 +59,14 @@ var robotsTxt []byte
 var sitemapXML []byte
 
 const projectRepositoryURL = "https://github.com/NaveLIL/veil"
+
+func retiredWebSocketHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Connection", "close")
+		w.Header().Set("Cache-Control", "no-store")
+		http.Error(w, "legacy WebSocket transport was removed; use /v3/events", http.StatusGone)
+	}
+}
 
 // buildCommit is replaced with the exact source commit by the release image
 // workflow. Local development builds deliberately fall back to the repository
@@ -151,7 +161,7 @@ func main() {
 	// Switch to structured JSON logging via slog (consumed by httpmw.AccessLog).
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})))
 
-	cfg, err := config.Load()
+	cfg, err := config.LoadGateway()
 	if err != nil {
 		log.Fatalf("configuration error: %v", err)
 	}
@@ -185,6 +195,51 @@ func main() {
 	if err := database.ValidateCryptographicPublicKeys(ctx); err != nil {
 		log.Fatalf("database cryptographic-key preflight failed: %v", err)
 	}
+	if err := database.AuditMembershipEpochsV1(ctx, cfg.PublicOrigin.String()); err != nil {
+		log.Fatalf("membership epoch startup audit failed: %v", err)
+	}
+	var identityTransparencySigner *auth.IdentityTransparencySigner
+	if cfg.IdentityTransparency != nil {
+		identityTransparencySigner, err = auth.NewIdentityTransparencySigner(
+			cfg.PublicOrigin,
+			cfg.IdentityTransparency.SigningSeed,
+		)
+		clear(cfg.IdentityTransparency.SigningSeed[:])
+		if err != nil {
+			log.Fatalf("identity transparency signer configuration failed: %v", err)
+		}
+		if len(cfg.IdentityTransparency.Witnesses) != 0 {
+			endpoints := make([]veiltransparency.WitnessEndpoint, len(cfg.IdentityTransparency.Witnesses))
+			for index := range cfg.IdentityTransparency.Witnesses {
+				endpoints[index] = veiltransparency.WitnessEndpoint{
+					URL:        cfg.IdentityTransparency.Witnesses[index].URL,
+					SigningKey: cfg.IdentityTransparency.Witnesses[index].SigningKey,
+				}
+			}
+			witnessQuorum, witnessErr := veiltransparency.NewHTTPWitnessQuorum(
+				endpoints, cfg.IdentityTransparency.WitnessThreshold, database,
+			)
+			if witnessErr != nil {
+				log.Fatalf("identity transparency witness configuration failed: %v", witnessErr)
+			}
+			identityTransparencySigner.SetWitnessCosigner(witnessQuorum)
+			log.Printf(
+				"identity transparency external witnesses enabled: configured=%d quorum=%d",
+				len(endpoints), cfg.IdentityTransparency.WitnessThreshold,
+			)
+		}
+		defer identityTransparencySigner.Destroy()
+		publicKey := identityTransparencySigner.PublicKey()
+		if err := database.EnableIdentityTransparencyLog(
+			ctx,
+			cfg.PublicOrigin,
+			identityTransparencySigner.LogID(),
+			publicKey[:],
+		); err != nil {
+			log.Fatalf("identity transparency activation failed: %v", err)
+		}
+		log.Println("identity transparency account-registration log enabled")
+	}
 	log.Println("database connected")
 
 	// Initialize services
@@ -193,6 +248,7 @@ func main() {
 
 	// Start hub
 	hub := gateway.NewHub(authSvc, chatSvc)
+	chatSvc.SetBroadcaster(hub)
 	if err := gateway.ConfigureFromEnv(); err != nil {
 		log.Fatalf("gateway config: %v", err)
 	}
@@ -200,8 +256,9 @@ func main() {
 
 	// HTTP routes
 	mux := http.NewServeMux()
-	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
-		gateway.HandleWebSocket(hub, w, r)
+	mux.HandleFunc("/ws", retiredWebSocketHandler())
+	mux.HandleFunc("/v3/events", func(w http.ResponseWriter, r *http.Request) {
+		gateway.HandleWebSocketV3(hub, w, r)
 	})
 
 	// Servers / Channels / Roles / Invites REST endpoints
@@ -209,10 +266,29 @@ func main() {
 
 	// Shared signature middleware + per-user rate limit. The middleware reads
 	// signing keys via the servers service (any of the three would do; they
-	// all share the same DB). The legacy unsigned bypass was removed in W3 —
-	// every REST call must carry the X-Veil-{User,Timestamp,Signature} triplet.
+	// all share the same DB). Every authenticated REST route is v2-only and
+	// requires the exact version/user/timestamp/nonce/signature proof set.
 	signedMw := authmw.New(serversSvc.SigningKeyLookup())
 	defer signedMw.Close()
+	restV2Verifier, err := authmw.NewRESTAuthV2Verifier(
+		cfg.PublicOrigin,
+		serversSvc.SigningKeyLookup(),
+		database,
+	)
+	if err != nil {
+		log.Fatalf("REST auth v2 verifier configuration: %v", err)
+	}
+	restV2Boundary, err := authmw.NewRESTAuthV2HTTPBoundary(restV2Verifier, signedMw)
+	if err != nil {
+		log.Fatalf("REST auth v2 HTTP boundary configuration: %v", err)
+	}
+	restDispatcher, err := authmw.NewRESTAuthVersionDispatcher(restV2Boundary)
+	if err != nil {
+		log.Fatalf("REST auth version dispatcher configuration: %v", err)
+	}
+	replayJanitorCtx, replayJanitorCancel := context.WithCancel(context.Background())
+	defer replayJanitorCancel()
+	go runRESTAuthV2ReplayJanitor(replayJanitorCtx, database)
 	rl := authmw.NewRateLimit(240, time.Minute) // 4 req/sec sustained, burst 240
 	defer rl.Close()
 	profileMutationRL := authmw.NewRateLimit(12, time.Minute)
@@ -224,9 +300,12 @@ func main() {
 
 	// Auth REST endpoints (prekeys, devices, user lookup)
 	authHandler := auth.NewHandler(authSvc, signedMw, rl)
+	authHandler.SetRESTAuthVersionDispatcher(restDispatcher)
+	authHandler.SetIdentityTransparencySigner(identityTransparencySigner)
 	authHandler.RegisterRoutes(mux)
 	profileStore := profiles.NewPostgresStore(database.Pool)
 	profilesHandler := profiles.NewHandler(profileStore, signedMw, rl, profileMutationRL, hub)
+	profilesHandler.SetRESTAuthVersionDispatcher(restDispatcher)
 	profilesHandler.RegisterRoutes(mux)
 	avatarJanitorCtx, avatarJanitorCancel := context.WithCancel(context.Background())
 	defer avatarJanitorCancel()
@@ -234,9 +313,11 @@ func main() {
 
 	// Chat REST endpoints (message sync, conversations)
 	chatHandler := chat.NewHandler(chatSvc, signedMw, rl)
+	chatHandler.SetRESTAuthVersionDispatcher(restDispatcher)
 	chatHandler.RegisterRoutes(mux)
 
 	serversHandler := servers.NewHandler(serversSvc, signedMw, rl)
+	serversHandler.SetRESTAuthVersionDispatcher(restDispatcher)
 	veilPreviewRL := authmw.NewRateLimit(30, time.Minute)
 	defer veilPreviewRL.Close()
 	veilJoinRL := authmw.NewRateLimit(10, time.Minute)
@@ -266,6 +347,7 @@ func main() {
 	})
 	hub.SetPushNotifier(pushDispatcher)
 	pushHandler := push.NewHandlerWithEndpointPolicy(database, signedMw, rl, pushEndpointPolicy)
+	pushHandler.SetRESTAuthVersionDispatcher(restDispatcher)
 	pushHandler.SetDispatcher(pushDispatcher)
 	pushHandler.RegisterRoutes(mux)
 	if pushDispatcher.Enabled() {
@@ -277,6 +359,7 @@ func main() {
 	// arrive at online recipients in real time without polling.
 	mlsStore := mls.NewStore(database.Pool)
 	mlsHandler := mls.NewHandler(mlsStore, signedMw, rl, hub)
+	mlsHandler.SetRESTAuthVersionDispatcher(restDispatcher)
 	mlsHandler.RegisterRoutes(mux)
 
 	// Phase 3 — tus.io resumable encrypted uploads. The token-mint
@@ -292,6 +375,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("uploads: %v", err)
 	}
+	uploadSvc.SetRESTAuthVersionDispatcher(restDispatcher)
 	uploadSvc.RegisterRoutes(mux, signedMw, rl)
 	if uploadSvc.Enabled() {
 		log.Printf("uploads enabled (dir=%s, quota=%d/%s)",
@@ -448,7 +532,7 @@ func main() {
 
 	// Internal listener for Prometheus + future pprof. Bound to a
 	// non-public address by default so the docker-compose `ports:` mapping
-	// only exposes /health and /ws to the internet.
+	// only exposes the public gateway routes to the internet.
 	var internalSrv *http.Server
 	if internalAddr != "" {
 		internalMux := http.NewServeMux()
@@ -484,6 +568,46 @@ func main() {
 
 type pinger interface {
 	Ping(context.Context) error
+}
+
+type restAuthV2ReplayCleaner interface {
+	DeleteExpiredRESTAuthV2ReplayNonces(context.Context, int) (int64, error)
+}
+
+func runRESTAuthV2ReplayJanitor(ctx context.Context, cleaner restAuthV2ReplayCleaner) {
+	if ctx == nil || cleaner == nil {
+		return
+	}
+	cleanup := func() {
+		for range 4 {
+			cleanupCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			deleted, err := cleaner.DeleteExpiredRESTAuthV2ReplayNonces(
+				cleanupCtx,
+				db.MaxRESTAuthV2ReplayCleanupBatch,
+			)
+			cancel()
+			if err != nil {
+				if ctx.Err() == nil {
+					log.Printf("REST auth v2 replay cleanup failed: class=%s", logsafe.ErrorClass(err))
+				}
+				return
+			}
+			if deleted < db.MaxRESTAuthV2ReplayCleanupBatch {
+				return
+			}
+		}
+	}
+	cleanup()
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			cleanup()
+		}
+	}
 }
 
 func readinessHandler(database pinger) http.HandlerFunc {

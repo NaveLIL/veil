@@ -76,7 +76,7 @@ describe("origin-scoped renderer boundary", () => {
 
   it("clears origin state and invalidates late work before switching instances", () => {
     appStore.setServerEndpoints(
-      "wss://alpha.example.test/ws",
+      "wss://alpha.example.test/v3/events",
       "https://alpha.example.test",
     );
     appStore.setUserId(USER_ID);
@@ -104,7 +104,7 @@ describe("origin-scoped renderer boundary", () => {
     const staleEpoch = captureUiSessionEpoch();
     const previousOriginEpoch = appStore.originEpoch();
     const change = appStore.setServerEndpoints(
-      "wss://beta.example.test/ws",
+      "wss://beta.example.test/v3/events",
       "https://beta.example.test",
     );
 
@@ -163,7 +163,7 @@ describe("origin-scoped renderer boundary", () => {
     await appStore.setupEventListeners();
     const mockedInvoke = vi.mocked(invoke);
     appStore.setServerEndpoints(
-      "wss://beta.example.test/ws",
+      "wss://beta.example.test/v3/events",
       "https://beta.example.test",
     );
     mockedInvoke.mockImplementation(async (command: string) => {
@@ -228,7 +228,7 @@ describe("origin-scoped renderer boundary", () => {
     const mockedInvoke = vi.mocked(invoke);
     const serverId = "550e8400-e29b-41d4-a716-446655440060";
     appStore.setServerEndpoints(
-      "wss://members.example.test/ws",
+      "wss://members.example.test/v3/events",
       "https://members.example.test",
     );
     mockedInvoke.mockImplementation(async (command: string) => {
@@ -300,7 +300,7 @@ describe("origin-scoped renderer boundary", () => {
     const peerUserId = "550e8400-e29b-41d4-a716-446655440071";
     const expectedPeerIdentityKey = "42".repeat(32);
     appStore.setServerEndpoints(
-      "wss://dm.example.test/ws",
+      "wss://dm.example.test/v3/events",
       "https://dm.example.test",
     );
     mockedInvoke.mockImplementation(async (command: string) => {
@@ -387,11 +387,11 @@ describe("origin-scoped renderer boundary", () => {
       return undefined as never;
     });
 
-    appStore.setServerEndpoints("wss://alpha.example.test/ws", "https://alpha.example.test/");
+    appStore.setServerEndpoints("wss://alpha.example.test/v3/events", "https://alpha.example.test/");
     const alpha = appStore.connectToServer();
-    appStore.setServerEndpoints("wss://queued.example.test/ws", "https://queued.example.test/");
+    appStore.setServerEndpoints("wss://queued.example.test/v3/events", "https://queued.example.test/");
     const queued = appStore.connectToServer();
-    appStore.setServerEndpoints("wss://latest.example.test/ws", "https://latest.example.test/");
+    appStore.setServerEndpoints("wss://latest.example.test/v3/events", "https://latest.example.test/");
     const latest = appStore.connectToServer();
 
     alphaConnect.resolve({

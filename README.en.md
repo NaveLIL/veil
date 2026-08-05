@@ -35,33 +35,59 @@ only invites an existing account into a Space.
 
 Substantial Preview implementations exist for:
 
-- native Rust identity, X3DH, Double Ratchet, authenticated Sender Keys v5,
+- native Rust identity, X3DH, Double Ratchet, membership-bound Sender Keys v6
+  with explicit v5 history compatibility,
   encrypted attachment primitives, and recovery foundations;
 - origin-scoped SQLCipher storage and a process-memory-only local search index;
-- signed REST/WebSocket transport with Protobuf contracts;
+- origin/account/device-bound REST v2 and WebSocket v3 transport with durable
+  replay protection and Protobuf contracts. `/v3/events` is the live client
+  endpoint; legacy `/ws` is disabled unless an explicit server-only emergency
+  rollback flag is set, and clients never auto-downgrade;
 - Direct, Circle, and structured Space/Room product surfaces and ACLs;
 - a Tauri v2 desktop client with a SolidJS interface;
 - a Go Veil Node gateway with PostgreSQL, uploads, push wake-ups, profiles,
   invitations, and release/download pages;
-- an Android/mobile foundation through React Native and UniFFI.
+- a closed Android Direct Preview through React Native, Kotlin, and UniFFI:
+  Node Access Pass registration, Keystore/SQLCipher runtime, receive/read,
+  one-shot peer-prekey, idempotent send/outbox, guarded reconnect, atomic vault,
+  native recovery, whole-app lifecycle authority, and host-tested durable
+  non-secret identity-setup reconciliation are implemented. Android Activity
+  recreation and OS process-death cases A04/A05 remain unexecuted.
 
 Implemented code is not the same as release evidence. The authoritative phase
 status and remaining physical/device matrices are tracked in
 [INTEGRATION_ROADMAP.md](INTEGRATION_ROADMAP.md) and the
 [completion reviews](docs/README.md#reviews-и-completion-gates).
+The exact 2026-08-04 beta handoff, current red checks, and local unsigned macOS
+x86_64 build evidence are recorded in the
+[beta integration and macOS checkpoint](docs/reviews/beta-integration-macos-2026-08-04.md).
 
 ## What is not complete
 
 - There is no stable, independently audited release.
-- Mobile production messaging, calls, and the MLS runtime are not enabled as
-  complete user features.
-- Key transparency is not implemented; the current model is service-mediated
-  TOFU with explicit local fingerprint verification.
+- Android still lacks the full Desktop ↔ Android send/outbox/reconnect/airplane/
+  process-death device matrix, connected recovery/capture instrumentation,
+  app-wide public failure codes, and signed standalone tester distribution.
+  Its native Direct runtime reliably opens and services only the authenticated
+  existing Direct directory. Baseline `f6dbf5a` adds screens and FFI/Kotlin/
+  request scaffolding for user search, friend requests, and Direct creation,
+  but the generated Kotlin bindings and route/header/transport contracts do not
+  yet match the gateway. This is not a completed mobile contact flow.
+  `PublicFailureCodeV1` currently covers Android identity setup and the secure
+  runtime gate; Direct session/send/delivery and desktop/Go consumers remain
+  open. Calls and the MLS runtime are not enabled as complete user features.
+- Identity Transparency v1 verifies Node-signed Merkle inclusion/consistency,
+  pins accepted history, and supports independent witness quorum and public
+  checkpoint gossip. The repository does not operate the independent witness
+  service; explicit local fingerprint/QR verification remains authoritative.
 - Platform signing, multi-device, attachment, and distributor matrices still
   require release evidence.
 - There is no full browser client. Web surfaces are deliberately limited to
-  the project site, origin-hosted Node Access and Space invitation pages, and
-  a narrow one-time Share Viewer.
+  the project site and origin-hosted Node Access and Space invitation pages.
+  A narrow Secure Share Viewer is planned, but the current WASM module is an
+  unwired prototype rather than a working public service.
+- Node-wide administration, an in-product report queue, and the production
+  guest Secure Share flow are planned contracts, not completed Preview features.
 
 ## Security boundary
 
@@ -70,10 +96,22 @@ inside the native Rust boundary. Sending fails closed when the required
 session, roster proof, or Sender Key is unavailable; there is no plaintext
 fallback.
 
+On Android, recovery material is displayed only inside a screenshot-protected
+native Activity and is excluded from React Native, clipboard, autofill,
+accessibility, content capture, and the system IME. An interrupted result remains
+unknown until a strict native durable-vault check; a recovery phrase is never
+discarded based on a failed or unsettled check.
+
 The Veil Node stores and routes ciphertext, but it still sees unavoidable
 routing metadata such as network addresses, timing, sizes, account and
 conversation membership, and delivery state. E2EE does not hide that metadata.
-The canonical HTTPS origin is part of account identity.
+The canonical HTTPS origin is part of the account model. Desktop and Android
+use exact REST v2 and `/v3/events` WS v3 contracts through the Rust/FFI/native
+boundaries. Production rejects missing/legacy proofs without fallback. A
+disposable PostgreSQL hostile two-Node relay/downgrade matrix and parser fuzz
+smoke are in CI. Cross-client/physical evidence, independently operated
+witnesses, signed release candidates, and independent review remain release
+gates.
 
 Files are encrypted before upload. Push payloads are restricted to generic
 wake-up signals without sender, message, conversation, or plaintext preview.
@@ -93,10 +131,10 @@ databases, or unsanitized logs in a public Issue.
 | **veil-search**, **veil-uploads** | In-memory search and encrypted transfer primitives |
 | **veil-ffi**, **veil-mls** | Mobile native boundary and experimental MLS foundation |
 | **veil-desktop** | Tauri/SolidJS desktop application |
-| **veil-mobile** | React Native/Expo mobile foundation |
+| **veil-mobile** | Closed Android Direct Preview using React Native, Kotlin, and Rust/UniFFI |
 | **veil-server** | Go Veil Node gateway and hosted web surfaces |
 | **veil-proto** | Protobuf wire contracts |
-| **veil-share-viewer** | Isolated one-time share viewer |
+| **veil-share-viewer** | Experimental viewer prototype; production Secure Share is not wired |
 | **deploy** | Production Compose, Nginx, backup, rollback, and smoke procedures |
 
 ## Build and run pointers

@@ -59,7 +59,7 @@ describe("exact search result store publication", () => {
   beforeEach(async () => {
     vi.mocked(invoke).mockReset();
     appStore.setServerEndpoints(
-      "wss://search.example.test/ws",
+      "wss://search.example.test/v3/events",
       "https://search.example.test",
     );
     vi.mocked(invoke).mockImplementation(async (command: string) => {

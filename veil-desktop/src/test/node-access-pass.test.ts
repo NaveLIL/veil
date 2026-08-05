@@ -38,7 +38,7 @@ describe("Node Access Pass renderer boundary", () => {
 
   it("derives a matching HTTPS/WSS endpoint pair from the bound origin", () => {
     expect(nodeAccessEndpointsFromOrigin("https://veil.erez.pro:443")).toEqual({
-      ws: "wss://veil.erez.pro/ws",
+      ws: "wss://veil.erez.pro/v3/events",
       http: "https://veil.erez.pro",
     });
     expect(() => nodeAccessEndpointsFromOrigin("http://veil.erez.pro:80")).toThrow(

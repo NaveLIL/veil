@@ -2,6 +2,7 @@ package chat
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"log"
@@ -11,6 +12,8 @@ import (
 	"github.com/NaveLIL/veil/veil-server/internal/db"
 	"github.com/NaveLIL/veil/veil-server/internal/logsafe"
 	pb "github.com/NaveLIL/veil/veil-server/pkg/proto/v1"
+	"github.com/google/uuid"
+	"google.golang.org/protobuf/proto"
 )
 
 var (
@@ -21,17 +24,49 @@ var (
 	ErrPreKeyAccessDenied           = errors.New("prekey access requires a shared conversation")
 	ErrMessageConversationMismatch  = errors.New("message does not belong to conversation")
 	ErrAttachmentAccess             = errors.New("attachment is unavailable or not owned by sender")
+	ErrSealedMessageUnsupported     = errors.New("sealed messages are unavailable until live and history storage have matching semantics")
 	ErrSecureMessageEditUnsupported = errors.New("editing Sender-Key group/channel messages requires an exact device-routed edit protocol")
+	ErrInvalidReaction              = errors.New("invalid reaction request")
+	ErrReactionLimitReached         = errors.New("message reaction limit reached")
+	ErrInvalidClientMessageID       = errors.New("client_message_id must be a canonical lowercase non-nil UUID")
+	ErrClientMessageIDConflict      = errors.New("client_message_id already identifies different send bytes")
+	ErrSendMessageUnknownFields     = errors.New("send_message contains unsupported protobuf fields")
+	ErrInvalidSendMessage           = errors.New("invalid send_message")
 )
+
+const sendMessageDigestDomain = "veil.message.send.v1\x00"
+
+// Broadcaster delivers non-authoritative conversation discovery hints to
+// online accounts. The exact directory is always resolved again through the
+// signed membership-scoped REST endpoint.
+type Broadcaster interface {
+	BroadcastToUsers(userIDs []string, env *pb.Envelope)
+}
 
 // Service handles message routing and prekey distribution.
 type Service struct {
-	db  *db.DB
-	cfg *config.Config
+	db    *db.DB
+	cfg   *config.Config
+	bcast Broadcaster
 }
 
 func NewService(database *db.DB, cfg *config.Config) *Service {
 	return &Service{db: database, cfg: cfg}
+}
+
+// SetBroadcaster wires the gateway after both mutually-referencing services
+// have been constructed. It is intended for startup use before serving calls.
+func (s *Service) SetBroadcaster(bcast Broadcaster) { s.bcast = bcast }
+
+func (s *Service) notifyConversationAvailable(userIDs []string, conversationID string) {
+	if s.bcast == nil || len(userIDs) == 0 || conversationID == "" {
+		return
+	}
+	s.bcast.BroadcastToUsers(userIDs, &pb.Envelope{
+		Payload: &pb.Envelope_ConversationAvailable{
+			ConversationAvailable: &pb.ConversationAvailable{ConversationId: conversationID},
+		},
+	})
 }
 
 // DB returns the underlying database handle.
@@ -39,9 +74,109 @@ func (s *Service) DB() *db.DB {
 	return s.db
 }
 
+// SendMessageResult is the durable result of one account-scoped send intent.
+// Replayed results are ACK-only and never eligible for a second live fan-out.
+type SendMessageResult struct {
+	MessageID        string
+	ServerTimestamp  time.Time
+	Recipients       []string
+	Replayed         bool
+	AckRosterVersion *uint64
+	MembershipEpoch  *uint64
+	MembershipHash   []byte
+}
+
+// CanonicalClientMessageID returns the wire correlation key only when it is a
+// canonical lowercase non-nil UUID. Invalid values must never be reflected.
+func CanonicalClientMessageID(msg *pb.SendMessage) (string, bool) {
+	if msg == nil || msg.ClientMessageId == "" {
+		return "", false
+	}
+	parsed, err := uuid.Parse(msg.ClientMessageId)
+	if err != nil || parsed == uuid.Nil || parsed.String() != msg.ClientMessageId {
+		return "", false
+	}
+	return msg.ClientMessageId, true
+}
+
+func validateAndDigestSendMessage(msg *pb.SendMessage) (string, [sha256.Size]byte, error) {
+	clientMessageID, valid := CanonicalClientMessageID(msg)
+	if !valid {
+		return "", [sha256.Size]byte{}, ErrInvalidClientMessageID
+	}
+	if len(msg.ProtoReflect().GetUnknown()) != 0 {
+		return "", [sha256.Size]byte{}, ErrSendMessageUnknownFields
+	}
+	encoded, err := (proto.MarshalOptions{Deterministic: true}).Marshal(msg)
+	if err != nil {
+		return "", [sha256.Size]byte{}, fmt.Errorf("marshal send_message digest: %w", err)
+	}
+	hasher := sha256.New()
+	_, _ = hasher.Write([]byte(sendMessageDigestDomain))
+	_, _ = hasher.Write(encoded)
+	var digest [sha256.Size]byte
+	copy(digest[:], hasher.Sum(nil))
+	return clientMessageID, digest, nil
+}
+
+func sendMessageResultFromDB(outcome *db.MessageSendOutcome) *SendMessageResult {
+	if outcome == nil {
+		return nil
+	}
+	return &SendMessageResult{
+		MessageID:        outcome.MessageID,
+		ServerTimestamp:  outcome.ServerTimestamp,
+		Replayed:         outcome.Replayed,
+		AckRosterVersion: outcome.AckRosterVersion,
+		MembershipEpoch:  outcome.MembershipEpoch,
+		MembershipHash:   append([]byte(nil), outcome.MembershipHash...),
+	}
+}
+
+func mapSendMessageStoreError(err error) error {
+	if errors.Is(err, db.ErrMessageSendIDConflict) {
+		return ErrClientMessageIDConflict
+	}
+	return err
+}
+
+func (s *Service) lookupSendMessageReplay(
+	ctx context.Context,
+	senderUserID string,
+	clientMessageID string,
+	digest [sha256.Size]byte,
+) (*SendMessageResult, error) {
+	outcome, err := s.db.LookupMessageSendOutcome(
+		ctx, senderUserID, clientMessageID, digest[:],
+	)
+	if err != nil {
+		return nil, mapSendMessageStoreError(err)
+	}
+	return sendMessageResultFromDB(outcome), nil
+}
+
+// LookupSendMessageReplay performs the authenticated early replay check. It
+// intentionally needs no current membership or roster state: the ledger is
+// the authority for an already accepted exact request.
+func (s *Service) LookupSendMessageReplay(ctx context.Context, senderUserID string, msg *pb.SendMessage) (*SendMessageResult, error) {
+	clientMessageID, digest, err := validateAndDigestSendMessage(msg)
+	if err != nil {
+		return nil, err
+	}
+	return s.lookupSendMessageReplay(ctx, senderUserID, clientMessageID, digest)
+}
+
 // HandleSendMessage processes a client's send_message request.
 // Returns: message ID, server timestamp, list of recipient user IDs for fan-out.
 func (s *Service) HandleSendMessage(ctx context.Context, senderUserID string, msg *pb.SendMessage) (string, time.Time, []string, error) {
+	result, err := s.HandleSendMessageResult(ctx, senderUserID, msg)
+	if err != nil {
+		return "", time.Time{}, nil, err
+	}
+	return result.MessageID, result.ServerTimestamp, result.Recipients, nil
+}
+
+func (s *Service) HandleSendMessageResult(ctx context.Context, senderUserID string, msg *pb.SendMessage) (*SendMessageResult, error) {
 	return s.handleSendMessage(ctx, senderUserID, msg, nil)
 }
 
@@ -49,19 +184,41 @@ func (s *Service) HandleSendMessage(ctx context.Context, senderUserID string, ms
 // required for every new group/channel row. DM callers continue through
 // HandleSendMessage with no Sender-Key context.
 func (s *Service) HandleSecureSendMessage(ctx context.Context, senderUserID string, msg *pb.SendMessage, security *db.MessageSecurityContext) (string, time.Time, []string, error) {
+	result, err := s.HandleSecureSendMessageResult(ctx, senderUserID, msg, security)
+	if err != nil {
+		return "", time.Time{}, nil, err
+	}
+	return result.MessageID, result.ServerTimestamp, result.Recipients, nil
+}
+
+func (s *Service) HandleSecureSendMessageResult(ctx context.Context, senderUserID string, msg *pb.SendMessage, security *db.MessageSecurityContext) (*SendMessageResult, error) {
 	return s.handleSendMessage(ctx, senderUserID, msg, security)
 }
 
-func (s *Service) handleSendMessage(ctx context.Context, senderUserID string, msg *pb.SendMessage, security *db.MessageSecurityContext) (string, time.Time, []string, error) {
-	// --- Validate ---
-	if msg == nil || msg.ConversationId == "" {
-		return "", time.Time{}, nil, errors.New("conversation_id required")
+func (s *Service) handleSendMessage(ctx context.Context, senderUserID string, msg *pb.SendMessage, security *db.MessageSecurityContext) (*SendMessageResult, error) {
+	clientMessageID, digest, err := validateAndDigestSendMessage(msg)
+	if err != nil {
+		return nil, err
+	}
+	// No sealed message has ever been accepted, so this static rejection can
+	// remain before the DB lookup and preserves the fail-closed no-storage path.
+	if msg.Sealed {
+		return nil, ErrSealedMessageUnsupported
+	}
+	replay, err := s.lookupSendMessageReplay(ctx, senderUserID, clientMessageID, digest)
+	if err != nil || replay != nil {
+		return replay, err
+	}
+
+	// --- Validate a new send ---
+	if msg.ConversationId == "" {
+		return nil, fmt.Errorf("%w: conversation_id required", ErrInvalidSendMessage)
 	}
 	if len(msg.Ciphertext) == 0 {
-		return "", time.Time{}, nil, errors.New("empty ciphertext")
+		return nil, fmt.Errorf("%w: empty ciphertext", ErrInvalidSendMessage)
 	}
 	if len(msg.Ciphertext) > s.cfg.MaxMessageSize {
-		return "", time.Time{}, nil, ErrMessageTooBig
+		return nil, ErrMessageTooBig
 	}
 
 	// --- Check membership ---
@@ -72,10 +229,10 @@ func (s *Service) handleSendMessage(ctx context.Context, senderUserID string, ms
 		db.PermViewChannel|db.PermSendMessages,
 	)
 	if err != nil {
-		return "", time.Time{}, nil, fmt.Errorf("check membership: %w", err)
+		return nil, fmt.Errorf("check membership: %w", err)
 	}
 	if !isMember {
-		return "", time.Time{}, nil, ErrNotMember
+		return nil, ErrNotMember
 	}
 
 	// --- Compute TTL ---
@@ -96,22 +253,22 @@ func (s *Service) handleSendMessage(ctx context.Context, senderUserID string, ms
 		SecurityContext: security,
 	}
 	if len(msg.Attachments) > 32 {
-		return "", time.Time{}, nil, errors.New("too many attachments")
+		return nil, fmt.Errorf("%w: too many attachments", ErrInvalidSendMessage)
 	}
 	seenAttachments := make(map[string]struct{}, len(msg.Attachments))
 	for position, attachment := range msg.Attachments {
 		if attachment == nil || !validAttachmentFileID(attachment.MediaId) {
-			return "", time.Time{}, nil, errors.New("invalid attachment media_id")
+			return nil, fmt.Errorf("%w: invalid attachment media_id", ErrInvalidSendMessage)
 		}
 		if _, duplicate := seenAttachments[attachment.MediaId]; duplicate {
-			return "", time.Time{}, nil, errors.New("duplicate attachment media_id")
+			return nil, fmt.Errorf("%w: duplicate attachment media_id", ErrInvalidSendMessage)
 		}
 		seenAttachments[attachment.MediaId] = struct{}{}
 		if len(attachment.EncryptedKey) == 0 || len(attachment.EncryptedKey) > 4096 ||
 			len(attachment.Nonce) == 0 || len(attachment.Nonce) > 64 ||
 			attachment.ContentType != "application/octet-stream" ||
 			attachment.Size > uint64(1<<63-1) {
-			return "", time.Time{}, nil, errors.New("invalid encrypted attachment metadata")
+			return nil, fmt.Errorf("%w: invalid encrypted attachment metadata", ErrInvalidSendMessage)
 		}
 		dbMsg.Attachments = append(dbMsg.Attachments, db.MessageAttachment{
 			FileID:       attachment.MediaId,
@@ -124,39 +281,78 @@ func (s *Service) handleSendMessage(ctx context.Context, senderUserID string, ms
 	}
 	if msg.ReplyToId != nil {
 		if *msg.ReplyToId == "" {
-			return "", time.Time{}, nil, errors.New("reply_to_id cannot be empty")
+			return nil, fmt.Errorf("%w: reply_to_id cannot be empty", ErrInvalidSendMessage)
 		}
 		dbMsg.ReplyToID = msg.ReplyToId
 	}
 
-	if err := s.db.StoreMessage(ctx, dbMsg); err != nil {
+	outcome, err := s.db.StoreMessageIdempotent(ctx, dbMsg, clientMessageID, digest[:])
+	if err != nil {
 		if errors.Is(err, db.ErrReplyTargetMismatch) {
-			return "", time.Time{}, nil, ErrMessageConversationMismatch
+			return nil, ErrMessageConversationMismatch
 		}
 		if errors.Is(err, db.ErrAttachmentScope) {
-			return "", time.Time{}, nil, ErrAttachmentAccess
+			return nil, ErrAttachmentAccess
+		}
+		if errors.Is(err, db.ErrMessageSendIDConflict) {
+			return nil, ErrClientMessageIDConflict
 		}
 		if errors.Is(err, db.ErrMessageSecurityContext) || errors.Is(err, db.ErrMessageRosterChanged) {
-			return "", time.Time{}, nil, err
+			return nil, err
 		}
-		return "", time.Time{}, nil, fmt.Errorf("store message: %w", err)
+		return nil, fmt.Errorf("store message: %w", err)
+	}
+	result := sendMessageResultFromDB(outcome)
+	if result.Replayed {
+		return result, nil
 	}
 
-	// --- Get recipients for fan-out ---
-	members, err := s.db.GetAuthorizedConversationMembers(ctx, msg.ConversationId, db.ChannelReadPermissions)
+	// Recipient resolution happens after StoreMessage commits. It is therefore
+	// deliberately best-effort: returning an error here would tell the sender
+	// that a durable message failed and could cause a duplicate retry. On a
+	// lookup failure the caller still ACKs the committed row, while live fan-out
+	// is skipped and reconnect/history remains the source of truth.
+	result.Recipients = committedChatRecipients(
+		ctx, s.db, dbMsg.ID, msg.ConversationId, senderUserID,
+	)
+	return result, nil
+}
+
+type authorizedConversationMemberLookup interface {
+	GetAuthorizedConversationMembers(context.Context, string, uint64) ([]string, error)
+}
+
+// committedChatRecipients cannot report an error by design. Its caller is
+// already past a durable send/edit/delete/reaction commit boundary and must
+// never turn a fan-out lookup failure into a mutation failure visible to the
+// client.
+func committedChatRecipients(
+	ctx context.Context,
+	store authorizedConversationMemberLookup,
+	messageID string,
+	conversationID string,
+	senderUserID string,
+) []string {
+	members, err := store.GetAuthorizedConversationMembers(
+		ctx, conversationID, db.ChannelReadPermissions,
+	)
 	if err != nil {
-		return "", time.Time{}, nil, fmt.Errorf("get members: %w", err)
+		log.Printf(
+			"committed chat mutation recipient lookup failed: message_ref=%s conversation_ref=%s class=%s",
+			logsafe.Ref("message", messageID),
+			logsafe.Ref("conversation", conversationID),
+			logsafe.ErrorClass(err),
+		)
+		return nil
 	}
 
-	// Filter out sender
-	var recipients []string
+	recipients := make([]string, 0, len(members))
 	for _, uid := range members {
 		if uid != senderUserID {
 			recipients = append(recipients, uid)
 		}
 	}
-
-	return dbMsg.ID, dbMsg.CreatedAt, recipients, nil
+	return recipients
 }
 
 func validAttachmentFileID(fileID string) bool {
@@ -219,17 +415,9 @@ func (s *Service) HandleEditMessage(ctx context.Context, senderUserID string, ms
 		return "", time.Time{}, nil, fmt.Errorf("edit message: %w", err)
 	}
 
-	members, err := s.db.GetAuthorizedConversationMembers(ctx, convID, db.ChannelReadPermissions)
-	if err != nil {
-		return "", time.Time{}, nil, fmt.Errorf("get members: %w", err)
-	}
-
-	var recipients []string
-	for _, uid := range members {
-		if uid != senderUserID {
-			recipients = append(recipients, uid)
-		}
-	}
+	recipients := committedChatRecipients(
+		ctx, s.db, msg.MessageId, convID, senderUserID,
+	)
 	return convID, editedAt, recipients, nil
 }
 
@@ -261,73 +449,56 @@ func (s *Service) HandleDeleteMessage(ctx context.Context, senderUserID string, 
 		return "", time.Time{}, nil, fmt.Errorf("delete message: %w", err)
 	}
 
-	members, err := s.db.GetAuthorizedConversationMembers(ctx, convID, db.ChannelReadPermissions)
-	if err != nil {
-		return "", time.Time{}, nil, fmt.Errorf("get members: %w", err)
-	}
-
-	var recipients []string
-	for _, uid := range members {
-		if uid != senderUserID {
-			recipients = append(recipients, uid)
-		}
-	}
+	recipients := committedChatRecipients(
+		ctx, s.db, msg.MessageId, convID, senderUserID,
+	)
 	return convID, deletedAt, recipients, nil
 }
 
 // HandleReaction processes a client's reaction_update request.
-// Returns: list of recipient user IDs for fan-out.
-func (s *Service) HandleReaction(ctx context.Context, senderUserID string, msg *pb.ReactionUpdate) ([]string, error) {
+// Returns the recipient user IDs and whether durable state changed. Exact
+// retries are acknowledged but must not produce a duplicate fan-out event.
+func (s *Service) HandleReaction(ctx context.Context, senderUserID string, msg *pb.ReactionUpdate) ([]string, bool, error) {
 	if msg == nil || msg.MessageId == "" || msg.ConversationId == "" {
-		return nil, errors.New("message_id and conversation_id required")
+		return nil, false, fmt.Errorf("%w: message_id and conversation_id required", ErrInvalidReaction)
 	}
 	if msg.Emoji == "" || len(msg.Emoji) > 64 {
-		return nil, errors.New("emoji must be between 1 and 64 bytes")
+		return nil, false, fmt.Errorf("%w: emoji must be between 1 and 64 bytes", ErrInvalidReaction)
+	}
+	if _, err := uuid.Parse(msg.MessageId); err != nil {
+		return nil, false, fmt.Errorf("%w: malformed message_id", ErrInvalidReaction)
+	}
+	if _, err := uuid.Parse(msg.ConversationId); err != nil {
+		return nil, false, fmt.Errorf("%w: malformed conversation_id", ErrInvalidReaction)
 	}
 
-	isMember, err := s.db.CanAccessConversation(
-		ctx,
-		msg.ConversationId,
-		senderUserID,
-		db.PermViewChannel|db.PermSendMessages,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("check membership: %w", err)
-	}
-	if !isMember {
-		return nil, ErrNotMember
-	}
-
-	matches, err := s.db.MessageBelongsToConversation(ctx, msg.MessageId, msg.ConversationId)
-	if err != nil {
-		return nil, fmt.Errorf("check reaction message: %w", err)
-	}
-	if !matches {
-		return nil, ErrMessageConversationMismatch
-	}
-
+	var changed bool
+	var err error
 	if msg.Add {
-		if err := s.db.AddReaction(ctx, msg.MessageId, msg.ConversationId, senderUserID, msg.Emoji); err != nil {
-			return nil, fmt.Errorf("add reaction: %w", err)
-		}
+		changed, err = s.db.AddReaction(ctx, msg.MessageId, msg.ConversationId, senderUserID, msg.Emoji)
 	} else {
-		if err := s.db.RemoveReaction(ctx, msg.MessageId, msg.ConversationId, senderUserID, msg.Emoji); err != nil {
-			return nil, fmt.Errorf("remove reaction: %w", err)
-		}
+		changed, err = s.db.RemoveReaction(ctx, msg.MessageId, msg.ConversationId, senderUserID, msg.Emoji)
 	}
-
-	members, err := s.db.GetAuthorizedConversationMembers(ctx, msg.ConversationId, db.ChannelReadPermissions)
 	if err != nil {
-		return nil, fmt.Errorf("get members: %w", err)
-	}
-
-	var recipients []string
-	for _, uid := range members {
-		if uid != senderUserID {
-			recipients = append(recipients, uid)
+		switch {
+		case errors.Is(err, db.ErrConversationAccessDenied):
+			return nil, false, ErrNotMember
+		case errors.Is(err, db.ErrMessageMutationScope):
+			return nil, false, ErrMessageConversationMismatch
+		case errors.Is(err, db.ErrReactionLimitReached):
+			return nil, false, ErrReactionLimitReached
+		default:
+			return nil, false, fmt.Errorf("mutate reaction: %w", err)
 		}
 	}
-	return recipients, nil
+	if !changed {
+		return nil, false, nil
+	}
+
+	recipients := committedChatRecipients(
+		ctx, s.db, msg.MessageId, msg.ConversationId, senderUserID,
+	)
+	return recipients, true, nil
 }
 
 // HandlePreKeyRequest fetches a prekey bundle for establishing an X3DH session.
@@ -438,7 +609,20 @@ func (s *Service) CreateCircle(ctx context.Context, name, creatorUserID string, 
 		}
 		seen[member.UserID] = struct{}{}
 	}
-	return s.db.CreateGroupWithMembers(ctx, name, creatorUserID, members)
+	conversationID, err := s.db.CreateGroupWithMembers(ctx, name, creatorUserID, members)
+	if err != nil {
+		return "", err
+	}
+	recipients := make([]string, 0, len(members)+1)
+	recipients = append(recipients, creatorUserID)
+	for _, member := range members {
+		recipients = append(recipients, member.UserID)
+	}
+	// The DB transaction is committed before this hint. The creator can now
+	// safely distribute Sender-Key state knowing every online invitee receives
+	// and hydrates the directory hint first on its ordered WS queue.
+	s.notifyConversationAvailable(recipients, conversationID)
+	return conversationID, nil
 }
 
 // AddGroupMember adds a user to a group. Only admins/owners can add.
@@ -462,7 +646,11 @@ func (s *Service) AddGroupMember(ctx context.Context, convID, requesterID, targe
 		return fmt.Errorf("target user not found: %w", err)
 	}
 
-	return s.db.AddGroupMember(ctx, convID, targetUserID, 0) // role=0 member
+	if err := s.db.AddGroupMember(ctx, convID, targetUserID, 0); err != nil {
+		return err
+	}
+	s.notifyConversationAvailable([]string{targetUserID}, convID)
+	return nil
 }
 
 // RemoveGroupMember removes a user from a group.

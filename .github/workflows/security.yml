@@ -2,12 +2,16 @@ name: Security Audit
 
 on:
   push:
-    branches: [master, main]
+    branches: [master, main, "ds/beta-all-2026-07-21"]
   pull_request:
     branches: [master, main]
   schedule:
     # Run weekly on Monday at 06:00 UTC
     - cron: "0 6 * * 1"
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.head.ref || github.ref_name }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -17,7 +21,7 @@ jobs:
     name: Release SSH Helper
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
 
@@ -29,7 +33,7 @@ jobs:
     name: Cargo Audit (CVE scan)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
@@ -38,13 +42,18 @@ jobs:
         run: cargo install cargo-audit --version 0.22.2 --locked
 
       - name: Run cargo audit
-        run: cargo audit
+        # Tauri's Linux WebKitGTK stack still pins glib 0.18.5. The advisory is
+        # limited to VariantStrIter methods Veil does not call and cannot be
+        # upgraded independently of the Tauri runtime. Keep that single,
+        # reviewed exception explicit while making every new unsound advisory
+        # a hard failure.
+        run: cargo audit --deny unsound --ignore RUSTSEC-2024-0429
 
   cargo-deny:
     name: Cargo Deny (licenses + advisories)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Install cargo-deny
         uses: EmbarkStudios/cargo-deny-action@8f84122a46a358a27cb0625d85ad60ab436a1b87 # v2
@@ -56,16 +65,16 @@ jobs:
     name: Go Vulnerability Scan
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Set up Go
-        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version: "1.26.5"
           cache-dependency-path: veil-server/go.sum
 
       - name: Install govulncheck
-        run: go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
 
       - name: Scan reachable Go code
         working-directory: veil-server
@@ -75,17 +84,15 @@ jobs:
     name: Desktop Dependency Audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
-      # pnpm 10 uses npm's retired quick-audit endpoints. pnpm 11 uses the
-      # supported bulk advisory API while auditing the committed lockfile.
-      # Build/install jobs stay on pnpm 10 until overrides move to
-      # pnpm-workspace.yaml; this audit-only job does not rewrite the lockfile.
-      - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
+      # pnpm 11 uses the supported bulk advisory API while auditing the
+      # committed lockfile. Security overrides live in pnpm-workspace.yaml.
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
           version: 11.13.0
 
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
 
@@ -97,15 +104,15 @@ jobs:
     name: Mobile Dependency Audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       # Keep this aligned with desktop-audit so registry API behavior cannot
       # diverge between the two JavaScript dependency gates.
-      - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
           version: 11.13.0
 
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
 
@@ -117,7 +124,7 @@ jobs:
     name: Third-party Notice Generation
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
@@ -126,18 +133,18 @@ jobs:
         run: cargo install cargo-about --version 0.9.1 --locked --features cli
 
       - name: Install Go
-        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version: "1.26.5"
           cache-dependency-path: veil-server/go.sum
 
       - name: Install pnpm
-        uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
           version: 10.29.2
 
       - name: Install Node.js
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
           cache: pnpm
@@ -168,17 +175,20 @@ jobs:
     name: Zeroize Compliance
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Check for raw secret patterns without zeroize
         run: |
           echo "=== Checking for potential unzeroized secrets ==="
 
           # Files that handle secrets must import zeroize
-          # signature/chunked_aead only borrow keys owned by zeroizing types;
-          # public_key validates public material only. None retain raw private
-          # material themselves.
-          CRYPTO_FILES=$(find veil-crypto/src -name "*.rs" ! -name "lib.rs" ! -name "fingerprint.rs" ! -name "signature.rs" ! -name "chunked_aead.rs" ! -name "public_key.rs")
+          # signature/chunked_aead/x25519 only borrow keys owned by zeroizing
+          # types; public_key validates public material only. Membership and
+          # transparency production code encode/verify public keys, hashes,
+          # signatures, and public commitments only; their fixed test-vector
+          # seeds are synthetic fixtures, never runtime secret ownership.
+          # None of these reviewed modules retain raw private material.
+          CRYPTO_FILES=$(find veil-crypto/src -name "*.rs" ! -name "lib.rs" ! -name "fingerprint.rs" ! -name "signature.rs" ! -name "chunked_aead.rs" ! -name "x25519.rs" ! -name "public_key.rs" ! -name "membership.rs" ! -name "transparency.rs")
           FAIL=0
 
           for f in $CRYPTO_FILES; do

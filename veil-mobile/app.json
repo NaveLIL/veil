@@ -14,7 +14,7 @@
     "android": {
       "package": "io.veil.mobile",
       "edgeToEdgeEnabled": true,
-      "permissions": ["INTERNET", "POST_NOTIFICATIONS", "VIBRATE"],
+      "permissions": ["INTERNET", "POST_NOTIFICATIONS", "VIBRATE", "CAMERA"],
       "blockedPermissions": [
         "android.permission.READ_EXTERNAL_STORAGE",
         "android.permission.WRITE_EXTERNAL_STORAGE",
@@ -30,6 +30,12 @@
     },
     "backgroundColor": "#111117",
     "plugins": [
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Allow Veil to scan an account verification QR code."
+        }
+      ],
       "expo-secure-store",
       "expo-system-ui"
     ]

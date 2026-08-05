@@ -1,0 +1,50 @@
+name: Protocol Contracts CI
+
+on:
+  push:
+    branches: [master, main, "ds/beta-all-2026-07-21"]
+    paths:
+      - "veil-proto/**"
+      - "scripts/validate-public-failure-code-v1.mjs"
+      - "scripts/tests/validate-public-failure-code-v1.test.mjs"
+      - "veil-mobile/src/contracts/publicFailureCodesV1.ts"
+      - "veil-mobile/android/app/src/main/java/io/veil/mobile/runtime/PublicFailureCodeV1.kt"
+      - ".github/workflows/proto-contracts.yml"
+  pull_request:
+    branches: [master, main]
+    paths:
+      - "veil-proto/**"
+      - "scripts/validate-public-failure-code-v1.mjs"
+      - "scripts/tests/validate-public-failure-code-v1.test.mjs"
+      - "veil-mobile/src/contracts/publicFailureCodesV1.ts"
+      - "veil-mobile/android/app/src/main/java/io/veil/mobile/runtime/PublicFailureCodeV1.kt"
+      - ".github/workflows/proto-contracts.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.head.ref || github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  public-failure-code-v1:
+    name: PublicFailureCodeV1 append-only registry
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+
+      - name: Test the registry validator
+        run: node --test scripts/tests/validate-public-failure-code-v1.test.mjs
+
+      - name: Validate registry schema and append-only history
+        env:
+          PUBLIC_FAILURE_BASE_REF: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+        run: node scripts/validate-public-failure-code-v1.mjs

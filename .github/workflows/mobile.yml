@@ -2,21 +2,39 @@ name: Mobile CI
 
 on:
   push:
-    branches: [master, main]
+    branches: [master, main, "ds/beta-all-2026-07-21"]
     paths:
       - "veil-mobile/**"
+      - "veil-ffi/**"
+      - "veil-client/**"
+      - "veil-crypto/**"
+      - "veil-store/**"
+      - "veil-search/**"
+      - "veil-proto/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
       - ".github/workflows/mobile.yml"
+      - ".github/workflows/mobile-tester.yml"
   pull_request:
     branches: [master, main]
     paths:
       - "veil-mobile/**"
+      - "veil-ffi/**"
+      - "veil-client/**"
+      - "veil-crypto/**"
+      - "veil-store/**"
+      - "veil-search/**"
+      - "veil-proto/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
       - ".github/workflows/mobile.yml"
+      - ".github/workflows/mobile-tester.yml"
 
 permissions:
   contents: read
 
 concurrency:
-  group: mobile-${{ github.workflow }}-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.head.ref || github.ref_name }}
   cancel-in-progress: true
 
 jobs:
@@ -27,13 +45,13 @@ jobs:
       run:
         working-directory: veil-mobile
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
-      - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
           version: 10.29.2
 
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
           cache: pnpm
@@ -45,5 +63,252 @@ jobs:
       - name: Lint
         run: pnpm lint
 
+      - name: Type-check
+        run: pnpm exec tsc --noEmit
+
       - name: Run unit tests
         run: pnpm test --runInBand
+
+      - name: Verify production UniFFI surface
+        run: pnpm verify:uniffi-production-surface
+
+      - name: Test fail-closed Android tester APK verifier
+        run: pnpm test:android-tester-apk-verifier
+
+  android-native:
+    name: Native Android and tester policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      ANDROID_NDK_VERSION: 27.1.12297006
+      CARGO_NDK_VERSION: 4.1.2
+      CARGO_TERM_COLOR: always
+      NODE_ENV: development
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Java
+        uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9 # v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle and validate the wrapper
+        uses: gradle/actions/setup-gradle@0b6dd653ba04f4f93bf581ec31e66cbd7dcb644d # v4
+        with:
+          cache-read-only: ${{ github.event_name == 'pull_request' }}
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 10.29.2
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: veil-mobile/pnpm-lock.yaml
+
+      - name: Install locked JavaScript dependencies
+        working-directory: veil-mobile
+        run: pnpm install --frozen-lockfile
+
+      - name: Set up Protocol Buffers compiler
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+        with:
+          version: "34.1"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Rust Android targets
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          targets: aarch64-linux-android,x86_64-linux-android
+
+      - name: Verify Android WebSocket TLS policy
+        shell: bash
+        run: |
+          tls_features="$(cargo tree --locked -p veil-ffi --target aarch64-linux-android -e features)"
+          if ! grep -Fq 'tokio-tungstenite feature "rustls-tls-webpki-roots"' <<<"${tls_features}"; then
+            echo "Android veil-ffi graph is missing the webpki root store." >&2
+            exit 1
+          fi
+          if grep -Fq 'tokio-tungstenite feature "rustls-tls-native-roots"' <<<"${tls_features}"; then
+            echo "Android veil-ffi graph must not use rustls native-root discovery." >&2
+            exit 1
+          fi
+          if ! grep -Fq 'rustls feature "ring"' <<<"${tls_features}"; then
+            echo "Android veil-ffi graph is missing the reviewed rustls ring provider." >&2
+            exit 1
+          fi
+          if ! grep -Fq 'rustls feature "tls12"' <<<"${tls_features}"; then
+            echo "Android veil-ffi graph must keep the reviewed TLS 1.2/1.3 transport contract." >&2
+            exit 1
+          fi
+          if grep -Fq 'rustls feature "aws_lc_rs"' <<<"${tls_features}"; then
+            echo "Android veil-ffi graph must not compile an unreviewed second rustls provider." >&2
+            exit 1
+          fi
+
+      - name: Install native build prerequisites
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            build-essential \
+            libdbus-1-dev \
+            libsecret-1-dev \
+            libssl-dev \
+            perl \
+            pkg-config
+
+      - name: Set up Android command-line tools
+        uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
+        with:
+          cmdline-tools-version: "14742923"
+          packages: ""
+          log-accepted-android-sdk-licenses: false
+
+      - name: Install pinned Android SDK and NDK packages
+        shell: bash
+        run: |
+          sdkmanager --install \
+            "platform-tools" \
+            "platforms;android-35" \
+            "build-tools;35.0.0" \
+            "cmake;3.22.1" \
+            "ndk;${ANDROID_NDK_VERSION}"
+          echo "ANDROID_HOME=${ANDROID_SDK_ROOT}" >> "${GITHUB_ENV}"
+          echo "ANDROID_NDK_HOME=${ANDROID_SDK_ROOT}/ndk/${ANDROID_NDK_VERSION}" >> "${GITHUB_ENV}"
+
+      - name: Install pinned cargo-ndk
+        run: cargo install cargo-ndk --locked --version "${CARGO_NDK_VERSION}"
+
+      - name: Build Rust libraries and regenerate UniFFI bindings
+        shell: pwsh
+        env:
+          VEIL_IDENTITY_TRANSPARENCY_WITNESS_KEYS: ${{ vars.VEIL_IDENTITY_TRANSPARENCY_WITNESS_KEYS }}
+          VEIL_IDENTITY_TRANSPARENCY_WITNESS_QUORUM: ${{ vars.VEIL_IDENTITY_TRANSPARENCY_WITNESS_QUORUM }}
+        run: |
+          & ./veil-mobile/scripts/build-android-native.ps1 `
+            -CargoTargetDir (Join-Path $env:RUNNER_TEMP "veil-mobile-rust-target")
+
+      - name: Verify generated UniFFI bindings are current
+        shell: bash
+        run: |
+          if [[ -n "$(git status --porcelain --untracked-files=all -- veil-mobile/src/native/generated)" ]]; then
+            git diff -- veil-mobile/src/native/generated
+            git status --short --untracked-files=all -- veil-mobile/src/native/generated
+            echo "UniFFI Kotlin bindings are stale. Regenerate and commit them." >&2
+            exit 1
+          fi
+
+      - name: Verify production UniFFI surface
+        working-directory: veil-mobile
+        run: pnpm verify:uniffi-production-surface
+
+      - name: Verify release and tester packaging and device mutation fail closed
+        working-directory: veil-mobile/android
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          expect_blocked() {
+            local expected="$1"
+            shift
+            local output
+            local status
+            set +e
+            output="$(bash ./gradlew --no-daemon --dry-run "$@" 2>&1)"
+            status=$?
+            set -e
+            if (( status == 0 )) || ! grep -Fq -- "${expected}" <<<"${output}"; then
+              printf '%s\n' "${output}"
+              echo "Expected Gradle task graph to fail closed: $*" >&2
+              exit 1
+            fi
+          }
+
+          expect_blocked \
+            "Tester packaging is blocked without all VEIL_ANDROID_TESTER" \
+            :app:assembleInternalTester
+          expect_blocked \
+            "Release signing is required." \
+            :app:assembleRelease
+          expect_blocked \
+            "Android install and uninstall tasks are blocked." \
+            :app:installDebug
+          expect_blocked \
+            "Android install and uninstall tasks are blocked." \
+            :app:uninstallInternalTester
+
+      - name: Run native Android unit tests
+        working-directory: veil-mobile/android
+        shell: bash
+        run: >-
+          bash ./gradlew
+          --no-daemon
+          --stacktrace
+          :app:testDebugUnitTest
+          -PreactNativeArchitectures=arm64-v8a,x86_64
+
+      - name: Run release-like tester policy tests and lint
+        working-directory: veil-mobile/android
+        shell: bash
+        env:
+          NODE_ENV: production
+        run: >-
+          bash ./gradlew
+          --no-daemon
+          --stacktrace
+          :app:testReleaseUnitTest
+          :app:testInternalTesterUnitTest
+          :app:lintInternalTester
+          -PreactNativeArchitectures=arm64-v8a,x86_64
+
+      - name: Print Android lint reports on failure
+        if: failure()
+        working-directory: veil-mobile/android
+        shell: bash
+        run: >-
+          find app/build -type f -name 'lint-results-*.txt'
+          -print -exec cat {} \;
+
+      - name: Assemble debug CI APK
+        working-directory: veil-mobile/android
+        shell: bash
+        run: >-
+          bash ./gradlew
+          --no-daemon
+          --stacktrace
+          :app:assembleDebug
+          -PreactNativeArchitectures=arm64-v8a,x86_64
+
+      - name: Verify APK and Rust ABI payloads
+        shell: bash
+        run: |
+          apk_path="veil-mobile/android/app/build/outputs/apk/debug/app-debug.apk"
+          test -f "$apk_path"
+          test -f veil-mobile/android/app/src/main/jniLibs/arm64-v8a/libveil_ffi.so
+          test -f veil-mobile/android/app/src/main/jniLibs/x86_64/libveil_ffi.so
+          sha256sum "$apk_path" > "${apk_path}.sha256"
+          {
+            echo "### Android debug CI APK"
+            echo
+            echo '```text'
+            cat "${apk_path}.sha256"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload debug APK as short-lived CI evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: veil-mobile-debug-ci
+          path: |
+            veil-mobile/android/app/build/outputs/apk/debug/app-debug.apk
+            veil-mobile/android/app/build/outputs/apk/debug/app-debug.apk.sha256
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0

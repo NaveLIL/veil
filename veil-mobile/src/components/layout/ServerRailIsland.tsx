@@ -57,7 +57,7 @@ export const ServerRailIsland: React.FC<Props> = ({ onSelect }) => {
                     {isDm ? "Direct messages" : server.name}
                   </Text>
                   <Text style={styles.sub}>
-                    {isDm ? "DMs · groups" : "tap to open"}
+                    {isDm ? "Immutable Direct text" : "tap to open"}
                   </Text>
                 </View>
                 {server.unread ? (
@@ -69,12 +69,15 @@ export const ServerRailIsland: React.FC<Props> = ({ onSelect }) => {
             );
           })}
 
-          <Pressable style={({ pressed }) => [styles.addRow, pressed && { opacity: 0.7 }]}>
+          <View style={styles.addRow}>
             <View style={styles.addIcon}>
-              <Text style={styles.addPlus}>+</Text>
+              <Text style={styles.addPlus}>◇</Text>
             </View>
-            <Text style={styles.addLabel}>Add server</Text>
-          </Pressable>
+            <View style={styles.meta}>
+              <Text style={styles.addLabel}>Spaces arrive later</Text>
+              <Text style={styles.sub}>Direct text preview is active now</Text>
+            </View>
+          </View>
         </ScrollView>
       </Island>
     </View>

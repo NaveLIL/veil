@@ -106,3 +106,62 @@ message RegisterDevice {
   // Для привязки к существующему аккаунту:
   optional bytes link_signature = 5;  // Подпись от master device
 }
+
+// Dedicated WebSocket auth v3 wire foundation. Appended after every legacy
+// declaration so generated descriptor indexes remain stable. The current /ws
+// runtime stays on legacy AuthChallenge/AuthResponse/AuthResult and does not
+// emit or accept these messages before the separately reviewed activation.
+enum WsRegistrationIntentV3 {
+  WS_REGISTRATION_INTENT_V3_UNSPECIFIED = 0;
+  WS_REGISTRATION_INTENT_V3_EXISTING = 1;
+  WS_REGISTRATION_INTENT_V3_OPEN = 2;
+  WS_REGISTRATION_INTENT_V3_PASS = 3;
+}
+
+message AuthChallengeV3 {
+  uint32 protocol_version = 1;       // Must be exactly 3 at the future runtime boundary.
+  bytes server_ephemeral = 2;        // X25519 public key, exactly 32 bytes.
+  string canonical_node_origin = 3; // Exact configured canonical Node origin.
+}
+
+message AuthResponseV3 {
+  uint32 protocol_version = 1;          // Must be exactly 3.
+  bytes identity_key = 2;               // Account X25519 public key, exactly 32 bytes.
+  bytes signing_key = 3;                // Account Ed25519 public key, exactly 32 bytes.
+  bytes account_proof_signature = 4;    // Ed25519 signature over the v3 account proof.
+  bytes device_id = 5;                  // Stable device identifier, exactly 16 bytes.
+  string device_name = 6;
+  string client_version = 7;
+  DeviceBindingV1 device_binding = 8;   // Required and strictly verified before commitment use.
+  bytes device_proof_signature = 9;     // Ed25519 signature over the chained v3 device proof.
+  WsRegistrationIntentV3 registration_intent = 10;
+  // Raw 32-byte bearer only for PASS intent. The future runtime must clear
+  // decoded copies promptly and derive the signed origin-scoped commitment.
+  bytes node_access_pass = 11;
+}
+
+enum WsAuthFailureReasonV3 {
+  WS_AUTH_FAILURE_REASON_V3_UNSPECIFIED = 0;
+  WS_AUTH_FAILURE_REASON_V3_AUTHENTICATION_FAILED = 1;
+  WS_AUTH_FAILURE_REASON_V3_REGISTRATION_CLOSED = 2;
+  WS_AUTH_FAILURE_REASON_V3_NODE_ACCESS_PASS_INVALID = 3;
+}
+
+message AuthResultV3 {
+  // Canonical success has user_id present, per_device_secure=true, a positive
+  // active binding version/status, failure_reason=UNSPECIFIED, and no
+  // error_message. Canonical failure has no user_id, per_device_secure=false,
+  // binding version 0/status UNSPECIFIED, and one known non-zero reason;
+  // error_message is optional untrusted diagnostic text only.
+  // REGISTRATION_CLOSED is valid only for the signed OPEN intent and
+  // NODE_ACCESS_PASS_INVALID only for the signed PASS intent.
+  uint32 protocol_version = 1;       // Must be exactly 3.
+  bool success = 2;
+  optional string user_id = 3;
+  optional string error_message = 4;
+  bool per_device_secure = 5;
+  uint64 device_binding_version = 6;
+  DeviceBindingStatus device_binding_status = 7;
+  WsAuthFailureReasonV3 failure_reason = 8;
+  string canonical_node_origin = 9; // Exact configured origin for client comparison.
+}

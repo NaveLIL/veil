@@ -21,6 +21,7 @@ import (
 type Handler struct {
 	store           Store
 	mw              *authmw.Middleware
+	restDispatcher  *authmw.RESTAuthVersionDispatcher
 	rl              *authmw.RateLimit
 	mutationRL      *authmw.RateLimit
 	avatarAdmission chan struct{}
@@ -42,24 +43,45 @@ func NewHandler(store Store, mw *authmw.Middleware, rl, mutationRL *authmw.RateL
 	}
 }
 
+// SetRESTAuthVersionDispatcher activates the reviewed REST v2 policies for
+// all signed profile routes.
+func (h *Handler) SetRESTAuthVersionDispatcher(dispatcher *authmw.RESTAuthVersionDispatcher) {
+	h.restDispatcher = dispatcher
+}
+
 func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
-	signed := func(f http.HandlerFunc, mutation bool) http.HandlerFunc {
+	signed := func(policy authmw.RESTAuthV2HTTPPolicy, f http.HandlerFunc, mutation bool) http.HandlerFunc {
 		if mutation && h.mutationRL != nil {
 			f = h.mutationRL.Wrap(f)
 		}
 		if h.rl != nil {
 			f = h.rl.Wrap(f)
 		}
-		if h.mw != nil {
-			f = h.mw.RequireSigned(f)
+		if h.restDispatcher != nil {
+			f = h.restDispatcher.RequireSigned(policy, f)
+		} else if h.mw != nil {
+			var unavailable *authmw.RESTAuthVersionDispatcher
+			f = unavailable.RequireSigned(policy, f)
 		}
 		return f
 	}
-	mux.HandleFunc("GET /v1/users/{userID}/profile", signed(h.getProfile, false))
-	mux.HandleFunc("PUT /v1/users/me/profile", signed(h.updateProfile, true))
-	mux.HandleFunc("PUT /v1/users/me/profile/avatar", signed(h.admitAvatarUpload(h.updateAvatar), true))
-	mux.HandleFunc("DELETE /v1/users/me/profile/avatar", signed(h.removeAvatar, true))
-	mux.HandleFunc("GET /v1/profile-avatars/{assetID}", signed(h.getAvatar, false))
+	jsonPolicy, err := authmw.NewRESTAuthV2JSONHTTPPolicy(4096)
+	if err != nil {
+		panic("invalid profiles REST v2 JSON policy")
+	}
+	avatarPolicy, err := authmw.NewRESTAuthV2AllowedBodyHTTPPolicy(
+		[]string{"image/jpeg", "image/png"},
+		maxAvatarInputBytes,
+	)
+	if err != nil {
+		panic("invalid avatar REST v2 body policy")
+	}
+	bodylessPolicy := authmw.RESTAuthV2BodylessHTTPPolicy()
+	mux.HandleFunc("GET /v1/users/{userID}/profile", signed(bodylessPolicy, h.getProfile, false))
+	mux.HandleFunc("PUT /v1/users/me/profile", signed(jsonPolicy, h.updateProfile, true))
+	mux.HandleFunc("PUT /v1/users/me/profile/avatar", signed(avatarPolicy, h.admitAvatarUpload(h.updateAvatar), true))
+	mux.HandleFunc("DELETE /v1/users/me/profile/avatar", signed(bodylessPolicy, h.removeAvatar, true))
+	mux.HandleFunc("GET /v1/profile-avatars/{assetID}", signed(bodylessPolicy, h.getAvatar, false))
 }
 
 func (h *Handler) admitAvatarUpload(next http.HandlerFunc) http.HandlerFunc {

@@ -20,7 +20,7 @@ export const Island: React.FC<IslandProps> = ({
   children,
   style,
   variant = "default",
-  glow = true,
+  glow = false,
   padding,
   ...rest
 }) => {
@@ -49,7 +49,9 @@ export const Island: React.FC<IslandProps> = ({
     </View>
   );
 
-  if (!supportsBlur) return inner;
+  // Solid/full-height content surfaces should stay crisp. Backdrop blur is
+  // reserved for compact floating chrome and sheets, not message/list panes.
+  if (!supportsBlur || variant === "solid") return inner;
 
   return (
     <View
@@ -72,10 +74,7 @@ export const Island: React.FC<IslandProps> = ({
             borderRadius: radii.xl,
             borderWidth: StyleSheet.hairlineWidth,
             borderColor: colors.border,
-            backgroundColor:
-              variant === "solid"
-                ? "rgba(30,31,34,0.55)"
-                : "rgba(30,31,34,0.35)",
+            backgroundColor: "rgba(30,31,34,0.35)",
             ...(padding != null ? { padding } : null),
           },
         ]}

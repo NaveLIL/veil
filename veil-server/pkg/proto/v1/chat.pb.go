@@ -125,7 +125,7 @@ func (x MessageEvent_EventType) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use MessageEvent_EventType.Descriptor instead.
 func (MessageEvent_EventType) EnumDescriptor() ([]byte, []int) {
-	return file_veil_v1_chat_proto_rawDescGZIP(), []int{7, 0}
+	return file_veil_v1_chat_proto_rawDescGZIP(), []int{8, 0}
 }
 
 // Клиент → сервер: отправка сообщения
@@ -144,8 +144,26 @@ type SendMessage struct {
 	// ciphertext only for the exact current ready device roster.
 	RosterVersion    uint64 `protobuf:"varint,9,opt,name=roster_version,json=rosterVersion,proto3" json:"roster_version,omitempty"`
 	RosterCommitment []byte `protobuf:"bytes,10,opt,name=roster_commitment,json=rosterCommitment,proto3" json:"roster_commitment,omitempty"` // SHA-256, 32 bytes
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	// Native-generated idempotency key. It is mandatory for every send and
+	// must be a canonical lowercase, non-nil UUID. Exact retries reuse the same
+	// value and the exact same deterministic SendMessage bytes.
+	ClientMessageId string `protobuf:"bytes,11,opt,name=client_message_id,json=clientMessageId,proto3" json:"client_message_id,omitempty"`
+	// Required together for Direct v2. The authenticated gateway supplies the
+	// sender device from the WS v3 principal, verifies the exact active target
+	// binding, and routes this ciphertext only to that device. Empty values are
+	// the legacy Direct v1 profile and are never inferred as v2.
+	CryptoProfile        string `protobuf:"bytes,12,opt,name=crypto_profile,json=cryptoProfile,proto3" json:"crypto_profile,omitempty"`      // "direct_v2"
+	CryptoEra            uint64 `protobuf:"varint,13,opt,name=crypto_era,json=cryptoEra,proto3" json:"crypto_era,omitempty"`                 // profile era, currently 1
+	TargetDeviceId       []byte `protobuf:"bytes,14,opt,name=target_device_id,json=targetDeviceId,proto3" json:"target_device_id,omitempty"` // exact 16-byte protocol device id
+	TargetBindingVersion uint64 `protobuf:"varint,15,opt,name=target_binding_version,json=targetBindingVersion,proto3" json:"target_binding_version,omitempty"`
+	DirectSessionId      []byte `protobuf:"bytes,16,opt,name=direct_session_id,json=directSessionId,proto3" json:"direct_session_id,omitempty"` // SHA-256 Direct v2 transcript commitment
+	// Required together for Sender-Key v6 after a conversation activates
+	// client-authorized membership epochs. They identify the exact signed
+	// epoch that authorized this roster; legacy Sender-Key v5 keeps both empty.
+	MembershipEpoch     uint64 `protobuf:"varint,17,opt,name=membership_epoch,json=membershipEpoch,proto3" json:"membership_epoch,omitempty"`
+	MembershipEpochHash []byte `protobuf:"bytes,18,opt,name=membership_epoch_hash,json=membershipEpochHash,proto3" json:"membership_epoch_hash,omitempty"` // SHA-256, 32 bytes
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
 }
 
 func (x *SendMessage) Reset() {
@@ -248,6 +266,62 @@ func (x *SendMessage) GetRosterCommitment() []byte {
 	return nil
 }
 
+func (x *SendMessage) GetClientMessageId() string {
+	if x != nil {
+		return x.ClientMessageId
+	}
+	return ""
+}
+
+func (x *SendMessage) GetCryptoProfile() string {
+	if x != nil {
+		return x.CryptoProfile
+	}
+	return ""
+}
+
+func (x *SendMessage) GetCryptoEra() uint64 {
+	if x != nil {
+		return x.CryptoEra
+	}
+	return 0
+}
+
+func (x *SendMessage) GetTargetDeviceId() []byte {
+	if x != nil {
+		return x.TargetDeviceId
+	}
+	return nil
+}
+
+func (x *SendMessage) GetTargetBindingVersion() uint64 {
+	if x != nil {
+		return x.TargetBindingVersion
+	}
+	return 0
+}
+
+func (x *SendMessage) GetDirectSessionId() []byte {
+	if x != nil {
+		return x.DirectSessionId
+	}
+	return nil
+}
+
+func (x *SendMessage) GetMembershipEpoch() uint64 {
+	if x != nil {
+		return x.MembershipEpoch
+	}
+	return 0
+}
+
+func (x *SendMessage) GetMembershipEpochHash() []byte {
+	if x != nil {
+		return x.MembershipEpochHash
+	}
+	return nil
+}
+
 type EncryptedAttachment struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	MediaId       string                 `protobuf:"bytes,1,opt,name=media_id,json=mediaId,proto3" json:"media_id,omitempty"`                // ID загруженного файла
@@ -335,6 +409,10 @@ type MessageAck struct {
 	SenderKeyGeneration *uint32                `protobuf:"varint,6,opt,name=sender_key_generation,json=senderKeyGeneration,proto3,oneof" json:"sender_key_generation,omitempty"`
 	RosterVersion       *uint64                `protobuf:"varint,7,opt,name=roster_version,json=rosterVersion,proto3,oneof" json:"roster_version,omitempty"`
 	EnvelopeCommitment  []byte                 `protobuf:"bytes,8,opt,name=envelope_commitment,json=envelopeCommitment,proto3,oneof" json:"envelope_commitment,omitempty"` // SHA-256 of the retained SKDM
+	// Required for chat-message ACKs and empty for generic command ACKs.
+	ClientMessageId     string  `protobuf:"bytes,9,opt,name=client_message_id,json=clientMessageId,proto3" json:"client_message_id,omitempty"`
+	MembershipEpoch     *uint64 `protobuf:"varint,10,opt,name=membership_epoch,json=membershipEpoch,proto3,oneof" json:"membership_epoch,omitempty"`
+	MembershipEpochHash []byte  `protobuf:"bytes,11,opt,name=membership_epoch_hash,json=membershipEpochHash,proto3,oneof" json:"membership_epoch_hash,omitempty"`
 	unknownFields       protoimpl.UnknownFields
 	sizeCache           protoimpl.SizeCache
 }
@@ -421,6 +499,27 @@ func (x *MessageAck) GetRosterVersion() uint64 {
 func (x *MessageAck) GetEnvelopeCommitment() []byte {
 	if x != nil {
 		return x.EnvelopeCommitment
+	}
+	return nil
+}
+
+func (x *MessageAck) GetClientMessageId() string {
+	if x != nil {
+		return x.ClientMessageId
+	}
+	return ""
+}
+
+func (x *MessageAck) GetMembershipEpoch() uint64 {
+	if x != nil && x.MembershipEpoch != nil {
+		return *x.MembershipEpoch
+	}
+	return 0
+}
+
+func (x *MessageAck) GetMembershipEpochHash() []byte {
+	if x != nil {
+		return x.MembershipEpochHash
 	}
 	return nil
 }
@@ -547,6 +646,54 @@ func (x *MessageRead) GetTimestamp() uint64 {
 	return 0
 }
 
+// Server -> client: authenticated hint that a conversation has just become
+// available to this account. The UUID is presentation-free and is never
+// trusted as directory metadata; clients fetch the exact membership-scoped
+// REST projection before accepting the conversation or any Sender-Key state.
+type ConversationAvailable struct {
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	ConversationId string                 `protobuf:"bytes,1,opt,name=conversation_id,json=conversationId,proto3" json:"conversation_id,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
+func (x *ConversationAvailable) Reset() {
+	*x = ConversationAvailable{}
+	mi := &file_veil_v1_chat_proto_msgTypes[5]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ConversationAvailable) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ConversationAvailable) ProtoMessage() {}
+
+func (x *ConversationAvailable) ProtoReflect() protoreflect.Message {
+	mi := &file_veil_v1_chat_proto_msgTypes[5]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ConversationAvailable.ProtoReflect.Descriptor instead.
+func (*ConversationAvailable) Descriptor() ([]byte, []int) {
+	return file_veil_v1_chat_proto_rawDescGZIP(), []int{5}
+}
+
+func (x *ConversationAvailable) GetConversationId() string {
+	if x != nil {
+		return x.ConversationId
+	}
+	return ""
+}
+
 // Клиент → сервер: редактирование сообщения
 type EditMessage struct {
 	state          protoimpl.MessageState `protogen:"open.v1"`
@@ -560,7 +707,7 @@ type EditMessage struct {
 
 func (x *EditMessage) Reset() {
 	*x = EditMessage{}
-	mi := &file_veil_v1_chat_proto_msgTypes[5]
+	mi := &file_veil_v1_chat_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -572,7 +719,7 @@ func (x *EditMessage) String() string {
 func (*EditMessage) ProtoMessage() {}
 
 func (x *EditMessage) ProtoReflect() protoreflect.Message {
-	mi := &file_veil_v1_chat_proto_msgTypes[5]
+	mi := &file_veil_v1_chat_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -585,7 +732,7 @@ func (x *EditMessage) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EditMessage.ProtoReflect.Descriptor instead.
 func (*EditMessage) Descriptor() ([]byte, []int) {
-	return file_veil_v1_chat_proto_rawDescGZIP(), []int{5}
+	return file_veil_v1_chat_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *EditMessage) GetMessageId() string {
@@ -627,7 +774,7 @@ type DeleteMessage struct {
 
 func (x *DeleteMessage) Reset() {
 	*x = DeleteMessage{}
-	mi := &file_veil_v1_chat_proto_msgTypes[6]
+	mi := &file_veil_v1_chat_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -639,7 +786,7 @@ func (x *DeleteMessage) String() string {
 func (*DeleteMessage) ProtoMessage() {}
 
 func (x *DeleteMessage) ProtoReflect() protoreflect.Message {
-	mi := &file_veil_v1_chat_proto_msgTypes[6]
+	mi := &file_veil_v1_chat_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -652,7 +799,7 @@ func (x *DeleteMessage) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteMessage.ProtoReflect.Descriptor instead.
 func (*DeleteMessage) Descriptor() ([]byte, []int) {
-	return file_veil_v1_chat_proto_rawDescGZIP(), []int{6}
+	return file_veil_v1_chat_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *DeleteMessage) GetMessageId() string {
@@ -698,13 +845,29 @@ type MessageEvent struct {
 	CryptoProfile        string `protobuf:"bytes,19,opt,name=crypto_profile,json=cryptoProfile,proto3" json:"crypto_profile,omitempty"` // "sender_key_v5"
 	CryptoEra            uint64 `protobuf:"varint,20,opt,name=crypto_era,json=cryptoEra,proto3" json:"crypto_era,omitempty"`            // profile-era version, currently 1
 	SenderBindingVersion uint64 `protobuf:"varint,21,opt,name=sender_binding_version,json=senderBindingVersion,proto3" json:"sender_binding_version,omitempty"`
-	unknownFields        protoimpl.UnknownFields
-	sizeCache            protoimpl.SizeCache
+	TargetBindingVersion uint64 `protobuf:"varint,22,opt,name=target_binding_version,json=targetBindingVersion,proto3" json:"target_binding_version,omitempty"`
+	DirectSessionId      []byte `protobuf:"bytes,23,opt,name=direct_session_id,json=directSessionId,proto3" json:"direct_session_id,omitempty"`
+	// Complete account-signed source-device coordinate for Direct v2. These
+	// fields are absent for legacy Direct and Sender-Key traffic. The receiver
+	// combines them with the authenticated account directory and its exact
+	// local binding to reconstruct the canonical Direct v2 transcript.
+	SenderUserId              string `protobuf:"bytes,24,opt,name=sender_user_id,json=senderUserId,proto3" json:"sender_user_id,omitempty"`
+	SenderDeviceIdentityKey   []byte `protobuf:"bytes,25,opt,name=sender_device_identity_key,json=senderDeviceIdentityKey,proto3" json:"sender_device_identity_key,omitempty"`
+	SenderDeviceSigningKey    []byte `protobuf:"bytes,26,opt,name=sender_device_signing_key,json=senderDeviceSigningKey,proto3" json:"sender_device_signing_key,omitempty"`
+	SenderDeviceCapabilities  uint64 `protobuf:"varint,27,opt,name=sender_device_capabilities,json=senderDeviceCapabilities,proto3" json:"sender_device_capabilities,omitempty"`
+	SenderDeviceBindingStatus uint32 `protobuf:"varint,28,opt,name=sender_device_binding_status,json=senderDeviceBindingStatus,proto3" json:"sender_device_binding_status,omitempty"`
+	SenderAccountSignature    []byte `protobuf:"bytes,29,opt,name=sender_account_signature,json=senderAccountSignature,proto3" json:"sender_account_signature,omitempty"`
+	// Exact client-authorized membership epoch for Sender-Key v6. Empty/zero
+	// for historical Sender-Key v5 and Direct traffic.
+	MembershipEpoch     uint64 `protobuf:"varint,30,opt,name=membership_epoch,json=membershipEpoch,proto3" json:"membership_epoch,omitempty"`
+	MembershipEpochHash []byte `protobuf:"bytes,31,opt,name=membership_epoch_hash,json=membershipEpochHash,proto3" json:"membership_epoch_hash,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
 }
 
 func (x *MessageEvent) Reset() {
 	*x = MessageEvent{}
-	mi := &file_veil_v1_chat_proto_msgTypes[7]
+	mi := &file_veil_v1_chat_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -716,7 +879,7 @@ func (x *MessageEvent) String() string {
 func (*MessageEvent) ProtoMessage() {}
 
 func (x *MessageEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_veil_v1_chat_proto_msgTypes[7]
+	mi := &file_veil_v1_chat_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -729,7 +892,7 @@ func (x *MessageEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MessageEvent.ProtoReflect.Descriptor instead.
 func (*MessageEvent) Descriptor() ([]byte, []int) {
-	return file_veil_v1_chat_proto_rawDescGZIP(), []int{7}
+	return file_veil_v1_chat_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *MessageEvent) GetEventType() MessageEvent_EventType {
@@ -879,6 +1042,76 @@ func (x *MessageEvent) GetSenderBindingVersion() uint64 {
 	return 0
 }
 
+func (x *MessageEvent) GetTargetBindingVersion() uint64 {
+	if x != nil {
+		return x.TargetBindingVersion
+	}
+	return 0
+}
+
+func (x *MessageEvent) GetDirectSessionId() []byte {
+	if x != nil {
+		return x.DirectSessionId
+	}
+	return nil
+}
+
+func (x *MessageEvent) GetSenderUserId() string {
+	if x != nil {
+		return x.SenderUserId
+	}
+	return ""
+}
+
+func (x *MessageEvent) GetSenderDeviceIdentityKey() []byte {
+	if x != nil {
+		return x.SenderDeviceIdentityKey
+	}
+	return nil
+}
+
+func (x *MessageEvent) GetSenderDeviceSigningKey() []byte {
+	if x != nil {
+		return x.SenderDeviceSigningKey
+	}
+	return nil
+}
+
+func (x *MessageEvent) GetSenderDeviceCapabilities() uint64 {
+	if x != nil {
+		return x.SenderDeviceCapabilities
+	}
+	return 0
+}
+
+func (x *MessageEvent) GetSenderDeviceBindingStatus() uint32 {
+	if x != nil {
+		return x.SenderDeviceBindingStatus
+	}
+	return 0
+}
+
+func (x *MessageEvent) GetSenderAccountSignature() []byte {
+	if x != nil {
+		return x.SenderAccountSignature
+	}
+	return nil
+}
+
+func (x *MessageEvent) GetMembershipEpoch() uint64 {
+	if x != nil {
+		return x.MembershipEpoch
+	}
+	return 0
+}
+
+func (x *MessageEvent) GetMembershipEpochHash() []byte {
+	if x != nil {
+		return x.MembershipEpochHash
+	}
+	return nil
+}
+
 // Клиент → сервер: добавить/убрать реакцию
 type ReactionUpdate struct {
 	state          protoimpl.MessageState `protogen:"open.v1"`
@@ -892,7 +1125,7 @@ type ReactionUpdate struct {
 
 func (x *ReactionUpdate) Reset() {
 	*x = ReactionUpdate{}
-	mi := &file_veil_v1_chat_proto_msgTypes[8]
+	mi := &file_veil_v1_chat_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -904,7 +1137,7 @@ func (x *ReactionUpdate) String() string {
 func (*ReactionUpdate) ProtoMessage() {}
 
 func (x *ReactionUpdate) ProtoReflect() protoreflect.Message {
-	mi := &file_veil_v1_chat_proto_msgTypes[8]
+	mi := &file_veil_v1_chat_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -917,7 +1150,7 @@ func (x *ReactionUpdate) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReactionUpdate.ProtoReflect.Descriptor instead.
 func (*ReactionUpdate) Descriptor() ([]byte, []int) {
-	return file_veil_v1_chat_proto_rawDescGZIP(), []int{8}
+	return file_veil_v1_chat_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *ReactionUpdate) GetMessageId() string {
@@ -963,7 +1196,7 @@ type ReactionEvent struct {
 
 func (x *ReactionEvent) Reset() {
 	*x = ReactionEvent{}
-	mi := &file_veil_v1_chat_proto_msgTypes[9]
+	mi := &file_veil_v1_chat_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -975,7 +1208,7 @@ func (x *ReactionEvent) String() string {
 func (*ReactionEvent) ProtoMessage() {}
 
 func (x *ReactionEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_veil_v1_chat_proto_msgTypes[9]
+	mi := &file_veil_v1_chat_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -988,7 +1221,7 @@ func (x *ReactionEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReactionEvent.ProtoReflect.Descriptor instead.
 func (*ReactionEvent) Descriptor() ([]byte, []int) {
-	return file_veil_v1_chat_proto_rawDescGZIP(), []int{9}
+	return file_veil_v1_chat_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *ReactionEvent) GetMessageId() string {
@@ -1048,7 +1281,7 @@ type PreKeyBundle struct {
 
 func (x *PreKeyBundle) Reset() {
 	*x = PreKeyBundle{}
-	mi := &file_veil_v1_chat_proto_msgTypes[10]
+	mi := &file_veil_v1_chat_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1060,7 +1293,7 @@ func (x *PreKeyBundle) String() string {
 func (*PreKeyBundle) ProtoMessage() {}
 
 func (x *PreKeyBundle) ProtoReflect() protoreflect.Message {
-	mi := &file_veil_v1_chat_proto_msgTypes[10]
+	mi := &file_veil_v1_chat_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1073,7 +1306,7 @@ func (x *PreKeyBundle) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PreKeyBundle.ProtoReflect.Descriptor instead.
 func (*PreKeyBundle) Descriptor() ([]byte, []int) {
-	return file_veil_v1_chat_proto_rawDescGZIP(), []int{10}
+	return file_veil_v1_chat_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *PreKeyBundle) GetIdentityKey() []byte {
@@ -1129,7 +1362,7 @@ type PreKeyRequest struct {
 
 func (x *PreKeyRequest) Reset() {
 	*x = PreKeyRequest{}
-	mi := &file_veil_v1_chat_proto_msgTypes[11]
+	mi := &file_veil_v1_chat_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1141,7 +1374,7 @@ func (x *PreKeyRequest) String() string {
 func (*PreKeyRequest) ProtoMessage() {}
 
 func (x *PreKeyRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_veil_v1_chat_proto_msgTypes[11]
+	mi := &file_veil_v1_chat_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1154,7 +1387,7 @@ func (x *PreKeyRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PreKeyRequest.ProtoReflect.Descriptor instead.
 func (*PreKeyRequest) Descriptor() ([]byte, []int) {
-	return file_veil_v1_chat_proto_rawDescGZIP(), []int{11}
+	return file_veil_v1_chat_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *PreKeyRequest) GetTargetIdentityKey() []byte {
@@ -1196,13 +1429,17 @@ type SenderKeyDistribution struct {
 	SenderDeviceCapabilities  uint64 `protobuf:"varint,16,opt,name=sender_device_capabilities,json=senderDeviceCapabilities,proto3" json:"sender_device_capabilities,omitempty"`
 	SenderDeviceBindingStatus uint32 `protobuf:"varint,17,opt,name=sender_device_binding_status,json=senderDeviceBindingStatus,proto3" json:"sender_device_binding_status,omitempty"`
 	SenderAccountSignature    []byte `protobuf:"bytes,18,opt,name=sender_account_signature,json=senderAccountSignature,proto3" json:"sender_account_signature,omitempty"`
-	unknownFields             protoimpl.UnknownFields
-	sizeCache                 protoimpl.SizeCache
+	// Required together for Sender-Key v6. A conversation with an activated
+	// membership head rejects distributions without the exact current values.
+	MembershipEpoch     uint64 `protobuf:"varint,19,opt,name=membership_epoch,json=membershipEpoch,proto3" json:"membership_epoch,omitempty"`
+	MembershipEpochHash []byte `protobuf:"bytes,20,opt,name=membership_epoch_hash,json=membershipEpochHash,proto3" json:"membership_epoch_hash,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
 }
 
 func (x *SenderKeyDistribution) Reset() {
 	*x = SenderKeyDistribution{}
-	mi := &file_veil_v1_chat_proto_msgTypes[12]
+	mi := &file_veil_v1_chat_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1214,7 +1451,7 @@ func (x *SenderKeyDistribution) String() string {
 func (*SenderKeyDistribution) ProtoMessage() {}
 
 func (x *SenderKeyDistribution) ProtoReflect() protoreflect.Message {
-	mi := &file_veil_v1_chat_proto_msgTypes[12]
+	mi := &file_veil_v1_chat_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1227,7 +1464,7 @@ func (x *SenderKeyDistribution) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SenderKeyDistribution.ProtoReflect.Descriptor instead.
 func (*SenderKeyDistribution) Descriptor() ([]byte, []int) {
-	return file_veil_v1_chat_proto_rawDescGZIP(), []int{12}
+	return file_veil_v1_chat_proto_rawDescGZIP(), []int{13}
 }
 
 func (x *SenderKeyDistribution) GetConversationId() string {
@@ -1356,24 +1593,40 @@ func (x *SenderKeyDistribution) GetSenderAccountSignature() []byte {
 	return nil
 }
 
+func (x *SenderKeyDistribution) GetMembershipEpoch() uint64 {
+	if x != nil {
+		return x.MembershipEpoch
+	}
+	return 0
+}
+
+func (x *SenderKeyDistribution) GetMembershipEpochHash() []byte {
+	if x != nil {
+		return x.MembershipEpochHash
+	}
+	return nil
+}
+
 // Recipient -> server acknowledgement after the exact device installed one
 // retained Sender-Key distribution. The immutable stream head is preserved;
 // only the matching pending row is collected.
 type SenderKeyReceipt struct {
-	state              protoimpl.MessageState `protogen:"open.v1"`
-	ConversationId     string                 `protobuf:"bytes,1,opt,name=conversation_id,json=conversationId,proto3" json:"conversation_id,omitempty"`
-	OwnerDeviceId      []byte                 `protobuf:"bytes,2,opt,name=owner_device_id,json=ownerDeviceId,proto3" json:"owner_device_id,omitempty"`
-	TargetDeviceId     []byte                 `protobuf:"bytes,3,opt,name=target_device_id,json=targetDeviceId,proto3" json:"target_device_id,omitempty"`
-	Generation         uint32                 `protobuf:"varint,4,opt,name=generation,proto3" json:"generation,omitempty"`
-	RosterVersion      uint64                 `protobuf:"varint,5,opt,name=roster_version,json=rosterVersion,proto3" json:"roster_version,omitempty"`
-	EnvelopeCommitment []byte                 `protobuf:"bytes,6,opt,name=envelope_commitment,json=envelopeCommitment,proto3" json:"envelope_commitment,omitempty"`
-	unknownFields      protoimpl.UnknownFields
-	sizeCache          protoimpl.SizeCache
+	state               protoimpl.MessageState `protogen:"open.v1"`
+	ConversationId      string                 `protobuf:"bytes,1,opt,name=conversation_id,json=conversationId,proto3" json:"conversation_id,omitempty"`
+	OwnerDeviceId       []byte                 `protobuf:"bytes,2,opt,name=owner_device_id,json=ownerDeviceId,proto3" json:"owner_device_id,omitempty"`
+	TargetDeviceId      []byte                 `protobuf:"bytes,3,opt,name=target_device_id,json=targetDeviceId,proto3" json:"target_device_id,omitempty"`
+	Generation          uint32                 `protobuf:"varint,4,opt,name=generation,proto3" json:"generation,omitempty"`
+	RosterVersion       uint64                 `protobuf:"varint,5,opt,name=roster_version,json=rosterVersion,proto3" json:"roster_version,omitempty"`
+	EnvelopeCommitment  []byte                 `protobuf:"bytes,6,opt,name=envelope_commitment,json=envelopeCommitment,proto3" json:"envelope_commitment,omitempty"`
+	MembershipEpoch     uint64                 `protobuf:"varint,7,opt,name=membership_epoch,json=membershipEpoch,proto3" json:"membership_epoch,omitempty"`
+	MembershipEpochHash []byte                 `protobuf:"bytes,8,opt,name=membership_epoch_hash,json=membershipEpochHash,proto3" json:"membership_epoch_hash,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
 }
 
 func (x *SenderKeyReceipt) Reset() {
 	*x = SenderKeyReceipt{}
-	mi := &file_veil_v1_chat_proto_msgTypes[13]
+	mi := &file_veil_v1_chat_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1385,7 +1638,7 @@ func (x *SenderKeyReceipt) String() string {
 func (*SenderKeyReceipt) ProtoMessage() {}
 
 func (x *SenderKeyReceipt) ProtoReflect() protoreflect.Message {
-	mi := &file_veil_v1_chat_proto_msgTypes[13]
+	mi := &file_veil_v1_chat_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1398,7 +1651,7 @@ func (x *SenderKeyReceipt) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SenderKeyReceipt.ProtoReflect.Descriptor instead.
 func (*SenderKeyReceipt) Descriptor() ([]byte, []int) {
-	return file_veil_v1_chat_proto_rawDescGZIP(), []int{13}
+	return file_veil_v1_chat_proto_rawDescGZIP(), []int{14}
 }
 
 func (x *SenderKeyReceipt) GetConversationId() string {
@@ -1443,11 +1696,25 @@ func (x *SenderKeyReceipt) GetEnvelopeCommitment() []byte {
 	return nil
 }
 
+func (x *SenderKeyReceipt) GetMembershipEpoch() uint64 {
+	if x != nil {
+		return x.MembershipEpoch
+	}
+	return 0
+}
+
+func (x *SenderKeyReceipt) GetMembershipEpochHash() []byte {
+	if x != nil {
+		return x.MembershipEpochHash
+	}
+	return nil
+}
+
 var File_veil_v1_chat_proto protoreflect.FileDescriptor
 
 const file_veil_v1_chat_proto_rawDesc = "" +
 	"\n" +
-	"\x12veil/v1/chat.proto\x12\aveil.v1\"\xb6\x03\n" +
+	"\x12veil/v1/chat.proto\x12\aveil.v1\"\x93\x06\n" +
 	"\vSendMessage\x12'\n" +
 	"\x0fconversation_id\x18\x01 \x01(\tR\x0econversationId\x12\x1e\n" +
 	"\n" +
@@ -1462,7 +1729,16 @@ const file_veil_v1_chat_proto_rawDesc = "" +
 	"\x06sealed\x18\b \x01(\bR\x06sealed\x12%\n" +
 	"\x0eroster_version\x18\t \x01(\x04R\rrosterVersion\x12+\n" +
 	"\x11roster_commitment\x18\n" +
-	" \x01(\fR\x10rosterCommitmentB\x0e\n" +
+	" \x01(\fR\x10rosterCommitment\x12*\n" +
+	"\x11client_message_id\x18\v \x01(\tR\x0fclientMessageId\x12%\n" +
+	"\x0ecrypto_profile\x18\f \x01(\tR\rcryptoProfile\x12\x1d\n" +
+	"\n" +
+	"crypto_era\x18\r \x01(\x04R\tcryptoEra\x12(\n" +
+	"\x10target_device_id\x18\x0e \x01(\fR\x0etargetDeviceId\x124\n" +
+	"\x16target_binding_version\x18\x0f \x01(\x04R\x14targetBindingVersion\x12*\n" +
+	"\x11direct_session_id\x18\x10 \x01(\fR\x0fdirectSessionId\x12)\n" +
+	"\x10membership_epoch\x18\x11 \x01(\x04R\x0fmembershipEpoch\x122\n" +
+	"\x15membership_epoch_hash\x18\x12 \x01(\fR\x13membershipEpochHashB\x0e\n" +
 	"\f_reply_to_idB\x0e\n" +
 	"\f_ttl_seconds\"\xa2\x01\n" +
 	"\x13EncryptedAttachment\x12\x19\n" +
@@ -1470,7 +1746,7 @@ const file_veil_v1_chat_proto_rawDesc = "" +
 	"\rencrypted_key\x18\x02 \x01(\fR\fencryptedKey\x12\x14\n" +
 	"\x05nonce\x18\x03 \x01(\fR\x05nonce\x12\x12\n" +
 	"\x04size\x18\x04 \x01(\x04R\x04size\x12!\n" +
-	"\fcontent_type\x18\x05 \x01(\tR\vcontentType\"\xbb\x03\n" +
+	"\fcontent_type\x18\x05 \x01(\tR\vcontentType\"\xff\x04\n" +
 	"\n" +
 	"MessageAck\x12\x1d\n" +
 	"\n" +
@@ -1481,11 +1757,17 @@ const file_veil_v1_chat_proto_rawDesc = "" +
 	"\x0fconversation_id\x18\x05 \x01(\tH\x00R\x0econversationId\x88\x01\x01\x127\n" +
 	"\x15sender_key_generation\x18\x06 \x01(\rH\x01R\x13senderKeyGeneration\x88\x01\x01\x12*\n" +
 	"\x0eroster_version\x18\a \x01(\x04H\x02R\rrosterVersion\x88\x01\x01\x124\n" +
-	"\x13envelope_commitment\x18\b \x01(\fH\x03R\x12envelopeCommitment\x88\x01\x01B\x12\n" +
+	"\x13envelope_commitment\x18\b \x01(\fH\x03R\x12envelopeCommitment\x88\x01\x01\x12*\n" +
+	"\x11client_message_id\x18\t \x01(\tR\x0fclientMessageId\x12.\n" +
+	"\x10membership_epoch\x18\n" +
+	" \x01(\x04H\x04R\x0fmembershipEpoch\x88\x01\x01\x127\n" +
+	"\x15membership_epoch_hash\x18\v \x01(\fH\x05R\x13membershipEpochHash\x88\x01\x01B\x12\n" +
 	"\x10_conversation_idB\x18\n" +
 	"\x16_sender_key_generationB\x11\n" +
 	"\x0f_roster_versionB\x16\n" +
-	"\x14_envelope_commitment\"x\n" +
+	"\x14_envelope_commitmentB\x13\n" +
+	"\x11_membership_epochB\x18\n" +
+	"\x16_membership_epoch_hash\"x\n" +
 	"\x10MessageDelivered\x12\x1d\n" +
 	"\n" +
 	"message_id\x18\x01 \x01(\tR\tmessageId\x12'\n" +
@@ -1495,7 +1777,9 @@ const file_veil_v1_chat_proto_rawDesc = "" +
 	"\x0fconversation_id\x18\x01 \x01(\tR\x0econversationId\x12 \n" +
 	"\flast_read_id\x18\x02 \x01(\tR\n" +
 	"lastReadId\x12\x1c\n" +
-	"\ttimestamp\x18\x03 \x01(\x04R\ttimestamp\"\x9b\x01\n" +
+	"\ttimestamp\x18\x03 \x01(\x04R\ttimestamp\"@\n" +
+	"\x15ConversationAvailable\x12'\n" +
+	"\x0fconversation_id\x18\x01 \x01(\tR\x0econversationId\"\x9b\x01\n" +
 	"\vEditMessage\x12\x1d\n" +
 	"\n" +
 	"message_id\x18\x01 \x01(\tR\tmessageId\x12'\n" +
@@ -1506,7 +1790,7 @@ const file_veil_v1_chat_proto_rawDesc = "" +
 	"\rDeleteMessage\x12\x1d\n" +
 	"\n" +
 	"message_id\x18\x01 \x01(\tR\tmessageId\x12'\n" +
-	"\x0fconversation_id\x18\x02 \x01(\tR\x0econversationId\"\x9e\b\n" +
+	"\x0fconversation_id\x18\x02 \x01(\tR\x0econversationId\"\xb6\f\n" +
 	"\fMessageEvent\x12>\n" +
 	"\n" +
 	"event_type\x18\x01 \x01(\x0e2\x1f.veil.v1.MessageEvent.EventTypeR\teventType\x12\x1d\n" +
@@ -1535,7 +1819,17 @@ const file_veil_v1_chat_proto_rawDesc = "" +
 	"\x0ecrypto_profile\x18\x13 \x01(\tR\rcryptoProfile\x12\x1d\n" +
 	"\n" +
 	"crypto_era\x18\x14 \x01(\x04R\tcryptoEra\x124\n" +
-	"\x16sender_binding_version\x18\x15 \x01(\x04R\x14senderBindingVersion\"-\n" +
+	"\x16sender_binding_version\x18\x15 \x01(\x04R\x14senderBindingVersion\x124\n" +
+	"\x16target_binding_version\x18\x16 \x01(\x04R\x14targetBindingVersion\x12*\n" +
+	"\x11direct_session_id\x18\x17 \x01(\fR\x0fdirectSessionId\x12$\n" +
+	"\x0esender_user_id\x18\x18 \x01(\tR\fsenderUserId\x12;\n" +
+	"\x1asender_device_identity_key\x18\x19 \x01(\fR\x17senderDeviceIdentityKey\x129\n" +
+	"\x19sender_device_signing_key\x18\x1a \x01(\fR\x16senderDeviceSigningKey\x12<\n" +
+	"\x1asender_device_capabilities\x18\x1b \x01(\x04R\x18senderDeviceCapabilities\x12?\n" +
+	"\x1csender_device_binding_status\x18\x1c \x01(\rR\x19senderDeviceBindingStatus\x128\n" +
+	"\x18sender_account_signature\x18\x1d \x01(\fR\x16senderAccountSignature\x12)\n" +
+	"\x10membership_epoch\x18\x1e \x01(\x04R\x0fmembershipEpoch\x122\n" +
+	"\x15membership_epoch_hash\x18\x1f \x01(\fR\x13membershipEpochHash\"-\n" +
 	"\tEventType\x12\a\n" +
 	"\x03NEW\x10\x00\x12\n" +
 	"\n" +
@@ -1574,7 +1868,7 @@ const file_veil_v1_chat_proto_rawDesc = "" +
 	"\rPreKeyRequest\x12.\n" +
 	"\x13target_identity_key\x18\x01 \x01(\fR\x11targetIdentityKey\x12-\n" +
 	"\x10target_device_id\x18\x02 \x01(\fH\x00R\x0etargetDeviceId\x88\x01\x01B\x13\n" +
-	"\x11_target_device_id\"\xbc\a\n" +
+	"\x11_target_device_id\"\x9b\b\n" +
 	"\x15SenderKeyDistribution\x12'\n" +
 	"\x0fconversation_id\x18\x01 \x01(\tR\x0econversationId\x12,\n" +
 	"\x12sender_key_message\x18\x02 \x01(\fR\x10senderKeyMessage\x12\x1e\n" +
@@ -1596,7 +1890,9 @@ const file_veil_v1_chat_proto_rawDesc = "" +
 	"\x19sender_device_signing_key\x18\x0f \x01(\fR\x16senderDeviceSigningKey\x12<\n" +
 	"\x1asender_device_capabilities\x18\x10 \x01(\x04R\x18senderDeviceCapabilities\x12?\n" +
 	"\x1csender_device_binding_status\x18\x11 \x01(\rR\x19senderDeviceBindingStatus\x128\n" +
-	"\x18sender_account_signature\x18\x12 \x01(\fR\x16senderAccountSignature\"\x85\x02\n" +
+	"\x18sender_account_signature\x18\x12 \x01(\fR\x16senderAccountSignature\x12)\n" +
+	"\x10membership_epoch\x18\x13 \x01(\x04R\x0fmembershipEpoch\x122\n" +
+	"\x15membership_epoch_hash\x18\x14 \x01(\fR\x13membershipEpochHash\"\xe4\x02\n" +
 	"\x10SenderKeyReceipt\x12'\n" +
 	"\x0fconversation_id\x18\x01 \x01(\tR\x0econversationId\x12&\n" +
 	"\x0fowner_device_id\x18\x02 \x01(\fR\rownerDeviceId\x12(\n" +
@@ -1605,7 +1901,9 @@ const file_veil_v1_chat_proto_rawDesc = "" +
 	"generation\x18\x04 \x01(\rR\n" +
 	"generation\x12%\n" +
 	"\x0eroster_version\x18\x05 \x01(\x04R\rrosterVersion\x12/\n" +
-	"\x13envelope_commitment\x18\x06 \x01(\fR\x12envelopeCommitment*\xa5\x01\n" +
+	"\x13envelope_commitment\x18\x06 \x01(\fR\x12envelopeCommitment\x12)\n" +
+	"\x10membership_epoch\x18\a \x01(\x04R\x0fmembershipEpoch\x122\n" +
+	"\x15membership_epoch_hash\x18\b \x01(\fR\x13membershipEpochHash*\xa5\x01\n" +
 	"\vMessageType\x12\x15\n" +
 	"\x11MESSAGE_TYPE_TEXT\x10\x00\x12\x16\n" +
 	"\x12MESSAGE_TYPE_IMAGE\x10\x01\x12\x15\n" +
@@ -1627,7 +1925,7 @@ func file_veil_v1_chat_proto_rawDescGZIP() []byte {
 }
 
 var file_veil_v1_chat_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
-var file_veil_v1_chat_proto_msgTypes = make([]protoimpl.MessageInfo, 14)
+var file_veil_v1_chat_proto_msgTypes = make([]protoimpl.MessageInfo, 15)
 var file_veil_v1_chat_proto_goTypes = []any{
 	(MessageType)(0),              // 0: veil.v1.MessageType
 	(MessageEvent_EventType)(0),   // 1: veil.v1.MessageEvent.EventType
@@ -1636,15 +1934,16 @@ var file_veil_v1_chat_proto_goTypes = []any{
 	(*MessageAck)(nil),            // 4: veil.v1.MessageAck
 	(*MessageDelivered)(nil),      // 5: veil.v1.MessageDelivered
 	(*MessageRead)(nil),           // 6: veil.v1.MessageRead
-	(*EditMessage)(nil),           // 7: veil.v1.EditMessage
-	(*DeleteMessage)(nil),         // 8: veil.v1.DeleteMessage
-	(*MessageEvent)(nil),          // 9: veil.v1.MessageEvent
-	(*ReactionUpdate)(nil),        // 10: veil.v1.ReactionUpdate
-	(*ReactionEvent)(nil),         // 11: veil.v1.ReactionEvent
-	(*PreKeyBundle)(nil),          // 12: veil.v1.PreKeyBundle
-	(*PreKeyRequest)(nil),         // 13: veil.v1.PreKeyRequest
-	(*SenderKeyDistribution)(nil), // 14: veil.v1.SenderKeyDistribution
-	(*SenderKeyReceipt)(nil),      // 15: veil.v1.SenderKeyReceipt
+	(*ConversationAvailable)(nil), // 7: veil.v1.ConversationAvailable
+	(*EditMessage)(nil),           // 8: veil.v1.EditMessage
+	(*DeleteMessage)(nil),         // 9: veil.v1.DeleteMessage
+	(*MessageEvent)(nil),          // 10: veil.v1.MessageEvent
+	(*ReactionUpdate)(nil),        // 11: veil.v1.ReactionUpdate
+	(*ReactionEvent)(nil),         // 12: veil.v1.ReactionEvent
+	(*PreKeyBundle)(nil),          // 13: veil.v1.PreKeyBundle
+	(*PreKeyRequest)(nil),         // 14: veil.v1.PreKeyRequest
+	(*SenderKeyDistribution)(nil), // 15: veil.v1.SenderKeyDistribution
+	(*SenderKeyReceipt)(nil),      // 16: veil.v1.SenderKeyReceipt
 }
 var file_veil_v1_chat_proto_depIdxs = []int32{
 	0, // 0: veil.v1.SendMessage.msg_type:type_name -> veil.v1.MessageType
@@ -1666,16 +1965,16 @@ func file_veil_v1_chat_proto_init() {
 	}
 	file_veil_v1_chat_proto_msgTypes[0].OneofWrappers = []any{}
 	file_veil_v1_chat_proto_msgTypes[2].OneofWrappers = []any{}
-	file_veil_v1_chat_proto_msgTypes[7].OneofWrappers = []any{}
-	file_veil_v1_chat_proto_msgTypes[10].OneofWrappers = []any{}
+	file_veil_v1_chat_proto_msgTypes[8].OneofWrappers = []any{}
 	file_veil_v1_chat_proto_msgTypes[11].OneofWrappers = []any{}
+	file_veil_v1_chat_proto_msgTypes[12].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_veil_v1_chat_proto_rawDesc), len(file_veil_v1_chat_proto_rawDesc)),
 			NumEnums:      2,
-			NumMessages:   14,
+			NumMessages:   15,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

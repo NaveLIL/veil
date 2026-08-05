@@ -38,6 +38,21 @@ tag. Set `VEIL_RELEASE_ID` to the matching Git tag or Git commit SHA and change
 it for every rollout. This makes Compose recreate the completed migration job
 when a release changes.
 
+`VEIL_PUBLIC_ORIGIN` is also mandatory. For the managed Node it is exactly
+`https://veil.erez.pro:443`: lowercase scheme/host, an explicit canonical port,
+and no credentials, path, query, fragment, or trailing slash. Compose has no
+production fallback for this value, and gateway startup fails closed when it is
+missing or non-canonical. The application must never infer this trust scope from
+incoming `Host`, `X-Forwarded-Host`, redirects, or DNS.
+
+This configuration is the non-deployed Phase 5S.3B-1 foundation only. It does
+not cut the primary transport over: `/ws` and signed REST still use legacy
+Preview WS auth v2 and REST auth v1. The gateway also registers a separate
+experimental `/v3/events` integration endpoint, but its FFI/Android bindings,
+cross-client behavior, and two-Node evidence are incomplete. Do not describe
+this setting or the side endpoint as closing the hostile-Node P1, enabling
+production cryptography, or satisfying the two-Node relay gate.
+
 Keep `VEIL_ALLOW_REGISTRATION=false` while the managed Node is in closed
 Preview. This setting blocks creation of first-time accounts but does not lock
 out identities already registered on that Node. Opening registration is an
@@ -110,6 +125,10 @@ Validate configuration before contacting a registry or starting containers:
 docker compose -f deploy/compose.prod.yml --env-file deploy/.env config --quiet
 ```
 
+Configuration resolution must fail if `VEIL_PUBLIC_ORIGIN` is removed or set to
+an empty value. This check is local and must not be replaced by starting or
+mutating the running Node.
+
 ## 2. First certificate and the existing Nginx SNI router
 
 Confirm that the selected loopback listener is unused:
@@ -137,10 +156,42 @@ sudo certbot certonly --webroot -w /var/www/letsencrypt \
 Replace the bootstrap vhost with the final loopback TLS vhost:
 
 ```sh
+python3 scripts/tests/check_nginx_rest_authority.py
 sudo install -m 0644 deploy/nginx/veil.erez.pro.conf /etc/nginx/sites-available/veil.erez.pro
 sudo nginx -t
 sudo systemctl reload nginx
 ```
+
+The final vhost has a temporary, strict `veil-rest-v1` authority bridge.
+Previously released desktop builds sign and send `veil.erez.pro`; Android and
+current canonical clients sign and send `veil.erez.pro:443`. Nginx accepts
+those two reviewed authority forms and maps either to the corresponding
+lowercase literal before preserving it as upstream `Host` and
+`X-Forwarded-Host`. DNS hostname matching is case-insensitive, so case variants
+of the same hostname normalize to the same literal. Any other hostname, port,
+leading-zero port alias, trailing dot, or missing authority is rejected with
+HTTP 421. Deploy and verify this bridge before publishing a client that always
+includes the effective port, and retain it while a supported released desktop
+can still send the bare authority. Do not replace the allowlist with direct
+`$host` or `$http_host` forwarding. The permanent fix is the coordinated
+configured public-origin + REST v2 + WS v3 migration, not broader ingress
+trust.
+
+Before replacement, save the active expanded configuration and vhost so the
+change has a deterministic rollback path:
+
+```sh
+sudo sh -c 'nginx -T > /root/nginx-before-veil-authority.txt'
+sudo cp -a /etc/nginx/sites-available/veil.erez.pro \
+  /root/veil.erez.pro.before-authority
+sudo sha256sum /root/nginx-before-veil-authority.txt \
+  /root/veil.erez.pro.before-authority
+```
+
+After reload, verify HTTP/1.1 and HTTP/2 preserve both allowed authorities to
+the gateway, reject an unexpected port, and keep the packaged desktop and
+Android signed REST probes green. If either client receives a new 401, restore
+the saved vhost, run `sudo nginx -t`, and reload immediately.
 
 Before publishing the managed-service privacy notice, verify that the host's
 existing Nginx logrotate policy covers `/var/log/nginx/veil.erez.pro.*.log`
@@ -185,6 +236,11 @@ sudo certbot renew --dry-run
 
 ## 3. Backup gate before migrations
 
+The current deployment default remains PostgreSQL 16. Do not override it with
+PostgreSQL 18 for an existing volume; the required major-version evidence and
+fresh-volume procedure are defined in
+[`docs/operations/postgresql-18-upgrade-gate.md`](../docs/operations/postgresql-18-upgrade-gate.md).
+
 Start only PostgreSQL first:
 
 ```sh
@@ -215,11 +271,13 @@ dump and archives to separate storage, and verify the PostgreSQL dump with
 `pg_restore --list` before proceeding. A live copy of `veil_pgdata` is not a
 substitute for `pg_dump` or a coordinated filesystem snapshot.
 
-Two migrations are intentionally destructive and require explicit acceptance:
+Three migrations are intentionally destructive and require explicit acceptance:
 
 - `023_veil_links_and_bans.sql` drops/recreates invite data, removes voice-room
   channel rows, and drops `servers.icon_url`;
-- `025_webpush_cutover.sql` deletes all existing push subscriptions.
+- `025_webpush_cutover.sql` deletes all existing push subscriptions;
+- `028_reaction_history_bound.sql` removes invalid legacy reaction-scope rows
+  and deterministically retains only the oldest 256 reactions per message.
 
 If any of that data must survive, stop here and write a conversion migration.
 An application image rollback cannot undo these database changes.

@@ -31,6 +31,27 @@ message SendMessage {
   // ciphertext only for the exact current ready device roster.
   uint64 roster_version = 9;
   bytes roster_commitment = 10; // SHA-256, 32 bytes
+
+  // Native-generated idempotency key. It is mandatory for every send and
+  // must be a canonical lowercase, non-nil UUID. Exact retries reuse the same
+  // value and the exact same deterministic SendMessage bytes.
+  string client_message_id = 11;
+
+  // Required together for Direct v2. The authenticated gateway supplies the
+  // sender device from the WS v3 principal, verifies the exact active target
+  // binding, and routes this ciphertext only to that device. Empty values are
+  // the legacy Direct v1 profile and are never inferred as v2.
+  string crypto_profile = 12;       // "direct_v2"
+  uint64 crypto_era = 13;           // profile era, currently 1
+  bytes target_device_id = 14;      // exact 16-byte protocol device id
+  uint64 target_binding_version = 15;
+  bytes direct_session_id = 16;     // SHA-256 Direct v2 transcript commitment
+
+  // Required together for Sender-Key v6 after a conversation activates
+  // client-authorized membership epochs. They identify the exact signed
+  // epoch that authorized this roster; legacy Sender-Key v5 keeps both empty.
+  uint64 membership_epoch = 17;
+  bytes membership_epoch_hash = 18; // SHA-256, 32 bytes
 }
 
 message EncryptedAttachment {
@@ -51,6 +72,11 @@ message MessageAck {
   optional uint32 sender_key_generation = 6;
   optional uint64 roster_version = 7;
   optional bytes envelope_commitment = 8; // SHA-256 of the retained SKDM
+
+  // Required for chat-message ACKs and empty for generic command ACKs.
+  string client_message_id = 9;
+  optional uint64 membership_epoch = 10;
+  optional bytes membership_epoch_hash = 11;
 }
 
 // Сервер → клиент: сообщение доставлено получателю
@@ -65,6 +91,14 @@ message MessageRead {
   string conversation_id = 1;
   string last_read_id = 2;   // ID последнего прочитанного сообщения
   uint64 timestamp = 3;
+}
+
+// Server -> client: authenticated hint that a conversation has just become
+// available to this account. The UUID is presentation-free and is never
+// trusted as directory metadata; clients fetch the exact membership-scoped
+// REST projection before accepting the conversation or any Sender-Key state.
+message ConversationAvailable {
+  string conversation_id = 1;
 }
 
 // Клиент → сервер: редактирование сообщения
@@ -119,6 +153,24 @@ message MessageEvent {
   string crypto_profile = 19;        // "sender_key_v5"
   uint64 crypto_era = 20;            // profile-era version, currently 1
   uint64 sender_binding_version = 21;
+  uint64 target_binding_version = 22;
+  bytes direct_session_id = 23;
+
+  // Complete account-signed source-device coordinate for Direct v2. These
+  // fields are absent for legacy Direct and Sender-Key traffic. The receiver
+  // combines them with the authenticated account directory and its exact
+  // local binding to reconstruct the canonical Direct v2 transcript.
+  string sender_user_id = 24;
+  bytes sender_device_identity_key = 25;
+  bytes sender_device_signing_key = 26;
+  uint64 sender_device_capabilities = 27;
+  uint32 sender_device_binding_status = 28;
+  bytes sender_account_signature = 29;
+
+  // Exact client-authorized membership epoch for Sender-Key v6. Empty/zero
+  // for historical Sender-Key v5 and Direct traffic.
+  uint64 membership_epoch = 30;
+  bytes membership_epoch_hash = 31;
 }
 
 // Клиент → сервер: добавить/убрать реакцию
@@ -182,6 +234,11 @@ message SenderKeyDistribution {
   uint64 sender_device_capabilities = 16;
   uint32 sender_device_binding_status = 17;
   bytes sender_account_signature = 18;
+
+  // Required together for Sender-Key v6. A conversation with an activated
+  // membership head rejects distributions without the exact current values.
+  uint64 membership_epoch = 19;
+  bytes membership_epoch_hash = 20;
 }
 
 // Recipient -> server acknowledgement after the exact device installed one
@@ -194,4 +251,6 @@ message SenderKeyReceipt {
   uint32 generation = 4;
   uint64 roster_version = 5;
   bytes envelope_commitment = 6;
+  uint64 membership_epoch = 7;
+  bytes membership_epoch_hash = 8;
 }

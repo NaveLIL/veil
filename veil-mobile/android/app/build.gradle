@@ -87,6 +87,45 @@ def releaseKeyAlias = System.getenv('VEIL_ANDROID_KEY_ALIAS')
 def releaseKeyPassword = System.getenv('VEIL_ANDROID_KEY_PASSWORD')
 def releaseSigningConfigured = [releaseStorePath, releaseStorePassword, releaseKeyAlias, releaseKeyPassword].every { it }
 
+def nonBlankEnvironmentValue = { String name ->
+    def value = System.getenv(name)
+    value != null && !value.trim().isEmpty() ? value : null
+}
+def testerStorePath = nonBlankEnvironmentValue('VEIL_ANDROID_TESTER_KEYSTORE')
+def testerStorePassword = nonBlankEnvironmentValue('VEIL_ANDROID_TESTER_KEYSTORE_PASSWORD')
+def testerKeyAlias = nonBlankEnvironmentValue('VEIL_ANDROID_TESTER_KEY_ALIAS')
+def testerKeyPassword = nonBlankEnvironmentValue('VEIL_ANDROID_TESTER_KEY_PASSWORD')
+def testerSigningValues = [testerStorePath, testerStorePassword, testerKeyAlias, testerKeyPassword]
+def testerSigningPartiallyConfigured = testerSigningValues.any { it != null } && !testerSigningValues.every { it != null }
+if (testerSigningPartiallyConfigured) {
+    throw new GradleException('Tester signing is partially configured. Set all of VEIL_ANDROID_TESTER_KEYSTORE, VEIL_ANDROID_TESTER_KEYSTORE_PASSWORD, VEIL_ANDROID_TESTER_KEY_ALIAS, and VEIL_ANDROID_TESTER_KEY_PASSWORD, or unset all four.')
+}
+def testerSigningConfigured = testerSigningValues.every { it != null }
+
+def testerVersionCodeRaw = nonBlankEnvironmentValue('VEIL_ANDROID_TESTER_VERSION_CODE')
+def testerVersionNameRaw = nonBlankEnvironmentValue('VEIL_ANDROID_TESTER_VERSION_NAME')
+if ((testerVersionCodeRaw == null) != (testerVersionNameRaw == null)) {
+    throw new GradleException('Tester versioning is partially configured. Set both VEIL_ANDROID_TESTER_VERSION_CODE and VEIL_ANDROID_TESTER_VERSION_NAME, or unset both.')
+}
+def testerVersionCode = null
+if (testerVersionCodeRaw != null) {
+    if (!(testerVersionCodeRaw ==~ /^[1-9][0-9]{0,9}$/)) {
+        throw new GradleException('VEIL_ANDROID_TESTER_VERSION_CODE must be a positive decimal integer no greater than 2100000000.')
+    }
+    def parsed = Long.parseLong(testerVersionCodeRaw)
+    if (parsed > 2100000000L) {
+        throw new GradleException('VEIL_ANDROID_TESTER_VERSION_CODE must be a positive decimal integer no greater than 2100000000.')
+    }
+    testerVersionCode = (int) parsed
+}
+def testerVersionNamePattern = ~/^[0-9]+(?:\.[0-9]+){2}-tester(?:\.[0-9A-Za-z][0-9A-Za-z.-]{0,31})?$/
+if (testerVersionNameRaw != null && (testerVersionNameRaw.length() > 64 || !(testerVersionNameRaw ==~ testerVersionNamePattern))) {
+    throw new GradleException('VEIL_ANDROID_TESTER_VERSION_NAME must use safe syntax such as 0.1.0-tester or 0.1.0-tester.20260720.1.')
+}
+def sourceCommitRaw = nonBlankEnvironmentValue('VEIL_SOURCE_COMMIT')
+def sourceCommitValid = sourceCommitRaw != null && sourceCommitRaw ==~ /^[0-9a-f]{40}$/
+def sourceCommitForMetadata = sourceCommitValid ? sourceCommitRaw : 'unconfigured'
+
 android {
     ndkVersion rootProject.ext.ndkVersion
 
@@ -100,6 +139,10 @@ android {
         targetSdkVersion rootProject.ext.targetSdkVersion
         versionCode 1
         versionName "0.1.0"
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+    }
+    compileOptions {
+        coreLibraryDesugaringEnabled true
     }
     sourceSets {
         main.java.srcDirs += file('../../src/native/generated/uniffi')
@@ -113,10 +156,50 @@ android {
                 keyPassword releaseKeyPassword
             }
         }
+        if (testerSigningConfigured) {
+            tester {
+                storeFile file(testerStorePath)
+                storePassword testerStorePassword
+                keyAlias testerKeyAlias
+                keyPassword testerKeyPassword
+                enableV1Signing = false
+                enableV2Signing = true
+                enableV3Signing = false
+                enableV4Signing = false
+            }
+        }
     }
     buildTypes {
-        debug {}
+        debug {
+            // Visual-feedback builds may capture only the fully authenticated
+            // ready shell. MainActivity still starts secure and re-secures on
+            // pause; RecoveryActivity and Recents are never downgraded.
+            buildConfigField "boolean", "ALLOW_READY_SCREEN_CAPTURE", "true"
+            buildConfigField "String", "BUILD_CHANNEL", '"debug"'
+            buildConfigField "String", "SOURCE_COMMIT", "\"${sourceCommitForMetadata}\""
+            buildConfigField "String", "ENROLLMENT_SCHEME", '"veil"'
+            buildConfigField "String", "ENROLLMENT_HTTPS_HOST", '"veil.erez.pro"'
+            manifestPlaceholders = [
+                veilBuildChannel: 'debug',
+                veilSourceCommit: sourceCommitForMetadata,
+                veilAllowReadyScreenCapture: 'true',
+                veilEnrollmentScheme: 'veil',
+                veilEnrollmentHttpsHost: 'veil.erez.pro',
+            ]
+        }
         release {
+            buildConfigField "boolean", "ALLOW_READY_SCREEN_CAPTURE", "false"
+            buildConfigField "String", "BUILD_CHANNEL", '"release"'
+            buildConfigField "String", "SOURCE_COMMIT", "\"${sourceCommitForMetadata}\""
+            buildConfigField "String", "ENROLLMENT_SCHEME", '"veil"'
+            buildConfigField "String", "ENROLLMENT_HTTPS_HOST", '"veil.erez.pro"'
+            manifestPlaceholders = [
+                veilBuildChannel: 'release',
+                veilSourceCommit: sourceCommitForMetadata,
+                veilAllowReadyScreenCapture: 'false',
+                veilEnrollmentScheme: 'veil',
+                veilEnrollmentHttpsHost: 'veil.erez.pro',
+            ]
             if (releaseSigningConfigured) {
                 signingConfig signingConfigs.release
             }
@@ -124,6 +207,32 @@ android {
             minifyEnabled enableProguardInReleaseBuilds
             proguardFiles getDefaultProguardFile("proguard-android.txt"), "proguard-rules.pro"
             crunchPngs (findProperty('android.enablePngCrunchInReleaseBuilds')?.toBoolean() ?: true)
+        }
+        internalTester {
+            initWith release
+            applicationIdSuffix ".tester"
+            debuggable false
+            matchingFallbacks = ['release']
+
+            // initWith(release) copies release signing. Always clear it before
+            // selecting the independently configured tester identity.
+            signingConfig = null
+            if (testerSigningConfigured) {
+                signingConfig signingConfigs.tester
+            }
+
+            buildConfigField "boolean", "ALLOW_READY_SCREEN_CAPTURE", "false"
+            buildConfigField "String", "BUILD_CHANNEL", '"tester"'
+            buildConfigField "String", "SOURCE_COMMIT", "\"${sourceCommitForMetadata}\""
+            buildConfigField "String", "ENROLLMENT_SCHEME", '"veil-tester"'
+            buildConfigField "String", "ENROLLMENT_HTTPS_HOST", '"tester.invalid"'
+            manifestPlaceholders = [
+                veilBuildChannel: 'tester',
+                veilSourceCommit: sourceCommitForMetadata,
+                veilAllowReadyScreenCapture: 'false',
+                veilEnrollmentScheme: 'veil-tester',
+                veilEnrollmentHttpsHost: 'tester.invalid',
+            ]
         }
     }
     packagingOptions {
@@ -133,6 +242,17 @@ android {
     }
     androidResources {
         ignoreAssetsPattern '!.svn:!.git:!.ds_store:!*.scc:!CVS:!thumbs.db:!picasa.ini:!*~'
+    }
+}
+
+// AGP 8 VariantOutput properties keep tester artifact versions independent
+// from the desktop/release defaults without mutating defaultConfig.
+androidComponents {
+    onVariants(selector().withBuildType('internalTester')) { variant ->
+        variant.outputs.each { output ->
+            output.versionCode.set(testerVersionCode ?: 1)
+            output.versionName.set(testerVersionNameRaw ?: '0.1.0-tester.unconfigured')
+        }
     }
 }
 
@@ -157,12 +277,20 @@ android {
 }
 
 dependencies {
+    coreLibraryDesugaring('com.android.tools:desugar_jdk_libs:2.1.5')
     // The version of react-native is set by the React Native Gradle Plugin
     implementation("com.facebook.react:react-android")
     implementation("net.java.dev.jna:jna:5.17.0@aar")
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
     // 3.0.10 is the newest connector built with Expo SDK 53's Kotlin 2.0.21 ABI.
     // 3.1+ requires Kotlin 2.2/2.3 and must land with the planned Expo upgrade.
     implementation("org.unifiedpush.android:connector:3.0.10")
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("com.squareup.okhttp3:mockwebserver:4.12.0")
+    testImplementation("com.squareup.okhttp3:okhttp-tls:4.12.0")
+    androidTestImplementation("androidx.test:core:1.7.0")
+    androidTestImplementation("androidx.test.ext:junit:1.3.0")
+    androidTestImplementation("androidx.test:runner:1.7.0")
 
     def isGifEnabled = (findProperty('expo.gif.enabled') ?: "") == "true";
     def isWebpEnabled = (findProperty('expo.webp.enabled') ?: "") == "true";
@@ -190,9 +318,216 @@ dependencies {
 }
 
 gradle.taskGraph.whenReady { graph ->
-    def requestedRelease = graph.allTasks.any { it.project == project && it.name.toLowerCase().contains('release') }
-    if (requestedRelease && !releaseSigningConfigured) {
+    def deviceMutationTasks = graph.allTasks.findAll {
+        it.project == project && it.name ==~ /(?i)^(?:install|uninstall).*/
+    }
+    if (!deviceMutationTasks.isEmpty()) {
+        throw new GradleException(
+            'Android install and uninstall tasks are blocked. Use an assemble* task for a host-only build; ' +
+            'device installation or removal requires separate authorization under the manual physical test plan.'
+        )
+    }
+
+    def releasePackagingTaskNames = [
+        'assemblerelease',
+        'bundlerelease',
+        'packagerelease',
+        'packagereleasebundle',
+        'packagereleaseuniversalapk',
+        'signreleasebundle',
+        'installrelease',
+        'validatesigningrelease',
+        'makeapkfrombundleforrelease',
+        'zipapksforrelease',
+        'extractapksforrelease',
+    ] as Set
+    def releasePackagingTasks = graph.allTasks.findAll {
+        def taskName = it.name.toLowerCase()
+        it.project == project && (
+            releasePackagingTaskNames.contains(taskName) ||
+            taskName.startsWith('publishrelease')
+        )
+    }
+    if (!releasePackagingTasks.isEmpty() && !releaseSigningConfigured) {
         throw new GradleException('Release signing is required. Set VEIL_ANDROID_KEYSTORE, VEIL_ANDROID_KEYSTORE_PASSWORD, VEIL_ANDROID_KEY_ALIAS, and VEIL_ANDROID_KEY_PASSWORD.')
+    }
+
+    def testerBuildType = android.buildTypes.getByName('internalTester')
+    def effectiveTesterSigning = testerBuildType.signingConfig
+    if (testerSigningConfigured) {
+        if (effectiveTesterSigning == null || effectiveTesterSigning.name != 'tester') {
+            throw new GradleException('Tester signing is not bound to the isolated tester signingConfig.')
+        }
+        if (effectiveTesterSigning.enableV1Signing != false ||
+            effectiveTesterSigning.enableV2Signing != true ||
+            effectiveTesterSigning.enableV3Signing != false ||
+            effectiveTesterSigning.enableV4Signing != false) {
+            throw new GradleException('Tester signing must use only APK Signature Scheme v2.')
+        }
+        if (releaseSigningConfigured &&
+            file(testerStorePath).canonicalFile == file(releaseStorePath).canonicalFile &&
+            testerKeyAlias == releaseKeyAlias) {
+            throw new GradleException('Tester signing must not reuse the production keystore alias.')
+        }
+    } else if (effectiveTesterSigning != null) {
+        throw new GradleException('Tester signing unexpectedly inherited another signingConfig.')
+    }
+
+    def testerPackagingTaskNames = [
+        'assembleinternaltester',
+        'bundleinternaltester',
+        'packageinternaltester',
+        'packageinternaltesterbundle',
+        'packageinternaltesteruniversalapk',
+        'signinternaltesterbundle',
+        'installinternaltester',
+        'validatesigninginternaltester',
+        'makeapkfrombundleforinternaltester',
+        'zipapksforinternaltester',
+        'extractapksforinternaltester',
+    ] as Set
+    def testerPackagingTasks = graph.allTasks.findAll {
+        def taskName = it.name.toLowerCase()
+        it.project == project && (
+            testerPackagingTaskNames.contains(taskName) ||
+            taskName.startsWith('publishinternaltester')
+        )
+    }
+    if (!testerPackagingTasks.isEmpty()) {
+        if (!testerSigningConfigured) {
+            throw new GradleException('Tester packaging is blocked without all VEIL_ANDROID_TESTER_KEYSTORE, VEIL_ANDROID_TESTER_KEYSTORE_PASSWORD, VEIL_ANDROID_TESTER_KEY_ALIAS, and VEIL_ANDROID_TESTER_KEY_PASSWORD values.')
+        }
+        if (!file(testerStorePath).isFile()) {
+            throw new GradleException('Tester packaging is blocked because VEIL_ANDROID_TESTER_KEYSTORE does not name a file.')
+        }
+        if (testerVersionCode == null || testerVersionNameRaw == null) {
+            throw new GradleException('Tester packaging requires VEIL_ANDROID_TESTER_VERSION_CODE and VEIL_ANDROID_TESTER_VERSION_NAME.')
+        }
+        if (!sourceCommitValid) {
+            throw new GradleException('Tester packaging requires VEIL_SOURCE_COMMIT as exactly 40 lowercase hexadecimal characters.')
+        }
+    }
+
+    def connectedAndroidTestTasks = graph.allTasks.findAll {
+        it.project == project && it.name ==~ /(?i)^connected.*AndroidTest$/
+    }
+    if (!connectedAndroidTestTasks.isEmpty()) {
+        def acknowledgementProperty = 'veilConnectedAndroidTestDisposable'
+        def requiredAcknowledgement = 'I_UNDERSTAND_APP_DATA_WILL_BE_DELETED'
+        def suppliedAcknowledgement = gradle.startParameter.projectProperties[acknowledgementProperty]
+        if (suppliedAcknowledgement != requiredAcknowledgement) {
+            throw new GradleException(
+                "Connected Android instrumentation is destructive and blocked by default. " +
+                "Use only a fresh single-user disposable emulator and acknowledge this invocation with " +
+                "-P${acknowledgementProperty}=${requiredAcknowledgement}."
+            )
+        }
+
+        def adbName = System.getProperty('os.name', '').toLowerCase().contains('windows') ? 'adb.exe' : 'adb'
+        def adbExecutable = new File(android.sdkDirectory, "platform-tools/${adbName}")
+        if (!adbExecutable.isFile()) {
+            throw new GradleException('Connected Android instrumentation is blocked: the Android SDK adb executable could not be resolved.')
+        }
+
+        def runAdb = { List<String> arguments, String purpose ->
+            def command = [adbExecutable.absolutePath]
+            command.addAll(arguments)
+            def process
+            try {
+                process = new ProcessBuilder(command).redirectErrorStream(true).start()
+            } catch (Exception error) {
+                throw new GradleException("Connected Android instrumentation is blocked: adb could not start for ${purpose}.", error)
+            }
+            if (!process.waitFor(10, java.util.concurrent.TimeUnit.SECONDS)) {
+                process.destroyForcibly()
+                throw new GradleException("Connected Android instrumentation is blocked: adb timed out while checking ${purpose}.")
+            }
+            def output = process.inputStream.getText('UTF-8').trim()
+            if (process.exitValue() != 0) {
+                throw new GradleException("Connected Android instrumentation is blocked: adb failed while checking ${purpose}.")
+            }
+            output
+        }
+
+        def validateDisposableEmulator = {
+            def devicesOutput = runAdb(['devices', '-l'], 'connected devices')
+            def deviceLines = devicesOutput.readLines()
+            def devicesHeader = deviceLines.findIndexOf { it.trim() == 'List of devices attached' }
+            if (devicesHeader < 0) {
+                throw new GradleException('Connected Android instrumentation is blocked: adb device output was not recognized.')
+            }
+            def deviceRows = deviceLines.drop(devicesHeader + 1).findAll { !it.trim().isEmpty() }
+            if (deviceRows.size() != 1) {
+                throw new GradleException('Connected Android instrumentation is blocked: exactly one online disposable emulator is required.')
+            }
+            def onlineDevice = deviceRows[0] =~ /^(.+?)\s+device(?:\s|$)/
+            if (!onlineDevice.find()) {
+                throw new GradleException('Connected Android instrumentation is blocked: exactly one online disposable emulator is required.')
+            }
+            def serial = onlineDevice.group(1).trim()
+            def boundSerial = System.getenv('ANDROID_SERIAL')
+            if (boundSerial == null || boundSerial.isEmpty() || boundSerial.contains(',') || boundSerial != serial) {
+                throw new GradleException('Connected Android instrumentation is blocked: ANDROID_SERIAL must name exactly the sole verified disposable emulator.')
+            }
+
+            def emulatorMarker = runAdb(['-s', serial, 'shell', 'getprop', 'ro.kernel.qemu'], 'emulator identity')
+            if (emulatorMarker != '1') {
+                throw new GradleException('Connected Android instrumentation is blocked: physical devices are forbidden; use a fresh single-user disposable emulator.')
+            }
+
+            def usersOutput = runAdb(['-s', serial, 'shell', 'pm', 'list', 'users'], 'Android users')
+            def userLines = usersOutput.readLines().collect { it.trim() }.findAll { !it.isEmpty() }
+            def ownerUser = userLines.size() == 2 ? (userLines[1] =~ /^UserInfo\{(\d+):[^}]*\}(?:\s+.*)?$/) : null
+            if (userLines.size() != 2 || userLines[0] != 'Users:' || !ownerUser.matches() || ownerUser.group(1) != '0') {
+                throw new GradleException('Connected Android instrumentation is blocked: the disposable emulator must contain only Android user 0.')
+            }
+
+            for (packageId in ['io.veil.mobile', 'io.veil.mobile.tester']) {
+                def retainedPackages = runAdb(
+                    ['-s', serial, 'shell', 'pm', 'list', 'packages', '--user', '0', '-u', packageId],
+                    "retained ${packageId} package state"
+                ).readLines().collect { it.trim() }
+                if (retainedPackages.contains("package:${packageId}")) {
+                    throw new GradleException("Connected Android instrumentation is blocked: ${packageId} is already installed or retained on the emulator.")
+                }
+            }
+            serial
+        }
+
+        def verifiedSerial = validateDisposableEmulator()
+        def configuredTargetSerials = { connectedTask ->
+            if (connectedTask.metaClass.respondsTo(connectedTask, 'getTestRunnerFactory').isEmpty()) {
+                return null
+            }
+            def runnerFactory = connectedTask.getTestRunnerFactory()
+            def directSerials = runnerFactory.getDeviceSerialValues()
+            def values = directSerials.isPresent()
+                ? directSerials.get()
+                : runnerFactory.getConnectedCheckDeviceSerials().getOrElse(Collections.emptyList())
+            new ArrayList<String>(values)
+        }
+        def serialAwareConnectedTasks = connectedAndroidTestTasks.findAll {
+            !it.metaClass.respondsTo(it, 'getTestRunnerFactory').isEmpty()
+        }
+        if (serialAwareConnectedTasks.isEmpty()) {
+            throw new GradleException('Connected Android instrumentation is blocked: AGP target serial binding could not be inspected.')
+        }
+        def requireVerifiedTaskTarget = { connectedTask, String expectedSerial ->
+            def targetSerials = configuredTargetSerials(connectedTask)
+            if (targetSerials == null || (!targetSerials.isEmpty() && targetSerials != [expectedSerial])) {
+                throw new GradleException('Connected Android instrumentation is blocked: task --serial targets must be empty or exactly the verified disposable emulator.')
+            }
+        }
+        serialAwareConnectedTasks.each { connectedTask ->
+            requireVerifiedTaskTarget(connectedTask, verifiedSerial)
+            connectedTask.doFirst {
+                def executionSerial = validateDisposableEmulator()
+                if (executionSerial != verifiedSerial) {
+                    throw new GradleException('Connected Android instrumentation is blocked: the verified emulator changed before task execution.')
+                }
+                requireVerifiedTaskTarget(connectedTask, executionSerial)
+            }
+        }
     }
 }
 

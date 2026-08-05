@@ -20,7 +20,7 @@ const PEER_ID = "550e8400-e29b-41d4-a716-446655440001";
 describe("profile update event boundary", () => {
   it("accepts only canonical bounded updates from the current binding", async () => {
     const mockedInvoke = vi.mocked(invoke);
-    appStore.setServerEndpoints("wss://profile.example.test/ws", "https://profile.example.test");
+    appStore.setServerEndpoints("wss://profile.example.test/v3/events", "https://profile.example.test");
     mockedInvoke.mockImplementation(async (command: string) => {
       if (command === "connect_to_server") {
         return {
@@ -102,7 +102,10 @@ describe("profile update event boundary", () => {
     } });
     expect(appStore.identityChangeNotice()?.userId).toBe(PEER_ID);
 
-    appStore.setServerEndpoints("wss://profile.example.test/other", "https://profile.example.test");
+    appStore.setServerEndpoints(
+      "wss://profile-other.example.test/v3/events",
+      "https://profile-other.example.test",
+    );
     expect(appStore.profileUpdateNotice()).toBeNull();
     expect(appStore.identityChangeNotice()).toBeNull();
   });

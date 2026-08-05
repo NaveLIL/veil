@@ -38,6 +38,7 @@ import (
 	"github.com/NaveLIL/veil/veil-server/internal/chat"
 	"github.com/NaveLIL/veil/veil-server/internal/config"
 	"github.com/NaveLIL/veil/veil-server/internal/db"
+	"github.com/NaveLIL/veil/veil-server/internal/nodeorigin"
 	"github.com/NaveLIL/veil/veil-server/internal/profiles"
 	"github.com/NaveLIL/veil/veil-server/internal/servers"
 	pb "github.com/NaveLIL/veil/veil-server/pkg/proto/v1"
@@ -47,6 +48,8 @@ import (
 	"github.com/testcontainers/testcontainers-go/wait"
 	"golang.org/x/crypto/curve25519"
 )
+
+const integrationNodeOrigin = "https://integration-node.example.test:443"
 
 // Harness is a fully wired veil-server REST stack backed by an ephemeral
 // PostgreSQL container. It is safe to use from one test at a time; create a
@@ -118,8 +121,8 @@ func New(t *testing.T) *Harness {
 	}
 
 	cfg := &config.Config{
+		PublicOrigin:          mustIntegrationNodeOrigin(t, integrationNodeOrigin),
 		AuthChallengeTTL:      30 * time.Second,
-		AuthMaxAttempts:       3,
 		PreKeyLowWarning:      10,
 		AllowRegistration:     true,
 		MaxMessageSize:        64 * 1024,
@@ -133,12 +136,36 @@ func New(t *testing.T) *Harness {
 
 	mw := authmw.New(serversSvc.SigningKeyLookup())
 	t.Cleanup(mw.Close)
+	restV2Verifier, err := authmw.NewRESTAuthV2Verifier(
+		cfg.PublicOrigin,
+		serversSvc.SigningKeyLookup(),
+		database,
+	)
+	if err != nil {
+		t.Fatalf("create REST auth v2 verifier: %v", err)
+	}
+	restV2Boundary, err := authmw.NewRESTAuthV2HTTPBoundary(restV2Verifier, mw)
+	if err != nil {
+		t.Fatalf("create REST auth v2 HTTP boundary: %v", err)
+	}
+	restDispatcher, err := authmw.NewRESTAuthVersionDispatcher(restV2Boundary)
+	if err != nil {
+		t.Fatalf("create REST auth v2 dispatcher: %v", err)
+	}
 
 	mux := http.NewServeMux()
-	auth.NewHandler(authSvc, mw, nil).RegisterRoutes(mux)
-	chat.NewHandler(chatSvc, mw, nil).RegisterRoutes(mux)
-	servers.NewHandler(serversSvc, mw, nil).RegisterRoutes(mux)
-	profiles.NewHandler(profiles.NewPostgresStore(database.Pool), mw, nil, nil, nil).RegisterRoutes(mux)
+	authHandler := auth.NewHandler(authSvc, mw, nil)
+	authHandler.SetRESTAuthVersionDispatcher(restDispatcher)
+	authHandler.RegisterRoutes(mux)
+	chatHandler := chat.NewHandler(chatSvc, mw, nil)
+	chatHandler.SetRESTAuthVersionDispatcher(restDispatcher)
+	chatHandler.RegisterRoutes(mux)
+	serversHandler := servers.NewHandler(serversSvc, mw, nil)
+	serversHandler.SetRESTAuthVersionDispatcher(restDispatcher)
+	serversHandler.RegisterRoutes(mux)
+	profilesHandler := profiles.NewHandler(profiles.NewPostgresStore(database.Pool), mw, nil, nil, nil)
+	profilesHandler.SetRESTAuthVersionDispatcher(restDispatcher)
+	profilesHandler.RegisterRoutes(mux)
 
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
@@ -151,6 +178,15 @@ func New(t *testing.T) *Harness {
 		mw:          mw,
 		pgContainer: pgC,
 	}
+}
+
+func mustIntegrationNodeOrigin(t *testing.T, raw string) nodeorigin.Canonical {
+	t.Helper()
+	origin, err := nodeorigin.ParseCanonical(raw)
+	if err != nil {
+		t.Fatalf("parse integration Node origin: %v", err)
+	}
+	return origin
 }
 
 // User is a registered test user with the secret material needed to sign
@@ -241,14 +277,28 @@ func (h *Harness) doSignedRaw(u *User, method, path string, raw []byte, contentT
 	if req.URL.ForceQuery || req.URL.RawQuery != "" {
 		target += "?" + req.URL.RawQuery
 	}
-	canonical, err := authmw.CanonicalRequest(req.Method, req.Host, target, strconv.FormatInt(tsMs, 10), raw)
+	var nonce [authmw.RESTAuthV2NonceSize]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		h.t.Fatalf("generate REST auth v2 nonce: %v", err)
+	}
+	canonical, err := authmw.RESTAuthV2SigningMessage(authmw.RESTAuthV2Input{
+		CanonicalOrigin: integrationNodeOrigin,
+		UserID:          u.ID,
+		Method:          req.Method,
+		RequestTarget:   target,
+		TimestampMS:     uint64(tsMs),
+		Nonce:           nonce,
+		BodySHA256:      authmw.RESTAuthV2BodyDigest(raw),
+	})
 	if err != nil {
 		h.t.Fatalf("canonical request: %v", err)
 	}
 	sig := ed25519.Sign(u.SigningKey, canonical)
-	req.Header.Set("X-Veil-User", u.ID)
-	req.Header.Set("X-Veil-Timestamp", strconv.FormatInt(tsMs, 10))
-	req.Header.Set("X-Veil-Signature", base64.StdEncoding.EncodeToString(sig))
+	req.Header.Set(authmw.RESTAuthV2VersionHeader, authmw.RESTAuthV2ProtocolVersion)
+	req.Header.Set(authmw.RESTAuthV2UserHeader, u.ID)
+	req.Header.Set(authmw.RESTAuthV2TimestampHeader, strconv.FormatInt(tsMs, 10))
+	req.Header.Set(authmw.RESTAuthV2NonceHeader, base64.RawURLEncoding.EncodeToString(nonce[:]))
+	req.Header.Set(authmw.RESTAuthV2SignatureHeader, base64.RawURLEncoding.EncodeToString(sig))
 	if contentType != "" {
 		req.Header.Set("Content-Type", contentType)
 	}
@@ -265,8 +315,8 @@ func (h *Harness) doSignedRaw(u *User, method, path string, raw []byte, contentT
 	return resp.StatusCode, respBody, parsed
 }
 
-// DoUnsigned issues a request without the X-Veil-* triplet. Used to assert
-// that authmw rejects bare/legacy requests with 401.
+// DoUnsigned issues a request without the REST auth v2 proof set. Used to
+// assert that the production v2-only dispatcher rejects bare/legacy requests.
 func (h *Harness) DoUnsigned(method, path string, body any) (int, []byte) {
 	h.t.Helper()
 	var raw []byte

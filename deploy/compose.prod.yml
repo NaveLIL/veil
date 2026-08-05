@@ -8,6 +8,8 @@ x-logging: &default-logging
 
 services:
   postgres:
+    # Keep the default aligned with deploy/.env.example until the PostgreSQL 18
+    # dump/restore gate has physical upgrade evidence.
     image: "${VEIL_POSTGRES_IMAGE:-postgres:16.14-alpine3.24}"
     restart: unless-stopped
     stop_grace_period: 1m
@@ -69,6 +71,7 @@ services:
     environment:
       PORT: "8080"
       DATABASE_URL: "postgres://veil:${VEIL_DB_PASSWORD:?set VEIL_DB_PASSWORD in deploy/.env}@postgres:5432/veil?sslmode=disable"
+      VEIL_PUBLIC_ORIGIN: "${VEIL_PUBLIC_ORIGIN:?set VEIL_PUBLIC_ORIGIN in deploy/.env to the exact canonical HTTPS origin with an explicit port}"
       VEIL_WS_ORIGINS: "${VEIL_WS_ORIGINS:-https://veil.erez.pro}"
       VEIL_CORS_ORIGINS: "${VEIL_CORS_ORIGINS:-https://veil.erez.pro}"
       VEIL_WS_MAX_CONNS_PER_IP: "${VEIL_WS_MAX_CONNS_PER_IP:-64}"
@@ -119,7 +122,7 @@ services:
         hard: 65536
 
   ntfy:
-    image: "${VEIL_NTFY_IMAGE:-binwiederhier/ntfy:v2.23.0}"
+    image: "${VEIL_NTFY_IMAGE:-binwiederhier/ntfy:v2.26.0}"
     profiles: ["push"]
     restart: unless-stopped
     command: serve

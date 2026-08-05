@@ -20,6 +20,9 @@ const SCOPE: AuthenticatedServerScope = {
 const hit = (id: string, body: string): SearchHitDto => ({
   id,
   conversationId: `conversation-${id}`,
+  conversationType: "dm",
+  conversationName: null,
+  serverId: null,
   body,
   ts: 1,
   score: 1,
@@ -54,10 +57,44 @@ describe("message search product boundary", () => {
   beforeEach(() => {
     invokeMock.mockReset();
     vi.spyOn(appStore, "authenticatedServerScope").mockReturnValue(SCOPE);
+    appStore.setServers([]);
   });
 
   afterEach(() => {
+    appStore.setServers([]);
     vi.restoreAllMocks();
+  });
+
+  it("renders authenticated human context for Directs, Circles and Rooms without raw IDs", async () => {
+    const spaceId = "550e8400-e29b-41d4-a716-446655440099";
+    appStore.setServers([{ id: spaceId, name: "Research Space", ownerId: SCOPE.userId }]);
+    invokeMock.mockImplementation((command: string) => {
+      if (command === "get_search_coverage") return Promise.resolve(null);
+      if (command !== "search_messages") return Promise.resolve(undefined);
+      return Promise.resolve([
+        { ...hit("private-id", "private result"), conversationName: "Sable", conversationType: "dm" },
+        { ...hit("circle-id", "circle result"), conversationName: "Release crew", conversationType: "group" },
+        {
+          ...hit("room-id", "room result"),
+          conversationName: "general",
+          conversationType: "channel",
+          serverId: spaceId,
+        },
+        { ...hit("stale-secret-id", "stale result"), conversationName: null, conversationType: "group" },
+      ]);
+    });
+    renderPalette(async () => true);
+
+    fireEvent.input(screen.getByRole("combobox", { name: "Search messages" }), {
+      target: { value: "result" },
+    });
+    const options = await screen.findAllByRole("option");
+    expect(options).toHaveLength(4);
+    expect(options[0]).toHaveTextContent("Sable");
+    expect(options[1]).toHaveTextContent("Release crew");
+    expect(options[2]).toHaveTextContent("Research Space / #general");
+    expect(options[3]).toHaveTextContent("Circle");
+    expect(options.map((option) => option.textContent).join(" ")).not.toContain("stale-secret-id");
   });
 
   it("ignores an older search response that arrives after the current query", async () => {
@@ -128,7 +165,9 @@ describe("message search product boundary", () => {
     renderPalette(async () => true);
 
     const warning = await screen.findByTestId("search-coverage-warning");
-    expect(warning).toHaveTextContent("Search covers the newest 12,345 messages");
+    expect(warning).toHaveTextContent(
+      /Search covers the newest 12[\s,.'’]?345 messages/,
+    );
     expect(warning).toHaveTextContent("Older local history is omitted");
     expect(invokeMock).toHaveBeenCalledWith("get_search_coverage");
   });

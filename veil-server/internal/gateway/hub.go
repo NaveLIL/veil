@@ -14,10 +14,12 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
+	"github.com/jackc/pgx/v5"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/NaveLIL/veil/veil-server/internal/auth"
@@ -32,9 +34,14 @@ import (
 
 const (
 	maxMessageSize = 64 * 1024
-	writeWait      = 10 * time.Second
-	pongWait       = 60 * time.Second
-	pingPeriod     = (pongWait * 9) / 10
+	// Friend metadata travels over the same authenticated event queue as Direct
+	// traffic. Keep sender validation aligned with the client ingress bound so
+	// one client cannot persist a request that forces another to reject its
+	// authenticated epoch.
+	maxFriendRequestMessageBytes = 1024
+	writeWait                    = 10 * time.Second
+	pongWait                     = 60 * time.Second
+	pingPeriod                   = (pongWait * 9) / 10
 
 	// defaultMaxConnsPerIP caps concurrent WebSocket connections originating
 	// from a single client IP. Override via VEIL_WS_MAX_CONNS_PER_IP. Zero or
@@ -154,7 +161,16 @@ var upgrader = websocket.Upgrader{
 type Client struct {
 	hub  *Hub
 	conn *websocket.Conn
-	send chan []byte
+	send chan outboundBatch
+
+	// closing is set before a saturated client is disconnected. Fan-out skips
+	// such sessions immediately, even while the read pump is still unwinding
+	// and Hub.Run has not removed the indexes yet.
+	closing   atomic.Bool
+	closeOnce sync.Once
+	// closeFn is a deterministic test seam. Production falls back to conn.Close.
+	closeFn    func() error
+	registered chan struct{}
 
 	// Connection ID for challenge tracking (not user-visible)
 	connID string
@@ -171,9 +187,88 @@ type Client struct {
 	perDeviceSecure      bool
 	deviceBindingVersion uint64
 	deviceBindingStatus  db.DeviceBindingStatus
+}
 
-	// Rate limiting
-	authAttempts int
+type authenticatedSenderSnapshot struct {
+	identityKey []byte
+	username    string
+}
+
+// snapshotAuthenticatedSender captures the identity authenticated on this
+// transport. Message mutation handlers take it before touching durable state,
+// so live events never depend on a fallible post-ACK directory lookup.
+func (c *Client) snapshotAuthenticatedSender() (authenticatedSenderSnapshot, bool) {
+	if !c.authenticated || c.userID == "" || len(c.identityKey) != 32 || c.username == "" {
+		return authenticatedSenderSnapshot{}, false
+	}
+	return authenticatedSenderSnapshot{
+		identityKey: append([]byte(nil), c.identityKey...),
+		username:    c.username,
+	}, true
+}
+
+// outboundBatch is one indivisible FIFO unit for the single WebSocket writer.
+// Authentication publishes retained control envelopes and the successful
+// AuthResult in one batch so no live event can be written between them.
+type outboundBatch struct {
+	frames      [][]byte
+	publication *publicationGate
+}
+
+// publicationGate prevents writePump from exposing a successful AuthResult
+// until the Hub has published the authenticated connection in both indexes.
+// Closing ready synchronizes the allowed write with wait().
+type publicationGate struct {
+	once    sync.Once
+	ready   chan struct{}
+	allowed bool
+}
+
+func newPublicationGate() *publicationGate {
+	return &publicationGate{ready: make(chan struct{})}
+}
+
+func (g *publicationGate) resolve(allowed bool) {
+	if g == nil {
+		return
+	}
+	g.once.Do(func() {
+		g.allowed = allowed
+		close(g.ready)
+	})
+}
+
+func (g *publicationGate) wait() bool {
+	if g == nil {
+		return true
+	}
+	<-g.ready
+	return g.allowed
+}
+
+func singleOutbound(data []byte) outboundBatch {
+	return outboundBatch{frames: [][]byte{data}}
+}
+
+func (c *Client) markClosing() bool {
+	return c.closing.CompareAndSwap(false, true)
+}
+
+func (c *Client) closeTransportOnce() {
+	c.closeOnce.Do(func() {
+		if c.closeFn != nil {
+			_ = c.closeFn()
+			return
+		}
+		if c.conn != nil {
+			_ = c.conn.Close()
+		}
+	})
+}
+
+func (c *Client) failClosed() {
+	c.closing.Store(true)
+	c.closeTransportOnce()
 }
 
 // Hub maintains active clients and routes messages.
@@ -258,6 +353,9 @@ func (h *Hub) Run() {
 			h.clients[client] = true
 			n := len(h.clients)
 			h.mu.Unlock()
+			if client.registered != nil {
+				close(client.registered)
+			}
 			metrics.WSConnectionsTotal.Inc()
 			metrics.WSConnectionsActive.Set(float64(n))
 			log.Printf("client connected: %s (total: %d)", client.connID, n)
@@ -298,9 +396,7 @@ func (h *Hub) Run() {
 	}
 }
 
-// indexClient adds a client to the userID index after authentication.
-func (h *Hub) indexClient(client *Client) {
-	h.mu.Lock()
+func (h *Hub) indexClientLocked(client *Client) {
 	if h.userClients[client.userID] == nil {
 		h.userClients[client.userID] = make(map[*Client]bool)
 	}
@@ -312,7 +408,27 @@ func (h *Hub) indexClient(client *Client) {
 		h.deviceClients[client.deviceID] = make(map[*Client]bool)
 	}
 	h.deviceClients[client.deviceID][client] = true
-	h.mu.Unlock()
+}
+
+// publishAuthenticatedClient is the sole successful authentication cutover.
+// The success batch is already queued but writePump is blocked on gate. While
+// holding the write lock we publish identity state and both fan-out indexes,
+// then release the writer. Fan-out takes the matching read lock, so every live
+// envelope accepted after this point is queued strictly behind AuthResult.
+func (h *Hub) publishAuthenticatedClient(client *Client, gate *publicationGate) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if gate == nil || client == nil || !h.clients[client] || client.closing.Load() ||
+		client.userID == "" || client.deviceID == "" {
+		if gate != nil {
+			gate.resolve(false)
+		}
+		return false
+	}
+	client.authenticated = true
+	h.indexClientLocked(client)
+	gate.resolve(true)
+	return true
 }
 
 // enqueueToUser sends a serialized Envelope to every currently indexed
@@ -325,17 +441,25 @@ func (h *Hub) indexClient(client *Client) {
 // connection indexing and removal.
 func (h *Hub) enqueueToUser(userID string, data []byte) bool {
 	h.mu.RLock()
-	defer h.mu.RUnlock()
-
 	clients := h.userClients[userID]
 	enqueued := false
+	toClose := make([]*Client, 0)
 	for c := range clients {
+		if c.closing.Load() {
+			continue
+		}
 		select {
-		case c.send <- data:
+		case c.send <- singleOutbound(data):
 			enqueued = true
 		default:
-			// Client too slow, will be cleaned up by writePump.
+			if c.markClosing() {
+				toClose = append(toClose, c)
+			}
 		}
+	}
+	h.mu.RUnlock()
+	for _, client := range toClose {
+		client.closeTransportOnce()
 	}
 	return enqueued
 }
@@ -351,15 +475,25 @@ func (h *Hub) sendToUser(userID string, data []byte) {
 // saturated session is not considered online for push fallback.
 func (h *Hub) enqueueToDevice(deviceID string, data []byte) bool {
 	h.mu.RLock()
-	defer h.mu.RUnlock()
 	clients := h.deviceClients[deviceID]
 	enqueued := false
+	toClose := make([]*Client, 0)
 	for client := range clients {
+		if client.closing.Load() {
+			continue
+		}
 		select {
-		case client.send <- data:
+		case client.send <- singleOutbound(data):
 			enqueued = true
 		default:
+			if client.markClosing() {
+				toClose = append(toClose, client)
+			}
 		}
+	}
+	h.mu.RUnlock()
+	for _, client := range toClose {
+		client.closeTransportOnce()
 	}
 	return enqueued
 }
@@ -471,63 +605,10 @@ func (h *Hub) BroadcastToUsers(userIDs []string, env *pb.Envelope) {
 	}
 }
 
-// HandleWebSocket upgrades HTTP to WebSocket, sends auth challenge, starts pumps.
-func HandleWebSocket(hub *Hub, w http.ResponseWriter, r *http.Request) {
-	ip := wsClientIP(r)
-
-	// Per-IP connection cap. Reject BEFORE upgrade so we don't waste a
-	// goroutine + websocket buffer on an attacker flooding from one IP.
-	if !hub.tryAcquireIP(ip) {
-		metrics.WSRefusedTotal.WithLabelValues("ip_cap").Inc()
-		http.Error(w, "too many connections from this address", http.StatusTooManyRequests)
-		return
-	}
-
-	conn, err := upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		// Upgrade may fail because of CheckOrigin too — count it.
-		metrics.WSRefusedTotal.WithLabelValues("upgrade_error").Inc()
-		hub.releaseIP(ip)
-		log.Printf("upgrade error: class=%s", logsafe.ErrorClass(err))
-		return
-	}
-
-	connID := fmt.Sprintf("%p-%d", conn, time.Now().UnixNano())
-	client := &Client{
-		hub:    hub,
-		conn:   conn,
-		send:   make(chan []byte, 256),
-		connID: connID,
-		ip:     ip,
-	}
-
-	hub.register <- client
-
-	// Send auth challenge immediately
-	nonce, err := hub.authSvc.CreateChallenge(connID)
-	if err != nil {
-		log.Printf("failed to create challenge: class=%s", logsafe.ErrorClass(err))
-		conn.Close()
-		return
-	}
-
-	env := &pb.Envelope{
-		Timestamp: uint64(time.Now().UnixNano()),
-		Payload: &pb.Envelope_AuthChallenge{
-			AuthChallenge: &pb.AuthChallenge{Challenge: nonce[:]},
-		},
-	}
-	data, _ := proto.Marshal(env)
-	client.send <- data
-
-	go client.writePump()
-	go client.readPump()
-}
-
 func (c *Client) readPump() {
 	defer func() {
 		c.hub.unregister <- c
-		c.conn.Close()
+		c.failClosed()
 	}()
 
 	c.conn.SetReadLimit(maxMessageSize)
@@ -596,61 +677,95 @@ func envelopeKind(env *pb.Envelope) string {
 }
 
 func (c *Client) handleEnvelope(env *pb.Envelope) {
-	ctx := context.Background()
-
-	switch payload := env.Payload.(type) {
-
-	// === Auth Response ===
-	case *pb.Envelope_AuthResponse:
-		c.handleAuth(ctx, env.Seq, payload.AuthResponse)
-
-	// === All other messages require authentication ===
-	default:
-		if !c.authenticated {
-			c.sendError(env.Seq, 401, "not authenticated")
-			return
-		}
-
-		// W10 — per-(user, kind) rate limit. Drop with a 429-equivalent
-		// error so the client knows to back off, and increment the
-		// rejected-total metric so ops can see the offender.
-		kind := kindForUserBucket(envelopeKind(env))
-		if !allowEnvelope(c.userID, kind) {
-			c.sendError(env.Seq, 429, "ws rate limit exceeded for "+kind)
-			return
-		}
-
-		switch p := env.Payload.(type) {
-		case *pb.Envelope_SendMessage:
-			c.handleSendMessage(ctx, env.Seq, p.SendMessage)
-		case *pb.Envelope_EditMessage:
-			c.handleEditMessage(ctx, env.Seq, p.EditMessage)
-		case *pb.Envelope_DeleteMessage:
-			c.handleDeleteMessage(ctx, env.Seq, p.DeleteMessage)
-		case *pb.Envelope_ReactionUpdate:
-			c.handleReaction(ctx, env.Seq, p.ReactionUpdate)
-		case *pb.Envelope_PrekeyRequest:
-			c.handlePreKeyRequest(ctx, env.Seq, p.PrekeyRequest)
-		case *pb.Envelope_TypingEvent:
-			c.handleTyping(ctx, env.Seq, p.TypingEvent)
-		case *pb.Envelope_PresenceUpdate:
-			c.handlePresence(ctx, p.PresenceUpdate)
-		case *pb.Envelope_SenderKeyDist:
-			c.handleSenderKeyDist(ctx, env.Seq, p.SenderKeyDist)
-		case *pb.Envelope_SenderKeyReceipt:
-			c.handleSenderKeyReceipt(ctx, env.Seq, p.SenderKeyReceipt)
-		case *pb.Envelope_FriendRequest:
-			c.handleFriendRequest(ctx, env.Seq, p.FriendRequest)
-		case *pb.Envelope_FriendRespond:
-			c.handleFriendRespond(ctx, env.Seq, p.FriendRespond)
-		case *pb.Envelope_FriendRemove:
-			c.handleFriendRemove(ctx, env.Seq, p.FriendRemove)
-		case *pb.Envelope_FriendListRequest:
-			c.handleFriendListRequest(ctx, env.Seq)
-		default:
-			c.sendError(env.Seq, 501, "unsupported message type")
-		}
+	// Authentication completes synchronously before readPump starts. A later
+	// auth frame is therefore a terminal protocol violation. In particular, a
+	// legacy v2 response must never re-authenticate an origin-bound v3 socket.
+	if response := env.GetAuthResponseV3(); response != nil {
+		defer clear(response.NodeAccessPass)
 	}
+	if response := env.GetAuthResponse(); response != nil {
+		defer clear(response.NodeAccessInvite)
+	}
+	if env.GetAuthResponseV3() != nil || env.GetAuthResponse() != nil {
+		metrics.WSAuthFailuresTotal.Inc()
+		c.failClosed()
+		return
+	}
+	ctx := context.Background()
+	clientMessageID, sendMessageReason := sendMessageEnvelopeContext(env)
+
+	if !c.authenticated {
+		if clientMessageID != "" {
+			sendMessageReason = sendMessageReasonNotAuthenticated
+		}
+		c.sendErrorWithSendMessageContext(
+			env.Seq, 401, "not authenticated", clientMessageID, sendMessageReason,
+		)
+		return
+	}
+
+	// W10 — per-(user, kind) rate limit. Drop with a 429-equivalent
+	// error so the client knows to back off, and increment the
+	// rejected-total metric so ops can see the offender.
+	kind := kindForUserBucket(envelopeKind(env))
+	if !allowEnvelope(c.userID, kind) {
+		if clientMessageID != "" {
+			sendMessageReason = sendMessageReasonRateLimited
+		}
+		c.sendErrorWithSendMessageContext(
+			env.Seq, 429, "ws rate limit exceeded for "+kind, clientMessageID, sendMessageReason,
+		)
+		return
+	}
+
+	switch p := env.Payload.(type) {
+	case *pb.Envelope_SendMessage:
+		c.handleSendMessage(ctx, env.Seq, p.SendMessage)
+	case *pb.Envelope_EditMessage:
+		c.handleEditMessage(ctx, env.Seq, p.EditMessage)
+	case *pb.Envelope_DeleteMessage:
+		c.handleDeleteMessage(ctx, env.Seq, p.DeleteMessage)
+	case *pb.Envelope_ReactionUpdate:
+		c.handleReaction(ctx, env.Seq, p.ReactionUpdate)
+	case *pb.Envelope_PrekeyRequest:
+		c.handlePreKeyRequest(ctx, env.Seq, p.PrekeyRequest)
+	case *pb.Envelope_TypingEvent:
+		c.handleTyping(ctx, env.Seq, p.TypingEvent)
+	case *pb.Envelope_PresenceUpdate:
+		c.handlePresence(ctx, p.PresenceUpdate)
+	case *pb.Envelope_SenderKeyDist:
+		c.handleSenderKeyDist(ctx, env.Seq, p.SenderKeyDist)
+	case *pb.Envelope_SenderKeyReceipt:
+		c.handleSenderKeyReceipt(ctx, env.Seq, p.SenderKeyReceipt)
+	case *pb.Envelope_FriendRequest:
+		c.handleFriendRequest(ctx, env.Seq, p.FriendRequest)
+	case *pb.Envelope_FriendRespond:
+		c.handleFriendRespond(ctx, env.Seq, p.FriendRespond)
+	case *pb.Envelope_FriendRemove:
+		c.handleFriendRemove(ctx, env.Seq, p.FriendRemove)
+	case *pb.Envelope_FriendListRequest:
+		c.handleFriendListRequest(ctx, env.Seq)
+	default:
+		c.sendError(env.Seq, 501, "unsupported message type")
+	}
+}
+
+// sendMessageEnvelopeContext extracts correlation only from send_message.
+// Invalid or absent IDs are never reflected back to the peer; the stable
+// reason lets clients distinguish this wire-contract failure from unrelated
+// authentication and rate-limit errors.
+func sendMessageEnvelopeContext(env *pb.Envelope) (string, string) {
+	if env == nil {
+		return "", ""
+	}
+	payload, ok := env.Payload.(*pb.Envelope_SendMessage)
+	if !ok {
+		return "", ""
+	}
+	if clientMessageID, valid := chat.CanonicalClientMessageID(payload.SendMessage); valid {
+		return clientMessageID, ""
+	}
+	return "", sendMessageReasonInvalidClientMessageID
 }
 
 // --- Auth ---
@@ -681,127 +796,142 @@ func deviceBindingFromProto(binding *pb.DeviceBindingV1) (*auth.DeviceBindingInp
 	}, nil
 }
 
-func (c *Client) handleAuth(ctx context.Context, seq uint64, resp *pb.AuthResponse) {
-	c.authAttempts++
-	if c.authAttempts > 3 {
-		c.sendError(seq, 429, "too many auth attempts")
-		c.conn.Close()
-		return
-	}
-
-	if resp == nil {
-		metrics.WSAuthFailuresTotal.Inc()
-		_ = c.sendPublicAuthFailure(seq, publicerr.New(
-			http.StatusUnauthorized, "authentication_failed", "authentication failed", errors.New("missing authentication response"),
-		))
-		return
-	}
-	// The access pass is a short-lived bearer. Protobuf and WebSocket/TLS
-	// decoding necessarily create transient wire copies, but this avoidable
-	// decoded field must not remain in the heap until the envelope is collected.
-	defer clear(resp.NodeAccessInvite)
-	deviceBinding, err := deviceBindingFromProto(resp.GetDeviceBinding())
-	if err != nil {
-		metrics.WSAuthFailuresTotal.Inc()
-		_ = c.sendPublicAuthFailure(seq, publicerr.New(
-			http.StatusUnauthorized, "authentication_failed", "authentication failed", err,
-		))
-		return
-	}
-	result, err := c.hub.authSvc.VerifyResponseV2(
-		ctx, c.connID,
-		resp.IdentityKey, resp.SigningKey, resp.Signature,
-		resp.DeviceId, resp.DeviceName, deviceBinding, resp.GetDeviceSignature(),
-		resp.GetNodeAccessInvite(),
-	)
-	if err != nil {
-		log.Printf("auth failed [%s]: class=%s", c.connID, logsafe.ErrorClass(err))
-		metrics.WSAuthFailuresTotal.Inc()
-		_ = c.sendMappedAuthFailure(seq, err)
-		return
-	}
-
-	c.userID = result.UserID
-	c.deviceID = result.DeviceID
-	c.deviceKey = append([]byte(nil), resp.DeviceId...)
-	c.username = result.Username
-	c.identityKey = resp.IdentityKey
-	c.perDeviceSecure = result.PerDeviceSecure
-	c.deviceBindingVersion = result.DeviceBindingVersion
-	c.deviceBindingStatus = result.DeviceBindingStatus
-
-	// Restore durable sender-key state before declaring the session ready. A
-	// database failure forces a reconnect so the client cannot start sending
-	// group messages without the latest retained generation.
-	pendingSenderKeys, err := c.pendingSenderKeyEnvelopes(ctx)
-	if err != nil {
-		log.Printf("auth state restore failed [%s]: reason=%s", c.connID, senderKeyRestoreErrorLabel(err))
-		message := "failed to restore encrypted session state"
-		switch {
-		case errors.Is(err, db.ErrSenderKeyRetentionExpired):
-			message = "encrypted history unavailable: sender-key receipt deadline expired"
-		case errors.Is(err, db.ErrSenderKeyRestoreBacklogExceeded):
-			message = "encrypted session backlog exceeds the safe restore limit"
-		case errors.Is(err, db.ErrSenderKeyLegacyState):
-			message = "encrypted session contains unsupported legacy sender-key state"
-		}
-		_ = c.sendAuthResult(seq, false, "", message)
-		if c.conn != nil {
-			_ = c.conn.Close()
-		}
-		return
-	}
-	// Queue retained group-key control state before the AuthResult barrier.
-	// The client buffers these envelopes during its handshake, installs them
-	// as soon as AuthResult succeeds, and can then decrypt REST backlog before
-	// the normal WS poller starts. The connection is published only after all
-	// control envelopes and the barrier are durably queued in FIFO order.
-	for _, data := range pendingSenderKeys {
-		if err := c.enqueueData(data); err != nil {
-			log.Printf("pending sender-key delivery failed [%s]: class=%s", c.connID, logsafe.ErrorClass(err))
-			if c.conn != nil {
-				_ = c.conn.Close()
-			}
-			return
-		}
-	}
-	if err := c.sendAuthResult(seq, true, result.UserID, "", result); err != nil {
-		log.Printf("auth result queue failed [%s]: class=%s", c.connID, logsafe.ErrorClass(err))
-		if c.conn != nil {
-			_ = c.conn.Close()
-		}
-		return
-	}
-	c.authenticated = true
-	c.hub.indexClient(c)
-	log.Printf("auth success [%s]: user_ref=%s device_ref=%s", c.connID, logsafe.Ref("user", c.userID), logsafe.Ref("device", c.deviceID))
-}
-
 // --- Chat ---
 
+func validateDirectV2SendShape(msg *pb.SendMessage) (bool, error) {
+	if msg == nil {
+		return false, chat.ErrInvalidSendMessage
+	}
+	absent := msg.CryptoProfile == "" && msg.CryptoEra == 0 &&
+		len(msg.TargetDeviceId) == 0 && msg.TargetBindingVersion == 0 &&
+		len(msg.DirectSessionId) == 0
+	if absent {
+		return false, nil
+	}
+	if (msg.CryptoProfile == db.MessageCryptoProfileSenderKeyV5 &&
+		msg.CryptoEra == db.MessageCryptoEraSenderKeyV5 ||
+		msg.CryptoProfile == db.MessageCryptoProfileSenderKeyV6 &&
+			msg.CryptoEra == db.MessageCryptoEraSenderKeyV6) &&
+		len(msg.TargetDeviceId) == 0 && msg.TargetBindingVersion == 0 &&
+		len(msg.DirectSessionId) == 0 {
+		return false, nil
+	}
+	if msg.CryptoProfile != db.MessageCryptoProfileDirectV2 ||
+		msg.CryptoEra != db.MessageCryptoEraDirectV2 ||
+		len(msg.TargetDeviceId) != 16 || bytes.Equal(msg.TargetDeviceId, make([]byte, 16)) ||
+		msg.TargetBindingVersion == 0 || msg.TargetBindingVersion > uint64(^uint64(0)>>1) ||
+		len(msg.DirectSessionId) != 32 || bytes.Equal(msg.DirectSessionId, make([]byte, 32)) {
+		return false, chat.ErrInvalidSendMessage
+	}
+	if len(msg.Header) == 0 {
+		return false, chat.ErrInvalidSendMessage
+	}
+	switch msg.Header[0] {
+	case 0x11:
+		if len(msg.Header) != 1+32+32+4+4+41 {
+			return false, chat.ErrInvalidSendMessage
+		}
+	case 0x12:
+		if len(msg.Header) != 1+32+41 {
+			return false, chat.ErrInvalidSendMessage
+		}
+	default:
+		return false, chat.ErrInvalidSendMessage
+	}
+	if !bytes.Equal(msg.Header[1:33], msg.DirectSessionId) {
+		return false, chat.ErrInvalidSendMessage
+	}
+	return true, nil
+}
+
 func (c *Client) handleSendMessage(ctx context.Context, seq uint64, msg *pb.SendMessage) {
+	clientMessageID, validClientMessageID := chat.CanonicalClientMessageID(msg)
+	sender, authenticated := c.snapshotAuthenticatedSender()
+	if !authenticated {
+		reason := sendMessageReasonNotAuthenticated
+		if !validClientMessageID {
+			reason = sendMessageReasonInvalidClientMessageID
+		}
+		c.sendErrorWithSendMessageContext(
+			seq, http.StatusUnauthorized, "authentication required", clientMessageID, reason,
+		)
+		return
+	}
+	if !validClientMessageID {
+		c.sendErrorWithSendMessageContext(
+			seq, http.StatusBadRequest, "invalid client message id", "", sendMessageReasonInvalidClientMessageID,
+		)
+		return
+	}
+	// Sealed-message semantics are not persisted in REST history yet. Reject
+	// this globally unsupported shape before any conversation, device, or
+	// roster lookup so every authenticated caller gets the same safe outcome.
+	// The Service repeats the guard as defense in depth for non-WS callers.
+	if msg != nil && msg.Sealed {
+		status, message, reason := classifySendMessageError(chat.ErrSealedMessageUnsupported)
+		c.sendErrorWithSendMessageContext(seq, uint32(status), message, clientMessageID, reason)
+		return
+	}
+
+	// An accepted request remains replayable even when mutable conversation or
+	// device state has changed since the original commit. The service compares
+	// the canonical request digest and returns the durable ACK tuple. Replays
+	// are ACKed here and deliberately never reach fan-out.
+	replay, err := c.hub.chatSvc.LookupSendMessageReplay(ctx, c.userID, msg)
+	if err != nil {
+		status, message, reason := classifySendMessageLookupError(err)
+		c.sendErrorWithSendMessageContext(seq, uint32(status), message, clientMessageID, reason)
+		return
+	}
+	if replay != nil {
+		c.sendMessageAck(seq, clientMessageID, replay)
+		return
+	}
+	directV2, directShapeErr := validateDirectV2SendShape(msg)
+	if directShapeErr != nil {
+		status, message, reason := classifySendMessageError(directShapeErr)
+		c.sendErrorWithSendMessageContext(seq, uint32(status), message, clientMessageID, reason)
+		return
+	}
+
 	var secureRoster *db.ConversationDeviceRoster
 	var messageSecurity *db.MessageSecurityContext
+	var directSourceBinding, directTargetBinding *db.DeviceBinding
 	if msg != nil && msg.ConversationId != "" {
 		canSend, accessErr := c.hub.chatSvc.DB().CanAccessConversation(
 			ctx, msg.ConversationId, c.userID,
 			db.PermViewChannel|db.PermSendMessages,
 		)
-		if accessErr != nil || !canSend {
-			c.sendError(seq, 403, "not a conversation member")
+		if accessErr != nil {
+			c.sendErrorWithSendMessageContext(
+				seq, http.StatusInternalServerError, "internal error", clientMessageID, sendMessageReasonInternalError,
+			)
+			return
+		}
+		if !canSend {
+			c.sendErrorWithSendMessageContext(
+				seq, http.StatusForbidden, "not a conversation member", clientMessageID, sendMessageReasonNotMember,
+			)
 			return
 		}
 		conversationType, typeErr := c.hub.chatSvc.DB().GetConversationType(ctx, msg.ConversationId)
 		if typeErr != nil {
-			c.sendError(seq, 400, "conversation not found")
+			c.sendErrorWithSendMessageContext(
+				seq, http.StatusBadRequest, "conversation not found", clientMessageID, sendMessageReasonConversationNotFound,
+			)
 			return
 		}
 		if conversationType == 1 || conversationType == 2 {
+			if directV2 {
+				status, message, reason := classifySendMessageError(chat.ErrInvalidSendMessage)
+				c.sendErrorWithSendMessageContext(seq, uint32(status), message, clientMessageID, reason)
+				return
+			}
 			if !c.perDeviceSecure || c.deviceBindingStatus != db.DeviceBindingActive ||
 				c.deviceBindingVersion == 0 || len(c.deviceKey) != 16 {
-				c.sendPublicError(seq, http.StatusConflict, publicerr.New(
+				c.sendMessagePublicError(seq, http.StatusConflict, publicerr.New(
 					http.StatusConflict, "device_not_eligible", "device is not eligible for secure channel traffic", errDeviceNotEligible,
-				))
+				), clientMessageID, sendMessageReasonDeviceNotEligible)
 				return
 			}
 			var rosterErr error
@@ -810,86 +940,159 @@ func (c *Client) handleSendMessage(ctx context.Context, seq uint64, msg *pb.Send
 				msg.GetRosterVersion(), msg.GetRosterCommitment(),
 			)
 			if rosterErr != nil {
-				c.sendPublicError(seq, http.StatusConflict, publicerr.New(
+				c.sendMessagePublicError(seq, http.StatusConflict, publicerr.New(
 					http.StatusConflict, "secure_roster_changed", "secure device roster changed; rotate and redistribute", rosterErr,
-				))
+				), clientMessageID, sendMessageReasonSecureRosterChanged)
 				return
 			}
 			source, sourceErr := findRosterDeviceByDatabaseID(secureRoster, c.deviceID)
 			if sourceErr != nil || !bytes.Equal(source.device.DeviceKey, c.deviceKey) ||
 				source.device.Binding.Version != c.deviceBindingVersion {
-				c.sendPublicError(seq, http.StatusConflict, publicerr.New(
+				c.sendMessagePublicError(seq, http.StatusConflict, publicerr.New(
 					http.StatusConflict, "device_not_eligible", "device is not eligible for secure channel traffic", errDeviceNotEligible,
-				))
+				), clientMessageID, sendMessageReasonDeviceNotEligible)
 				return
 			}
+			cryptoProfile := db.MessageCryptoProfileSenderKeyV5
+			cryptoEra := db.MessageCryptoEraSenderKeyV5
+			var membershipEpoch uint64
+			var membershipEpochHash []byte
+			membershipRecord, membershipErr := c.hub.chatSvc.DB().MembershipEpochForRosterForRequesterV1(
+				ctx, msg.ConversationId, c.userID, secureRoster.Version, secureRoster.Commitment,
+			)
+			switch {
+			case errors.Is(membershipErr, pgx.ErrNoRows):
+				if msg.MembershipEpoch != 0 || len(msg.MembershipEpochHash) != 0 ||
+					(msg.CryptoProfile != "" && msg.CryptoProfile != db.MessageCryptoProfileSenderKeyV5) ||
+					(msg.CryptoProfile == "" && msg.CryptoEra != 0) ||
+					(msg.CryptoProfile == db.MessageCryptoProfileSenderKeyV5 && msg.CryptoEra != db.MessageCryptoEraSenderKeyV5) {
+					status, message, reason := classifySendMessageError(chat.ErrInvalidSendMessage)
+					c.sendErrorWithSendMessageContext(seq, uint32(status), message, clientMessageID, reason)
+					return
+				}
+			case membershipErr != nil:
+				c.sendMessagePublicError(seq, http.StatusConflict, publicerr.New(
+					http.StatusConflict, "membership_epoch_changed", "signed membership changed; refresh the conversation and retry", membershipErr,
+				), clientMessageID, sendMessageReasonSecureRosterChanged)
+				return
+			default:
+				if membershipRecord == nil || msg.CryptoProfile != db.MessageCryptoProfileSenderKeyV6 ||
+					msg.CryptoEra != db.MessageCryptoEraSenderKeyV6 ||
+					msg.MembershipEpoch != membershipRecord.Epoch.Number ||
+					!bytes.Equal(msg.MembershipEpochHash, membershipRecord.Hash[:]) {
+					c.sendMessagePublicError(seq, http.StatusConflict, publicerr.New(
+						http.StatusConflict, "membership_epoch_changed", "signed membership changed; refresh the conversation and retry", db.ErrMembershipEpochRosterStale,
+					), clientMessageID, sendMessageReasonSecureRosterChanged)
+					return
+				}
+				cryptoProfile = db.MessageCryptoProfileSenderKeyV6
+				cryptoEra = db.MessageCryptoEraSenderKeyV6
+				membershipEpoch = membershipRecord.Epoch.Number
+				membershipEpochHash = append([]byte(nil), membershipRecord.Hash[:]...)
+			}
 			messageSecurity = &db.MessageSecurityContext{
-				CryptoProfile:          db.MessageCryptoProfileSenderKeyV5,
-				CryptoEra:              db.MessageCryptoEraSenderKeyV5,
+				CryptoProfile:          cryptoProfile,
+				CryptoEra:              cryptoEra,
 				RosterVersion:          secureRoster.Version,
 				RosterCommitment:       append([]byte(nil), secureRoster.Commitment[:]...),
+				MembershipEpoch:        membershipEpoch,
+				MembershipEpochHash:    membershipEpochHash,
 				SenderDeviceID:         append([]byte(nil), source.device.DeviceKey...),
 				SenderBindingVersion:   source.device.Binding.Version,
 				SenderDeviceDatabaseID: source.device.DeviceID,
 			}
+		} else {
+			if msg.RosterVersion != 0 || len(msg.RosterCommitment) != 0 {
+				status, message, reason := classifySendMessageError(chat.ErrInvalidSendMessage)
+				c.sendErrorWithSendMessageContext(seq, uint32(status), message, clientMessageID, reason)
+				return
+			}
+			if !directV2 && (msg.CryptoProfile != "" || msg.CryptoEra != 0 ||
+				msg.MembershipEpoch != 0 || len(msg.MembershipEpochHash) != 0) {
+				status, message, reason := classifySendMessageError(chat.ErrInvalidSendMessage)
+				c.sendErrorWithSendMessageContext(seq, uint32(status), message, clientMessageID, reason)
+				return
+			}
+			if directV2 {
+				if !c.perDeviceSecure || c.deviceBindingStatus != db.DeviceBindingActive ||
+					c.deviceBindingVersion == 0 || len(c.deviceKey) != 16 {
+					c.sendMessagePublicError(seq, http.StatusConflict, publicerr.New(
+						http.StatusConflict, "device_not_eligible", "device is not eligible for Direct v2 traffic", errDeviceNotEligible,
+					), clientMessageID, sendMessageReasonDeviceNotEligible)
+					return
+				}
+				directSourceBinding, err = c.hub.chatSvc.DB().GetLatestDeviceBinding(ctx, c.deviceID)
+				if err != nil || directSourceBinding.UserID != c.userID ||
+					directSourceBinding.Status != db.DeviceBindingActive ||
+					directSourceBinding.Version != c.deviceBindingVersion ||
+					!bytes.Equal(directSourceBinding.DeviceKey, c.deviceKey) {
+					c.sendMessagePublicError(seq, http.StatusConflict, publicerr.New(
+						http.StatusConflict, "device_not_eligible", "source device binding changed; re-authenticate", errDeviceNotEligible,
+					), clientMessageID, sendMessageReasonDeviceNotEligible)
+					return
+				}
+				directTargetBinding, err = c.hub.chatSvc.DB().GetLatestDeviceBindingByKey(ctx, msg.TargetDeviceId)
+				if err != nil || directTargetBinding.UserID == c.userID ||
+					directTargetBinding.Status != db.DeviceBindingActive ||
+					directTargetBinding.Version != msg.TargetBindingVersion ||
+					!bytes.Equal(directTargetBinding.DeviceKey, msg.TargetDeviceId) {
+					c.sendMessagePublicError(seq, http.StatusConflict, publicerr.New(
+						http.StatusConflict, "device_not_eligible", "target device binding changed; refresh the peer prekey", errDeviceNotEligible,
+					), clientMessageID, sendMessageReasonDeviceNotEligible)
+					return
+				}
+				messageSecurity = &db.MessageSecurityContext{
+					CryptoProfile:             db.MessageCryptoProfileDirectV2,
+					CryptoEra:                 db.MessageCryptoEraDirectV2,
+					SenderDeviceID:            append([]byte(nil), directSourceBinding.DeviceKey...),
+					SenderBindingVersion:      directSourceBinding.Version,
+					SenderDeviceDatabaseID:    directSourceBinding.DeviceID,
+					SenderDeviceIdentityKey:   append([]byte(nil), directSourceBinding.DeviceIdentityKey...),
+					SenderDeviceSigningKey:    append([]byte(nil), directSourceBinding.DeviceSigningKey...),
+					SenderDeviceCapabilities:  directSourceBinding.Capabilities,
+					SenderDeviceBindingStatus: directSourceBinding.Status,
+					SenderAccountSignature:    append([]byte(nil), directSourceBinding.AccountSignature...),
+					TargetDeviceID:            append([]byte(nil), directTargetBinding.DeviceKey...),
+					TargetBindingVersion:      directTargetBinding.Version,
+					TargetDeviceDatabaseID:    directTargetBinding.DeviceID,
+					DirectSessionID:           append([]byte(nil), msg.DirectSessionId...),
+				}
+			}
 		}
 	}
 
-	var msgID string
-	var serverTime time.Time
-	var recipients []string
-	var err error
+	var result *chat.SendMessageResult
 	if messageSecurity != nil {
-		msgID, serverTime, recipients, err = c.hub.chatSvc.HandleSecureSendMessage(
+		result, err = c.hub.chatSvc.HandleSecureSendMessageResult(
 			ctx, c.userID, msg, messageSecurity,
 		)
 	} else {
-		msgID, serverTime, recipients, err = c.hub.chatSvc.HandleSendMessage(ctx, c.userID, msg)
+		result, err = c.hub.chatSvc.HandleSendMessageResult(ctx, c.userID, msg)
 	}
 	if err != nil {
-		status, message := classifySendMessageError(err)
-		c.sendError(seq, uint32(status), message)
+		status, message, reason := classifySendMessageError(err)
+		c.sendErrorWithSendMessageContext(seq, uint32(status), message, clientMessageID, reason)
 		return
 	}
 
-	// ACK to sender
-	ack := &pb.MessageAck{
-		MessageId:       msgID,
-		ServerTimestamp: uint64(serverTime.UnixNano()),
-		RefSeq:          seq,
+	if !c.sendMessageAck(seq, clientMessageID, result) {
+		return
 	}
-	if secureRoster != nil {
-		version := secureRoster.Version
-		ack.RosterVersion = &version
-	}
-	c.sendEnvelope(&pb.Envelope{
-		Seq:       seq,
-		Timestamp: uint64(serverTime.UnixNano()),
-		Payload: &pb.Envelope_MessageAck{
-			MessageAck: ack,
-		},
-	})
-
-	// Lookup sender info for the event
-	sender, _ := c.hub.chatSvc.LookupUser(ctx, c.userID)
-	var senderKey []byte
-	var senderName string
-	if sender != nil {
-		senderKey = sender.IdentityKey
-		senderName = sender.Username
+	if result.Replayed {
+		return
 	}
 
 	// Fan-out MessageEvent to recipients
 	event := &pb.Envelope{
-		Timestamp: uint64(serverTime.UnixNano()),
+		Timestamp: uint64(result.ServerTimestamp.UnixNano()),
 		Payload: &pb.Envelope_MessageEvent{
 			MessageEvent: &pb.MessageEvent{
 				EventType:         pb.MessageEvent_NEW,
-				MessageId:         msgID,
+				MessageId:         result.MessageID,
 				ConversationId:    msg.ConversationId,
-				SenderIdentityKey: senderKey,
-				SenderUsername:    senderName,
-				ServerTimestamp:   uint64(serverTime.UnixNano()),
+				SenderIdentityKey: sender.identityKey,
+				SenderUsername:    sender.username,
+				ServerTimestamp:   uint64(result.ServerTimestamp.UnixNano()),
 				Ciphertext:        msg.Ciphertext,
 				Header:            msg.Header,
 				MsgType:           &msg.MsgType,
@@ -902,25 +1105,91 @@ func (c *Client) handleSendMessage(ctx context.Context, seq uint64, msg *pb.Send
 	}
 	if messageSecurity != nil {
 		messageEvent := event.GetMessageEvent()
-		messageEvent.RosterVersion = messageSecurity.RosterVersion
-		messageEvent.RosterCommitment = append([]byte(nil), messageSecurity.RosterCommitment...)
 		messageEvent.SenderDeviceId = append([]byte(nil), messageSecurity.SenderDeviceID...)
 		messageEvent.CryptoProfile = messageSecurity.CryptoProfile
 		messageEvent.CryptoEra = messageSecurity.CryptoEra
 		messageEvent.SenderBindingVersion = messageSecurity.SenderBindingVersion
-		c.hub.fanoutMessageEventToDevices(
-			ctx, eligibleRosterRecipients(secureRoster, c.deviceID), event,
-		)
-		return
+		switch messageSecurity.CryptoProfile {
+		case db.MessageCryptoProfileSenderKeyV5, db.MessageCryptoProfileSenderKeyV6:
+			messageEvent.RosterVersion = messageSecurity.RosterVersion
+			messageEvent.RosterCommitment = append([]byte(nil), messageSecurity.RosterCommitment...)
+			messageEvent.MembershipEpoch = messageSecurity.MembershipEpoch
+			messageEvent.MembershipEpochHash = append([]byte(nil), messageSecurity.MembershipEpochHash...)
+			c.hub.fanoutMessageEventToDevices(
+				ctx, eligibleRosterRecipients(secureRoster, c.deviceID), event,
+			)
+			return
+		case db.MessageCryptoProfileDirectV2:
+			if directSourceBinding == nil || directTargetBinding == nil {
+				log.Printf("Direct v2 committed without live binding snapshot: message_ref=%s", logsafe.Ref("message", result.MessageID))
+				return
+			}
+			messageEvent.TargetDeviceId = append([]byte(nil), messageSecurity.TargetDeviceID...)
+			messageEvent.TargetBindingVersion = messageSecurity.TargetBindingVersion
+			messageEvent.DirectSessionId = append([]byte(nil), messageSecurity.DirectSessionID...)
+			messageEvent.SenderUserId = c.userID
+			messageEvent.SenderDeviceIdentityKey = append([]byte(nil), directSourceBinding.DeviceIdentityKey...)
+			messageEvent.SenderDeviceSigningKey = append([]byte(nil), directSourceBinding.DeviceSigningKey...)
+			messageEvent.SenderDeviceCapabilities = directSourceBinding.Capabilities
+			messageEvent.SenderDeviceBindingStatus = uint32(directSourceBinding.Status)
+			messageEvent.SenderAccountSignature = append([]byte(nil), directSourceBinding.AccountSignature...)
+			data, marshalErr := proto.Marshal(event)
+			if marshalErr != nil {
+				log.Printf("Direct v2 message fanout marshal failed: class=%s", logsafe.ErrorClass(marshalErr))
+				return
+			}
+			if !c.hub.enqueueToDevice(directTargetBinding.DeviceID, data) && c.hub.pushNotifier != nil {
+				c.hub.pushNotifier.NotifyOffline(ctx, directTargetBinding.UserID, event)
+			}
+			return
+		}
 	}
 	eventData, _ := proto.Marshal(event)
 
-	c.hub.fanoutMessageEvent(ctx, recipients, eventData, event)
+	c.hub.fanoutMessageEvent(ctx, result.Recipients, eventData, event)
+}
+
+func (c *Client) sendMessageAck(seq uint64, clientMessageID string, result *chat.SendMessageResult) bool {
+	if result == nil {
+		c.sendErrorWithSendMessageContext(
+			seq, http.StatusInternalServerError, "internal error", clientMessageID, sendMessageReasonInternalError,
+		)
+		return false
+	}
+	ack := &pb.MessageAck{
+		MessageId:       result.MessageID,
+		ServerTimestamp: uint64(result.ServerTimestamp.UnixNano()),
+		RefSeq:          seq,
+		ClientMessageId: clientMessageID,
+	}
+	if result.AckRosterVersion != nil {
+		version := *result.AckRosterVersion
+		ack.RosterVersion = &version
+	}
+	if result.MembershipEpoch != nil {
+		epoch := *result.MembershipEpoch
+		ack.MembershipEpoch = &epoch
+		ack.MembershipEpochHash = append([]byte(nil), result.MembershipHash...)
+	}
+	c.sendEnvelope(&pb.Envelope{
+		Seq:       seq,
+		Timestamp: uint64(result.ServerTimestamp.UnixNano()),
+		Payload: &pb.Envelope_MessageAck{
+			MessageAck: ack,
+		},
+	})
+	return true
 }
 
 // --- Edit Message ---
 
 func (c *Client) handleEditMessage(ctx context.Context, seq uint64, msg *pb.EditMessage) {
+	sender, authenticated := c.snapshotAuthenticatedSender()
+	if !authenticated {
+		c.sendError(seq, http.StatusUnauthorized, "authentication required")
+		return
+	}
+
 	conversationID, editedAt, recipients, err := c.hub.chatSvc.HandleEditMessage(ctx, c.userID, msg)
 	if err != nil {
 		c.sendPublicError(seq, http.StatusBadRequest, err)
@@ -940,14 +1209,6 @@ func (c *Client) handleEditMessage(ctx context.Context, seq uint64, msg *pb.Edit
 		},
 	})
 
-	sender, _ := c.hub.chatSvc.LookupUser(ctx, c.userID)
-	var senderKey []byte
-	var senderName string
-	if sender != nil {
-		senderKey = sender.IdentityKey
-		senderName = sender.Username
-	}
-
 	editTs := uint64(editedAt.UnixNano())
 	event := &pb.Envelope{
 		Timestamp: editTs,
@@ -956,8 +1217,8 @@ func (c *Client) handleEditMessage(ctx context.Context, seq uint64, msg *pb.Edit
 				EventType:         pb.MessageEvent_EDITED,
 				MessageId:         msg.MessageId,
 				ConversationId:    conversationID,
-				SenderIdentityKey: senderKey,
-				SenderUsername:    senderName,
+				SenderIdentityKey: sender.identityKey,
+				SenderUsername:    sender.username,
 				ServerTimestamp:   editTs,
 				Ciphertext:        msg.NewCiphertext,
 				Header:            msg.NewHeader,
@@ -974,6 +1235,12 @@ func (c *Client) handleEditMessage(ctx context.Context, seq uint64, msg *pb.Edit
 // --- Delete Message ---
 
 func (c *Client) handleDeleteMessage(ctx context.Context, seq uint64, msg *pb.DeleteMessage) {
+	sender, authenticated := c.snapshotAuthenticatedSender()
+	if !authenticated {
+		c.sendError(seq, http.StatusUnauthorized, "authentication required")
+		return
+	}
+
 	conversationID, deletedAt, recipients, err := c.hub.chatSvc.HandleDeleteMessage(ctx, c.userID, msg)
 	if err != nil {
 		c.sendPublicError(seq, http.StatusBadRequest, err)
@@ -995,14 +1262,6 @@ func (c *Client) handleDeleteMessage(ctx context.Context, seq uint64, msg *pb.De
 		},
 	})
 
-	sender, _ := c.hub.chatSvc.LookupUser(ctx, c.userID)
-	var senderKey []byte
-	var senderName string
-	if sender != nil {
-		senderKey = sender.IdentityKey
-		senderName = sender.Username
-	}
-
 	event := &pb.Envelope{
 		Timestamp: deletedTimestamp,
 		Payload: &pb.Envelope_MessageEvent{
@@ -1010,8 +1269,8 @@ func (c *Client) handleDeleteMessage(ctx context.Context, seq uint64, msg *pb.De
 				EventType:         pb.MessageEvent_DELETED,
 				MessageId:         msg.MessageId,
 				ConversationId:    conversationID,
-				SenderIdentityKey: senderKey,
-				SenderUsername:    senderName,
+				SenderIdentityKey: sender.identityKey,
+				SenderUsername:    sender.username,
 				ServerTimestamp:   deletedTimestamp,
 			},
 		},
@@ -1025,9 +1284,30 @@ func (c *Client) handleDeleteMessage(ctx context.Context, seq uint64, msg *pb.De
 // --- Reactions ---
 
 func (c *Client) handleReaction(ctx context.Context, seq uint64, msg *pb.ReactionUpdate) {
-	recipients, err := c.hub.chatSvc.HandleReaction(ctx, c.userID, msg)
+	sender, authenticated := c.snapshotAuthenticatedSender()
+	if !authenticated {
+		c.sendError(seq, http.StatusUnauthorized, "authentication required")
+		return
+	}
+
+	recipients, changed, err := c.hub.chatSvc.HandleReaction(ctx, c.userID, msg)
 	if err != nil {
-		c.sendPublicError(seq, http.StatusBadRequest, err)
+		switch {
+		case errors.Is(err, chat.ErrReactionLimitReached):
+			c.sendPublicError(seq, http.StatusConflict, publicerr.New(
+				http.StatusConflict,
+				"reaction_limit_reached",
+				"message reaction limit reached",
+				err,
+			))
+		case errors.Is(err, chat.ErrNotMember):
+			c.sendPublicError(seq, http.StatusForbidden, err)
+		case errors.Is(err, chat.ErrInvalidReaction),
+			errors.Is(err, chat.ErrMessageConversationMismatch):
+			c.sendPublicError(seq, http.StatusBadRequest, err)
+		default:
+			c.sendPublicError(seq, http.StatusInternalServerError, err)
+		}
 		return
 	}
 
@@ -1038,12 +1318,8 @@ func (c *Client) handleReaction(ctx context.Context, seq uint64, msg *pb.Reactio
 		Timestamp: now,
 		Payload:   &pb.Envelope_MessageAck{MessageAck: &pb.MessageAck{MessageId: msg.MessageId, ServerTimestamp: now, RefSeq: seq}},
 	})
-
-	// Lookup sender info
-	sender, _ := c.hub.chatSvc.LookupUser(ctx, c.userID)
-	var senderName string
-	if sender != nil {
-		senderName = sender.Username
+	if !changed {
+		return
 	}
 
 	// Fan-out ReactionEvent to other members
@@ -1055,7 +1331,7 @@ func (c *Client) handleReaction(ctx context.Context, seq uint64, msg *pb.Reactio
 				ConversationId: msg.ConversationId,
 				Emoji:          msg.Emoji,
 				UserId:         c.userID,
-				Username:       senderName,
+				Username:       sender.username,
 				Add:            msg.Add,
 			},
 		},
@@ -1287,6 +1563,10 @@ func (h *Hub) broadcastPresenceOnDisconnect(userID string, identityKey []byte) {
 // --- Friends ---
 
 func (c *Client) handleFriendRequest(ctx context.Context, seq uint64, req *pb.FriendRequest) {
+	if !isValidFriendRequestInput(req.TargetUserId, req.Message) {
+		c.sendError(seq, http.StatusBadRequest, "invalid friend request")
+		return
+	}
 	// Prevent self-friend
 	if req.TargetUserId == c.userID {
 		c.sendError(seq, 400, "cannot send friend request to yourself")
@@ -1362,6 +1642,10 @@ func (c *Client) handleFriendRequest(ctx context.Context, seq uint64, req *pb.Fr
 }
 
 func (c *Client) handleFriendRespond(ctx context.Context, seq uint64, resp *pb.FriendRespond) {
+	if !isCanonicalNonNilUUID(resp.RequestId) {
+		c.sendError(seq, http.StatusBadRequest, "invalid friend request response")
+		return
+	}
 	if resp.Accept {
 		otherUserID, err := c.hub.chatSvc.DB().AcceptFriendRequest(ctx, resp.RequestId, c.userID)
 		if err != nil {
@@ -1430,6 +1714,10 @@ func (c *Client) handleFriendRespond(ctx context.Context, seq uint64, resp *pb.F
 }
 
 func (c *Client) handleFriendRemove(ctx context.Context, seq uint64, req *pb.FriendRemove) {
+	if !isCanonicalNonNilUUID(req.UserId) {
+		c.sendError(seq, http.StatusBadRequest, "invalid friend id")
+		return
+	}
 	err := c.hub.chatSvc.DB().RemoveFriend(ctx, c.userID, req.UserId)
 	if err != nil {
 		c.sendPublicError(seq, http.StatusBadRequest, err)
@@ -1482,8 +1770,13 @@ func (c *Client) handleFriendListRequest(ctx context.Context, seq uint64) {
 		}
 		// Check if friend is currently online
 		c.hub.mu.RLock()
-		if clients, ok := c.hub.userClients[f.UserID]; ok && len(clients) > 0 {
-			entry.Status = pb.PresenceStatus_PRESENCE_ONLINE
+		if clients, ok := c.hub.userClients[f.UserID]; ok {
+			for client := range clients {
+				if !client.closing.Load() {
+					entry.Status = pb.PresenceStatus_PRESENCE_ONLINE
+					break
+				}
+			}
 		}
 		c.hub.mu.RUnlock()
 		friendEntries = append(friendEntries, entry)
@@ -1528,56 +1821,92 @@ func (c *Client) handleFriendListRequest(ctx context.Context, seq uint64) {
 	})
 }
 
+func isCanonicalNonNilUUID(value string) bool {
+	parsed, err := uuid.Parse(value)
+	return err == nil && parsed != uuid.Nil && parsed.String() == value
+}
+
+func isValidFriendRequestInput(targetUserID string, message *string) bool {
+	return isCanonicalNonNilUUID(targetUserID) &&
+		(message == nil || len(*message) <= maxFriendRequestMessageBytes)
+}
+
 // --- Helpers ---
 
 func (c *Client) sendEnvelope(env *pb.Envelope) {
-	data, err := proto.Marshal(env)
+	data, err := marshalEnvelope(env)
 	if err != nil {
 		log.Printf("marshal error: class=%s", logsafe.ErrorClass(err))
 		return
 	}
 	select {
-	case c.send <- data:
+	case c.send <- singleOutbound(data):
 	default:
+		c.failClosed()
 	}
 }
 
-// enqueueData is used for authentication state restoration where dropping an
-// envelope would be unsafe. The regular event path remains best-effort.
-func (c *Client) enqueueData(data []byte) error {
-	if len(data) == 0 {
-		return errors.New("empty websocket envelope")
+func marshalEnvelope(env *pb.Envelope) ([]byte, error) {
+	if env == nil {
+		return nil, errors.New("nil websocket envelope")
+	}
+	return proto.Marshal(env)
+}
+
+// enqueueBatch is used for authentication publication where dropping or
+// partially ordering an envelope would be unsafe.
+func (c *Client) enqueueBatch(batch outboundBatch) error {
+	if len(batch.frames) == 0 {
+		return errors.New("empty websocket batch")
+	}
+	for _, frame := range batch.frames {
+		if len(frame) == 0 {
+			return errors.New("empty websocket envelope")
+		}
 	}
 	timer := time.NewTimer(writeWait)
 	defer timer.Stop()
 	select {
-	case c.send <- data:
+	case c.send <- batch:
 		return nil
 	case <-timer.C:
+		c.failClosed()
 		return errors.New("websocket send queue timeout")
 	}
 }
 
-func (c *Client) enqueueEnvelope(env *pb.Envelope) error {
-	data, err := proto.Marshal(env)
-	if err != nil {
-		return fmt.Errorf("marshal envelope: %w", err)
-	}
-	return c.enqueueData(data)
+func (c *Client) sendError(refSeq uint64, code uint32, message string) {
+	c.sendErrorWithSendMessageContext(refSeq, code, message, "", "")
 }
 
-func (c *Client) sendError(refSeq uint64, code uint32, message string) {
+func (c *Client) sendErrorWithSendMessageContext(refSeq uint64, code uint32, message, clientMessageID, reason string) {
 	var refSeqPtr *uint64
 	if refSeq > 0 {
 		refSeqPtr = &refSeq
 	}
+	errorPayload := &pb.Error{
+		Code:    code,
+		Message: message,
+		RefSeq:  refSeqPtr,
+	}
+	if clientMessageID != "" {
+		canonical, valid := chat.CanonicalClientMessageID(&pb.SendMessage{ClientMessageId: clientMessageID})
+		if valid {
+			if reason == "" {
+				reason = sendMessageReasonInternalError
+			}
+			errorPayload.ClientMessageId = &canonical
+		} else {
+			reason = sendMessageReasonInvalidClientMessageID
+		}
+	}
+	if reason != "" {
+		value := reason
+		errorPayload.Reason = &value
+	}
 	c.sendEnvelope(&pb.Envelope{
 		Payload: &pb.Envelope_Error{
-			Error: &pb.Error{
-				Code:    code,
-				Message: message,
-				RefSeq:  refSeqPtr,
-			},
+			Error: errorPayload,
 		},
 	})
 }
@@ -1586,91 +1915,35 @@ func (c *Client) sendPublicError(refSeq uint64, status int, err error) {
 	c.sendError(refSeq, uint32(status), publicerr.Message(status, err))
 }
 
-func (c *Client) sendPublicAuthFailure(seq uint64, err error) error {
-	return c.sendAuthFailure(
-		seq,
-		pb.AuthFailureReason_AUTH_FAILURE_REASON_AUTHENTICATION_FAILED,
-		publicerr.Message(http.StatusUnauthorized, err),
+func (c *Client) sendMessagePublicError(refSeq uint64, status int, err error, clientMessageID, reason string) {
+	c.sendErrorWithSendMessageContext(
+		refSeq, uint32(status), publicerr.Message(status, err), clientMessageID, reason,
 	)
-}
-
-// sendMappedAuthFailure exposes the two enrollment outcomes only after the
-// auth service has completed account-key proof. Every earlier failure remains
-// the same generic authentication result.
-func (c *Client) sendMappedAuthFailure(seq uint64, err error) error {
-	switch {
-	case errors.Is(err, auth.ErrRegistrationClosed):
-		return c.sendAuthFailure(
-			seq,
-			pb.AuthFailureReason_AUTH_FAILURE_REASON_REGISTRATION_CLOSED,
-			"registration is closed",
-		)
-	case errors.Is(err, auth.ErrInviteInvalid):
-		return c.sendAuthFailure(
-			seq,
-			pb.AuthFailureReason_AUTH_FAILURE_REASON_INVITE_INVALID,
-			"invite is invalid, expired, or already used",
-		)
-	default:
-		return c.sendPublicAuthFailure(seq, publicerr.New(
-			http.StatusUnauthorized, "authentication_failed", "authentication failed", err,
-		))
-	}
-}
-
-func (c *Client) sendAuthFailure(seq uint64, reason pb.AuthFailureReason, message string) error {
-	result := &pb.AuthResult{
-		Success:       false,
-		FailureReason: reason,
-		ErrorMessage:  &message,
-	}
-	return c.enqueueEnvelope(&pb.Envelope{
-		Seq: seq,
-		Payload: &pb.Envelope_AuthResult{
-			AuthResult: result,
-		},
-	})
-}
-
-func (c *Client) sendAuthResult(seq uint64, success bool, userID, errMsg string, authDetails ...*auth.AuthResult) error {
-	result := &pb.AuthResult{Success: success}
-	if success {
-		result.UserId = &userID
-		if len(authDetails) == 1 && authDetails[0] != nil {
-			result.PerDeviceSecure = authDetails[0].PerDeviceSecure
-			result.DeviceBindingVersion = authDetails[0].DeviceBindingVersion
-			result.DeviceBindingStatus = pb.DeviceBindingStatus(authDetails[0].DeviceBindingStatus)
-		}
-	}
-	if errMsg != "" {
-		result.ErrorMessage = &errMsg
-	}
-	return c.enqueueEnvelope(&pb.Envelope{
-		Seq: seq,
-		Payload: &pb.Envelope_AuthResult{
-			AuthResult: result,
-		},
-	})
 }
 
 func (c *Client) writePump() {
 	ticker := time.NewTicker(pingPeriod)
 	defer func() {
 		ticker.Stop()
-		c.conn.Close()
+		c.failClosed()
 	}()
 
 	for {
 		select {
-		case message, ok := <-c.send:
-			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
+		case batch, ok := <-c.send:
 			if !ok {
 				c.conn.WriteMessage(websocket.CloseMessage, []byte{})
 				return
 			}
-			if err := c.conn.WriteMessage(websocket.BinaryMessage, message); err != nil {
-				log.Printf("write error [%s]: class=%s", c.connID, logsafe.ErrorClass(err))
+			if !batch.publication.wait() {
 				return
+			}
+			for _, message := range batch.frames {
+				c.conn.SetWriteDeadline(time.Now().Add(writeWait))
+				if err := c.conn.WriteMessage(websocket.BinaryMessage, message); err != nil {
+					log.Printf("write error [%s]: class=%s", c.connID, logsafe.ErrorClass(err))
+					return
+				}
 			}
 		case <-ticker.C:
 			c.conn.SetWriteDeadline(time.Now().Add(writeWait))

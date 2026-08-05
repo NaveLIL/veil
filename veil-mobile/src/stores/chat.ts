@@ -1,5 +1,20 @@
 import { create } from "zustand";
+
 import type { IdentityAuthority } from "../components/identity/IdentityProof";
+import {
+  directDeliveryPublicFailureCodeV1,
+  type PublicFailureCodeV1,
+} from "../contracts/publicFailureCodesV1";
+import VeilRuntime, {
+  isExactAuthenticatedBinding,
+  type AuthenticatedBinding,
+  type DirectMessageDelivery,
+  type DirectMessageDirection,
+  type DirectMessageProjection,
+  type DirectMessageView,
+  type DirectTextSendFailure,
+  type VeilMobileRuntimeSnapshot,
+} from "../native/runtime";
 
 export type ServerId = string;
 export type ChannelId = string;
@@ -37,34 +52,20 @@ export interface Member {
   color: string;
 }
 
-const origin = "https://veil.example:443";
-const currentAccountLocator = {
-  canonicalServerOrigin: origin,
-  userId: "10000000-0000-4000-8000-000000000001",
-  identityKey: "11".repeat(32),
-} as const;
-const member = (id: string, userId: string, identityByte: string, name: string, status: Member["status"], role: Member["role"], color: string, about?: string): Member => ({
-  id, canonicalServerOrigin: origin, userId, identityKey: identityByte.repeat(32),
-  // These rows are visual prototype fixtures, not observations from a native
-  // authenticated directory. Trust UI must therefore remain unavailable.
-  identityAuthority: "unavailable",
-  username: name.toLowerCase(), name, status, role, color, about,
-});
-
 export interface DmConversation {
   id: DmId;
   name: string;
-  isGroup: boolean;
+  isGroup: false;
   lastMessage?: string;
   lastAt?: string;
-  unread?: number;
   color: string;
+  peerUserId: string;
+  peerUsername: string;
   avatarIdentity: {
     canonicalServerOrigin: string;
-    userId?: string;
-    identityKey?: string;
+    userId: string;
     username: string;
-  } | null;
+  };
 }
 
 export interface Message {
@@ -72,104 +73,47 @@ export interface Message {
   author: Member;
   text: string;
   ts: string;
+  timestampMs: number | null;
+  direction: DirectMessageDirection;
+  delivery: DirectMessageDelivery;
+  deliveryPublicFailureCodeV1?: PublicFailureCodeV1;
 }
 
-/** Special pseudo-server id representing the DM/Groups inbox. */
+export type DirectProjectionState = "idle" | "loading" | "available" | "unavailable";
+export type DirectTextSendResult = "accepted" | DirectTextSendFailure;
+
+export type DirectTextSendErrorState =
+  | {
+      readonly reason: "rejected";
+      readonly publicFailureCodeV1: "VEIL-DIRECT-001";
+    }
+  | {
+      readonly reason: "unavailable";
+      readonly publicFailureCodeV1: "VEIL-RUNTIME-999";
+    };
+
+/** Special pseudo-server id representing the native Direct inbox. */
 export const DM_HOME_ID: ServerId = "__dm__";
 
-const SERVERS: Server[] = [
-  { id: DM_HOME_ID, name: "Direct messages", initials: "DM", color: "#7c6bf5" },
-  { id: "veil", name: "Veil", initials: "V", color: "#7c6bf5", unread: 3 },
-  { id: "rust", name: "Rust Crypto", initials: "RC", color: "#d97706" },
-  { id: "design", name: "Design Lab", initials: "DL", color: "#10b981", unread: 1 },
-  { id: "music", name: "Late Night Music", initials: "LN", color: "#ec4899" },
-];
-
-const CHANNELS: Channel[] = [
-  // Veil
-  { id: "veil-general", serverId: "veil", name: "general", category: "TEXT", unread: 2 },
-  { id: "veil-dev", serverId: "veil", name: "dev", category: "TEXT" },
-  { id: "veil-design", serverId: "veil", name: "design", category: "TEXT", unread: 1 },
-  { id: "veil-random", serverId: "veil", name: "random", category: "TEXT" },
-  { id: "veil-voice", serverId: "veil", name: "Lounge", category: "VOICE" },
-  // Rust Crypto
-  { id: "rust-help", serverId: "rust", name: "help", category: "TEXT" },
-  { id: "rust-internals", serverId: "rust", name: "internals", category: "TEXT" },
-  { id: "rust-async", serverId: "rust", name: "async", category: "TEXT" },
-  // Design
-  { id: "design-feedback", serverId: "design", name: "feedback", category: "TEXT", unread: 1 },
-  { id: "design-share", serverId: "design", name: "share", category: "TEXT" },
-  // Music
-  { id: "music-now", serverId: "music", name: "now-playing", category: "TEXT" },
-  { id: "music-discover", serverId: "music", name: "discover", category: "TEXT" },
-];
-
-const self = (id: string, role: Member["role"]): Member =>
-  member(id, currentAccountLocator.userId, "11", "dimon", "online", role, "#7c6bf5", "Building Veil carefully.");
-const anya = member("dm-anya-peer", "10000000-0000-4000-8000-000000000002", "22", "anya", "online", "member", "#ec4899", "Design and privacy.");
-const mark = member("dm-mark-peer", "10000000-0000-4000-8000-000000000004", "44", "mark", "dnd", "member", "#10b981");
-const leo = member("dm-leo-peer", "10000000-0000-4000-8000-000000000003", "33", "leo", "idle", "member", "#f43f5e");
-const family = member("dm-family-peer", "50000000-0000-4000-8000-000000000001", "a1", "family", "offline", "member", "#fbbf24");
-
-export const MEMBERS_BY_SERVER: Record<ServerId, Member[]> = {
-  veil: [
-    self("veil-self", "owner"),
-    member("u2", "10000000-0000-4000-8000-000000000002", "22", "anya", "online", "admin", "#ec4899", "Design and privacy."),
-    member("u3", "10000000-0000-4000-8000-000000000003", "33", "leo", "idle", "member", "#f43f5e"),
-    member("u4", "10000000-0000-4000-8000-000000000004", "44", "mark", "dnd", "member", "#10b981"),
-    member("u5", "10000000-0000-4000-8000-000000000005", "55", "iris", "offline", "member", "#fbbf24"),
-    member("u6", "10000000-0000-4000-8000-000000000006", "66", "noa", "offline", "member", "#94a3b8"),
-  ],
-  rust: [
-    self("rust-self", "member"),
-    member("r1", "20000000-0000-4000-8000-000000000001", "71", "alice", "online", "owner", "#d97706"),
-    member("r2", "20000000-0000-4000-8000-000000000002", "72", "bob", "online", "member", "#7c6bf5"),
-    member("r3", "20000000-0000-4000-8000-000000000003", "73", "carol", "offline", "member", "#10b981"),
-  ],
-  design: [
-    self("design-self", "member"),
-    member("d1", "30000000-0000-4000-8000-000000000001", "81", "sasha", "online", "owner", "#10b981"),
-    member("d2", "30000000-0000-4000-8000-000000000002", "82", "yulia", "online", "member", "#ec4899"),
-  ],
-  music: [
-    self("music-self", "member"),
-    member("m1", "40000000-0000-4000-8000-000000000001", "91", "dj", "online", "owner", "#ec4899"),
-  ],
+const DIRECT_SERVER: Server = {
+  id: DM_HOME_ID,
+  name: "Direct messages",
+  initials: "DM",
+  color: "#7c6bf5",
 };
 
-export const MEMBERS_BY_DM: Record<DmId, Member[]> = {
-  "dm-anya": [self("dm-anya-self", "member"), anya],
-  "dm-collab": [self("dm-collab-self", "member"), anya, mark, leo],
-  "dm-mark": [self("dm-mark-self", "member"), mark],
-  "dm-fam": [self("dm-fam-self", "member"), family],
-  "dm-leo": [self("dm-leo-self", "member"), leo],
-};
+const DIRECT_COLORS = ["#ec4899", "#10b981", "#7c6bf5", "#f43f5e", "#fbbf24"] as const;
+const CANONICAL_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const NIL_UUID = "00000000-0000-0000-0000-000000000000";
+const MAX_DIRECT_CONVERSATIONS = 10_000;
 
-const avatarIdentity = (profile: Member): DmConversation["avatarIdentity"] => ({
-  canonicalServerOrigin: profile.canonicalServerOrigin,
-  userId: profile.userId,
-  identityKey: profile.identityKey,
-  username: profile.username,
-});
+type RuntimeDirectConversation = VeilMobileRuntimeSnapshot["directConversations"][number];
 
-const DMS: DmConversation[] = [
-  { id: "dm-anya", name: "Anya", isGroup: false, lastMessage: "see you tomorrow ✨", lastAt: "21:04", color: "#ec4899", unread: 2, avatarIdentity: avatarIdentity(anya) },
-  { id: "dm-collab", name: "Veil core team", isGroup: true, lastMessage: "merged the ratchet PR", lastAt: "20:11", color: "#7c6bf5", avatarIdentity: null },
-  { id: "dm-mark", name: "Mark", isGroup: false, lastMessage: "ok thanks!", lastAt: "Yesterday", color: "#10b981", avatarIdentity: avatarIdentity(mark) },
-  { id: "dm-fam", name: "Family 🏡", isGroup: true, lastMessage: "mum: don't forget", lastAt: "Yesterday", color: "#fbbf24", unread: 5, avatarIdentity: null },
-  { id: "dm-leo", name: "Leo", isGroup: false, lastMessage: "🔥🔥🔥", lastAt: "Mon", color: "#f43f5e", avatarIdentity: avatarIdentity(leo) },
-];
-
-function makeMessages(channelName: string, authors: readonly Member[]): Message[] {
-  if (authors.length === 0) return [];
-  const author = (index: number): Member => authors[index % authors.length];
-  return [
-    { id: "m1", author: author(1), ts: "20:41", text: `welcome to #${channelName}` },
-    { id: "m2", author: author(2), ts: "20:42", text: "hey 👋" },
-    { id: "m3", author: author(0), ts: "20:50", text: "shipping the new island layout today" },
-    { id: "m4", author: author(1), ts: "20:51", text: "looks 🔥" },
-    { id: "m5", author: author(3), ts: "21:02", text: "swipe between islands feels native" },
-  ];
+interface RuntimeDirectory {
+  binding: AuthenticatedBinding;
+  directGeneration: number;
+  directContentRevision: number;
+  conversations: RuntimeDirectConversation[];
 }
 
 interface ChatState {
@@ -179,110 +123,533 @@ interface ChatState {
   selectedServerId: ServerId;
   selectedChannelId: ChannelId | null;
   selectedDmId: DmId | null;
-  messagesByChannel: Record<string, Message[]>;
+  messagesByChannel: Record<DmId, Message[]>;
+  directMembersByConversation: Record<DmId, { self: Member; peer: Member }>;
+  projectionStateByConversation: Record<DmId, DirectProjectionState>;
+  runtimeBinding: AuthenticatedBinding | null;
+  directGeneration: number | null;
+  directContentRevision: number | null;
+  directoryRevision: number;
+  projectionRequestRevision: number;
+  directSendPending: boolean;
+  directSendError: DirectTextSendErrorState | null;
+  directSendRequestRevision: number;
+  hydrateRuntimeDirectory: (snapshot: VeilMobileRuntimeSnapshot) => void;
   selectServer: (id: ServerId) => void;
   selectChannel: (id: ChannelId) => void;
   selectDm: (id: DmId) => void;
-  sendMessage: (text: string) => void;
-  channelsForServer: (id: ServerId) => Channel[];
-  membersForServer: (id: ServerId) => Member[];
-  currentMessages: () => Message[];
-  currentChatTitle: () => string;
+  loadSelectedDirectMessages: () => Promise<void>;
+  sendSelectedDirectText: (text: string) => Promise<DirectTextSendResult>;
+  clearRenderableChat: () => void;
 }
 
-export const useChatStore = create<ChatState>((set, get) => ({
-  servers: SERVERS,
-  channels: CHANNELS,
-  dms: DMS,
+function sameBinding(
+  left: AuthenticatedBinding | null,
+  right: AuthenticatedBinding | null,
+): boolean {
+  return Boolean(
+    left
+      && right
+      && left.canonicalServerOrigin === right.canonicalServerOrigin
+      && left.userId === right.userId,
+  );
+}
+
+function isCanonicalUuid(value: string): boolean {
+  return value !== NIL_UUID && CANONICAL_UUID.test(value);
+}
+
+function boundedUtf8Length(value: string, maxBytes: number): number | null {
+  let bytes = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    const codeUnit = value.charCodeAt(index);
+    let additional: number;
+    if (codeUnit <= 0x7f) additional = 1;
+    else if (codeUnit <= 0x7ff) additional = 2;
+    else if (codeUnit >= 0xd800 && codeUnit <= 0xdbff) {
+      if (index + 1 >= value.length) return null;
+      const next = value.charCodeAt(index + 1);
+      if (next < 0xdc00 || next > 0xdfff) return null;
+      index += 1;
+      additional = 4;
+    } else if (codeUnit >= 0xdc00 && codeUnit <= 0xdfff) return null;
+    else additional = 3;
+    if (bytes > maxBytes - additional) return null;
+    bytes += additional;
+  }
+  return bytes;
+}
+
+function isBoundedPublicLabel(value: unknown, maxBytes: number): value is string {
+  if (typeof value !== "string" || value.length === 0) return false;
+  for (let index = 0; index < value.length; index += 1) {
+    const codeUnit = value.charCodeAt(index);
+    if (codeUnit <= 0x1f || (codeUnit >= 0x7f && codeUnit <= 0x9f)) return false;
+  }
+  const bytes = boundedUtf8Length(value, maxBytes);
+  return bytes !== null && bytes > 0;
+}
+
+function normalizeDirectory(snapshot: VeilMobileRuntimeSnapshot): RuntimeDirectory | null {
+  if (
+    !snapshot.identityExists
+    || !Number.isSafeInteger(snapshot.runtimeRevision)
+    || snapshot.runtimeRevision < 1
+    || snapshot.sessionState !== "open"
+    || snapshot.connectionState !== "connected"
+    || !snapshot.directoryReady
+    || snapshot.secureSyncState !== "history_synchronized"
+    || !isExactAuthenticatedBinding(snapshot.binding)
+    || snapshot.directGeneration === null
+    || !Number.isSafeInteger(snapshot.directGeneration)
+    || snapshot.directGeneration < 1
+    || snapshot.directContentRevision === null
+    || !Number.isSafeInteger(snapshot.directContentRevision)
+    || snapshot.directContentRevision < 0
+    || !Array.isArray(snapshot.directConversations)
+    || snapshot.directConversations.length > MAX_DIRECT_CONVERSATIONS
+  ) return null;
+  const binding = snapshot.binding;
+  if (!binding) return null;
+  const conversations: RuntimeDirectConversation[] = [];
+  let previousConversationId: string | null = null;
+  for (const candidate of snapshot.directConversations) {
+    if (
+      !candidate
+      || typeof candidate.conversationId !== "string"
+      || !isCanonicalUuid(candidate.conversationId)
+      || (previousConversationId !== null && previousConversationId >= candidate.conversationId)
+      || typeof candidate.peerUserId !== "string"
+      || !isCanonicalUuid(candidate.peerUserId)
+      || candidate.peerUserId === binding.userId
+      || !isBoundedPublicLabel(candidate.name, 256)
+      || !isBoundedPublicLabel(candidate.peerUsername, 128)
+    ) return null;
+    previousConversationId = candidate.conversationId;
+    conversations.push(candidate);
+  }
+  return {
+    binding,
+    directGeneration: snapshot.directGeneration,
+    directContentRevision: snapshot.directContentRevision,
+    conversations,
+  };
+}
+
+function directoryFingerprint(directory: RuntimeDirectory): string {
+  return JSON.stringify({
+    origin: directory.binding.canonicalServerOrigin,
+    account: directory.binding.userId,
+    directGeneration: directory.directGeneration,
+    conversations: directory.conversations.map((conversation) => [
+      conversation.conversationId,
+      conversation.name,
+      conversation.peerUserId,
+      conversation.peerUsername,
+    ]),
+  });
+}
+
+function colorFor(value: string): string {
+  let hash = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    hash = (hash * 31 + value.charCodeAt(index)) >>> 0;
+  }
+  return DIRECT_COLORS[hash % DIRECT_COLORS.length];
+}
+
+function membersFor(
+  binding: AuthenticatedBinding,
+  conversation: RuntimeDirectConversation,
+  color: string,
+): { self: Member; peer: Member } {
+  const common = {
+    canonicalServerOrigin: binding.canonicalServerOrigin,
+    identityKey: "",
+    // The public directory contract currently pins account ids and names but
+    // does not expose an identity key. Keep trust UI explicitly unavailable.
+    identityAuthority: "unavailable" as const,
+    status: "offline" as const,
+    role: "member" as const,
+  };
+  return {
+    self: {
+      ...common,
+      id: `self:${binding.userId}`,
+      userId: binding.userId,
+      username: "you",
+      name: "You",
+      color: "#7c6bf5",
+    },
+    peer: {
+      ...common,
+      id: `peer:${conversation.peerUserId}`,
+      userId: conversation.peerUserId,
+      username: conversation.peerUsername,
+      name: conversation.name,
+      color,
+    },
+  };
+}
+
+function projectDirectory(directory: RuntimeDirectory): {
+  dms: DmConversation[];
+  members: ChatState["directMembersByConversation"];
+} {
+  const members: ChatState["directMembersByConversation"] = {};
+  const dms = directory.conversations.map((conversation) => {
+    const color = colorFor(conversation.peerUserId);
+    members[conversation.conversationId] = membersFor(directory.binding, conversation, color);
+    return {
+      id: conversation.conversationId,
+      name: conversation.name,
+      isGroup: false as const,
+      color,
+      peerUserId: conversation.peerUserId,
+      peerUsername: conversation.peerUsername,
+      avatarIdentity: {
+        canonicalServerOrigin: directory.binding.canonicalServerOrigin,
+        userId: conversation.peerUserId,
+        username: conversation.peerUsername,
+      },
+    };
+  });
+  return { dms, members };
+}
+
+function formatTimestamp(timestampMs: number | null): string {
+  if (timestampMs === null) return "Pending";
+  return new Date(timestampMs).toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+function directTextSendErrorState(error: unknown): DirectTextSendErrorState {
+  try {
+    if (error && typeof error === "object" && !Array.isArray(error)) {
+      const reasonProperty = Object.getOwnPropertyDescriptor(error, "reason");
+      const codeProperty = Object.getOwnPropertyDescriptor(error, "publicFailureCodeV1");
+      const reason = reasonProperty && "value" in reasonProperty
+        ? reasonProperty.value
+        : undefined;
+      const publicFailureCodeV1 = codeProperty && "value" in codeProperty
+        ? codeProperty.value
+        : undefined;
+      if (reason === "rejected" && publicFailureCodeV1 === "VEIL-DIRECT-001") {
+        return {
+          reason: "rejected",
+          publicFailureCodeV1: "VEIL-DIRECT-001",
+        };
+      }
+      if (reason === "unavailable" && publicFailureCodeV1 === "VEIL-RUNTIME-999") {
+        return {
+          reason: "unavailable",
+          publicFailureCodeV1: "VEIL-RUNTIME-999",
+        };
+      }
+    }
+  } catch {
+    // Revoked proxies and hostile getters are untrusted exception shapes.
+  }
+  // Never retain an exception message, native detail, or an unreviewed code.
+  return {
+    reason: "unavailable",
+    publicFailureCodeV1: "VEIL-RUNTIME-999",
+  };
+}
+
+function toRenderableMessages(
+  projection: DirectMessageProjection,
+  members: { self: Member; peer: Member },
+): Message[] | null {
+  if (projection.availability !== "available") return null;
+  return projection.messages.map((message: DirectMessageView) => {
+    const deliveryPublicFailureCodeV1 = directDeliveryPublicFailureCodeV1(message.delivery);
+    return {
+      id: message.messageId,
+      author: message.direction === "outgoing" ? members.self : members.peer,
+      text: message.text,
+      ts: formatTimestamp(message.timestampMs),
+      timestampMs: message.timestampMs,
+      direction: message.direction,
+      delivery: message.delivery,
+      ...(deliveryPublicFailureCodeV1 ? { deliveryPublicFailureCodeV1 } : {}),
+    };
+  });
+}
+
+const initialChatState = {
+  servers: [DIRECT_SERVER],
+  channels: [] as Channel[],
+  dms: [] as DmConversation[],
   selectedServerId: DM_HOME_ID,
   selectedChannelId: null,
-  selectedDmId: "dm-anya",
-  messagesByChannel: {
-    "dm-anya": [
-      { id: "a1", author: MEMBERS_BY_DM["dm-anya"][1], ts: "20:58", text: "are we still on for 9?" },
-      { id: "a2", author: MEMBERS_BY_DM["dm-anya"][0], ts: "20:59", text: "yes 🤝" },
-      { id: "a3", author: MEMBERS_BY_DM["dm-anya"][1], ts: "21:04", text: "see you tomorrow ✨" },
-    ],
-  },
+  selectedDmId: null,
+  messagesByChannel: {} as Record<DmId, Message[]>,
+  directMembersByConversation: {} as ChatState["directMembersByConversation"],
+  projectionStateByConversation: {} as Record<DmId, DirectProjectionState>,
+  runtimeBinding: null as AuthenticatedBinding | null,
+  directGeneration: null as number | null,
+  directContentRevision: null as number | null,
+  directoryRevision: 0,
+  projectionRequestRevision: 0,
+  directSendPending: false,
+  directSendError: null as DirectTextSendErrorState | null,
+  directSendRequestRevision: 0,
+};
 
-  selectServer: (id) =>
-    set((s) => {
-      if (!s.servers.some((server) => server.id === id)) return s;
-      if (id === DM_HOME_ID) {
-        return { selectedServerId: id, selectedChannelId: null };
-      }
-      const first = s.channels.find((c) => c.serverId === id);
-      return {
-        selectedServerId: id,
-        selectedChannelId: first?.id ?? null,
-        selectedDmId: null,
-      };
-    }),
+export const useChatStore = create<ChatState>((set, get) => ({
+  ...initialChatState,
 
-  selectChannel: (id) =>
-    set((s) => {
-      const ch = s.channels.find((c) => c.id === id);
-      if (!ch || ch.serverId !== s.selectedServerId) return s;
-      const next = { ...s.messagesByChannel };
-      if (!next[id]) next[id] = makeMessages(ch.name, MEMBERS_BY_SERVER[ch.serverId] ?? []);
-      return { selectedChannelId: id, messagesByChannel: next };
-    }),
-
-  selectDm: (id) =>
-    set((s) => {
-      if (!s.dms.some((dm) => dm.id === id) || !MEMBERS_BY_DM[id]) return s;
-      const next = { ...s.messagesByChannel };
-      if (!next[id]) {
-        const dm = s.dms.find((d) => d.id === id);
-        next[id] = makeMessages(dm?.name ?? "dm", MEMBERS_BY_DM[id] ?? []);
-      }
-      return { selectedDmId: id, selectedServerId: DM_HOME_ID, selectedChannelId: null, messagesByChannel: next };
-    }),
-
-  sendMessage: (text) =>
-    set((s) => {
-      const key =
-        s.selectedServerId === DM_HOME_ID ? s.selectedDmId : s.selectedChannelId;
-      if (!key) return s;
-      const exactContext = s.selectedServerId === DM_HOME_ID
-        ? s.dms.some((dm) => dm.id === key)
-        : s.channels.some((channel) => channel.id === key && channel.serverId === s.selectedServerId);
-      if (!exactContext) return s;
-      const roster = s.selectedServerId === DM_HOME_ID
-        ? (s.selectedDmId ? MEMBERS_BY_DM[s.selectedDmId] : undefined)
-        : MEMBERS_BY_SERVER[s.selectedServerId];
-      const author = roster?.find((candidate) =>
-        candidate.canonicalServerOrigin === currentAccountLocator.canonicalServerOrigin
-        && candidate.userId === currentAccountLocator.userId
-        && candidate.identityKey === currentAccountLocator.identityKey,
-      );
-      if (!author) return s;
-      const msg: Message = {
-        id: `local-${Date.now()}`,
-        author,
-        ts: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
-        text,
-      };
-      const list = s.messagesByChannel[key] ?? [];
-      return { messagesByChannel: { ...s.messagesByChannel, [key]: [...list, msg] } };
-    }),
-
-  channelsForServer: (id) => get().channels.filter((c) => c.serverId === id),
-  membersForServer: (id) => MEMBERS_BY_SERVER[id] ?? [],
-
-  currentMessages: () => {
-    const s = get();
-    const key = s.selectedServerId === DM_HOME_ID ? s.selectedDmId : s.selectedChannelId;
-    if (!key) return [];
-    return s.messagesByChannel[key] ?? [];
-  },
-
-  currentChatTitle: () => {
-    const s = get();
-    if (s.selectedServerId === DM_HOME_ID) {
-      return s.dms.find((d) => d.id === s.selectedDmId)?.name ?? "Direct messages";
+  hydrateRuntimeDirectory: (snapshot) => {
+    const directory = normalizeDirectory(snapshot);
+    if (!directory) {
+      get().clearRenderableChat();
+      return;
     }
-    const ch = s.channels.find((c) => c.id === s.selectedChannelId);
-    return ch ? `# ${ch.name}` : "Channel";
+
+    const state = get();
+    const currentDirectory: RuntimeDirectory | null = state.runtimeBinding
+      && state.directGeneration !== null
+      ? {
+          binding: state.runtimeBinding,
+          directGeneration: state.directGeneration,
+          directContentRevision: state.directContentRevision ?? 0,
+          conversations: state.dms.map((dm) => ({
+            conversationId: dm.id,
+            name: dm.name,
+            peerUserId: dm.peerUserId,
+            peerUsername: dm.peerUsername,
+          })),
+        }
+      : null;
+    const sameDirectory =
+      currentDirectory
+      && sameBinding(currentDirectory.binding, directory.binding)
+      && directoryFingerprint(currentDirectory) === directoryFingerprint(directory);
+    if (sameDirectory) {
+      if (
+        state.directContentRevision === null
+        || directory.directContentRevision < state.directContentRevision
+      ) {
+        get().clearRenderableChat();
+        return;
+      }
+      if (directory.directContentRevision === state.directContentRevision) return;
+      set({ directContentRevision: directory.directContentRevision });
+      return;
+    }
+
+    const projected = projectDirectory(directory);
+    set({
+      dms: projected.dms,
+      selectedServerId: DM_HOME_ID,
+      selectedChannelId: null,
+      // Directory metadata may preload, plaintext may not. A fresh runtime
+      // authority requires an explicit user selection before projection.
+      selectedDmId: null,
+      messagesByChannel: {},
+      directMembersByConversation: projected.members,
+      projectionStateByConversation: {},
+      runtimeBinding: directory.binding,
+      directGeneration: directory.directGeneration,
+      directContentRevision: directory.directContentRevision,
+      directoryRevision: state.directoryRevision + 1,
+      projectionRequestRevision: state.projectionRequestRevision + 1,
+      directSendPending: false,
+      directSendError: null,
+      directSendRequestRevision: state.directSendRequestRevision + 1,
+    });
+  },
+
+  selectServer: (id) => {
+    if (id !== DM_HOME_ID) return;
+    set({ selectedServerId: DM_HOME_ID, selectedChannelId: null });
+  },
+
+  // Space/channel rendering is intentionally absent from this Direct-only
+  // production slice. It cannot synthesize messages or identities.
+  selectChannel: () => undefined,
+
+  selectDm: (id) => {
+    const state = get();
+    if (!state.dms.some((dm) => dm.id === id)) return;
+    if (state.selectedDmId === id) return;
+    set({
+      selectedDmId: id,
+      selectedServerId: DM_HOME_ID,
+      selectedChannelId: null,
+      // Native exposes exactly one bounded conversation projection. Mirror
+      // that minimization in JS: switching never retains another peer's
+      // plaintext rows or last-message preview.
+      messagesByChannel: {},
+      projectionStateByConversation: {},
+      dms: state.dms.map(({ lastMessage: _lastMessage, lastAt: _lastAt, ...dm }) => dm),
+      projectionRequestRevision: state.projectionRequestRevision + 1,
+      directSendError: null,
+    });
+  },
+
+  loadSelectedDirectMessages: async () => {
+    const state = get();
+    const conversationId = state.selectedDmId;
+    const binding = state.runtimeBinding;
+    const directGeneration = state.directGeneration;
+    const members = conversationId
+      ? state.directMembersByConversation[conversationId]
+      : undefined;
+    if (!conversationId || !binding || directGeneration === null || !members) return;
+
+    const requestRevision = state.projectionRequestRevision + 1;
+    set({
+      projectionRequestRevision: requestRevision,
+      // An aggregate native invalidation can represent an incoming message or
+      // ACK, but it can also revoke a quarantined projection. Clear plaintext
+      // synchronously before crossing the async native boundary so a blocked
+      // conversation cannot remain visible behind a stalled Promise.
+      messagesByChannel: {},
+      dms: state.dms.map(({ lastMessage: _lastMessage, lastAt: _lastAt, ...dm }) => dm),
+      projectionStateByConversation: { [conversationId]: "loading" },
+    });
+
+    let projection: DirectMessageProjection;
+    try {
+      projection = await VeilRuntime.getDirectMessages(conversationId);
+    } catch {
+      const current = get();
+      if (
+        current.projectionRequestRevision === requestRevision
+        && current.selectedDmId === conversationId
+        && sameBinding(current.runtimeBinding, binding)
+        && current.directGeneration === directGeneration
+        && current.directMembersByConversation[conversationId] === members
+      ) {
+        const nextMessages = { ...current.messagesByChannel };
+        delete nextMessages[conversationId];
+        set({
+          messagesByChannel: nextMessages,
+          projectionStateByConversation: {
+            ...current.projectionStateByConversation,
+            [conversationId]: "unavailable",
+          },
+        });
+      }
+      return;
+    }
+    const current = get();
+    if (
+      current.projectionRequestRevision !== requestRevision
+      || current.selectedDmId !== conversationId
+      || !sameBinding(current.runtimeBinding, binding)
+      || current.directGeneration !== directGeneration
+      || current.directMembersByConversation[conversationId] !== members
+    ) return;
+
+    const messages = toRenderableMessages(projection, members);
+    if (messages === null) {
+      const nextMessages = { ...current.messagesByChannel };
+      delete nextMessages[conversationId];
+      set({
+        messagesByChannel: nextMessages,
+        projectionStateByConversation: {
+          ...current.projectionStateByConversation,
+          [conversationId]: "unavailable",
+        },
+      });
+      return;
+    }
+
+    const last = messages[messages.length - 1];
+    set({
+      messagesByChannel: {
+        ...current.messagesByChannel,
+        [conversationId]: messages,
+      },
+      projectionStateByConversation: {
+        ...current.projectionStateByConversation,
+        [conversationId]: "available",
+      },
+      dms: current.dms.map((dm) => dm.id === conversationId
+        ? {
+            ...dm,
+            lastMessage: last?.text,
+            lastAt: last?.ts,
+          }
+        : dm),
+    });
+  },
+
+  sendSelectedDirectText: async (text) => {
+    const state = get();
+    const conversationId = state.selectedDmId;
+    const binding = state.runtimeBinding;
+    const directGeneration = state.directGeneration;
+    const members = conversationId
+      ? state.directMembersByConversation[conversationId]
+      : undefined;
+    if (
+      state.directSendPending
+      || state.selectedServerId !== DM_HOME_ID
+      || !conversationId
+      || !binding
+      || directGeneration === null
+      || !members
+      || state.projectionStateByConversation[conversationId] !== "available"
+    ) return "unavailable";
+
+    const requestRevision = state.directSendRequestRevision + 1;
+    set({
+      directSendPending: true,
+      directSendError: null,
+      directSendRequestRevision: requestRevision,
+    });
+
+    try {
+      await VeilRuntime.sendDirectText(conversationId, directGeneration, text);
+    } catch (error) {
+      const failure = directTextSendErrorState(error);
+      const current = get();
+      if (current.directSendRequestRevision === requestRevision) {
+        const stillSelectedAuthority = current.selectedDmId === conversationId
+          && sameBinding(current.runtimeBinding, binding)
+          && current.directGeneration === directGeneration
+          && current.directMembersByConversation[conversationId] === members;
+        set({
+          directSendPending: false,
+          directSendError: stillSelectedAuthority ? failure : null,
+        });
+      }
+      return failure.reason;
+    }
+
+    const current = get();
+    if (current.directSendRequestRevision === requestRevision) {
+      const stillSelectedAuthority = current.selectedDmId === conversationId
+        && sameBinding(current.runtimeBinding, binding)
+        && current.directGeneration === directGeneration
+        && current.directMembersByConversation[conversationId] === members;
+      set({ directSendPending: false, directSendError: null });
+      if (stillSelectedAuthority) {
+        // Only the post-commit native projection may create the visible row.
+        // Never synthesize an ID, sequence, timestamp, or optimistic plaintext.
+        void get().loadSelectedDirectMessages();
+      }
+    }
+    return "accepted";
+  },
+
+  clearRenderableChat: () => {
+    const state = get();
+    set({
+      ...initialChatState,
+      directoryRevision: state.directoryRevision + 1,
+      projectionRequestRevision: state.projectionRequestRevision + 1,
+      directSendRequestRevision: state.directSendRequestRevision + 1,
+    });
   },
 }));
+
+export function resetChatStoreForTests(): void {
+  useChatStore.setState(initialChatState);
+}

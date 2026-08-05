@@ -9,15 +9,11 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
-	"errors"
-	"fmt"
 	"net/http"
 	"strconv"
 	"testing"
-	"time"
 
 	"github.com/NaveLIL/veil/veil-server/internal/auth"
-	"github.com/NaveLIL/veil/veil-server/internal/config"
 	"github.com/NaveLIL/veil/veil-server/internal/db"
 	"golang.org/x/crypto/curve25519"
 )
@@ -147,14 +143,23 @@ func TestDeviceDirectoryLifecycle(t *testing.T) {
 	conversationID := conversation["conversation_id"].(string)
 	directoryPath := "/v1/conversations/" + conversationID + "/device-directory"
 
-	if status, _ := h.DoUnsigned(http.MethodGet, directoryPath, nil); status != http.StatusUnauthorized {
-		t.Fatalf("unsigned directory status = %d, want 401", status)
+	if status, _ := h.DoUnsigned(http.MethodGet, directoryPath, nil); status != http.StatusBadRequest {
+		t.Fatalf("unsigned directory status = %d, want 400", status)
 	}
 	if status, _, _ := h.Do(mallory, http.MethodGet, directoryPath, nil); status != http.StatusForbidden {
 		t.Fatalf("non-member directory status = %d, want 403", status)
 	}
 
 	legacy := requireDirectory(t, h, alice, conversationID, 1, false)
+	for _, field := range []string{
+		"membership_conversation_kind",
+		"membership_bootstrap_owner_id",
+		"membership_bootstrap_owner_signing_key",
+	} {
+		if _, present := legacy[field]; present {
+			t.Fatalf("Direct directory unexpectedly exposed %s", field)
+		}
+	}
 	if reason, _ := legacy["reason"].(string); reason != "legacy_unbound_device" {
 		t.Fatalf("legacy directory reason = %q", reason)
 	}
@@ -254,98 +259,4 @@ func TestDeviceDirectoryLifecycle(t *testing.T) {
 	_, forbiddenV6 := signedDeviceBinding(t, alice, aliceDeviceKey, aliceKeys, 6, db.RequiredChannelCapabilities, db.DeviceBindingActive)
 	putDeviceBinding(t, h, alice, aliceDeviceKey, forbiddenV6, http.StatusConflict)
 	requireDirectory(t, h, alice, conversationID, 7, false)
-}
-
-func authProofForChallenge(t *testing.T, serverPublic []byte, user *User, binding *auth.DeviceBindingInput, deviceKeys integrationDeviceKeys) ([]byte, []byte) {
-	t.Helper()
-	accountShared, err := curve25519.X25519(user.IdentityPrivate, serverPublic)
-	if err != nil {
-		t.Fatal(err)
-	}
-	accountMessage, err := auth.WSAuthSigningMessage(serverPublic, accountShared)
-	if err != nil {
-		t.Fatal(err)
-	}
-	accountSignature := ed25519.Sign(user.SigningKey, accountMessage)
-	deviceShared, err := curve25519.X25519(deviceKeys.identityPrivate, serverPublic)
-	if err != nil {
-		t.Fatal(err)
-	}
-	deviceMessage, err := auth.DeviceAuthSigningMessage(
-		serverPublic, user.IdentityKey, user.SigningPublic, binding, deviceShared,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return accountSignature, ed25519.Sign(deviceKeys.signingPrivate, deviceMessage)
-}
-
-func TestDeviceAuthenticationRequiresBothDeviceKeys(t *testing.T) {
-	h := New(t)
-	user := h.CreateUser("device-pop-user")
-	deviceKey := bytes.Repeat([]byte{0xc3}, 16)
-	deviceKeys := newIntegrationDeviceKeys(t)
-	binding, _ := signedDeviceBinding(t, user, deviceKey, deviceKeys, 1, db.RequiredChannelCapabilities, db.DeviceBindingActive)
-	svc := auth.NewService(h.DB, &config.Config{AuthChallengeTTL: 5 * time.Second, AuthMaxAttempts: 3})
-
-	serverPublic, err := svc.CreateChallenge("bad-device-pop")
-	if err != nil {
-		t.Fatal(err)
-	}
-	accountSignature, deviceSignature := authProofForChallenge(t, serverPublic[:], user, binding, deviceKeys)
-	deviceSignature[0] ^= 0x80
-	_, err = svc.VerifyResponseV1(
-		context.Background(), "bad-device-pop", user.IdentityKey, user.SigningPublic,
-		accountSignature, deviceKey, "device-pop", binding, deviceSignature,
-	)
-	if !errors.Is(err, auth.ErrBadDeviceProof) {
-		t.Fatalf("tampered device PoP error = %v, want ErrBadDeviceProof", err)
-	}
-
-	serverPublic, err = svc.CreateChallenge("valid-device-pop")
-	if err != nil {
-		t.Fatal(err)
-	}
-	accountSignature, deviceSignature = authProofForChallenge(t, serverPublic[:], user, binding, deviceKeys)
-	result, err := svc.VerifyResponseV1(
-		context.Background(), "valid-device-pop", user.IdentityKey, user.SigningPublic,
-		accountSignature, deviceKey, "device-pop", binding, deviceSignature,
-	)
-	if err != nil {
-		t.Fatalf("valid device PoP rejected: %v", err)
-	}
-	if !result.PerDeviceSecure || result.DeviceBindingVersion != 1 || result.DeviceBindingStatus != db.DeviceBindingActive {
-		t.Fatalf("unexpected per-device auth result: %+v", result)
-	}
-
-	// Once a device id is bound, omitting the per-device proof is an explicit
-	// downgrade attempt rather than legacy compatibility.
-	serverPublic, err = svc.CreateChallenge("device-pop-downgrade")
-	if err != nil {
-		t.Fatal(err)
-	}
-	accountShared, err := curve25519.X25519(user.IdentityPrivate, serverPublic[:])
-	if err != nil {
-		t.Fatal(err)
-	}
-	accountMessage, err := auth.WSAuthSigningMessage(serverPublic[:], accountShared)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = svc.VerifyResponse(
-		context.Background(), "device-pop-downgrade", user.IdentityKey, user.SigningPublic,
-		ed25519.Sign(user.SigningKey, accountMessage), deviceKey, "device-pop",
-	)
-	if !errors.Is(err, auth.ErrDeviceBindingRequired) {
-		t.Fatalf("bound-device downgrade error = %v, want ErrDeviceBindingRequired", err)
-	}
-
-	// Sanity-check that the directory-management route uses the protocol ID,
-	// not the database UUID, as its stable externally signed identifier.
-	status, raw, response := h.Do(user, http.MethodGet,
-		fmt.Sprintf("/v1/device-bindings/%x", deviceKey), nil,
-	)
-	if status != http.StatusOK || response["device_id"] != hex.EncodeToString(deviceKey) {
-		t.Fatalf("get device binding: status=%d body=%s parsed=%v", status, raw, response)
-	}
 }

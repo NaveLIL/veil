@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@solidjs/testing-library";
+import { fireEvent, render, screen, waitFor } from "@solidjs/testing-library";
 import { createSignal } from "solid-js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
@@ -8,6 +8,7 @@ import {
 import { UserAvatar } from "@/components/identity/UserAvatar";
 import { phaseprintIdentityForFriendRequest } from "@/components/identity/avatarIdentity";
 import { clearAvatarRegistry, installNativeAvatar } from "@/components/identity/avatarRegistry";
+import { appStore, type NetworkProfileView } from "@/stores/app";
 
 const ORIGIN_A = "https://alpha.example.test:443";
 const ORIGIN_B = "https://beta.example.test:443";
@@ -208,6 +209,67 @@ describe("UserAvatar", () => {
     ));
     expect(container.querySelector("img")).not.toBeInTheDocument();
     expect(container.querySelector("[data-phaseprint]")).toBeInTheDocument();
+  });
+
+  it("hydrates visible exact identities once and refreshes them after profile-updated", async () => {
+    const scope = {
+      canonicalServerOrigin: ORIGIN_A,
+      userId: "550e8400-e29b-41d4-a716-446655440099",
+      bindingGeneration: "7",
+    };
+    const [notice, setNotice] = createSignal<ReturnType<typeof appStore.profileUpdateNotice>>(null);
+    vi.spyOn(appStore, "authenticatedServerScope").mockReturnValue(scope);
+    vi.spyOn(appStore, "connected").mockReturnValue(true);
+    vi.spyOn(appStore, "bindingTransitioning").mockReturnValue(false);
+    vi.spyOn(appStore, "originTransitioning").mockReturnValue(false);
+    vi.spyOn(appStore, "profileUpdateNotice").mockImplementation(() => notice());
+    const profile = (version: string, assetSuffix: string): NetworkProfileView => ({
+      canonicalServerOrigin: ORIGIN_A,
+      userId: USER_ID,
+      identityKey: IDENTITY_KEY,
+      username: "sable",
+      displayName: "Sable",
+      about: "",
+      avatarAssetId: `550e8400-e29b-41d4-a716-44665544${assetSuffix}`,
+      avatarJpegBase64: "/9j/2Q==",
+      profileVersion: version,
+      profileUpdatedAt: "2026-07-21T00:00:00Z",
+      observedAt: "2026-07-21T00:00:00Z",
+      proofState: "not_compared",
+    });
+    const loadProfile = vi.spyOn(appStore, "loadNetworkProfile")
+      .mockResolvedValueOnce(profile("1", "0001"))
+      .mockResolvedValueOnce(profile("2", "0002"));
+
+    const { container } = render(() => (
+      <>
+        <UserAvatar
+          canonicalServerOrigin={ORIGIN_A}
+          userId={USER_ID}
+          identityKey={IDENTITY_KEY}
+        />
+        <UserAvatar
+          canonicalServerOrigin={ORIGIN_A}
+          userId={USER_ID}
+          identityKey={IDENTITY_KEY}
+        />
+      </>
+    ));
+
+    await waitFor(() => expect(container.querySelectorAll("img")).toHaveLength(2));
+    expect(loadProfile).toHaveBeenCalledTimes(1);
+    expect(container.querySelector("img")).toHaveAttribute("src", "blob:https://veil.local/avatar-1");
+
+    setNotice({
+      canonicalServerOrigin: ORIGIN_A,
+      userId: USER_ID,
+      profileVersion: "2",
+    });
+    await waitFor(() => expect(loadProfile).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(container.querySelector("img")).toHaveAttribute(
+      "src",
+      "blob:https://veil.local/avatar-2",
+    ));
   });
 
   it("keeps Phaseprint visible until a local blob decodes and restores it on failure", () => {

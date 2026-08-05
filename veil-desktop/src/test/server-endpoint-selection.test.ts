@@ -4,7 +4,7 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(async () => vi.fn()) }));
 
 const STORAGE_KEY = "veil.server-endpoints.v1";
-const PRODUCTION_WS = "wss://veil.erez.pro/ws";
+const PRODUCTION_WS = "wss://veil.erez.pro/v3/events";
 const PRODUCTION_HTTP = "https://veil.erez.pro";
 
 async function loadStore() {
@@ -53,20 +53,32 @@ describe("initial server endpoint selection", () => {
   it("preserves an explicit self-host endpoint across a restart", async () => {
     const initialStore = await loadStore();
     initialStore.setServerEndpoints(
-      "wss://chat.example.test/ws",
+      "wss://chat.example.test/v3/events",
       "https://chat.example.test",
     );
 
     vi.resetModules();
     const restartedStore = await loadStore();
 
-    expect(restartedStore.serverUrl()).toBe("wss://chat.example.test/ws");
+    expect(restartedStore.serverUrl()).toBe("wss://chat.example.test/v3/events");
     expect(restartedStore.serverHttpUrl()).toBe("https://chat.example.test");
+  });
+
+  it("migrates an exact stored legacy path to the v3 transport", async () => {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({
+      ws: "wss://chat.example.test/ws",
+      http: "https://chat.example.test",
+    }));
+
+    const appStore = await loadStore();
+
+    expect(appStore.serverUrl()).toBe("wss://chat.example.test/v3/events");
+    expect(appStore.serverHttpUrl()).toBe("https://chat.example.test");
   });
 
   it("ignores an insecure stored pair and falls back to production", async () => {
     localStorage.setItem(STORAGE_KEY, JSON.stringify({
-      ws: "ws://chat.example.test/ws",
+      ws: "ws://chat.example.test/v3/events",
       http: "http://chat.example.test",
     }));
 

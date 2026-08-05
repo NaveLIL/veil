@@ -22,11 +22,12 @@ import (
 // Handler exposes the REST surface for managing push subscriptions.
 // All routes require a signed request (the existing X-Veil triplet).
 type Handler struct {
-	db         *db.DB
-	mw         *authmw.Middleware
-	rl         *authmw.RateLimit
-	policy     *EndpointPolicy
-	dispatcher *Dispatcher
+	db                 *db.DB
+	mw                 *authmw.Middleware
+	restAuthDispatcher *authmw.RESTAuthVersionDispatcher
+	rl                 *authmw.RateLimit
+	policy             *EndpointPolicy
+	dispatcher         *Dispatcher
 }
 
 // NewHandler builds the handler. mw and rl may be nil to disable
@@ -42,23 +43,37 @@ func NewHandlerWithEndpointPolicy(database *db.DB, mw *authmw.Middleware, rl *au
 	return &Handler{db: database, mw: mw, rl: rl, policy: policy}
 }
 
+// SetRESTAuthVersionDispatcher activates mandatory REST v2 authentication
+// selection for every signed push route.
+func (h *Handler) SetRESTAuthVersionDispatcher(dispatcher *authmw.RESTAuthVersionDispatcher) {
+	h.restAuthDispatcher = dispatcher
+}
+
 // RegisterRoutes mounts the handler onto a mux.
 func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
-	signed := func(f http.HandlerFunc) http.HandlerFunc {
+	signed := func(policy authmw.RESTAuthV2HTTPPolicy, f http.HandlerFunc) http.HandlerFunc {
 		if h.rl != nil {
 			f = h.rl.Wrap(f)
 		}
-		if h.mw != nil {
-			f = h.mw.RequireSigned(f)
+		if h.restAuthDispatcher != nil {
+			f = h.restAuthDispatcher.RequireSigned(policy, f)
+		} else if h.mw != nil {
+			var unavailable *authmw.RESTAuthVersionDispatcher
+			f = unavailable.RequireSigned(policy, f)
 		}
 		return f
 	}
-	mux.HandleFunc("POST /v1/push/subscriptions", signed(h.create))
-	mux.HandleFunc("GET /v1/push/subscriptions", signed(h.list))
-	mux.HandleFunc("GET /v1/push/vapid-key", signed(h.vapidKey))
-	mux.HandleFunc("POST /v1/push/subscriptions/{id}/confirm", signed(h.confirm))
-	mux.HandleFunc("DELETE /v1/push/subscriptions/{id}", signed(h.delete))
-	mux.HandleFunc("PATCH /v1/push/subscriptions/{id}/policy", signed(h.updatePolicy))
+	jsonPolicy, err := authmw.NewRESTAuthV2JSONHTTPPolicy(8 << 10)
+	if err != nil {
+		panic("invalid push REST v2 JSON policy")
+	}
+	bodylessPolicy := authmw.RESTAuthV2BodylessHTTPPolicy()
+	mux.HandleFunc("POST /v1/push/subscriptions", signed(jsonPolicy, h.create))
+	mux.HandleFunc("GET /v1/push/subscriptions", signed(bodylessPolicy, h.list))
+	mux.HandleFunc("GET /v1/push/vapid-key", signed(bodylessPolicy, h.vapidKey))
+	mux.HandleFunc("POST /v1/push/subscriptions/{id}/confirm", signed(jsonPolicy, h.confirm))
+	mux.HandleFunc("DELETE /v1/push/subscriptions/{id}", signed(bodylessPolicy, h.delete))
+	mux.HandleFunc("PATCH /v1/push/subscriptions/{id}/policy", signed(jsonPolicy, h.updatePolicy))
 }
 
 type createReq struct {
@@ -92,8 +107,8 @@ func (h *Handler) vapidKey(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
-	userID := r.Header.Get("X-Veil-User")
-	if userID == "" {
+	userID, ok := authmw.VerifiedUserID(r.Context())
+	if !ok {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthenticated"})
 		return
 	}
@@ -174,8 +189,8 @@ func validateSubscriptionRequest(req *createReq) error {
 }
 
 func (h *Handler) list(w http.ResponseWriter, r *http.Request) {
-	userID := r.Header.Get("X-Veil-User")
-	if userID == "" {
+	userID, ok := authmw.VerifiedUserID(r.Context())
+	if !ok {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthenticated"})
 		return
 	}
@@ -216,8 +231,8 @@ type confirmReq struct {
 }
 
 func (h *Handler) confirm(w http.ResponseWriter, r *http.Request) {
-	userID := r.Header.Get("X-Veil-User")
-	if userID == "" {
+	userID, authenticated := authmw.VerifiedUserID(r.Context())
+	if !authenticated {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthenticated"})
 		return
 	}
@@ -267,8 +282,8 @@ func validatePolicyRequest(req *policyReq) error {
 }
 
 func (h *Handler) updatePolicy(w http.ResponseWriter, r *http.Request) {
-	userID := r.Header.Get("X-Veil-User")
-	if userID == "" {
+	userID, authenticated := authmw.VerifiedUserID(r.Context())
+	if !authenticated {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthenticated"})
 		return
 	}
@@ -301,8 +316,8 @@ func (h *Handler) updatePolicy(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) delete(w http.ResponseWriter, r *http.Request) {
-	userID := r.Header.Get("X-Veil-User")
-	if userID == "" {
+	userID, authenticated := authmw.VerifiedUserID(r.Context())
+	if !authenticated {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthenticated"})
 		return
 	}

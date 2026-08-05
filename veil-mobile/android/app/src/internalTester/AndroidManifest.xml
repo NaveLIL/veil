@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+  xmlns:tools="http://schemas.android.com/tools">
+  <application
+    android:icon="@drawable/ic_veil_tester_launcher"
+    android:roundIcon="@drawable/ic_veil_tester_launcher"
+    tools:replace="android:icon,android:roundIcon">
+    <activity
+      android:name="org.unifiedpush.android.connector.internal.LinkActivity"
+      tools:node="remove" />
+    <receiver
+      android:name="org.unifiedpush.android.connector.internal.MessagingReceiverImpl"
+      tools:node="remove" />
+    <service
+      android:name="org.unifiedpush.android.connector.internal.RaiseToForegroundService"
+      tools:node="remove" />
+    <!-- Keep the release-derived tester model explicit. AGP lint evaluates
+         this build-type manifest independently while checking startForeground. -->
+    <service
+      android:name="io.veil.mobile.runtime.VeilEventsService"
+      android:exported="false"
+      android:foregroundServiceType="dataSync"
+      tools:node="merge" />
+  </application>
+</manifest>

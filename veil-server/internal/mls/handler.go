@@ -15,10 +15,11 @@ import (
 // Handler exposes the MLS REST surface. All endpoints require a signed
 // request via the shared authmw middleware.
 type Handler struct {
-	store *Store
-	mw    *authmw.Middleware
-	rl    *authmw.RateLimit
-	hub   Fanout // optional WS fan-out, may be nil
+	store          *Store
+	mw             *authmw.Middleware
+	restDispatcher *authmw.RESTAuthVersionDispatcher
+	rl             *authmw.RateLimit
+	hub            Fanout // optional WS fan-out, may be nil
 }
 
 // Fanout abstracts the gateway hub's ability to push events to other
@@ -34,25 +35,39 @@ func NewHandler(store *Store, mw *authmw.Middleware, rl *authmw.RateLimit, hub F
 	return &Handler{store: store, mw: mw, rl: rl, hub: hub}
 }
 
+// SetRESTAuthVersionDispatcher activates the reviewed REST v2 boundary for all
+// signed MLS routes. A nil dispatcher preserves isolated v1 test fixtures.
+func (h *Handler) SetRESTAuthVersionDispatcher(dispatcher *authmw.RESTAuthVersionDispatcher) {
+	h.restDispatcher = dispatcher
+}
+
 // RegisterRoutes mounts the MLS routes on a mux.
 func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
-	signed := func(f http.HandlerFunc) http.HandlerFunc {
+	signed := func(policy authmw.RESTAuthV2HTTPPolicy, f http.HandlerFunc) http.HandlerFunc {
 		if h.rl != nil {
 			f = h.rl.Wrap(f)
 		}
-		if h.mw != nil {
-			f = h.mw.RequireSigned(f)
+		if h.restDispatcher != nil {
+			f = h.restDispatcher.RequireSigned(policy, f)
+		} else if h.mw != nil {
+			var unavailable *authmw.RESTAuthVersionDispatcher
+			f = unavailable.RequireSigned(policy, f)
 		}
 		return f
 	}
-	mux.HandleFunc("POST /v1/mls/keypackages", signed(h.uploadKeyPackages))
-	mux.HandleFunc("GET /v1/mls/keypackages/{userID}/{deviceID}/count", signed(h.countKeyPackages))
-	mux.HandleFunc("GET /v1/mls/keypackages/{userID}/{deviceID}", signed(h.consumeKeyPackage))
-	mux.HandleFunc("POST /v1/mls/welcomes", signed(h.uploadWelcome))
-	mux.HandleFunc("GET /v1/mls/welcomes/{deviceID}", signed(h.listWelcomes))
-	mux.HandleFunc("DELETE /v1/mls/welcomes/{id}", signed(h.deleteWelcome))
-	mux.HandleFunc("POST /v1/mls/commits", signed(h.uploadCommit))
-	mux.HandleFunc("GET /v1/mls/commits/{conversationID}", signed(h.listCommits))
+	jsonPolicy, err := authmw.NewRESTAuthV2JSONHTTPPolicy(authmw.RESTAuthV2MaxBodyBytes)
+	if err != nil {
+		panic("invalid MLS REST v2 JSON policy")
+	}
+	bodylessPolicy := authmw.RESTAuthV2BodylessHTTPPolicy()
+	mux.HandleFunc("POST /v1/mls/keypackages", signed(jsonPolicy, h.uploadKeyPackages))
+	mux.HandleFunc("GET /v1/mls/keypackages/{userID}/{deviceID}/count", signed(bodylessPolicy, h.countKeyPackages))
+	mux.HandleFunc("GET /v1/mls/keypackages/{userID}/{deviceID}", signed(bodylessPolicy, h.consumeKeyPackage))
+	mux.HandleFunc("POST /v1/mls/welcomes", signed(jsonPolicy, h.uploadWelcome))
+	mux.HandleFunc("GET /v1/mls/welcomes/{deviceID}", signed(bodylessPolicy, h.listWelcomes))
+	mux.HandleFunc("DELETE /v1/mls/welcomes/{id}", signed(bodylessPolicy, h.deleteWelcome))
+	mux.HandleFunc("POST /v1/mls/commits", signed(jsonPolicy, h.uploadCommit))
+	mux.HandleFunc("GET /v1/mls/commits/{conversationID}", signed(bodylessPolicy, h.listCommits))
 }
 
 // ─── KeyPackages ───────────────────────────────────────────────────
@@ -63,8 +78,8 @@ type uploadKPReq struct {
 }
 
 func (h *Handler) uploadKeyPackages(w http.ResponseWriter, r *http.Request) {
-	userID := r.Header.Get("X-Veil-User")
-	if userID == "" {
+	userID, ok := authmw.VerifiedUserID(r.Context())
+	if !ok {
 		writeJSONErr(w, http.StatusUnauthorized, "unauthenticated")
 		return
 	}
@@ -154,8 +169,8 @@ type uploadWelcomeReq struct {
 }
 
 func (h *Handler) uploadWelcome(w http.ResponseWriter, r *http.Request) {
-	senderUserID := r.Header.Get("X-Veil-User")
-	if senderUserID == "" {
+	_, ok := authmw.VerifiedUserID(r.Context())
+	if !ok {
 		writeJSONErr(w, http.StatusUnauthorized, "unauthenticated")
 		return
 	}
@@ -189,8 +204,8 @@ func (h *Handler) uploadWelcome(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) listWelcomes(w http.ResponseWriter, r *http.Request) {
-	userID := r.Header.Get("X-Veil-User")
-	if userID == "" {
+	userID, ok := authmw.VerifiedUserID(r.Context())
+	if !ok {
 		writeJSONErr(w, http.StatusUnauthorized, "unauthenticated")
 		return
 	}
@@ -217,8 +232,8 @@ func (h *Handler) listWelcomes(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) deleteWelcome(w http.ResponseWriter, r *http.Request) {
-	userID := r.Header.Get("X-Veil-User")
-	if userID == "" {
+	userID, ok := authmw.VerifiedUserID(r.Context())
+	if !ok {
 		writeJSONErr(w, http.StatusUnauthorized, "unauthenticated")
 		return
 	}
@@ -239,8 +254,8 @@ type uploadCommitReq struct {
 }
 
 func (h *Handler) uploadCommit(w http.ResponseWriter, r *http.Request) {
-	senderUserID := r.Header.Get("X-Veil-User")
-	if senderUserID == "" {
+	senderUserID, ok := authmw.VerifiedUserID(r.Context())
+	if !ok {
 		writeJSONErr(w, http.StatusUnauthorized, "unauthenticated")
 		return
 	}

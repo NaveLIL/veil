@@ -13,7 +13,7 @@ description = "Local-only Tantivy full-text index for decrypted Veil messages"
 tantivy = "0.26.1"
 serde = { version = "1", features = ["derive"] }
 tracing = "0.1"
-thiserror = "1"
+thiserror = "2"
 
 [dev-dependencies]
 tempfile = "3"

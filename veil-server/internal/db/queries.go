@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/NaveLIL/veil/veil-server/internal/cryptokey"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 )
@@ -33,10 +35,22 @@ var (
 	ErrAttachmentScope                  = errors.New("attachment is unavailable or not owned by sender")
 	ErrMessageSecurityContext           = errors.New("message security context does not match the conversation")
 	ErrMessageRosterChanged             = errors.New("message roster changed before durable admission")
+	ErrMessageSendIDConflict            = errors.New("client message id already has different send bytes")
 	ErrConversationAccessDenied         = errors.New("conversation access denied")
+	ErrReactionLimitReached             = errors.New("message reaction limit reached")
+	ErrPreKeyMaterialConflict           = errors.New("prekey protocol id already has different key material")
+	ErrPreKeyLiveStateFull              = errors.New("prekey live-state capacity reached")
 )
 
-const maxUnusedOneTimePreKeysPerDevice = 100
+// Publication state is constant per device: one current SPK, at most one
+// hundred live OPKs, and one high-watermark/idempotency receipt row. The
+// account caps bound malicious device proliferation without imposing a
+// lifetime limit on legitimate monotonic rotations of an existing device.
+const (
+	MaxUnusedOneTimePreKeysPerDevice = 100
+	MaxPreKeyDevicesPerAccount       = 128
+	MaxPreKeyRowsPerAccount          = MaxPreKeyDevicesPerAccount * (1 + MaxUnusedOneTimePreKeysPerDevice)
+)
 
 const (
 	MaxPendingSenderKeyGenerationsPerStream = 128
@@ -48,7 +62,16 @@ const (
 const (
 	MessageCryptoProfileSenderKeyV5 = "sender_key_v5"
 	MessageCryptoEraSenderKeyV5     = uint64(1)
+	MessageCryptoProfileSenderKeyV6 = "sender_key_v6"
+	MessageCryptoEraSenderKeyV6     = uint64(1)
+	MessageCryptoProfileDirectV2    = "direct_v2"
+	MessageCryptoEraDirectV2        = uint64(1)
 )
+
+// MaxReactionsPerMessage is the shared server/mobile history bound. Admission
+// is serialized per message in AddReaction so a committed row can never make
+// the strict mobile history parser observe a larger set.
+const MaxReactionsPerMessage = 256
 
 // --- Users ---
 
@@ -78,8 +101,13 @@ func (db *DB) CreateUser(ctx context.Context, identityKey, signingKey []byte, us
 	if len(identityKey) != 32 || !cryptokey.ValidEd25519PublicKey(signingKey) {
 		return nil, errors.New("invalid account cryptographic public keys")
 	}
+	tx, err := db.Pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		return nil, fmt.Errorf("begin user registration: %w", err)
+	}
+	defer tx.Rollback(ctx)
 	var u User
-	err := db.Pool.QueryRow(ctx,
+	err = tx.QueryRow(ctx,
 		`INSERT INTO users (identity_key, signing_key, username)
 		 VALUES ($1, $2, $3)
 		 RETURNING id, identity_key, signing_key, username, created_at`,
@@ -87,6 +115,12 @@ func (db *DB) CreateUser(ctx context.Context, identityKey, signingKey []byte, us
 	).Scan(&u.ID, &u.IdentityKey, &u.SigningKey, &u.Username, &u.CreatedAt)
 	if err != nil {
 		return nil, fmt.Errorf("create user: %w", err)
+	}
+	if err := db.appendIdentityTransparencyAccountTx(ctx, tx, &u); err != nil {
+		return nil, fmt.Errorf("append user transparency event: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit user registration: %w", err)
 	}
 	return &u, nil
 }
@@ -149,80 +183,652 @@ type PreKey struct {
 	Used          bool
 }
 
-// StorePreKeys bulk-inserts prekeys for a device.
+// PreKeyUploadReceipt is the bounded acknowledgement persisted for the latest
+// accepted canonical batch. Replay is process-local metadata and is not stored.
+type PreKeyUploadReceipt struct {
+	Stored int
+	Replay bool
+}
+
+type validatedPreKeyBatch struct {
+	keys       []PreKey
+	signed     PreKey
+	oneTime    []PreKey
+	digest     [sha256.Size]byte
+	maxOneTime uint32
+}
+
+type preKeyPublicationState struct {
+	signedHighWatermark  uint32
+	oneTimeHighWatermark uint32
+	latestDigest         []byte
+	latestStored         int
+}
+
+// StorePreKeys preserves the pre-receipt API for internal callers.
 func (db *DB) StorePreKeys(ctx context.Context, deviceID string, keys []PreKey) error {
+	batch, err := validatePreKeyBatch(keys)
+	if err != nil {
+		return err
+	}
+	digest := digestInternalPreKeyBatch(deviceID, batch.keys)
+	_, err = db.storePreKeysWithReceipt(ctx, deviceID, batch, digest)
+	return err
+}
+
+// StorePreKeysWithReceipt atomically publishes a monotonic prekey batch.
+//
+// Only the latest exact validated upload bytes are replayable. Their digest
+// remains after the corresponding OPKs are claimed and compacted, so a lost
+// HTTP ACK can be retried indefinitely without resurrecting an OPK. Any
+// non-latest protocol id at or below its per-type high watermark is
+// permanently retired.
+func (db *DB) StorePreKeysWithReceipt(
+	ctx context.Context,
+	deviceID string,
+	keys []PreKey,
+	exactUploadDigest [sha256.Size]byte,
+) (PreKeyUploadReceipt, error) {
+	batch, err := validatePreKeyBatch(keys)
+	if err != nil {
+		return PreKeyUploadReceipt{}, err
+	}
+	batch.digest = exactUploadDigest
+	return db.storePreKeysWithReceipt(ctx, deviceID, batch, exactUploadDigest)
+}
+
+func (db *DB) storePreKeysWithReceipt(
+	ctx context.Context,
+	deviceID string,
+	batch validatedPreKeyBatch,
+	exactUploadDigest [sha256.Size]byte,
+) (PreKeyUploadReceipt, error) {
+	batch.digest = exactUploadDigest
 	tx, err := db.Pool.Begin(ctx)
 	if err != nil {
-		return fmt.Errorf("begin tx: %w", err)
+		return PreKeyUploadReceipt{}, fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback(ctx)
 
-	for _, k := range keys {
-		// A protocol key id is chosen by the device and refers to local secret
-		// material.  The database BIGSERIAL id is only an internal row id and
-		// must never be sent in an X3DH header.  Re-uploading an SPK updates it;
-		// an already-known OPK is deliberately not resurrected after use.
-		var statement string
-		if k.KeyType == 0 {
-			statement = `INSERT INTO prekeys (device_id, key_type, protocol_key_id, public_key, signature)
-			 VALUES ($1, $2, $3, $4, $5)
-			 ON CONFLICT (device_id, key_type, protocol_key_id)
-			 DO UPDATE SET public_key = EXCLUDED.public_key,
-			               signature = EXCLUDED.signature,
-			               used = false`
-		} else {
-			statement = `INSERT INTO prekeys (device_id, key_type, protocol_key_id, public_key, signature)
-			 VALUES ($1, $2, $3, $4, $5)
-			 ON CONFLICT (device_id, key_type, protocol_key_id) DO NOTHING`
+	// Resolve the owner before taking locks, then serialize every publication
+	// for that account by locking the user first and the target device second.
+	// A stable user -> device lock order makes the account-wide quota exact
+	// even when separate devices publish concurrently, while the device lock
+	// preserves one stable view for retries and unused-key pruning.
+	var ownerID string
+	if err := tx.QueryRow(ctx,
+		`SELECT user_id FROM devices WHERE id = $1::uuid`,
+		deviceID,
+	).Scan(&ownerID); err != nil {
+		return PreKeyUploadReceipt{}, fmt.Errorf("resolve prekey device owner: %w", err)
+	}
+	var lockedOwnerID string
+	if err := tx.QueryRow(ctx,
+		`SELECT id FROM users WHERE id = $1::uuid FOR UPDATE`,
+		ownerID,
+	).Scan(&lockedOwnerID); err != nil {
+		return PreKeyUploadReceipt{}, fmt.Errorf("lock prekey owner: %w", err)
+	}
+	var lockedDeviceID, lockedDeviceOwnerID string
+	if err := tx.QueryRow(ctx,
+		`SELECT id, user_id FROM devices WHERE id = $1::uuid FOR UPDATE`,
+		deviceID,
+	).Scan(&lockedDeviceID, &lockedDeviceOwnerID); err != nil {
+		return PreKeyUploadReceipt{}, fmt.Errorf("lock prekey device: %w", err)
+	}
+	if lockedDeviceOwnerID != lockedOwnerID {
+		return PreKeyUploadReceipt{}, errors.New("prekey device owner changed while acquiring publication locks")
+	}
+
+	stateCreated, state, err := lockPreKeyPublicationState(ctx, tx, deviceID)
+	if err != nil {
+		return PreKeyUploadReceipt{}, err
+	}
+	if stateCreated {
+		var accountStates int
+		if err := tx.QueryRow(ctx,
+			`SELECT COUNT(*)
+			 FROM prekey_publication_state s
+			 JOIN devices d ON d.id = s.device_id
+			 WHERE d.user_id = $1::uuid`,
+			lockedOwnerID,
+		).Scan(&accountStates); err != nil {
+			return PreKeyUploadReceipt{}, fmt.Errorf("count account prekey states: %w", err)
 		}
-		_, err := tx.Exec(ctx, statement,
-			deviceID, k.KeyType, k.ProtocolKeyID, k.PublicKey, k.Signature)
-		if err != nil {
-			return fmt.Errorf("insert prekey: %w", err)
+		if accountStates > MaxPreKeyDevicesPerAccount {
+			return PreKeyUploadReceipt{}, fmt.Errorf(
+				"%w: account=%s device_states=%d",
+				ErrPreKeyLiveStateFull, lockedOwnerID, accountStates,
+			)
 		}
 	}
 
-	// Clients replenish opportunistically on reconnect. Bound only UNUSED
-	// OPKs so repeated uploads cannot grow the table indefinitely; claimed
-	// rows are preserved because they may still be referenced by an in-flight
-	// X3DH initial message and are useful for audit/retention policy.
+	if state.latestDigest != nil && bytes.Equal(state.latestDigest, batch.digest[:]) {
+		if state.latestStored != len(batch.keys) {
+			return PreKeyUploadReceipt{}, errors.New("persisted prekey receipt size does not match its canonical digest")
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return PreKeyUploadReceipt{}, fmt.Errorf("commit prekey replay: %w", err)
+		}
+		return PreKeyUploadReceipt{Stored: state.latestStored, Replay: true}, nil
+	}
+
+	var accountRowsBefore int
+	if err := tx.QueryRow(ctx,
+		`SELECT COUNT(*)
+		 FROM prekeys p
+		 JOIN devices d ON d.id = p.device_id
+		 WHERE d.user_id = $1::uuid`,
+		lockedOwnerID,
+	).Scan(&accountRowsBefore); err != nil {
+		return PreKeyUploadReceipt{}, fmt.Errorf("count account prekeys before publication: %w", err)
+	}
+
+	allLegacyOneTimeIDs := true
+	for _, key := range batch.oneTime {
+		if key.ProtocolKeyID > state.oneTimeHighWatermark {
+			allLegacyOneTimeIDs = false
+			break
+		}
+	}
+	legacyCandidate := state.latestDigest == nil &&
+		state.signedHighWatermark > 0 &&
+		batch.signed.ProtocolKeyID <= state.signedHighWatermark &&
+		allLegacyOneTimeIDs
+	if legacyCandidate {
+		exact, verifyErr := verifyLegacyPreKeyBatch(ctx, tx, deviceID, batch, state)
+		if verifyErr != nil {
+			return PreKeyUploadReceipt{}, verifyErr
+		}
+		if !exact {
+			return PreKeyUploadReceipt{}, preKeyConflict(deviceID, batch.signed.KeyType, batch.signed.ProtocolKeyID)
+		}
+		if err := compactPublishedPreKeys(ctx, tx, deviceID, batch.signed.ProtocolKeyID); err != nil {
+			return PreKeyUploadReceipt{}, err
+		}
+		if err := persistPreKeyReceipt(
+			ctx, tx, deviceID, state.signedHighWatermark, state.oneTimeHighWatermark,
+			batch.digest, len(batch.keys),
+		); err != nil {
+			return PreKeyUploadReceipt{}, err
+		}
+		if err := enforcePreKeyLiveBounds(ctx, tx, deviceID, lockedOwnerID, accountRowsBefore); err != nil {
+			return PreKeyUploadReceipt{}, err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return PreKeyUploadReceipt{}, fmt.Errorf("commit legacy prekey receipt: %w", err)
+		}
+		return PreKeyUploadReceipt{Stored: len(batch.keys)}, nil
+	}
+
+	reuseCurrentSignedPreKey := false
+	switch {
+	case batch.signed.ProtocolKeyID < state.signedHighWatermark:
+		return PreKeyUploadReceipt{}, preKeyConflict(deviceID, batch.signed.KeyType, batch.signed.ProtocolKeyID)
+	case batch.signed.ProtocolKeyID == state.signedHighWatermark:
+		exact, exactErr := currentSignedPreKeyExact(ctx, tx, deviceID, batch.signed)
+		if exactErr != nil {
+			return PreKeyUploadReceipt{}, exactErr
+		}
+		if !exact {
+			return PreKeyUploadReceipt{}, preKeyConflict(deviceID, batch.signed.KeyType, batch.signed.ProtocolKeyID)
+		}
+		reuseCurrentSignedPreKey = true
+	}
+	for _, key := range batch.oneTime {
+		if key.ProtocolKeyID <= state.oneTimeHighWatermark {
+			return PreKeyUploadReceipt{}, preKeyConflict(deviceID, key.KeyType, key.ProtocolKeyID)
+		}
+	}
+	hasNewProtocolID := batch.signed.ProtocolKeyID > state.signedHighWatermark || len(batch.oneTime) > 0
+	if !hasNewProtocolID {
+		// A different HTTP body may not replace the sole durable lost-ACK
+		// receipt unless it actually advances publication state.
+		return PreKeyUploadReceipt{}, preKeyConflict(deviceID, batch.signed.KeyType, batch.signed.ProtocolKeyID)
+	}
+
+	for _, key := range batch.keys {
+		if key.KeyType == 0 && reuseCurrentSignedPreKey {
+			continue
+		}
+		commandTag, insertErr := tx.Exec(ctx,
+			`INSERT INTO prekeys
+			    (device_id, key_type, protocol_key_id, public_key, signature)
+			 VALUES ($1::uuid, $2, $3, $4, $5)
+			 ON CONFLICT (device_id, key_type, protocol_key_id) DO NOTHING`,
+			deviceID, key.KeyType, key.ProtocolKeyID, key.PublicKey, key.Signature,
+		)
+		if insertErr != nil {
+			return PreKeyUploadReceipt{}, fmt.Errorf("insert prekey: %w", insertErr)
+		}
+		if commandTag.RowsAffected() != 1 {
+			return PreKeyUploadReceipt{}, preKeyConflict(deviceID, key.KeyType, key.ProtocolKeyID)
+		}
+	}
+
+	if err := compactPublishedPreKeys(ctx, tx, deviceID, batch.signed.ProtocolKeyID); err != nil {
+		return PreKeyUploadReceipt{}, err
+	}
+	if err := persistPreKeyReceipt(
+		ctx, tx, deviceID, max(state.signedHighWatermark, batch.signed.ProtocolKeyID),
+		max(state.oneTimeHighWatermark, batch.maxOneTime), batch.digest, len(batch.keys),
+	); err != nil {
+		return PreKeyUploadReceipt{}, err
+	}
+	if err := enforcePreKeyLiveBounds(ctx, tx, deviceID, lockedOwnerID, accountRowsBefore); err != nil {
+		return PreKeyUploadReceipt{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return PreKeyUploadReceipt{}, fmt.Errorf("commit prekey publication: %w", err)
+	}
+	return PreKeyUploadReceipt{Stored: len(batch.keys)}, nil
+}
+
+const internalPreKeyUploadDigestDomain = "veil-internal-prekey-upload-v1\x00"
+
+func validatePreKeyBatch(keys []PreKey) (validatedPreKeyBatch, error) {
+	if len(keys) == 0 || len(keys) > 1001 {
+		return validatedPreKeyBatch{}, errors.New("invalid prekey publication batch size or scope")
+	}
+	canonical := make([]PreKey, 0, len(keys))
+	for _, key := range keys {
+		copyKey := PreKey{
+			KeyType:       key.KeyType,
+			ProtocolKeyID: key.ProtocolKeyID,
+			PublicKey:     bytes.Clone(key.PublicKey),
+			Signature:     bytes.Clone(key.Signature),
+		}
+		if copyKey.ProtocolKeyID == 0 || len(copyKey.PublicKey) != 32 {
+			return validatedPreKeyBatch{}, errors.New("invalid prekey protocol id or public key")
+		}
+		switch copyKey.KeyType {
+		case 0:
+			if len(copyKey.Signature) != 64 {
+				return validatedPreKeyBatch{}, errors.New("invalid signed prekey signature")
+			}
+		case 1:
+			if len(copyKey.Signature) != 0 {
+				return validatedPreKeyBatch{}, errors.New("one-time prekey must not have a signature")
+			}
+		default:
+			return validatedPreKeyBatch{}, errors.New("invalid prekey type")
+		}
+		canonical = append(canonical, copyKey)
+	}
+	sort.Slice(canonical, func(i, j int) bool {
+		if canonical[i].KeyType != canonical[j].KeyType {
+			return canonical[i].KeyType < canonical[j].KeyType
+		}
+		return canonical[i].ProtocolKeyID < canonical[j].ProtocolKeyID
+	})
+
+	batch := validatedPreKeyBatch{keys: canonical}
+	for index, key := range canonical {
+		if index > 0 && key.KeyType == canonical[index-1].KeyType &&
+			key.ProtocolKeyID == canonical[index-1].ProtocolKeyID {
+			return validatedPreKeyBatch{}, errors.New("duplicate prekey protocol id in publication batch")
+		}
+		if key.KeyType == 0 {
+			if batch.signed.ProtocolKeyID != 0 {
+				return validatedPreKeyBatch{}, errors.New("prekey publication must contain exactly one signed prekey")
+			}
+			batch.signed = key
+		} else {
+			batch.oneTime = append(batch.oneTime, key)
+			batch.maxOneTime = max(batch.maxOneTime, key.ProtocolKeyID)
+		}
+	}
+	if batch.signed.ProtocolKeyID == 0 || len(batch.oneTime) > 1000 {
+		return validatedPreKeyBatch{}, errors.New("prekey publication must contain one signed prekey and at most 1000 one-time prekeys")
+	}
+
+	return batch, nil
+}
+
+// StorePreKeys is also used by trusted non-HTTP integration paths. They get a
+// deterministic domain-separated digest; the REST handler always calls
+// StorePreKeysWithReceipt with SHA-256 of the exact validated request bytes.
+func digestInternalPreKeyBatch(deviceID string, canonical []PreKey) [sha256.Size]byte {
+	hash := sha256.New()
+	_, _ = hash.Write([]byte(internalPreKeyUploadDigestDomain))
+	var encoded [4]byte
+	binary.BigEndian.PutUint32(encoded[:], uint32(len(deviceID)))
+	_, _ = hash.Write(encoded[:])
+	_, _ = hash.Write([]byte(deviceID))
+	binary.BigEndian.PutUint32(encoded[:], uint32(len(canonical)))
+	_, _ = hash.Write(encoded[:])
+	for _, key := range canonical {
+		_, _ = hash.Write([]byte{byte(key.KeyType)})
+		binary.BigEndian.PutUint32(encoded[:], key.ProtocolKeyID)
+		_, _ = hash.Write(encoded[:])
+		_, _ = hash.Write(key.PublicKey)
+		if key.Signature == nil {
+			_, _ = hash.Write([]byte{0})
+		} else {
+			_, _ = hash.Write([]byte{1})
+			_, _ = hash.Write(key.Signature)
+		}
+	}
+	var digest [sha256.Size]byte
+	copy(digest[:], hash.Sum(nil))
+	return digest
+}
+
+func lockPreKeyPublicationState(ctx context.Context, tx pgx.Tx, deviceID string) (bool, preKeyPublicationState, error) {
+	commandTag, err := tx.Exec(ctx,
+		`INSERT INTO prekey_publication_state (
+		    device_id, signed_prekey_high_watermark, one_time_prekey_high_watermark
+		 )
+		 SELECT d.id,
+		        COALESCE(MAX(p.protocol_key_id) FILTER (WHERE p.key_type = 0), 0),
+		        COALESCE(MAX(p.protocol_key_id) FILTER (WHERE p.key_type = 1), 0)
+		 FROM devices d
+		 LEFT JOIN prekeys p ON p.device_id = d.id
+		 WHERE d.id = $1::uuid
+		 GROUP BY d.id
+		 ON CONFLICT (device_id) DO NOTHING`,
+		deviceID,
+	)
+	if err != nil {
+		return false, preKeyPublicationState{}, fmt.Errorf("initialize prekey publication state: %w", err)
+	}
+	created := commandTag.RowsAffected() == 1
+	var signedHigh, oneTimeHigh int64
+	var state preKeyPublicationState
+	if err := tx.QueryRow(ctx,
+		`SELECT signed_prekey_high_watermark,
+		        one_time_prekey_high_watermark,
+		        latest_upload_digest,
+		        COALESCE(latest_upload_stored, 0)
+		 FROM prekey_publication_state
+		 WHERE device_id = $1::uuid
+		 FOR UPDATE`,
+		deviceID,
+	).Scan(&signedHigh, &oneTimeHigh, &state.latestDigest, &state.latestStored); err != nil {
+		return false, preKeyPublicationState{}, fmt.Errorf("lock prekey publication state: %w", err)
+	}
+	if signedHigh < 0 || signedHigh > math.MaxUint32 || oneTimeHigh < 0 || oneTimeHigh > math.MaxUint32 {
+		return false, preKeyPublicationState{}, errors.New("prekey publication watermark is invalid")
+	}
+	state.signedHighWatermark = uint32(signedHigh)
+	state.oneTimeHighWatermark = uint32(oneTimeHigh)
+	if state.latestDigest != nil && (len(state.latestDigest) != sha256.Size || state.latestStored <= 0) {
+		return false, preKeyPublicationState{}, errors.New("prekey publication receipt is invalid")
+	}
+	if state.latestDigest == nil && state.latestStored != 0 {
+		return false, preKeyPublicationState{}, errors.New("prekey publication receipt is incomplete")
+	}
+	return created, state, nil
+}
+
+func verifyLegacyPreKeyBatch(
+	ctx context.Context,
+	tx pgx.Tx,
+	deviceID string,
+	batch validatedPreKeyBatch,
+	state preKeyPublicationState,
+) (bool, error) {
+	if state.latestDigest != nil || state.signedHighWatermark == 0 {
+		return false, nil
+	}
+	var signedRowID, signedProtocolID int64
+	var signedPublic, signedSignature []byte
+	if err := tx.QueryRow(ctx,
+		`SELECT id, protocol_key_id, public_key, signature
+		 FROM prekeys
+		 WHERE device_id = $1::uuid AND key_type = 0
+		 ORDER BY id DESC LIMIT 1`,
+		deviceID,
+	).Scan(&signedRowID, &signedProtocolID, &signedPublic, &signedSignature); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, nil
+		}
+		return false, fmt.Errorf("load legacy current signed prekey: %w", err)
+	}
+	if signedProtocolID != int64(batch.signed.ProtocolKeyID) ||
+		!bytes.Equal(signedPublic, batch.signed.PublicKey) ||
+		!bytes.Equal(signedSignature, batch.signed.Signature) {
+		return false, nil
+	}
+
+	rows, err := tx.Query(ctx,
+		`SELECT protocol_key_id, public_key, signature
+		 FROM prekeys
+		 WHERE device_id = $1::uuid AND key_type = 1 AND id > $2
+		 ORDER BY protocol_key_id ASC`,
+		deviceID, signedRowID,
+	)
+	if err != nil {
+		return false, fmt.Errorf("load legacy latest OPK batch: %w", err)
+	}
+	defer rows.Close()
+	legacyOneTime := make([]PreKey, 0, len(batch.oneTime))
+	for rows.Next() {
+		var protocolID int64
+		var key PreKey
+		if err := rows.Scan(&protocolID, &key.PublicKey, &key.Signature); err != nil {
+			return false, fmt.Errorf("scan legacy latest OPK batch: %w", err)
+		}
+		if protocolID <= 0 || protocolID > math.MaxUint32 {
+			return false, errors.New("legacy OPK protocol id is invalid")
+		}
+		key.KeyType = 1
+		key.ProtocolKeyID = uint32(protocolID)
+		legacyOneTime = append(legacyOneTime, key)
+	}
+	if err := rows.Err(); err != nil {
+		return false, fmt.Errorf("iterate legacy latest OPK batch: %w", err)
+	}
+	if len(legacyOneTime) != len(batch.oneTime) {
+		return false, nil
+	}
+	for index := range legacyOneTime {
+		if legacyOneTime[index].ProtocolKeyID != batch.oneTime[index].ProtocolKeyID ||
+			!bytes.Equal(legacyOneTime[index].PublicKey, batch.oneTime[index].PublicKey) ||
+			!bytes.Equal(legacyOneTime[index].Signature, batch.oneTime[index].Signature) {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+func currentSignedPreKeyExact(ctx context.Context, tx pgx.Tx, deviceID string, expected PreKey) (bool, error) {
+	var protocolID int64
+	var publicKey, signature []byte
+	err := tx.QueryRow(ctx,
+		`SELECT protocol_key_id, public_key, signature
+		 FROM prekeys
+		 WHERE device_id = $1::uuid AND key_type = 0
+		 ORDER BY id DESC LIMIT 1`,
+		deviceID,
+	).Scan(&protocolID, &publicKey, &signature)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("load current signed prekey: %w", err)
+	}
+	return protocolID == int64(expected.ProtocolKeyID) &&
+		bytes.Equal(publicKey, expected.PublicKey) &&
+		bytes.Equal(signature, expected.Signature), nil
+}
+
+func compactPublishedPreKeys(ctx context.Context, tx pgx.Tx, deviceID string, currentSignedID uint32) error {
+	if _, err := tx.Exec(ctx,
+		`DELETE FROM prekeys
+		 WHERE device_id = $1::uuid AND key_type = 0 AND protocol_key_id <> $2`,
+		deviceID, currentSignedID,
+	); err != nil {
+		return fmt.Errorf("compact prior signed prekeys: %w", err)
+	}
+	if _, err := tx.Exec(ctx,
+		`DELETE FROM prekeys
+		 WHERE device_id = $1::uuid AND key_type = 1 AND used = true`,
+		deviceID,
+	); err != nil {
+		return fmt.Errorf("compact consumed one-time prekeys: %w", err)
+	}
 	if _, err := tx.Exec(ctx,
 		`DELETE FROM prekeys
 		 WHERE device_id = $1::uuid AND key_type = 1 AND used = false
 		   AND id NOT IN (
 		     SELECT id FROM prekeys
 		     WHERE device_id = $1::uuid AND key_type = 1 AND used = false
-		     ORDER BY id DESC
+		     ORDER BY protocol_key_id DESC, id DESC
 		     LIMIT $2
 		   )`,
-		deviceID, maxUnusedOneTimePreKeysPerDevice,
+		deviceID, MaxUnusedOneTimePreKeysPerDevice,
 	); err != nil {
-		return fmt.Errorf("prune old unused prekeys: %w", err)
+		return fmt.Errorf("compact excess unused one-time prekeys: %w", err)
+	}
+	return nil
+}
+
+func persistPreKeyReceipt(
+	ctx context.Context,
+	tx pgx.Tx,
+	deviceID string,
+	signedHighWatermark uint32,
+	oneTimeHighWatermark uint32,
+	digest [sha256.Size]byte,
+	stored int,
+) error {
+	commandTag, err := tx.Exec(ctx,
+		`UPDATE prekey_publication_state
+		 SET signed_prekey_high_watermark = $2,
+		     one_time_prekey_high_watermark = $3,
+		     latest_upload_digest = $4,
+		     latest_upload_stored = $5,
+		     updated_at = now()
+		 WHERE device_id = $1::uuid`,
+		deviceID, signedHighWatermark, oneTimeHighWatermark, digest[:], stored,
+	)
+	if err != nil {
+		return fmt.Errorf("persist prekey publication receipt: %w", err)
+	}
+	if commandTag.RowsAffected() != 1 {
+		return errors.New("prekey publication state disappeared while storing receipt")
+	}
+	return nil
+}
+
+func enforcePreKeyLiveBounds(
+	ctx context.Context,
+	tx pgx.Tx,
+	deviceID string,
+	ownerID string,
+	accountRowsBefore int,
+) error {
+	var signedRows, unusedRows, consumedRows int
+	if err := tx.QueryRow(ctx,
+		`SELECT
+		   COUNT(*) FILTER (WHERE key_type = 0),
+		   COUNT(*) FILTER (WHERE key_type = 1 AND used = false),
+		   COUNT(*) FILTER (WHERE key_type = 1 AND used = true)
+		 FROM prekeys
+		 WHERE device_id = $1::uuid`,
+		deviceID,
+	).Scan(&signedRows, &unusedRows, &consumedRows); err != nil {
+		return fmt.Errorf("count device live prekeys: %w", err)
+	}
+	if signedRows != 1 || unusedRows > MaxUnusedOneTimePreKeysPerDevice || consumedRows != 0 {
+		return errors.New("prekey compaction invariant failed")
 	}
 
-	return tx.Commit(ctx)
+	var accountRowsAfter int
+	if err := tx.QueryRow(ctx,
+		`SELECT COUNT(*)
+		 FROM prekeys p
+		 JOIN devices d ON d.id = p.device_id
+		 WHERE d.user_id = $1::uuid`,
+		ownerID,
+	).Scan(&accountRowsAfter); err != nil {
+		return fmt.Errorf("count account live prekeys: %w", err)
+	}
+	if accountRowsAfter > MaxPreKeyRowsPerAccount && accountRowsAfter > accountRowsBefore {
+		return fmt.Errorf(
+			"%w: account=%s rows=%d",
+			ErrPreKeyLiveStateFull, ownerID, accountRowsAfter,
+		)
+	}
+	return nil
+}
+
+func preKeyConflict(deviceID string, keyType int16, protocolID uint32) error {
+	return fmt.Errorf(
+		"%w: device=%s key_type=%d protocol_key_id=%d",
+		ErrPreKeyMaterialConflict, deviceID, keyType, protocolID,
+	)
 }
 
 // ClaimOneTimePreKey atomically claims an unused one-time prekey for a device.
 // Returns nil if no OPK available (falls back to signed-only X3DH).
 func (db *DB) ClaimOneTimePreKey(ctx context.Context, deviceID string) (*PreKey, error) {
-	var pk PreKey
-	err := db.Pool.QueryRow(ctx,
-		`UPDATE prekeys SET used = true
-		 WHERE id = (
-		   SELECT id FROM prekeys
-		   WHERE device_id = $1 AND key_type = 1 AND used = false
-		   ORDER BY id ASC LIMIT 1
-		   FOR UPDATE SKIP LOCKED
-		 )
-		 RETURNING id, device_id, key_type, protocol_key_id, public_key, signature, used`,
+	tx, err := db.Pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("begin OPK claim: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	// StorePreKeys takes FOR UPDATE on this row. FOR SHARE lets independent
+	// claims proceed concurrently while ensuring a claim observes either the
+	// complete legacy mode or the complete receipt/compaction cutover.
+	var lockedDeviceID string
+	if err := tx.QueryRow(ctx,
+		`SELECT id FROM devices WHERE id = $1::uuid FOR SHARE`,
 		deviceID,
-	).Scan(&pk.ID, &pk.DeviceID, &pk.KeyType, &pk.ProtocolKeyID, &pk.PublicKey, &pk.Signature, &pk.Used)
+	).Scan(&lockedDeviceID); err != nil {
+		return nil, fmt.Errorf("lock OPK device: %w", err)
+	}
+	var receiptEstablished bool
+	err = tx.QueryRow(ctx,
+		`SELECT latest_upload_digest IS NOT NULL
+		 FROM prekey_publication_state
+		 WHERE device_id = $1::uuid`,
+		deviceID,
+	).Scan(&receiptEstablished)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return nil, fmt.Errorf("load OPK publication state: %w", err)
+	}
+
+	var pk PreKey
+	if receiptEstablished {
+		err = tx.QueryRow(ctx,
+			`WITH candidate AS (
+			   SELECT id FROM prekeys
+			   WHERE device_id = $1::uuid AND key_type = 1 AND used = false
+			   ORDER BY protocol_key_id ASC, id ASC LIMIT 1
+			   FOR UPDATE SKIP LOCKED
+			 )
+			 DELETE FROM prekeys selected
+			 USING candidate
+			 WHERE selected.id = candidate.id
+			 RETURNING selected.id, selected.device_id, selected.key_type,
+			           selected.protocol_key_id, selected.public_key,
+			           selected.signature, true`,
+			deviceID,
+		).Scan(&pk.ID, &pk.DeviceID, &pk.KeyType, &pk.ProtocolKeyID, &pk.PublicKey, &pk.Signature, &pk.Used)
+	} else {
+		err = tx.QueryRow(ctx,
+			`UPDATE prekeys SET used = true
+			 WHERE id = (
+			   SELECT id FROM prekeys
+			   WHERE device_id = $1::uuid AND key_type = 1 AND used = false
+			   ORDER BY protocol_key_id ASC, id ASC LIMIT 1
+			   FOR UPDATE SKIP LOCKED
+			 )
+			 RETURNING id, device_id, key_type, protocol_key_id, public_key, signature, used`,
+			deviceID,
+		).Scan(&pk.ID, &pk.DeviceID, &pk.KeyType, &pk.ProtocolKeyID, &pk.PublicKey, &pk.Signature, &pk.Used)
+	}
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil // No OPK available, not an error
 		}
 		return nil, fmt.Errorf("claim opk: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit OPK claim: %w", err)
 	}
 	return &pk, nil
 }
@@ -282,13 +888,24 @@ type Message struct {
 // for a Sender-Key group/channel ciphertext. SenderDeviceDatabaseID is used
 // only while admitting a new row and is never returned on the wire.
 type MessageSecurityContext struct {
-	CryptoProfile          string
-	CryptoEra              uint64
-	RosterVersion          uint64
-	RosterCommitment       []byte
-	SenderDeviceID         []byte
-	SenderBindingVersion   uint64
-	SenderDeviceDatabaseID string
+	CryptoProfile             string
+	CryptoEra                 uint64
+	RosterVersion             uint64
+	RosterCommitment          []byte
+	MembershipEpoch           uint64
+	MembershipEpochHash       []byte
+	SenderDeviceID            []byte
+	SenderBindingVersion      uint64
+	SenderDeviceDatabaseID    string
+	SenderDeviceIdentityKey   []byte
+	SenderDeviceSigningKey    []byte
+	SenderDeviceCapabilities  uint64
+	SenderDeviceBindingStatus DeviceBindingStatus
+	SenderAccountSignature    []byte
+	TargetDeviceID            []byte
+	TargetBindingVersion      uint64
+	TargetDeviceDatabaseID    string
+	DirectSessionID           []byte
 }
 
 type MessageAttachment struct {
@@ -299,6 +916,370 @@ type MessageAttachment struct {
 	Nonce        []byte
 	SizeBytes    int64
 	ContentType  string
+}
+
+// MessageSendOutcome is the immutable server identity assigned to one
+// account-scoped client send intent. The ledger deliberately outlives the
+// message row so an exact retry can still be acknowledged after TTL cleanup.
+type MessageSendOutcome struct {
+	MessageID        string
+	ServerTimestamp  time.Time
+	AckRosterVersion *uint64
+	MembershipEpoch  *uint64
+	MembershipHash   []byte
+	Replayed         bool
+}
+
+func isCanonicalNonNilUUID(value string) bool {
+	parsed, err := uuid.Parse(value)
+	return err == nil && parsed != uuid.Nil && parsed.String() == value
+}
+
+// LookupMessageSendOutcome returns the durable result for an exact request
+// digest. A reused client ID with different bytes fails closed.
+func (db *DB) LookupMessageSendOutcome(
+	ctx context.Context,
+	senderID string,
+	clientMessageID string,
+	requestDigest []byte,
+) (*MessageSendOutcome, error) {
+	if !isCanonicalNonNilUUID(senderID) || !isCanonicalNonNilUUID(clientMessageID) ||
+		len(requestDigest) != sha256.Size {
+		return nil, errors.New("invalid message send lookup")
+	}
+	var (
+		storedDigest    []byte
+		messageID       string
+		serverTimestamp time.Time
+		rosterVersion   *int64
+		membershipEpoch *int64
+		membershipHash  []byte
+	)
+	err := db.Pool.QueryRow(ctx,
+		`SELECT request_digest, message_id::text, server_timestamp, ack_roster_version,
+		        ack_membership_epoch, ack_membership_epoch_hash
+		 FROM message_send_idempotency
+		 WHERE sender_id = $1::uuid AND client_message_id = $2::uuid`,
+		senderID, clientMessageID,
+	).Scan(&storedDigest, &messageID, &serverTimestamp, &rosterVersion,
+		&membershipEpoch, &membershipHash)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if !isCanonicalNonNilUUID(messageID) {
+		return nil, errors.New("invalid stored message send outcome")
+	}
+	if len(storedDigest) != sha256.Size ||
+		subtle.ConstantTimeCompare(storedDigest, requestDigest) != 1 {
+		return nil, ErrMessageSendIDConflict
+	}
+	outcome := &MessageSendOutcome{
+		MessageID:       messageID,
+		ServerTimestamp: serverTimestamp,
+		Replayed:        true,
+	}
+	if rosterVersion != nil {
+		version := uint64(*rosterVersion)
+		outcome.AckRosterVersion = &version
+	}
+	if membershipEpoch != nil {
+		if *membershipEpoch <= 0 || len(membershipHash) != 32 {
+			return nil, errors.New("invalid stored membership send outcome")
+		}
+		epoch := uint64(*membershipEpoch)
+		outcome.MembershipEpoch = &epoch
+		outcome.MembershipHash = append([]byte(nil), membershipHash...)
+	} else if membershipHash != nil {
+		return nil, errors.New("partial stored membership send outcome")
+	}
+	return outcome, nil
+}
+
+// StoreMessageIdempotent atomically claims an account-scoped client send ID,
+// validates the current conversation/security snapshot, and inserts the
+// message and attachments. Exact concurrent retries return the first durable
+// result without inserting or fan-out eligibility.
+func (db *DB) StoreMessageIdempotent(
+	ctx context.Context,
+	m *Message,
+	clientMessageID string,
+	requestDigest []byte,
+) (*MessageSendOutcome, error) {
+	if m == nil || m.ConversationID == "" || !isCanonicalNonNilUUID(m.SenderID) ||
+		len(m.Ciphertext) == 0 || !isCanonicalNonNilUUID(clientMessageID) ||
+		len(requestDigest) != sha256.Size {
+		return nil, errors.New("invalid idempotent message")
+	}
+	if m.SecurityContext != nil {
+		if err := validateMessageSecurityContext(m.SecurityContext); err != nil {
+			return nil, err
+		}
+	}
+	attempts := 1
+	if m.SecurityContext != nil {
+		attempts = 3
+	}
+	for attempt := 0; attempt < attempts; attempt++ {
+		outcome, err := db.storeMessageIdempotentOnce(ctx, m, clientMessageID, requestDigest)
+		if !isSenderKeySerializationFailure(err) {
+			return outcome, err
+		}
+	}
+	return nil, ErrMessageRosterChanged
+}
+
+func (db *DB) storeMessageIdempotentOnce(
+	ctx context.Context,
+	m *Message,
+	clientMessageID string,
+	requestDigest []byte,
+) (*MessageSendOutcome, error) {
+	txOptions := pgx.TxOptions{}
+	if m.SecurityContext != nil {
+		txOptions.IsoLevel = pgx.Serializable
+	}
+	tx, err := db.Pool.BeginTx(ctx, txOptions)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+
+	messageID := uuid.NewString()
+	var ackRosterVersion any
+	var ackMembershipEpoch, ackMembershipHash any
+	if m.SecurityContext != nil && (m.SecurityContext.CryptoProfile == MessageCryptoProfileSenderKeyV5 ||
+		m.SecurityContext.CryptoProfile == MessageCryptoProfileSenderKeyV6) {
+		ackRosterVersion = int64(m.SecurityContext.RosterVersion)
+		if m.SecurityContext.CryptoProfile == MessageCryptoProfileSenderKeyV6 {
+			ackMembershipEpoch = int64(m.SecurityContext.MembershipEpoch)
+			ackMembershipHash = m.SecurityContext.MembershipEpochHash
+		}
+	}
+	var (
+		serverTimestamp       time.Time
+		storedRosterVersion   *int64
+		storedMembershipEpoch *int64
+		storedMembershipHash  []byte
+	)
+	err = tx.QueryRow(ctx,
+		`INSERT INTO message_send_idempotency (
+		   sender_id, client_message_id, request_digest, message_id,
+		   server_timestamp, ack_roster_version, ack_membership_epoch,
+		   ack_membership_epoch_hash
+		 ) VALUES ($1::uuid, $2::uuid, $3, $4::uuid, now(), $5, $6, $7)
+		 ON CONFLICT (sender_id, client_message_id) DO NOTHING
+		 RETURNING message_id::text, server_timestamp, ack_roster_version,
+		           ack_membership_epoch, ack_membership_epoch_hash`,
+		m.SenderID, clientMessageID, requestDigest, messageID, ackRosterVersion,
+		ackMembershipEpoch, ackMembershipHash,
+	).Scan(&messageID, &serverTimestamp, &storedRosterVersion,
+		&storedMembershipEpoch, &storedMembershipHash)
+	if errors.Is(err, pgx.ErrNoRows) {
+		var storedDigest []byte
+		err = tx.QueryRow(ctx,
+			`SELECT request_digest, message_id::text, server_timestamp, ack_roster_version,
+			        ack_membership_epoch, ack_membership_epoch_hash
+			 FROM message_send_idempotency
+			 WHERE sender_id = $1::uuid AND client_message_id = $2::uuid`,
+			m.SenderID, clientMessageID,
+		).Scan(&storedDigest, &messageID, &serverTimestamp, &storedRosterVersion,
+			&storedMembershipEpoch, &storedMembershipHash)
+		if err != nil {
+			return nil, err
+		}
+		if !isCanonicalNonNilUUID(messageID) {
+			return nil, errors.New("invalid stored message send outcome")
+		}
+		if len(storedDigest) != sha256.Size ||
+			subtle.ConstantTimeCompare(storedDigest, requestDigest) != 1 {
+			return nil, ErrMessageSendIDConflict
+		}
+		m.ID = messageID
+		m.CreatedAt = serverTimestamp
+		outcome := &MessageSendOutcome{
+			MessageID:       messageID,
+			ServerTimestamp: serverTimestamp,
+			Replayed:        true,
+		}
+		if storedRosterVersion != nil {
+			version := uint64(*storedRosterVersion)
+			outcome.AckRosterVersion = &version
+		}
+		if storedMembershipEpoch != nil {
+			if *storedMembershipEpoch <= 0 || len(storedMembershipHash) != 32 {
+				return nil, errors.New("invalid stored membership send outcome")
+			}
+			epoch := uint64(*storedMembershipEpoch)
+			outcome.MembershipEpoch = &epoch
+			outcome.MembershipHash = append([]byte(nil), storedMembershipHash...)
+		} else if storedMembershipHash != nil {
+			return nil, errors.New("partial stored membership send outcome")
+		}
+		return outcome, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if !isCanonicalNonNilUUID(messageID) {
+		return nil, errors.New("invalid stored message send outcome")
+	}
+
+	var conversationType int16
+	if err := tx.QueryRow(ctx,
+		`SELECT conv_type FROM conversations WHERE id = $1::uuid FOR UPDATE`,
+		m.ConversationID,
+	).Scan(&conversationType); err != nil {
+		return nil, err
+	}
+	if conversationType == 1 || conversationType == 2 {
+		if err := validateMessageSecurityContext(m.SecurityContext); err != nil {
+			return nil, err
+		}
+		var lockedDeviceID string
+		if err := tx.QueryRow(ctx,
+			`SELECT id::text FROM devices
+			 WHERE id = $1::uuid AND user_id = $2::uuid FOR UPDATE`,
+			m.SecurityContext.SenderDeviceDatabaseID, m.SenderID,
+		).Scan(&lockedDeviceID); err != nil {
+			return nil, ErrMessageSecurityContext
+		}
+		roster, err := resolveConversationDeviceRosterSnapshot(
+			ctx, tx, m.ConversationID, RequiredChannelCapabilities,
+		)
+		if err != nil {
+			if errors.Is(err, ErrSenderKeyRosterChanged) {
+				return nil, ErrMessageRosterChanged
+			}
+			return nil, err
+		}
+		if err := validateMessageRosterSnapshot(
+			ctx, tx, roster, m.ConversationID, m.SenderID, m.SecurityContext,
+		); err != nil {
+			return nil, err
+		}
+	} else if m.SecurityContext != nil {
+		if err := validateDirectMessageDeviceSnapshot(
+			ctx, tx, m.ConversationID, m.SenderID, m.SecurityContext,
+		); err != nil {
+			return nil, err
+		}
+	}
+
+	var securityProfile, rosterCommitment, senderDeviceID, targetDeviceID, directSessionID any
+	var senderDeviceIdentityKey, senderDeviceSigningKey, senderAccountSignature any
+	var membershipEpoch, membershipEpochHash any
+	var securityEra, rosterVersion, senderBindingVersion, targetBindingVersion any
+	var senderDeviceCapabilities, senderDeviceBindingStatus any
+	if m.SecurityContext != nil {
+		securityProfile = m.SecurityContext.CryptoProfile
+		securityEra = int64(m.SecurityContext.CryptoEra)
+		senderDeviceID = m.SecurityContext.SenderDeviceID
+		senderBindingVersion = int64(m.SecurityContext.SenderBindingVersion)
+		if m.SecurityContext.CryptoProfile == MessageCryptoProfileSenderKeyV5 ||
+			m.SecurityContext.CryptoProfile == MessageCryptoProfileSenderKeyV6 {
+			rosterVersion = int64(m.SecurityContext.RosterVersion)
+			rosterCommitment = m.SecurityContext.RosterCommitment
+			if m.SecurityContext.CryptoProfile == MessageCryptoProfileSenderKeyV6 {
+				membershipEpoch = int64(m.SecurityContext.MembershipEpoch)
+				membershipEpochHash = m.SecurityContext.MembershipEpochHash
+			}
+		} else {
+			targetDeviceID = m.SecurityContext.TargetDeviceID
+			targetBindingVersion = int64(m.SecurityContext.TargetBindingVersion)
+			directSessionID = m.SecurityContext.DirectSessionID
+			senderDeviceIdentityKey = m.SecurityContext.SenderDeviceIdentityKey
+			senderDeviceSigningKey = m.SecurityContext.SenderDeviceSigningKey
+			senderDeviceCapabilities = int64(m.SecurityContext.SenderDeviceCapabilities)
+			senderDeviceBindingStatus = int16(m.SecurityContext.SenderDeviceBindingStatus)
+			senderAccountSignature = m.SecurityContext.SenderAccountSignature
+		}
+	}
+
+	m.ID = messageID
+	m.CreatedAt = serverTimestamp
+	err = tx.QueryRow(ctx,
+		`INSERT INTO messages (
+		   id, conversation_id, sender_id, ciphertext, header, msg_type,
+		   reply_to_id, expires_at, crypto_profile, crypto_era,
+		   roster_version, roster_commitment, sender_device_id,
+           sender_binding_version, target_device_id, target_binding_version,
+           direct_session_id, sender_device_identity_key,
+           sender_device_signing_key, sender_device_capabilities,
+           sender_device_binding_status, sender_account_signature,
+           membership_epoch, membership_epoch_hash, created_at
+		 )
+		 SELECT $1::uuid, $2::uuid, $3::uuid, $4, $5, $6, $7::uuid, $8,
+                $9, $10, $11, $12, $13, $14, $15, $16, $17, $18,
+                $19, $20, $21, $22, $23, $24, $25
+		 WHERE $7::uuid IS NULL OR EXISTS (
+		   SELECT 1 FROM messages reply
+		   WHERE reply.id = $7::uuid
+		     AND reply.conversation_id = $2::uuid
+		     AND reply.is_deleted = false
+		 )
+		 RETURNING id::text, created_at`,
+		m.ID, m.ConversationID, m.SenderID, m.Ciphertext, m.Header, m.MsgType,
+		m.ReplyToID, m.ExpiresAt, securityProfile, securityEra, rosterVersion,
+		rosterCommitment, senderDeviceID, senderBindingVersion, targetDeviceID,
+		targetBindingVersion, directSessionID, senderDeviceIdentityKey,
+		senderDeviceSigningKey, senderDeviceCapabilities, senderDeviceBindingStatus,
+		senderAccountSignature, membershipEpoch, membershipEpochHash, m.CreatedAt,
+	).Scan(&m.ID, &m.CreatedAt)
+	if errors.Is(err, pgx.ErrNoRows) && m.ReplyToID != nil {
+		return nil, ErrReplyTargetMismatch
+	}
+	if err != nil {
+		return nil, err
+	}
+	for _, attachment := range m.Attachments {
+		var inserted string
+		err = tx.QueryRow(ctx,
+			`INSERT INTO message_attachments
+			   (message_id, file_id, position, encrypted_key, nonce, size_bytes, content_type)
+			 SELECT $1::uuid, upload.file_id, $3, $4, $5, $6, $7
+			 FROM tus_uploads upload
+			 WHERE upload.file_id = $2
+			   AND upload.user_id = $8::uuid
+			   AND upload.finished_at IS NOT NULL
+			   AND upload.received_bytes = upload.size_bytes
+			   AND upload.size_bytes = $6
+			   AND upload.expires_at > now()
+			 RETURNING file_id`,
+			m.ID, attachment.FileID, attachment.Position, attachment.EncryptedKey,
+			attachment.Nonce, attachment.SizeBytes, attachment.ContentType, m.SenderID,
+		).Scan(&inserted)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrAttachmentScope
+		}
+		if err != nil {
+			return nil, fmt.Errorf("store message attachment: %w", err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	outcome := &MessageSendOutcome{
+		MessageID:       m.ID,
+		ServerTimestamp: m.CreatedAt,
+	}
+	if storedRosterVersion != nil {
+		version := uint64(*storedRosterVersion)
+		outcome.AckRosterVersion = &version
+	}
+	if storedMembershipEpoch != nil {
+		if *storedMembershipEpoch <= 0 || len(storedMembershipHash) != 32 {
+			return nil, errors.New("invalid stored membership send outcome")
+		}
+		epoch := uint64(*storedMembershipEpoch)
+		outcome.MembershipEpoch = &epoch
+		outcome.MembershipHash = append([]byte(nil), storedMembershipHash...)
+	} else if storedMembershipHash != nil {
+		return nil, errors.New("partial stored membership send outcome")
+	}
+	return outcome, nil
 }
 
 // StoreMessage persists an encrypted message.
@@ -363,28 +1344,56 @@ func (db *DB) storeMessageOnce(ctx context.Context, m *Message) error {
 			return err
 		}
 	} else if m.SecurityContext != nil {
-		return ErrMessageSecurityContext
+		if err := validateDirectMessageDeviceSnapshot(
+			ctx, tx, m.ConversationID, m.SenderID, m.SecurityContext,
+		); err != nil {
+			return err
+		}
 	}
 
-	var securityProfile, rosterCommitment, senderDeviceID any
-	var securityEra, rosterVersion, senderBindingVersion any
+	var securityProfile, rosterCommitment, senderDeviceID, targetDeviceID, directSessionID any
+	var senderDeviceIdentityKey, senderDeviceSigningKey, senderAccountSignature any
+	var membershipEpoch, membershipEpochHash any
+	var securityEra, rosterVersion, senderBindingVersion, targetBindingVersion any
+	var senderDeviceCapabilities, senderDeviceBindingStatus any
 	if m.SecurityContext != nil {
 		securityProfile = m.SecurityContext.CryptoProfile
 		securityEra = int64(m.SecurityContext.CryptoEra)
-		rosterVersion = int64(m.SecurityContext.RosterVersion)
-		rosterCommitment = m.SecurityContext.RosterCommitment
 		senderDeviceID = m.SecurityContext.SenderDeviceID
 		senderBindingVersion = int64(m.SecurityContext.SenderBindingVersion)
+		if m.SecurityContext.CryptoProfile == MessageCryptoProfileSenderKeyV5 ||
+			m.SecurityContext.CryptoProfile == MessageCryptoProfileSenderKeyV6 {
+			rosterVersion = int64(m.SecurityContext.RosterVersion)
+			rosterCommitment = m.SecurityContext.RosterCommitment
+			if m.SecurityContext.CryptoProfile == MessageCryptoProfileSenderKeyV6 {
+				membershipEpoch = int64(m.SecurityContext.MembershipEpoch)
+				membershipEpochHash = m.SecurityContext.MembershipEpochHash
+			}
+		} else {
+			targetDeviceID = m.SecurityContext.TargetDeviceID
+			targetBindingVersion = int64(m.SecurityContext.TargetBindingVersion)
+			directSessionID = m.SecurityContext.DirectSessionID
+			senderDeviceIdentityKey = m.SecurityContext.SenderDeviceIdentityKey
+			senderDeviceSigningKey = m.SecurityContext.SenderDeviceSigningKey
+			senderDeviceCapabilities = int64(m.SecurityContext.SenderDeviceCapabilities)
+			senderDeviceBindingStatus = int16(m.SecurityContext.SenderDeviceBindingStatus)
+			senderAccountSignature = m.SecurityContext.SenderAccountSignature
+		}
 	}
 
 	err = tx.QueryRow(ctx,
 		`INSERT INTO messages (
 		   conversation_id, sender_id, ciphertext, header, msg_type, reply_to_id, expires_at,
 		   crypto_profile, crypto_era, roster_version, roster_commitment,
-		   sender_device_id, sender_binding_version
+           sender_device_id, sender_binding_version, target_device_id,
+           target_binding_version, direct_session_id, sender_device_identity_key,
+           sender_device_signing_key, sender_device_capabilities,
+           sender_device_binding_status, sender_account_signature,
+           membership_epoch, membership_epoch_hash
 		 )
 		 SELECT $1::uuid, $2::uuid, $3, $4, $5, $6::uuid, $7,
-		        $8, $9, $10, $11, $12, $13
+                $8, $9, $10, $11, $12, $13, $14, $15, $16,
+                $17, $18, $19, $20, $21, $22, $23
 		 WHERE $6::uuid IS NULL OR EXISTS (
 		   SELECT 1 FROM messages reply
 		   WHERE reply.id = $6::uuid
@@ -393,7 +1402,11 @@ func (db *DB) storeMessageOnce(ctx context.Context, m *Message) error {
 		 )
 		 RETURNING id, created_at`,
 		m.ConversationID, m.SenderID, m.Ciphertext, m.Header, m.MsgType, m.ReplyToID, m.ExpiresAt,
-		securityProfile, securityEra, rosterVersion, rosterCommitment, senderDeviceID, senderBindingVersion,
+		securityProfile, securityEra, rosterVersion, rosterCommitment, senderDeviceID,
+		senderBindingVersion, targetDeviceID, targetBindingVersion, directSessionID,
+		senderDeviceIdentityKey, senderDeviceSigningKey, senderDeviceCapabilities,
+		senderDeviceBindingStatus, senderAccountSignature,
+		membershipEpoch, membershipEpochHash,
 	).Scan(&m.ID, &m.CreatedAt)
 	if errors.Is(err, pgx.ErrNoRows) && m.ReplyToID != nil {
 		return ErrReplyTargetMismatch
@@ -429,12 +1442,59 @@ func (db *DB) storeMessageOnce(ctx context.Context, m *Message) error {
 }
 
 func validateMessageSecurityContext(security *MessageSecurityContext) error {
-	if security == nil || security.CryptoProfile != MessageCryptoProfileSenderKeyV5 ||
-		security.CryptoEra != MessageCryptoEraSenderKeyV5 ||
-		security.RosterVersion == 0 || security.RosterVersion > math.MaxInt64 ||
-		len(security.RosterCommitment) != 32 || len(security.SenderDeviceID) != 16 ||
+	if security == nil || len(security.SenderDeviceID) != 16 ||
+		bytes.Equal(security.SenderDeviceID, make([]byte, 16)) ||
 		security.SenderBindingVersion == 0 || security.SenderBindingVersion > math.MaxInt64 ||
 		security.SenderDeviceDatabaseID == "" {
+		return ErrMessageSecurityContext
+	}
+	switch security.CryptoProfile {
+	case MessageCryptoProfileSenderKeyV5:
+		if security.CryptoEra != MessageCryptoEraSenderKeyV5 ||
+			security.RosterVersion == 0 || security.RosterVersion > math.MaxInt64 ||
+			len(security.RosterCommitment) != 32 ||
+			bytes.Equal(security.RosterCommitment, make([]byte, 32)) ||
+			len(security.TargetDeviceID) != 0 ||
+			security.MembershipEpoch != 0 || len(security.MembershipEpochHash) != 0 ||
+			security.TargetBindingVersion != 0 || security.TargetDeviceDatabaseID != "" ||
+			len(security.DirectSessionID) != 0 || len(security.SenderDeviceIdentityKey) != 0 ||
+			len(security.SenderDeviceSigningKey) != 0 || security.SenderDeviceCapabilities != 0 ||
+			security.SenderDeviceBindingStatus != 0 || len(security.SenderAccountSignature) != 0 {
+			return ErrMessageSecurityContext
+		}
+	case MessageCryptoProfileSenderKeyV6:
+		if security.CryptoEra != MessageCryptoEraSenderKeyV6 ||
+			security.RosterVersion == 0 || security.RosterVersion > math.MaxInt64 ||
+			len(security.RosterCommitment) != 32 ||
+			bytes.Equal(security.RosterCommitment, make([]byte, 32)) ||
+			security.MembershipEpoch == 0 ||
+			security.MembershipEpoch > math.MaxInt64 || len(security.MembershipEpochHash) != 32 ||
+			bytes.Equal(security.MembershipEpochHash, make([]byte, 32)) ||
+			len(security.TargetDeviceID) != 0 || security.TargetBindingVersion != 0 ||
+			security.TargetDeviceDatabaseID != "" || len(security.DirectSessionID) != 0 ||
+			len(security.SenderDeviceIdentityKey) != 0 || len(security.SenderDeviceSigningKey) != 0 ||
+			security.SenderDeviceCapabilities != 0 || security.SenderDeviceBindingStatus != 0 ||
+			len(security.SenderAccountSignature) != 0 {
+			return ErrMessageSecurityContext
+		}
+	case MessageCryptoProfileDirectV2:
+		if security.CryptoEra != MessageCryptoEraDirectV2 ||
+			security.RosterVersion != 0 || len(security.RosterCommitment) != 0 ||
+			security.MembershipEpoch != 0 || len(security.MembershipEpochHash) != 0 ||
+			len(security.SenderDeviceIdentityKey) != 32 ||
+			len(security.SenderDeviceSigningKey) != 32 ||
+			bytes.Equal(security.SenderDeviceIdentityKey, security.SenderDeviceSigningKey) ||
+			security.SenderDeviceCapabilities == 0 ||
+			security.SenderDeviceCapabilities > math.MaxInt64 ||
+			security.SenderDeviceBindingStatus != DeviceBindingActive ||
+			len(security.SenderAccountSignature) != 64 ||
+			len(security.TargetDeviceID) != 16 ||
+			bytes.Equal(security.SenderDeviceID, security.TargetDeviceID) ||
+			security.TargetBindingVersion == 0 || security.TargetBindingVersion > math.MaxInt64 ||
+			security.TargetDeviceDatabaseID == "" || len(security.DirectSessionID) != 32 {
+			return ErrMessageSecurityContext
+		}
+	default:
 		return ErrMessageSecurityContext
 	}
 	return nil
@@ -444,6 +1504,13 @@ func validateMessageRosterSnapshot(ctx context.Context, tx pgx.Tx, roster *Conve
 	if roster == nil || !roster.Ready || security == nil ||
 		roster.Version != security.RosterVersion ||
 		!bytes.Equal(roster.Commitment[:], security.RosterCommitment) {
+		return ErrMessageRosterChanged
+	}
+	if err := validateMembershipTrafficContextV1(
+		ctx, tx, conversationID, security.CryptoProfile,
+		security.RosterVersion, security.RosterCommitment,
+		security.MembershipEpoch, security.MembershipEpochHash,
+	); err != nil {
 		return ErrMessageRosterChanged
 	}
 	senderFound := false
@@ -479,6 +1546,84 @@ func validateMessageRosterSnapshot(ctx context.Context, tx pgx.Tx, roster *Conve
 	}
 	if !canSend {
 		return ErrMessageRosterChanged
+	}
+	return nil
+}
+
+func validateDirectMessageDeviceSnapshot(
+	ctx context.Context,
+	tx pgx.Tx,
+	conversationID string,
+	senderUserID string,
+	security *MessageSecurityContext,
+) error {
+	if validateMessageSecurityContext(security) != nil ||
+		security.CryptoProfile != MessageCryptoProfileDirectV2 {
+		return ErrMessageSecurityContext
+	}
+	var (
+		sourceUserID, targetUserID                                  string
+		sourceDeviceKey, targetDeviceKey                            []byte
+		sourceIdentityKey, sourceSigningKey, sourceAccountSignature []byte
+		sourceVersion, targetVersion, sourceCapabilities            int64
+		sourceStatus, targetStatus                                  int16
+	)
+	err := tx.QueryRow(ctx,
+		`SELECT source.user_id::text, source.device_key,
+		        source_keys.device_identity_key, source_keys.device_signing_key,
+		        source_version.binding_version, source_version.capabilities,
+		        source_version.binding_status, source_version.account_signature,
+                target.user_id::text, target.device_key,
+                target_version.binding_version, target_version.binding_status
+         FROM devices source
+		 JOIN device_crypto_keys source_keys ON source_keys.device_id = source.id
+         JOIN device_binding_heads source_head ON source_head.device_id = source.id
+         JOIN device_binding_versions source_version
+           ON source_version.device_id = source.id
+          AND source_version.binding_version = source_head.binding_version
+         JOIN devices target ON target.id = $3::uuid
+         JOIN device_binding_heads target_head ON target_head.device_id = target.id
+         JOIN device_binding_versions target_version
+           ON target_version.device_id = target.id
+          AND target_version.binding_version = target_head.binding_version
+         WHERE source.id = $1::uuid AND source.user_id = $2::uuid
+         FOR UPDATE OF source_head, target_head`,
+		security.SenderDeviceDatabaseID,
+		senderUserID,
+		security.TargetDeviceDatabaseID,
+	).Scan(
+		&sourceUserID, &sourceDeviceKey, &sourceIdentityKey, &sourceSigningKey,
+		&sourceVersion, &sourceCapabilities, &sourceStatus, &sourceAccountSignature,
+		&targetUserID, &targetDeviceKey, &targetVersion, &targetStatus,
+	)
+	if err != nil || sourceUserID != senderUserID || targetUserID == senderUserID ||
+		!bytes.Equal(sourceDeviceKey, security.SenderDeviceID) ||
+		!bytes.Equal(sourceIdentityKey, security.SenderDeviceIdentityKey) ||
+		!bytes.Equal(sourceSigningKey, security.SenderDeviceSigningKey) ||
+		sourceCapabilities <= 0 || uint64(sourceCapabilities) != security.SenderDeviceCapabilities ||
+		!bytes.Equal(sourceAccountSignature, security.SenderAccountSignature) ||
+		!bytes.Equal(targetDeviceKey, security.TargetDeviceID) ||
+		sourceVersion <= 0 || uint64(sourceVersion) != security.SenderBindingVersion ||
+		targetVersion <= 0 || uint64(targetVersion) != security.TargetBindingVersion ||
+		DeviceBindingStatus(sourceStatus) != security.SenderDeviceBindingStatus ||
+		DeviceBindingStatus(sourceStatus) != DeviceBindingActive ||
+		DeviceBindingStatus(targetStatus) != DeviceBindingActive {
+		return ErrMessageSecurityContext
+	}
+	sourceAllowed, err := canAccessConversationWithQuery(
+		ctx, tx, conversationID, senderUserID, PermViewChannel|PermSendMessages,
+	)
+	if err != nil {
+		return err
+	}
+	targetAllowed, err := canAccessConversationWithQuery(
+		ctx, tx, conversationID, targetUserID, PermViewChannel,
+	)
+	if err != nil {
+		return err
+	}
+	if !sourceAllowed || !targetAllowed {
+		return ErrMessageSecurityContext
 	}
 	return nil
 }
@@ -574,7 +1719,12 @@ func getPendingMessagesWithQuery(ctx context.Context, query rosterQuerier, conve
 		        m.ciphertext, m.header, m.msg_type, m.reply_to_id, m.expires_at,
 		        m.edited_at, m.is_deleted, m.created_at,
 		        m.crypto_profile, m.crypto_era, m.roster_version,
-		        m.roster_commitment, m.sender_device_id, m.sender_binding_version
+		        m.roster_commitment, m.sender_device_id, m.sender_binding_version,
+		        m.target_device_id, m.target_binding_version, m.direct_session_id,
+		        m.sender_device_identity_key, m.sender_device_signing_key,
+		        m.sender_device_capabilities, m.sender_device_binding_status,
+		        m.sender_account_signature, m.membership_epoch,
+		        m.membership_epoch_hash
 		 FROM messages m
 		 JOIN conversation_members cm ON cm.conversation_id = m.conversation_id
 		 JOIN users u ON u.id = m.sender_id
@@ -591,30 +1741,92 @@ func getPendingMessagesWithQuery(ctx context.Context, query rosterQuerier, conve
 	for rows.Next() {
 		var m Message
 		var profile *string
-		var era, rosterVersion, senderBindingVersion *int64
-		var rosterCommitment, senderDeviceID []byte
+		var era, rosterVersion, senderBindingVersion, targetBindingVersion *int64
+		var membershipEpoch *int64
+		var sourceCapabilities *int64
+		var sourceStatus *int16
+		var rosterCommitment, senderDeviceID, targetDeviceID, directSessionID []byte
+		var sourceIdentityKey, sourceSigningKey, sourceAccountSignature []byte
+		var membershipEpochHash []byte
 		if err := rows.Scan(&m.ID, &m.ConversationID, &m.SenderID,
 			&m.SenderIdentityKey, &m.SenderSigningKey, &m.Ciphertext, &m.Header,
 			&m.MsgType, &m.ReplyToID, &m.ExpiresAt, &m.EditedAt, &m.IsDeleted, &m.CreatedAt,
 			&profile, &era, &rosterVersion, &rosterCommitment, &senderDeviceID, &senderBindingVersion,
+			&targetDeviceID, &targetBindingVersion, &directSessionID,
+			&sourceIdentityKey, &sourceSigningKey, &sourceCapabilities, &sourceStatus,
+			&sourceAccountSignature, &membershipEpoch, &membershipEpochHash,
 		); err != nil {
 			rows.Close()
 			return nil, err
 		}
 		if profile != nil || era != nil || rosterVersion != nil || rosterCommitment != nil ||
-			senderDeviceID != nil || senderBindingVersion != nil {
-			if profile == nil || era == nil || rosterVersion == nil || len(rosterCommitment) != 32 ||
-				len(senderDeviceID) != 16 || senderBindingVersion == nil || *era <= 0 ||
-				*rosterVersion <= 0 || *senderBindingVersion <= 0 {
+			senderDeviceID != nil || senderBindingVersion != nil || targetDeviceID != nil ||
+			targetBindingVersion != nil || directSessionID != nil {
+			if profile == nil || era == nil || len(senderDeviceID) != 16 ||
+				senderBindingVersion == nil || *era <= 0 || *senderBindingVersion <= 0 {
 				return nil, ErrMessageSecurityContext
 			}
-			m.SecurityContext = &MessageSecurityContext{
-				CryptoProfile:        *profile,
-				CryptoEra:            uint64(*era),
-				RosterVersion:        uint64(*rosterVersion),
-				RosterCommitment:     append([]byte(nil), rosterCommitment...),
-				SenderDeviceID:       append([]byte(nil), senderDeviceID...),
-				SenderBindingVersion: uint64(*senderBindingVersion),
+			switch *profile {
+			case MessageCryptoProfileSenderKeyV5:
+				if uint64(*era) != MessageCryptoEraSenderKeyV5 || rosterVersion == nil ||
+					*rosterVersion <= 0 || len(rosterCommitment) != 32 ||
+					targetDeviceID != nil || targetBindingVersion != nil || directSessionID != nil ||
+					membershipEpoch != nil || membershipEpochHash != nil {
+					return nil, ErrMessageSecurityContext
+				}
+				m.SecurityContext = &MessageSecurityContext{
+					CryptoProfile:        *profile,
+					CryptoEra:            uint64(*era),
+					RosterVersion:        uint64(*rosterVersion),
+					RosterCommitment:     append([]byte(nil), rosterCommitment...),
+					SenderDeviceID:       append([]byte(nil), senderDeviceID...),
+					SenderBindingVersion: uint64(*senderBindingVersion),
+				}
+			case MessageCryptoProfileSenderKeyV6:
+				if uint64(*era) != MessageCryptoEraSenderKeyV6 || rosterVersion == nil ||
+					*rosterVersion <= 0 || len(rosterCommitment) != 32 ||
+					targetDeviceID != nil || targetBindingVersion != nil || directSessionID != nil ||
+					membershipEpoch == nil || *membershipEpoch <= 0 || len(membershipEpochHash) != 32 {
+					return nil, ErrMessageSecurityContext
+				}
+				m.SecurityContext = &MessageSecurityContext{
+					CryptoProfile:        *profile,
+					CryptoEra:            uint64(*era),
+					RosterVersion:        uint64(*rosterVersion),
+					RosterCommitment:     append([]byte(nil), rosterCommitment...),
+					MembershipEpoch:      uint64(*membershipEpoch),
+					MembershipEpochHash:  append([]byte(nil), membershipEpochHash...),
+					SenderDeviceID:       append([]byte(nil), senderDeviceID...),
+					SenderBindingVersion: uint64(*senderBindingVersion),
+				}
+			case MessageCryptoProfileDirectV2:
+				if uint64(*era) != MessageCryptoEraDirectV2 || rosterVersion != nil ||
+					rosterCommitment != nil || len(targetDeviceID) != 16 ||
+					targetBindingVersion == nil || *targetBindingVersion <= 0 ||
+					len(directSessionID) != sha256.Size || len(sourceIdentityKey) != 32 ||
+					len(sourceSigningKey) != 32 || sourceCapabilities == nil ||
+					*sourceCapabilities <= 0 || sourceStatus == nil ||
+					DeviceBindingStatus(*sourceStatus) != DeviceBindingActive ||
+					len(sourceAccountSignature) != 64 || membershipEpoch != nil ||
+					membershipEpochHash != nil {
+					return nil, ErrMessageSecurityContext
+				}
+				m.SecurityContext = &MessageSecurityContext{
+					CryptoProfile:             *profile,
+					CryptoEra:                 uint64(*era),
+					SenderDeviceID:            append([]byte(nil), senderDeviceID...),
+					SenderBindingVersion:      uint64(*senderBindingVersion),
+					SenderDeviceIdentityKey:   append([]byte(nil), sourceIdentityKey...),
+					SenderDeviceSigningKey:    append([]byte(nil), sourceSigningKey...),
+					SenderDeviceCapabilities:  uint64(*sourceCapabilities),
+					SenderDeviceBindingStatus: DeviceBindingStatus(*sourceStatus),
+					SenderAccountSignature:    append([]byte(nil), sourceAccountSignature...),
+					TargetDeviceID:            append([]byte(nil), targetDeviceID...),
+					TargetBindingVersion:      uint64(*targetBindingVersion),
+					DirectSessionID:           append([]byte(nil), directSessionID...),
+				}
+			default:
+				return nil, ErrMessageSecurityContext
 			}
 		}
 		msgs = append(msgs, m)
@@ -816,6 +2028,43 @@ func (db *DB) ListUserConversations(ctx context.Context, userID string, after ti
 		}
 	}
 	return conversations, nil
+}
+
+// GetUserConversation returns one exact conversation projection only when the
+// requester is still authorized to read it. The membership join deliberately
+// makes a missing UUID and an inaccessible UUID indistinguishable to callers.
+// The complete member directory is filtered through the same channel ACL as
+// list/sync discovery before it crosses the REST boundary.
+func (db *DB) GetUserConversation(ctx context.Context, userID, conversationID string) (*ConversationDiscovery, error) {
+	var conversation ConversationDiscovery
+	err := db.Pool.QueryRow(ctx,
+		`SELECT conversation.id, conversation.conv_type, conversation.name,
+		        conversation.server_id, conversation.created_at
+		 FROM conversations conversation
+		 JOIN conversation_members mine ON mine.conversation_id = conversation.id
+		 WHERE conversation.id = $1::uuid AND mine.user_id = $2::uuid`,
+		conversationID, userID,
+	).Scan(
+		&conversation.ID, &conversation.ConvType, &conversation.Name,
+		&conversation.ServerID, &conversation.CreatedAt,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrConversationAccessDenied
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	conversation.Members, err = db.GetConversationMemberBindingsForRequester(
+		ctx, conversation.ID, userID, ChannelReadPermissions,
+	)
+	if errors.Is(err, ErrConversationAccessDenied) {
+		return nil, ErrConversationAccessDenied
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &conversation, nil
 }
 
 // FindOrCreateDM finds an existing DM conversation between two users, or
@@ -1126,14 +2375,21 @@ type senderKeyWrite struct {
 	rosterCommitment     []byte
 	ownerBindingVersion  uint64
 	targetBindingVersion uint64
+	membershipEpoch      uint64
+	membershipEpochHash  []byte
 	deviceRouted         bool
 }
 
 const senderKeyDeviceRouteDomainV1 = "veil-sender-key-device-route-v1\x00"
+const senderKeyDeviceRouteDomainV2 = "veil-sender-key-device-route-v2\x00"
 
 func senderKeyDeviceRouteCommitment(envelopeCommitment [32]byte, write senderKeyWrite) [32]byte {
-	message := make([]byte, 0, len(senderKeyDeviceRouteDomainV1)+32+8+32+8+8)
-	message = append(message, senderKeyDeviceRouteDomainV1...)
+	domain := senderKeyDeviceRouteDomainV1
+	if write.membershipEpoch != 0 {
+		domain = senderKeyDeviceRouteDomainV2
+	}
+	message := make([]byte, 0, len(domain)+32+8+32+8+8+8+32)
+	message = append(message, domain...)
 	message = append(message, envelopeCommitment[:]...)
 	var integer [8]byte
 	binary.BigEndian.PutUint64(integer[:], write.rosterVersion)
@@ -1143,6 +2399,11 @@ func senderKeyDeviceRouteCommitment(envelopeCommitment [32]byte, write senderKey
 	message = append(message, integer[:]...)
 	binary.BigEndian.PutUint64(integer[:], write.targetBindingVersion)
 	message = append(message, integer[:]...)
+	if write.membershipEpoch != 0 {
+		binary.BigEndian.PutUint64(integer[:], write.membershipEpoch)
+		message = append(message, integer[:]...)
+		message = append(message, write.membershipEpochHash...)
+	}
 	return sha256.Sum256(message)
 }
 
@@ -1150,9 +2411,18 @@ func senderKeyDeviceRouteCommitment(envelopeCommitment [32]byte, write senderKey
 // eligible device and binds the retained row to the roster and both immutable
 // binding versions that authorized it.
 func (db *DB) StoreDeviceSenderKey(ctx context.Context, convID, ownerDeviceID, targetDeviceID string, encryptedKey []byte, generation uint32, rosterVersion uint64, rosterCommitment []byte, ownerBindingVersion, targetBindingVersion uint64) error {
+	return db.StoreDeviceSenderKeyForMembership(
+		ctx, convID, ownerDeviceID, targetDeviceID, encryptedKey, generation,
+		rosterVersion, rosterCommitment, ownerBindingVersion, targetBindingVersion,
+		0, nil,
+	)
+}
+
+func (db *DB) StoreDeviceSenderKeyForMembership(ctx context.Context, convID, ownerDeviceID, targetDeviceID string, encryptedKey []byte, generation uint32, rosterVersion uint64, rosterCommitment []byte, ownerBindingVersion, targetBindingVersion, membershipEpoch uint64, membershipEpochHash []byte) error {
 	if rosterVersion == 0 || rosterVersion > math.MaxInt64 || len(rosterCommitment) != 32 ||
 		ownerBindingVersion == 0 || ownerBindingVersion > math.MaxInt64 ||
-		targetBindingVersion == 0 || targetBindingVersion > math.MaxInt64 {
+		targetBindingVersion == 0 || targetBindingVersion > math.MaxInt64 ||
+		!validOptionalMembershipCoordinateV1(membershipEpoch, membershipEpochHash) {
 		return errors.New("invalid sender key device route")
 	}
 	return db.storeSenderKeyWrites(ctx, convID, ownerDeviceID, generation, []senderKeyWrite{{
@@ -1162,6 +2432,8 @@ func (db *DB) StoreDeviceSenderKey(ctx context.Context, convID, ownerDeviceID, t
 		rosterCommitment:     append([]byte(nil), rosterCommitment...),
 		ownerBindingVersion:  ownerBindingVersion,
 		targetBindingVersion: targetBindingVersion,
+		membershipEpoch:      membershipEpoch,
+		membershipEpochHash:  append([]byte(nil), membershipEpochHash...),
 		deviceRouted:         true,
 	}})
 }
@@ -1291,11 +2563,26 @@ func (db *DB) storeSenderKeyWritesOnce(ctx context.Context, convID, ownerDeviceI
 				write.targetBindingVersion > math.MaxInt64 {
 				return errors.New("invalid sender key device route")
 			}
+			if !validOptionalMembershipCoordinateV1(write.membershipEpoch, write.membershipEpochHash) {
+				return errors.New("invalid sender key membership coordinate")
+			}
 		} else if write.rosterVersion != 0 || len(write.rosterCommitment) != 0 ||
-			write.ownerBindingVersion != 0 || write.targetBindingVersion != 0 {
+			write.ownerBindingVersion != 0 || write.targetBindingVersion != 0 ||
+			write.membershipEpoch != 0 || len(write.membershipEpochHash) != 0 {
 			return errors.New("partial sender key device route")
 		}
 		if write.deviceRouted {
+			profile := MessageCryptoProfileSenderKeyV5
+			if write.membershipEpoch != 0 {
+				profile = MessageCryptoProfileSenderKeyV6
+			}
+			if err := validateMembershipTrafficContextV1(
+				ctx, tx, convID, profile, write.rosterVersion,
+				write.rosterCommitment, write.membershipEpoch,
+				write.membershipEpochHash,
+			); err != nil {
+				return ErrSenderKeyRosterChanged
+			}
 			if err := validateSenderKeyRouteSnapshot(
 				ctx, tx, secureRoster, convID, ownerDeviceID, targetDeviceID, write,
 			); err != nil {
@@ -1347,12 +2634,13 @@ func (db *DB) storeSenderKeyWritesOnce(ctx context.Context, convID, ownerDeviceI
 			if !bytes.Equal(currentCommitment, headCommitment[:]) {
 				return ErrSenderKeyGenerationConflict
 			}
-			var retainedKey, retainedCommitment, retainedRosterCommitment []byte
-			var retainedRosterVersion, retainedOwnerBindingVersion, retainedTargetBindingVersion int64
+			var retainedKey, retainedCommitment, retainedRosterCommitment, retainedMembershipHash []byte
+			var retainedRosterVersion, retainedOwnerBindingVersion, retainedTargetBindingVersion, retainedMembershipEpoch int64
 			err := tx.QueryRow(ctx,
 				`SELECT encrypted_key, envelope_commitment,
 				        COALESCE(roster_version, 0), COALESCE(roster_commitment, ''::bytea),
-				        COALESCE(owner_binding_version, 0), COALESCE(target_binding_version, 0)
+				        COALESCE(owner_binding_version, 0), COALESCE(target_binding_version, 0),
+				        COALESCE(membership_epoch, 0), COALESCE(membership_epoch_hash, ''::bytea)
 				 FROM sender_keys
 				 WHERE conversation_id = $1::uuid
 				   AND owner_device_id = $2::uuid
@@ -1360,7 +2648,8 @@ func (db *DB) storeSenderKeyWritesOnce(ctx context.Context, convID, ownerDeviceI
 				   AND generation = $4`,
 				convID, ownerDeviceID, targetDeviceID, int64(generation),
 			).Scan(&retainedKey, &retainedCommitment, &retainedRosterVersion,
-				&retainedRosterCommitment, &retainedOwnerBindingVersion, &retainedTargetBindingVersion)
+				&retainedRosterCommitment, &retainedOwnerBindingVersion, &retainedTargetBindingVersion,
+				&retainedMembershipEpoch, &retainedMembershipHash)
 			if errors.Is(err, pgx.ErrNoRows) {
 				// The row was explicitly collected after its stream head was
 				// committed. An exact retry remains idempotent but must not
@@ -1373,7 +2662,8 @@ func (db *DB) storeSenderKeyWritesOnce(ctx context.Context, convID, ownerDeviceI
 			}
 			if !senderKeyWriteMatches(write, retainedKey, retainedCommitment,
 				retainedRosterVersion, retainedRosterCommitment,
-				retainedOwnerBindingVersion, retainedTargetBindingVersion) {
+				retainedOwnerBindingVersion, retainedTargetBindingVersion,
+				retainedMembershipEpoch, retainedMembershipHash) {
 				return ErrSenderKeyGenerationConflict
 			}
 			continue
@@ -1400,10 +2690,11 @@ func (db *DB) storeSenderKeyWritesOnce(ctx context.Context, convID, ownerDeviceI
 			   conversation_id, owner_device_id, target_device_id,
 			   encrypted_key, generation, envelope_commitment, roster_version,
 			   roster_commitment, owner_binding_version, target_binding_version,
+			   membership_epoch, membership_epoch_hash,
 			   expires_at
 			 ) VALUES (
 			   $1::uuid, $2::uuid, $3::uuid, $4, $5, $6, $7, $8, $9, $10,
-			   now() + ($11 * INTERVAL '1 second')
+			   $11, $12, now() + ($13 * INTERVAL '1 second')
 			 )
 			 ON CONFLICT (conversation_id, owner_device_id, target_device_id, generation)
 			 DO NOTHING`,
@@ -1412,6 +2703,8 @@ func (db *DB) storeSenderKeyWritesOnce(ctx context.Context, convID, ownerDeviceI
 			nullableSenderKeyBytes(write.rosterCommitment, write.deviceRouted),
 			nullableSenderKeyRoute(write.ownerBindingVersion, write.deviceRouted),
 			nullableSenderKeyRoute(write.targetBindingVersion, write.deviceRouted),
+			nullableSenderKeyRoute(write.membershipEpoch, write.membershipEpoch != 0),
+			nullableSenderKeyBytes(write.membershipEpochHash, write.membershipEpoch != 0),
 			int64(SenderKeyReceiptTTL/time.Second),
 		); err != nil {
 			return fmt.Errorf("store sender key target: %w", err)
@@ -1420,12 +2713,13 @@ func (db *DB) storeSenderKeyWritesOnce(ctx context.Context, convID, ownerDeviceI
 		// ON CONFLICT is intentionally non-mutating. Verify the retained row so
 		// an inconsistent legacy row, or even a theoretical commitment collision,
 		// cannot make a generation replace authenticated state.
-		var retainedKey, retainedCommitment, retainedRosterCommitment []byte
-		var retainedRosterVersion, retainedOwnerBindingVersion, retainedTargetBindingVersion int64
+		var retainedKey, retainedCommitment, retainedRosterCommitment, retainedMembershipHash []byte
+		var retainedRosterVersion, retainedOwnerBindingVersion, retainedTargetBindingVersion, retainedMembershipEpoch int64
 		if err := tx.QueryRow(ctx,
 			`SELECT encrypted_key, envelope_commitment,
 			        COALESCE(roster_version, 0), COALESCE(roster_commitment, ''::bytea),
-			        COALESCE(owner_binding_version, 0), COALESCE(target_binding_version, 0)
+			        COALESCE(owner_binding_version, 0), COALESCE(target_binding_version, 0),
+			        COALESCE(membership_epoch, 0), COALESCE(membership_epoch_hash, ''::bytea)
 			 FROM sender_keys
 			 WHERE conversation_id = $1::uuid
 			   AND owner_device_id = $2::uuid
@@ -1433,12 +2727,14 @@ func (db *DB) storeSenderKeyWritesOnce(ctx context.Context, convID, ownerDeviceI
 			   AND generation = $4`,
 			convID, ownerDeviceID, targetDeviceID, int64(generation),
 		).Scan(&retainedKey, &retainedCommitment, &retainedRosterVersion,
-			&retainedRosterCommitment, &retainedOwnerBindingVersion, &retainedTargetBindingVersion); err != nil {
+			&retainedRosterCommitment, &retainedOwnerBindingVersion, &retainedTargetBindingVersion,
+			&retainedMembershipEpoch, &retainedMembershipHash); err != nil {
 			return fmt.Errorf("verify retained sender key target: %w", err)
 		}
 		if !senderKeyWriteMatches(write, retainedKey, retainedCommitment,
 			retainedRosterVersion, retainedRosterCommitment,
-			retainedOwnerBindingVersion, retainedTargetBindingVersion) {
+			retainedOwnerBindingVersion, retainedTargetBindingVersion,
+			retainedMembershipEpoch, retainedMembershipHash) {
 			return ErrSenderKeyGenerationConflict
 		}
 	}
@@ -1504,10 +2800,18 @@ func validateSenderKeyRouteSnapshot(ctx context.Context, tx pgx.Tx, roster *Conv
 // Roster mutations therefore linearize either before the callback (which is
 // skipped) or after it (and may then prune the retained row).
 func (db *DB) WithCurrentSenderKeyRoute(ctx context.Context, conversationID, ownerDeviceID, targetDeviceID string, rosterVersion uint64, rosterCommitment []byte, ownerBindingVersion, targetBindingVersion uint64, publish func() error) error {
+	return db.WithCurrentSenderKeyRouteForMembership(
+		ctx, conversationID, ownerDeviceID, targetDeviceID, rosterVersion,
+		rosterCommitment, ownerBindingVersion, targetBindingVersion, 0, nil, publish,
+	)
+}
+
+func (db *DB) WithCurrentSenderKeyRouteForMembership(ctx context.Context, conversationID, ownerDeviceID, targetDeviceID string, rosterVersion uint64, rosterCommitment []byte, ownerBindingVersion, targetBindingVersion, membershipEpoch uint64, membershipEpochHash []byte, publish func() error) error {
 	if conversationID == "" || ownerDeviceID == "" || targetDeviceID == "" ||
 		rosterVersion == 0 || rosterVersion > math.MaxInt64 || len(rosterCommitment) != 32 ||
 		ownerBindingVersion == 0 || ownerBindingVersion > math.MaxInt64 ||
-		targetBindingVersion == 0 || targetBindingVersion > math.MaxInt64 || publish == nil {
+		targetBindingVersion == 0 || targetBindingVersion > math.MaxInt64 ||
+		!validOptionalMembershipCoordinateV1(membershipEpoch, membershipEpochHash) || publish == nil {
 		return ErrSenderKeyRosterChanged
 	}
 	tx, err := db.Pool.Begin(ctx)
@@ -1526,6 +2830,16 @@ func (db *DB) WithCurrentSenderKeyRoute(ctx context.Context, conversationID, own
 	if err != nil {
 		return err
 	}
+	profile := MessageCryptoProfileSenderKeyV5
+	if membershipEpoch != 0 {
+		profile = MessageCryptoProfileSenderKeyV6
+	}
+	if err := validateMembershipTrafficContextV1(
+		ctx, tx, conversationID, profile, rosterVersion, rosterCommitment,
+		membershipEpoch, membershipEpochHash,
+	); err != nil {
+		return ErrSenderKeyRosterChanged
+	}
 	if err := validateSenderKeyRouteSnapshot(
 		ctx, tx, roster, conversationID, ownerDeviceID, targetDeviceID,
 		senderKeyWrite{
@@ -1534,6 +2848,8 @@ func (db *DB) WithCurrentSenderKeyRoute(ctx context.Context, conversationID, own
 			rosterCommitment:     rosterCommitment,
 			ownerBindingVersion:  ownerBindingVersion,
 			targetBindingVersion: targetBindingVersion,
+			membershipEpoch:      membershipEpoch,
+			membershipEpochHash:  membershipEpochHash,
 			deviceRouted:         true,
 		},
 	); err != nil {
@@ -1550,9 +2866,17 @@ func (db *DB) WithCurrentSenderKeyRoute(ctx context.Context, conversationID, own
 // head remains the rollback barrier, so the sender must correct with a newer
 // generation for the new roster.
 func (db *DB) DiscardDeviceSenderKey(ctx context.Context, conversationID, ownerDeviceID, targetDeviceID string, generation uint32, rosterVersion uint64, envelopeCommitment []byte) error {
+	return db.DiscardDeviceSenderKeyForMembership(
+		ctx, conversationID, ownerDeviceID, targetDeviceID, generation,
+		rosterVersion, envelopeCommitment, 0, nil,
+	)
+}
+
+func (db *DB) DiscardDeviceSenderKeyForMembership(ctx context.Context, conversationID, ownerDeviceID, targetDeviceID string, generation uint32, rosterVersion uint64, envelopeCommitment []byte, membershipEpoch uint64, membershipEpochHash []byte) error {
 	if conversationID == "" || ownerDeviceID == "" || targetDeviceID == "" ||
 		generation == 0 || rosterVersion == 0 || rosterVersion > math.MaxInt64 ||
-		len(envelopeCommitment) != 32 {
+		len(envelopeCommitment) != 32 ||
+		!validOptionalMembershipCoordinateV1(membershipEpoch, membershipEpochHash) {
 		return ErrSenderKeyReceiptMismatch
 	}
 	_, err := db.Pool.Exec(ctx,
@@ -1562,9 +2886,13 @@ func (db *DB) DiscardDeviceSenderKey(ctx context.Context, conversationID, ownerD
 		   AND target_device_id = $3::uuid
 		   AND generation = $4
 		   AND roster_version = $5
-		   AND envelope_commitment = $6`,
+		   AND envelope_commitment = $6
+		   AND membership_epoch IS NOT DISTINCT FROM $7
+		   AND membership_epoch_hash IS NOT DISTINCT FROM $8`,
 		conversationID, ownerDeviceID, targetDeviceID, int64(generation),
 		int64(rosterVersion), envelopeCommitment,
+		nullableSenderKeyRoute(membershipEpoch, membershipEpoch != 0),
+		nullableSenderKeyBytes(membershipEpochHash, membershipEpoch != 0),
 	)
 	return err
 }
@@ -1772,7 +3100,7 @@ func nullableSenderKeyBytes(value []byte, present bool) any {
 	return value
 }
 
-func senderKeyWriteMatches(write senderKeyWrite, retainedKey, retainedCommitment []byte, rosterVersion int64, rosterCommitment []byte, ownerBindingVersion, targetBindingVersion int64) bool {
+func senderKeyWriteMatches(write senderKeyWrite, retainedKey, retainedCommitment []byte, rosterVersion int64, rosterCommitment []byte, ownerBindingVersion, targetBindingVersion, membershipEpoch int64, membershipEpochHash []byte) bool {
 	envelopeCommitment := sha256.Sum256(write.encryptedKey)
 	if !bytes.Equal(retainedKey, write.encryptedKey) ||
 		!bytes.Equal(retainedCommitment, envelopeCommitment[:]) {
@@ -1780,12 +3108,15 @@ func senderKeyWriteMatches(write senderKeyWrite, retainedKey, retainedCommitment
 	}
 	if !write.deviceRouted {
 		return rosterVersion == 0 && len(rosterCommitment) == 0 &&
-			ownerBindingVersion == 0 && targetBindingVersion == 0
+			ownerBindingVersion == 0 && targetBindingVersion == 0 &&
+			membershipEpoch == 0 && len(membershipEpochHash) == 0
 	}
 	return rosterVersion == int64(write.rosterVersion) &&
 		bytes.Equal(rosterCommitment, write.rosterCommitment) &&
 		ownerBindingVersion == int64(write.ownerBindingVersion) &&
-		targetBindingVersion == int64(write.targetBindingVersion)
+		targetBindingVersion == int64(write.targetBindingVersion) &&
+		membershipEpoch == int64(write.membershipEpoch) &&
+		bytes.Equal(membershipEpochHash, write.membershipEpochHash)
 }
 
 // SenderKeyConversationBacklog is bounded metadata used by pre-auth restore
@@ -1832,6 +3163,8 @@ func (db *DB) ListPendingSenderKeyConversations(ctx context.Context, targetDevic
 		          OR sender_key.roster_commitment IS NULL
 		          OR sender_key.owner_binding_version IS NULL
 		          OR sender_key.target_binding_version IS NULL
+		          OR (sender_key.membership_epoch IS NULL) <>
+		             (sender_key.membership_epoch_hash IS NULL)
 		        ), FALSE)
 		 FROM sender_keys AS sender_key
 		 JOIN conversations AS conversation
@@ -1962,6 +3295,7 @@ func (db *DB) loadPendingSenderKeyConversationOnce(ctx context.Context, targetDe
 		        COALESCE(bool_or(
 		          roster_version IS NULL OR roster_commitment IS NULL
 		          OR owner_binding_version IS NULL OR target_binding_version IS NULL
+		          OR (membership_epoch IS NULL) <> (membership_epoch_hash IS NULL)
 		        ), FALSE)
 		 FROM sender_keys
 		 WHERE target_device_id = $1::uuid
@@ -1991,6 +3325,8 @@ func (db *DB) loadPendingSenderKeyConversationOnce(ctx context.Context, targetDe
 		        sender_key.encrypted_key, sender_key.generation,
 		        sender_key.roster_version, sender_key.roster_commitment,
 		        sender_key.owner_binding_version, sender_key.target_binding_version,
+		        COALESCE(sender_key.membership_epoch, 0),
+		        COALESCE(sender_key.membership_epoch_hash, ''::bytea),
 		        sender_key.envelope_commitment,
 		        sender_key.created_at, sender_key.expires_at
 		 FROM sender_keys AS sender_key
@@ -2008,12 +3344,13 @@ func (db *DB) loadPendingSenderKeyConversationOnce(ctx context.Context, targetDe
 	keys := make([]SenderKeyRow, 0, int(totalRows))
 	for rows.Next() {
 		var key SenderKeyRow
-		var rosterVersion, ownerBindingVersion, targetBindingVersion int64
+		var rosterVersion, ownerBindingVersion, targetBindingVersion, membershipEpoch int64
 		if err := rows.Scan(
 			&key.ConversationID, &key.OwnerDeviceID, &key.TargetDeviceID,
 			&key.TargetUserID, &key.EncryptedKey, &key.Generation,
 			&rosterVersion, &key.RosterCommitment,
 			&ownerBindingVersion, &targetBindingVersion,
+			&membershipEpoch, &key.MembershipEpochHash,
 			&key.EnvelopeCommitment, &key.CreatedAt, &key.ExpiresAt,
 		); err != nil {
 			rows.Close()
@@ -2026,6 +3363,11 @@ func (db *DB) loadPendingSenderKeyConversationOnce(ctx context.Context, targetDe
 		key.RosterVersion = uint64(rosterVersion)
 		key.OwnerBindingVersion = uint64(ownerBindingVersion)
 		key.TargetBindingVersion = uint64(targetBindingVersion)
+		if !validOptionalMembershipCoordinateV1(uint64(membershipEpoch), key.MembershipEpochHash) {
+			rows.Close()
+			return nil, ErrSenderKeyLegacyState
+		}
+		key.MembershipEpoch = uint64(membershipEpoch)
 		keys = append(keys, key)
 	}
 	if err := rows.Err(); err != nil {
@@ -2090,6 +3432,7 @@ func (db *DB) GetPendingSenderKeys(ctx context.Context, targetDeviceID string) (
 		        COALESCE(bool_or(
 		          roster_version IS NULL OR roster_commitment IS NULL
 		          OR owner_binding_version IS NULL OR target_binding_version IS NULL
+		          OR (membership_epoch IS NULL) <> (membership_epoch_hash IS NULL)
 		        ), FALSE)
 		 FROM sender_keys WHERE target_device_id = $1::uuid`,
 		targetDeviceID,
@@ -2113,6 +3456,7 @@ func (db *DB) GetPendingSenderKeys(ctx context.Context, targetDeviceID string) (
 		        target_device.user_id, sk.encrypted_key, sk.generation,
 		        COALESCE(sk.roster_version, 0), COALESCE(sk.roster_commitment, ''::bytea),
 		        COALESCE(sk.owner_binding_version, 0), COALESCE(sk.target_binding_version, 0),
+		        COALESCE(sk.membership_epoch, 0), COALESCE(sk.membership_epoch_hash, ''::bytea),
 		        sk.envelope_commitment, sk.created_at, sk.expires_at
 		 FROM sender_keys sk
 		 JOIN conversations conversation ON conversation.id = sk.conversation_id AND conversation.conv_type IN (1, 2)
@@ -2133,10 +3477,11 @@ func (db *DB) GetPendingSenderKeys(ctx context.Context, targetDeviceID string) (
 	var keys []SenderKeyRow
 	for rows.Next() {
 		var k SenderKeyRow
-		var rosterVersion, ownerBindingVersion, targetBindingVersion int64
+		var rosterVersion, ownerBindingVersion, targetBindingVersion, membershipEpoch int64
 		if err := rows.Scan(&k.ConversationID, &k.OwnerDeviceID, &k.TargetDeviceID,
 			&k.TargetUserID, &k.EncryptedKey, &k.Generation, &rosterVersion,
 			&k.RosterCommitment, &ownerBindingVersion, &targetBindingVersion,
+			&membershipEpoch, &k.MembershipEpochHash,
 			&k.EnvelopeCommitment, &k.CreatedAt, &k.ExpiresAt); err != nil {
 			rows.Close()
 			return nil, err
@@ -2144,6 +3489,11 @@ func (db *DB) GetPendingSenderKeys(ctx context.Context, targetDeviceID string) (
 		k.RosterVersion = uint64(rosterVersion)
 		k.OwnerBindingVersion = uint64(ownerBindingVersion)
 		k.TargetBindingVersion = uint64(targetBindingVersion)
+		if !validOptionalMembershipCoordinateV1(uint64(membershipEpoch), k.MembershipEpochHash) {
+			rows.Close()
+			return nil, ErrSenderKeyLegacyState
+		}
+		k.MembershipEpoch = uint64(membershipEpoch)
 		keys = append(keys, k)
 	}
 	if err := rows.Err(); err != nil {
@@ -2186,6 +3536,8 @@ type SenderKeyRow struct {
 	Generation           uint32
 	RosterVersion        uint64
 	RosterCommitment     []byte
+	MembershipEpoch      uint64
+	MembershipEpochHash  []byte
 	OwnerBindingVersion  uint64
 	TargetBindingVersion uint64
 	EnvelopeCommitment   []byte
@@ -2197,9 +3549,17 @@ type SenderKeyRow struct {
 // authenticated target device. The stream head is deliberately retained so a
 // replay cannot resurrect or replace an acknowledged generation.
 func (db *DB) AcknowledgeSenderKey(ctx context.Context, conversationID, ownerDeviceID, targetDeviceID string, generation uint32, rosterVersion uint64, envelopeCommitment []byte) error {
+	return db.AcknowledgeSenderKeyForMembership(
+		ctx, conversationID, ownerDeviceID, targetDeviceID, generation,
+		rosterVersion, envelopeCommitment, 0, nil,
+	)
+}
+
+func (db *DB) AcknowledgeSenderKeyForMembership(ctx context.Context, conversationID, ownerDeviceID, targetDeviceID string, generation uint32, rosterVersion uint64, envelopeCommitment []byte, membershipEpoch uint64, membershipEpochHash []byte) error {
 	if conversationID == "" || ownerDeviceID == "" || targetDeviceID == "" ||
 		generation == 0 || rosterVersion == 0 || rosterVersion > math.MaxInt64 ||
-		len(envelopeCommitment) != 32 {
+		len(envelopeCommitment) != 32 ||
+		!validOptionalMembershipCoordinateV1(membershipEpoch, membershipEpochHash) {
 		return ErrSenderKeyReceiptMismatch
 	}
 	tag, err := db.Pool.Exec(ctx,
@@ -2209,9 +3569,13 @@ func (db *DB) AcknowledgeSenderKey(ctx context.Context, conversationID, ownerDev
 		   AND target_device_id = $3::uuid
 		   AND generation = $4
 		   AND roster_version = $5
-		   AND envelope_commitment = $6`,
+		   AND envelope_commitment = $6
+		   AND membership_epoch IS NOT DISTINCT FROM $7
+		   AND membership_epoch_hash IS NOT DISTINCT FROM $8`,
 		conversationID, ownerDeviceID, targetDeviceID, int64(generation),
 		int64(rosterVersion), envelopeCommitment,
+		nullableSenderKeyRoute(membershipEpoch, membershipEpoch != 0),
+		nullableSenderKeyBytes(membershipEpochHash, membershipEpoch != 0),
 	)
 	if err != nil {
 		return err
@@ -2239,26 +3603,176 @@ func (db *DB) MessageBelongsToConversation(ctx context.Context, messageID, conve
 	return exists, err
 }
 
-// AddReaction inserts a reaction (idempotent — ignores conflict).
-func (db *DB) AddReaction(ctx context.Context, messageID, conversationID, userID, emoji string) error {
-	_, err := db.Pool.Exec(ctx,
+// AddReaction inserts a reaction idempotently while enforcing the bounded
+// history contract. It returns false for an exact retry. Authorization,
+// message scope and admission are linearized in one transaction so a
+// committed revoke/delete cannot land between validation and storage.
+func (db *DB) AddReaction(ctx context.Context, messageID, conversationID, userID, emoji string) (bool, error) {
+	tx, err := db.Pool.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback(ctx)
+
+	if err := lockAuthorizedReactionAccess(ctx, tx, conversationID, userID); err != nil {
+		return false, err
+	}
+
+	// The database trigger takes the same lock for raw/future writers. Taking
+	// it explicitly here lets us map the cap to a stable domain error before
+	// attempting the INSERT. It must precede the message row lock: raw INSERT
+	// takes advisory first and later obtains an FK KEY SHARE lock on messages.
+	// A hash collision only delays another message.
+	if _, err := tx.Exec(ctx,
+		`SELECT pg_advisory_xact_lock(hashtextextended($1::uuid::text, 73))`,
+		messageID,
+	); err != nil {
+		return false, fmt.Errorf("lock message reactions: %w", err)
+	}
+	if err := lockActiveReactionMessage(ctx, tx, messageID, conversationID); err != nil {
+		return false, err
+	}
+
+	var exists bool
+	if err := tx.QueryRow(ctx,
+		`SELECT EXISTS(
+		   SELECT 1 FROM reactions
+		   WHERE message_id = $1::uuid AND conversation_id = $2::uuid
+		     AND user_id = $3::uuid AND emoji = $4
+		 )`,
+		messageID, conversationID, userID, emoji,
+	).Scan(&exists); err != nil {
+		return false, fmt.Errorf("check existing reaction: %w", err)
+	}
+	if exists {
+		if err := tx.Commit(ctx); err != nil {
+			return false, err
+		}
+		return false, nil
+	}
+
+	var count int
+	if err := tx.QueryRow(ctx,
+		`SELECT COUNT(*) FROM reactions WHERE message_id = $1::uuid`,
+		messageID,
+	).Scan(&count); err != nil {
+		return false, fmt.Errorf("count message reactions: %w", err)
+	}
+	if count >= MaxReactionsPerMessage {
+		return false, ErrReactionLimitReached
+	}
+
+	tag, err := tx.Exec(ctx,
 		`INSERT INTO reactions (message_id, conversation_id, user_id, emoji)
 		 VALUES ($1::uuid, $2::uuid, $3::uuid, $4)
-		 ON CONFLICT DO NOTHING`,
+		 ON CONFLICT (message_id, user_id, emoji) DO NOTHING`,
 		messageID, conversationID, userID, emoji,
 	)
-	return err
+	if err != nil {
+		if isReactionLimitViolation(err) {
+			return false, ErrReactionLimitReached
+		}
+		return false, fmt.Errorf("insert reaction: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() == 1, nil
 }
 
-// RemoveReaction deletes a specific reaction.
-func (db *DB) RemoveReaction(ctx context.Context, messageID, conversationID, userID, emoji string) error {
-	_, err := db.Pool.Exec(ctx,
+// RemoveReaction deletes a specific reaction and returns false for an
+// idempotent no-op. It uses the same authoritative scope transaction as add.
+func (db *DB) RemoveReaction(ctx context.Context, messageID, conversationID, userID, emoji string) (bool, error) {
+	tx, err := db.Pool.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback(ctx)
+	if err := lockAuthorizedReactionAccess(ctx, tx, conversationID, userID); err != nil {
+		return false, err
+	}
+	if err := lockActiveReactionMessage(ctx, tx, messageID, conversationID); err != nil {
+		return false, err
+	}
+	tag, err := tx.Exec(ctx,
 		`DELETE FROM reactions
 		 WHERE message_id = $1::uuid AND conversation_id = $2::uuid
 		   AND user_id = $3::uuid AND emoji = $4`,
 		messageID, conversationID, userID, emoji,
 	)
-	return err
+	if err != nil {
+		return false, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
+// lockAuthorizedReactionAccess linearizes current ACL state against every
+// roster-changing trigger. Access is checked before looking up the message so
+// an unauthorized caller cannot probe message existence.
+func lockAuthorizedReactionAccess(ctx context.Context, tx pgx.Tx, conversationID, userID string) error {
+	var revision int64
+	if err := tx.QueryRow(ctx,
+		`SELECT mutation_revision
+		 FROM conversation_roster_revisions
+		 WHERE conversation_id = $1::uuid
+		 FOR UPDATE`,
+		conversationID,
+	).Scan(&revision); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrConversationAccessDenied
+		}
+		return fmt.Errorf("lock conversation roster revision: %w", err)
+	}
+	allowed, err := canAccessConversationWithQuery(
+		ctx,
+		tx,
+		conversationID,
+		userID,
+		PermViewChannel|PermSendMessages,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrConversationAccessDenied
+	}
+	if err != nil {
+		return fmt.Errorf("authorize reaction mutation: %w", err)
+	}
+	if !allowed {
+		return ErrConversationAccessDenied
+	}
+	return nil
+}
+
+// lockActiveReactionMessage linearizes against edits and soft deletes. Add
+// calls this only after the per-message advisory lock, matching the raw INSERT
+// trigger's advisory -> foreign-key parent-lock order and avoiding a cycle.
+func lockActiveReactionMessage(ctx context.Context, tx pgx.Tx, messageID, conversationID string) error {
+	var active bool
+	if err := tx.QueryRow(ctx,
+		`SELECT true
+		 FROM messages
+		 WHERE id = $1::uuid
+		   AND conversation_id = $2::uuid
+		   AND is_deleted = false
+		 FOR UPDATE`,
+		messageID,
+		conversationID,
+	).Scan(&active); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrMessageMutationScope
+		}
+		return fmt.Errorf("lock reaction message: %w", err)
+	}
+	return nil
+}
+
+func isReactionLimitViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) &&
+		pgErr.Code == "23514" &&
+		pgErr.ConstraintName == "reactions_per_message_limit"
 }
 
 // Reaction represents a single stored reaction.

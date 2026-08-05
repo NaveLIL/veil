@@ -1,8 +1,21 @@
 # Дорожная карта Veil
 
-> Актуально на 2026-07-14. Это основной продуктовый и интеграционный план.
+> Актуально на 2026-08-05. Это основной продуктовый и интеграционный план.
 > [`ROADMAP.md`](ROADMAP.md) сохранён как исторический security/infra backlog;
 > при расхождении приоритетов главным считается этот документ.
+
+Текущий переносимый beta-checkpoint, включая локальные UI-изменения,
+экспериментальный `/v3/events`, macOS x86_64 build evidence, точные результаты
+проверок и известные blockers, опубликован в
+[`docs/reviews/beta-integration-macos-2026-08-04.md`](docs/reviews/beta-integration-macos-2026-08-04.md).
+Успешная локальная сборка неподписанного DMG не закрывает Phase 8, а наличие
+endpoint/UI scaffolding не закрывает Android parity или hostile-Node gate 5S.
+
+Итог security-hardening диапазона `b8ed439..92fc1c3`, точные проверки и
+оставшиеся release blockers зафиксированы в
+[`docs/reviews/security-hardening-audit-handoff-2026-08-05.md`](docs/reviews/security-hardening-audit-handoff-2026-08-05.md).
+На `92fc1c3` полный GitHub CI и beta artifact matrix зелёные; это инженерное
+свидетельство, а не замена независимому аудиту, подписи релиза или physical gate.
 
 Базовый принцип Veil: интерфейс обязан правдиво показывать фактически
 используемый режим защиты. Нельзя молча откатываться на plaintext или более
@@ -40,9 +53,39 @@ Veil ещё не выпускался, поэтому runtime backward compatibi
 5. Phase 3B и 4P сохраняются отдельными незакрытыми product scopes: имеющийся
    desktop/transport foundation не заменяет physical attachment и native mobile
    push device matrices.
-6. На стабильном desktop/profile фундаменте продолжить Android foundation (5A),
-   после per-device модели подключить боевые сообщения Android (5B).
-7. Затем довести MLS runtime, звонки и release polish.
+6. До public beta закрыть Phase 4F: отделить полномочия Node operator от Space
+   moderation, добавить транзакционный audit и встроенный report/case lifecycle.
+7. Secure Share вести как отдельную Phase 4G: сначала reviewed text/small-payload
+   capability, затем streaming large-file flow на фундаменте Phase 3B.
+8. Продолжить Android Direct Preview: foundation/runtime 5A, receive/read,
+   one-shot peer-prekey, shared idempotent send/outbox, typed ACK deadline,
+   transient reconnect и automated canonical-origin process-death recovery уже
+   реализованы. Ограниченный Samsung S23 smoke подтверждает Pass registration,
+   public-WebPKI transport, empty Direct и same-account force-stop reopen, но
+   полный Desktop ↔ Android E2EE/send/ACK/outbox/reconnect/airplane/background/
+   process-death gate и connected recovery/capture matrix остаются открыты.
+   Полный workspace, UniFFI/Kotlin bindings, обе native ABI и debug APK теперь
+   собираются и проверяются Mobile CI. Короткоживущий `veil-mobile-debug-ci`
+   пригоден для диагностики, но стабильный подписанный tester APK ещё не
+   произведён и не проверен.
+   Точный checkpoint приведён в Phase 5.
+   Следующий функциональный parity-срез — native contacts → identity check →
+   friend request → create Direct. В beta baseline `f6dbf5a` уже есть UI,
+   FFI/Kotlin и request scaffolding, но это не рабочий flow: create-Direct route,
+   identity header и friend-request REST contract ещё не сведены в один
+   production flow. Текущий Android
+   по-прежнему надёжно обслуживает только существующий authenticated Direct
+   directory. Контракт, запрещающий renderer-only или cross-origin fallback,
+   зафиксирован в
+   [`android-native-contacts-direct-initiation-contract.md`](docs/reviews/android-native-contacts-direct-initiation-contract.md).
+9. Реализация security baseline 5S существенно закрыта: production переведён
+   на origin/account/device-bound WS v3 и REST v2 без legacy network fallback;
+   hostile two-Node, Direct v2, transparency/witness/gossip и membership-epoch
+   contracts покрыты точными fixtures и CI. До release exit остаются независимый
+   аудит, deployable independent witnesses, Direct-vs-`libsignal` ADR и physical
+   Android fingerprint/QR/key-change matrix. Поэтому stable/critical-use claims
+   по-прежнему заблокированы.
+10. Затем довести MLS runtime, звонки и release polish.
 
 ## Статус по фазам
 
@@ -57,11 +100,15 @@ Veil ещё не выпускался, поэтому runtime backward compatibi
 | 4C | Server Channel Crypto Decision | baseline закрыт: exact-device/offline/ACK/atomic recovery реализованы |
 | 4D | Identity Island & Profiles | закрыто: product/security scope и completion gate зелёные |
 | 4E | Veil Spaces Experience | implementation/automated gate закрыты; manual two-device Veil Link matrix pending |
-| 5A | Android foundation | визуальный прототип есть, runtime не подключён |
-| 5B | Android messaging | не начато |
+| 4F | Node Administration, Moderation & Reports | запланировано: Space moderation существует, Node console/report queue отсутствуют |
+| 4G | Secure Share for guests | prototype foundation существует; production gateway/viewer/large-file lifecycle отсутствуют |
+| 5A | Android foundation | core runtime, TLS, atomic vault, lifecycle/Pass authority, native recovery и debug Ready-capture checkpoints опубликованы; полный workspace, UniFFI/Kotlin bindings, `arm64-v8a`/`x86_64` payloads и short-lived debug APK зелёные в Mobile CI; stable signed tester APK и deferred A04/A05/recovery/vault/capture physical matrix открыты |
+| 5B | Android messaging | automated receive/read, one-shot peer-prekey, idempotent native send/outbox, typed ACK, transient reconnect и true-empty Ready опубликованы; contacts/create-Direct UI и native request scaffolding добавлены, но route/header/friend-request/UniFFI contracts не состыкованы; полная Desktop ↔ Android E2EE/airplane/background/process-death matrix открыта |
+| 5C | Secure QR device linking / multi-device | отдельный blocking gate не начат: second-device enrollment, SAS approval, atomic activation, revoke и hostile-relay matrix обязательны до корректного multi-device |
+| 5S | Direct protocol assurance & hostile Node | production WS v3/REST v2 cutover выполнен, legacy `/ws`/REST v1 fail closed, cross-Node credential-scope P1 и hostile two-Node relay matrix закрыты; Direct v2, transparency/witness/gossip, membership epochs и Sender-Key v6 реализованы и покрыты frozen vectors/CI; release exit открыт до Direct-vs-`libsignal` ADR, independently operated witnesses, physical Android trust/QR matrix и независимого аудита |
 | 6 | OpenMLS | фундамент готов, runtime-ветвление выключено |
 | 7 | LiveKit звонки | не начато |
-| 8 | Полировка, релиз | частично: CI и Windows release workflow готовы |
+| 8 | Полировка, релиз | частично: полный CI и beta artifact matrix зелёные на `92fc1c3`, short-lived debug APK и unsigned desktop artifacts доступны; stable signing/notarization, signed tester APK, physical matrices и public release gate отсутствуют |
 
 ---
 
@@ -83,10 +130,12 @@ origin, identity, границы доступа и фактический crypto
 | **Room** | функциональный контекст внутри Space | text Room сейчас соответствует `channel` и отдельной conversation/security domain |
 | **Veil Node** | self-hosted инфраструктура и canonical origin аккаунта | exact `(scheme, host, effective port)` origin |
 | **Veil Link** | versioned приглашение в Space | scoped capability, не browser session и не identity proof |
+| **Secure Share** *(reserved planned term)* | настраиваемая E2EE-ссылка для текста/файлов получателю без аккаунта | несовместимые prototype crypto/schema/viewer pieces; production flow отсутствует |
 | **Community** *(future)* | публикационное совместное пространство с постами, комментариями, реакциями и опросами | отдельный будущий product/schema/privacy/security contract; runtime отсутствует |
 
 `Home`, `Direct`, `Circle`, `Space`, `Room`, `Veil Link` и `Veil Node` являются
-продуктовым языком. Внутренние `dm/group/server/channel` в PostgreSQL, REST,
+текущим продуктовым языком. `Secure Share` зарезервирован только для Phase 4G и
+не означает доступную функцию. Внутренние `dm/group/server/channel` в PostgreSQL, REST,
 protobuf и Rust/Go не переименовываются механически: это точные protocol/storage
 сущности, а не обязательство поддерживать старую информационную архитектуру.
 Ни один UI-термин не меняет crypto mode, ACL, roster или history policy.
@@ -1154,6 +1203,60 @@ types/modes и не добавляются без собственного revie
   initial focus и возвратом к точному trigger. Android Back закрывает sheet,
   затем возвращает к Rooms или списку Circles/Spaces. Пустая Calls tab не
   появляется до рабочего Phase 7 runtime.
+- Desktop context menu на mobile становится long-press + modal bottom sheet/
+  action sheet с теми же capability checks, destructive confirmation и точным
+  возвратом focus. Ни одно действие не может зависеть только от hover/right-click.
+- Реальный mobile roster переиспользует общий `UserAvatar`/Phaseprint и
+  Identity Island. Role и nickname остаются только Context: они не меняют
+  identity proof, trust, ACL или ключи. До authoritative roster локальный
+  дизайн-макет не выдаёт initials/role/presence за данные Node.
+- Mobile не копирует desktop multi-island layout пиксельно, но обязан оставаться
+  тем же Veil Design System: общие palette/type/radius/spacing/motion tokens,
+  PhaseShift/Phaseprint, термины, trust/crypto indicators, unread semantics и
+  public failure states. Desktop раскладывает контексты рядом, mobile открывает
+  те же контексты последовательным native stack; различие компоновки не может
+  менять capability, security state или смысл действия.
+- Mobile Appearance использует те же versioned theme IDs/tokens, но уважает
+  Android font/display scale вместо копирования desktop UI-scale. Настройки
+  различают реальные `switch`, enum selector/action sheet, slider, OS action и
+  read-only status; неработающие строки не выглядят интерактивными. Wallpaper и
+  avatar customization появляются только вместе с native sanitize/cache/size
+  boundary и никогда не загружаются в небезопасный JS/WebView path.
+- Корневой mobile shell ограничен тремя понятными направлениями: `Home`
+  (contacts/requests/Direct), `Spaces` (единый список Circles и Spaces) и
+  `Updates` (упоминания, ответы, приглашения и security events). Settings
+  открывается через постоянный account control, а не смешивается с Veil Node,
+  Space или Room. До наличия настоящей native projection направление не
+  показывается как рабочее. Debug/visual build может содержать отдельный явно
+  подписанный `DESIGN PREVIEW` с локальными Circle/Space/Room/Voice Room fixtures
+  для утверждения IA, но он не смешивается с Node projection, не разрешает
+  create/join/send/call/role actions и не делает runtime/security claims.
+  Voice Room fixture остаётся только схемой интерфейса до Phase 7.
+- Слово `Server` не используется как синоним Discord-like контейнера: такой
+  контейнер называется `Space`, а `Veil Node` остаётся origin/account boundary и
+  показывается в Settings/connection context. Если появится multi-origin account
+  switcher, он не смешивается со списком Spaces и всегда раскрывает смену identity/
+  trust scope до перехода.
+- Переходы фиксированы: `Home → Direct`, `Spaces → Circle`, `Spaces → Space →
+  Rooms → Room`; Circle не получает искусственный список Rooms. Members,
+  Identity и context details открываются sheet-ами из явной кнопки в header;
+  swipe может быть shortcut, но не единственным доступным способом.
+- Unread является точкой, а mention/reply — отдельным `@N` count. Сигнал
+  агрегируется без потери пути: root → exact Circle/Space → exact Room → message.
+  Открытие списка Space не помечает Room прочитанной; read cursor продвигается
+  только после authoritative projection и фактического показа сообщения. Updates
+  jump повторно проверяет origin/account/membership/Room ACL и при stale access
+  fail closed возвращает в свежий допустимый контекст.
+- Push до полного `K_push` lifecycle остаётся generic wake-up без имени, текста,
+  Space/Room или mention preview. После unlock клиент дедуплицирует событие по
+  origin-scoped message identity и вычисляет badges из проверенного локального
+  состояния, а не доверяет server-provided count. Multi-device read-state merge
+  требует отдельного versioned cursor contract и не угадывается по delivery ACK.
+- В authenticated content не используется постоянный полноэкранный ambient glow.
+  Фирменный свет остаётся дозированным в onboarding, empty/celebration state и
+  focused action; blur применяется к компактному navigation chrome/sheet, а не
+  ко всему message surface. Reduced motion и battery saver отключают декоративную
+  анимацию без потери hierarchy/status.
 - Реализация mobile runtime остаётся в 5A/5B. Phase 4E фиксирует общий
   navigation/deep-link contract и выполняет физическую desktop↔desktop matrix;
   desktop↔Android становится evidence 5B/release gate.
@@ -1181,36 +1284,772 @@ desktop↔desktop матрицы зелёные; полный installer соби
 
 ---
 
+## Phase 4F — Node Administration, Moderation & Reports
+
+**Статус 2026-07-15: запланировано.** Полноценной Node-админки и встроенной
+системы жалоб сейчас нет. Реализованы роли/ACL, kick, authoritative Space ban/
+unban и Veil Links внутри отдельного Space; `veil-admin` умеет только создавать
+Node Access Pass. Текущий пользовательский abuse flow — ручное обращение на
+`abuse@erez.pro`.
+
+Полный product/security contract находится в
+[`docs/product/node-administration-and-reports.md`](docs/product/node-administration-and-reports.md).
+Phase 4F разделяет две независимые authority:
+
+- Space owner/moderator управляет только своим Space;
+- Node operator управляет одним self-hosted инстансом, admission, account
+  availability, quotas и abuse cases. Report schema не имеет key-material fields,
+  а официальный клиент не читает/не экспортирует recovery/account/device/ratchet/
+  attachment stores. Storage получает encrypted evidence package, а выбранный
+  untrusted plaintext раскрывается только authorized moderation role. Existing
+  TOFU/malicious-service limits сохраняются до transparency work.
+
+### 4F.1 — private operator boundary и CLI
+
+- Отдельная operator identity/authorization namespace, не обычный Veil account
+  и не Space role.
+- CLI-first управление через local root-owned boundary; удалённо — SSH/private
+  management network. Public `/admin` с обычной account session не добавляется.
+- Bounded list/inspect account/device state, lifecycle Node Access Pass и quota.
+  Node-level account/device denial хранится отдельно от account-signed device
+  binding и увеличивает monotonic authorization revision; REST остаётся stateless,
+  а live session означает WebSocket connection.
+- Высокорисковые действия требуют reason, expected revision и повторной
+  авторизации; санкция и typed audit entry фиксируются атомарно.
+
+### 4F.2 — Space moderation parity
+
+- Desktop открывает kick/ban/unban делегированным ролям ровно по authoritative
+  permissions, а не только owner UI condition.
+- Добавляются warning/timeout/mute с bounded reason/expiry и понятным appeal
+  path; Space ban остаётся отдельным от Node suspension.
+- `Manage Messages` либо получает review и реальную серверную semantics для
+  чужого сообщения, либо удаляется из UI до реализации. Нельзя показывать
+  неработающее moderation permission.
+
+### 4F.3 — reports и добровольное evidence disclosure
+
+- In-app `Report` покрывает account/profile, Space/Room metadata, Veil Link,
+  Secure Share, file и конкретное message reference.
+- Жалоба имеет bounded category/comment, random receipt ID, deduplication и
+  retention. Per-account/capability/IP limits ограничивают cost/queue growth;
+  uniform response не перечисляет чужие аккаунты, receipt не раскрывает case/
+  target data, attacker-selected content не отражается третьим лицам.
+- E2EE plaintext/attachment передаётся модератору только после отдельного
+  подтверждения точного выбранного evidence. История, recovery phrase,
+  ratchet/file keys и unrelated context не прикладываются автоматически.
+- Selective-disclosure evidence получает отдельный crypto review: reporter-
+  supplied plaintext нельзя без доказательства называть verified authorship.
+
+### 4F.4 — audit и private console
+
+- Typed hash-linked operator journal хранит scoped immutable actor/action/target/
+  case/reason, timestamp и commitment предыдущей записи. Tamper evidence против
+  root/DB operator требует independently signed checkpoint с custody вне live
+  Node/DB, append-only export, fork/rollback detection и verifier procedure. В
+  journal нет username, public key, raw
+  content, token, IP или arbitrary JSON; доступ к evidence также audit event.
+- Case lifecycle revision-checked и идемпотентен при concurrent operators:
+  `new -> triaged -> actioned | dismissed -> appealed? -> closed`.
+- Private console начинается read-only dashboard и только затем получает узкие
+  mutations. Operator authentication, short session, re-auth, CSRF/CSP и
+  отсутствие browser-stored bearer являются blocking requirements.
+
+Критерий выхода: Space moderator не может получить Node privileges; report schema
+не имеет key fields и official evidence builder не читает/автоматически не
+экспортирует protected key stores; storage получает encrypted evidence package,
+а selected untrusted content доступен только authorized moderation role. TOFU/
+malicious-service limits документированы. DB sanction + audit является
+linearization point: после commit новая revision блокирует stale HTTP/WS auth,
+а соединения закрываются идемпотентно в bounded deadline. Concurrent sanction/
+case операции сохраняют audit chain и independently verified checkpoint, а
+purge/backup/restore не воскресают истёкшее evidence. Integration/concurrency/
+security/native UI/privacy gates зелёные. До
+этого момента продукт честно описывает только Space administration и ручной
+abuse contact.
+
+---
+
+## Phase 4G — Secure Share for guests
+
+**Статус 2026-07-15: prototype foundation, production flow отсутствует.** В
+репозитории есть legacy `shares` schema, small-payload crypto и экспериментальный
+WASM viewer, но gateway не регистрирует share API, ожидаемый viewer bundle/API
+не собирается, schema/protobuf/password formats не согласованы, а whole-buffer
+JSON/WASM path непригоден для больших файлов.
+
+Авторитетный planned contract находится в
+[`docs/product/secure-share-for-guests.md`](docs/product/secure-share-for-guests.md).
+Secure Share — узкая E2EE capability: зарегистрированный creator отправляет
+текст/файлы получателю без Veil account. Это не browser messenger и не anonymous
+account session.
+
+Canonical v1 link имеет вид:
+
+```text
+https://node.example/s/v1/<public-selector>#k=<root-secret>
+```
+
+Selector только находит запись. 256-bit fragment secret не уходит в HTTP request;
+domain-separated KDF с version/origin/selector context независимо выводит content,
+redemption и report capability material. Node хранит только domain-separated
+credential hashes и ciphertext; успешный claim выдаёт отдельный random lease
+credential. Initial metadata preview ничего не consume: link scanner/unfurl/
+prefetch не должен сжигать секрет. Claim/download pinned к canonical API origin,
+запрещают redirects/downgrade/alternate ports, передают lease только в
+`Authorization`, а cross-origin viewer использует exact CORS allowlist.
+
+### 4G.1 — text и small payload
+
+- Versioned authenticated envelope с hard size bound и encrypted manifest.
+- Native create/list/revoke, bounded TTL и claim count, explicit user claim,
+  atomic consume и отдельная короткая lease на каждый claim.
+- Dedicated cookieless viewer origin (или `credentials: omit` и cookie-ignoring
+  API) без third-party resources, analytics, service worker и generic Veil IPC;
+  строгий CSP, `no-store` для capability responses, `no-referrer`, `nosniff`,
+  `noindex` и generic public errors.
+- Browser threat model честно ограничен: malicious Node может подменить viewer
+  code во время открытия. Signed native client является более сильным
+  code-integrity path.
+
+### 4G.2 — streaming files
+
+- Переиспользуются Phase 3B chunked AEAD и tus только для authenticated creator
+  upload с immutable `purpose=secure_share`/`draft_share_id`, one-time binding и
+  retention, clamped by share expiry. Dual message/share attachment запрещён.
+  Обычный account bearer не расширяется до guest access.
+- Отдельная guest download lease ограничена одним share и immutable blob set.
+  Filename, MIME, digest, chunk geometry и text находятся в encrypted manifest;
+  сервер видит ciphertext size/timing/lifecycle metadata.
+- Viewer проверяет полные AEAD chunks с bounded memory. Multi-gigabyte base64
+  JSON, Rust `Vec`, JS array или browser `Blob` запрещены. Browser хранит в
+  private/OPFS только ciphertext либо plaintext, повторно зашифрованный случайным
+  page-lifetime key, и экспортирует лишь проверенный результат; orphan ciphertext
+  очищается при startup. Без audited atomic file API используется native fallback. Resume
+  совпадает с authenticated chunk boundaries и не публикует partial plaintext
+  как завершённый файл.
+
+### Claim, burn и password contract
+
+- Share state: `active -> burned | expired | revoked -> purging`; каждый
+  successful claim атомарно увеличивает `consumed_claims` и создаёт собственную
+  `issued -> expired | revoked` lease. Abandoned lease остаётся consumed,
+  completion ACK является telemetry. Browser resume ограничен жизнью страницы;
+  crash/resume разрешён native client только с reviewed OS-protected storage.
+- Expiry/revoke commit запрещает новые claim/range/resume requests и помечает
+  leases revoked; active responses отменяются best-effort в bounded deadline,
+  уже отправленные/буферизованные байты не возвращаются. Burn запрещает новые
+  claims, но purge ждёт terminal state ранее выданных leases и затем повторяется
+  идемпотентно. Backup retention не реактивирует burned link.
+- «Самоуничтожение» означает закрытие последующей серверной авторизации и удаление
+  hosted ciphertext после terminal leases. Оно не удаляет уже переданные байты,
+  сохранённую копию, screenshot или память получателя — UI не обещает невозможного.
+- Legacy downloadable wrapped-key password допускает offline brute force, поэтому
+  server rate limit его не защищает. Candidate V1 требует ADR: password как
+  server-verified второй gate поверх fragment secret, server-bounded Argon2,
+  capability-first checks и единая password+lease transaction. DB theft допускает
+  offline guessing verifier; zero-knowledge требует отдельного OPAQUE/PAKE review.
+
+### Abuse boundary и completion gate
+
+Первый релиз разрешает upload только authenticated creator и применяет account/
+IP/storage/concurrency quotas, orphan cleanup, emergency disable и operator
+revoke. Guest Drop с anonymous upload является отдельным будущим capability и не
+входит в 4G. Guest report использует domain-separated report capability, uniform
+response и отдельные лимиты, не передаёт root secret и не consume claim. Только
+явно выбранный untrusted plaintext раскрывается через consent flow Phase 4F;
+официальный builder не читает и не экспортирует protected key stores.
+
+Критерий выхода: secrets отсутствуют в path/query/application log/referrer/
+application cache/telemetry, а browser history/sync boundary документирован;
+redirect/origin policy fail closed; claim/lease/expiry/revoke races атомарны;
+wrong key/password, tamper, truncation,
+reorder, cross-share substitution и corrupt resume fail closed; browser CSP/XSS
+matrix зелёная; Windows/Linux create и physical text/small/maximum-file/native
+crash-resume flows пройдены; browser тестируется только в declared API matrix с
+verified temporary publication, а crash/reload/cancel не оставляет readable
+plaintext residue; quota, purge retry, backup retention и abuse revoke имеют
+integration/operations evidence. До versioned ADR, threat model и security
+review функция остаётся `planned/prototype`.
+
+---
+
 ## Phase 5 — Android
 
-**Текущее состояние:** существует качественный четырёхстраничный visual prototype
-`servers → channels/DM → chat → members` на React Navigation + PagerView и
-готовая modal Identity sheet. Это полезный визуальный фундамент, но старая
-четырёхколоночная последовательность не является целевой IA после Phase 4E.
-Chat/server data захардкожены, сеть и SQLCipher отсутствуют, auth живёт только в
-Zustand, а `VeilCrypto` в dev возвращает mock identity/signatures.
+**Текущее состояние:** Android уже не является изолированным visual prototype.
+React Native shell подключён к fail-closed `VeilMobileRuntime` на Rust/UniFFI;
+identity хранится через Android Keystore, account/runtime state — в SQLCipher,
+а Node Access Pass, authenticated WebSocket, own prekeys, Direct directory,
+history-to-live handoff, message projection и idempotent Direct text send/outbox
+принадлежат native boundary. Typed ACK deadline и guarded transient reconnect
+также готовы. Canonical-origin process-death recovery опубликован и физически
+восстановил тот же аккаунт на Samsung S23 без нового Pass или device. Append-only
+`PublicFailureCodeV1`, его CI validator, typed Rust/UniFFI/Android mapping и
+локальный Android catalog реализованы для identity setup и secure runtime gate;
+Direct session/send/delivery и consumer parity для desktop/Go остаются открытыми.
+Identity setup теперь использует native durable non-secret v1 journal в
+`noBackupFilesDir`: он хранит только random attempt/process UUID, create/restore
+mode и ограниченные phase/outcome/revision, без recovery phrase, identity/account
+data, origin, Pass или diagnostics. Reconciliation линейризуется с exact
+coordinator ownership и strict write-once vault; vault остаётся authority,
+terminal receipt сохраняется для at-least-once delivery, а React route остаётся
+opaque до проверки текущего foreground epoch. Host-only JVM/Jest gates покрывают
+state/fault/replay policy, но не доказывают Android Activity/OS scheduling.
+Connected A04/A05 и physical recovery matrix остаются открытыми.
+Это всё ещё закрытый Direct Preview: cross-client E2EE text/airplane/background
+matrix не готова. Изолированный `internalTester` package/signing contract,
+fail-closed APK verifier и ручной protected workflow реализованы, но stable
+tester key не предоставлен, подписанный standalone APK не произведён и physical
+matrix не выполнялась.
 
-Текущие обязательные исправления проекта:
+**Beta integration status sync 2026-08-04:** ветка
+`ds/beta-all-2026-07-21` включает baseline `f6dbf5a` с отдельным
+экспериментальным `/v3/events`, Rust/FFI controller, Android background service
+и contacts/create-Direct scaffolding. Это не зелёный integration gate: полный
+`cargo test --workspace --all-targets` останавливается на двух ошибках сборки
+`veil-ffi`, generated Kotlin bindings не синхронизированы, а mobile route/header/
+friend-request contracts расходятся с gateway. Точный состав, результаты
+desktop/mobile tests и macOS build evidence записаны в
+[`docs/reviews/beta-integration-macos-2026-08-04.md`](docs/reviews/beta-integration-macos-2026-08-04.md).
 
-- Исправить TypeScript config (`module: commonjs` несовместим с
-  `moduleResolution: bundler`).
-- Добавить реальный ESLint dependency/config и первые unit/component tests.
-- Mock crypto разрешён только в изолированном demo mode без сети/persistence;
-  production и connected dev обязаны fail closed.
-- Не мигрировать на NativeWind/Expo Router только ради совпадения со старым
-  планом. React Navigation + StyleSheet допустимы; общими должны быть semantic
-  tokens и поведение, а не конкретная CSS-библиотека.
+Следующий порядок: восстановить compile-green `veil-ffi`, регенерировать и
+проверить Kotlin bindings, состыковать contact transport с существующими Go/
+protobuf contracts и только затем возобновлять physical Android matrix.
+
+**Historical local status sync 2026-07-20:** после UI checkpoint `d65927c`
+локальная ветка содержит fail-closed connected-test guard `8e31cc1` и текущий
+PublicFailure/setup checkpoint. `origin/codex/mobile-direct-preview` остаётся на
+`08a4206`; эти новые локальные checkpoints ещё не являются remote publication.
+История на origin уже включает отдельные reviewed security checkpoints:
+
+- `6195c89` — Android WSS использует per-connection `ring`, TLS 1.2/1.3 и
+  public WebPKI roots без trust-all/process-global fallback;
+- `f13ba4d` — write-once identity vault публикуется атомарно с fsync/readback;
+- `91fd2f8` — managed Nginx ingress принимает только две exact legacy REST
+  authority-формы и отклоняет остальные 421;
+- `88c87bd` — desktop подписывает canonical `host:effective-port`;
+- `0bd82d1` — orphaned READY/TERMINAL recovery lease освобождается после
+  recreation, тогда как COMMITTING сохраняет ownership;
+- `3135297` — debug Ready screen capture ограничен точной foreground generation;
+  release, recovery, enrollment, background и Recents остаются защищены;
+- `b029a1f` — native recovery/result correlation и strict durable-presence
+  verification работают fail closed: `absent` невозможно получить, пока
+  coordinator READY/COMMITTING ещё способен опубликовать identity.
+
+Полный pre-split WIP на базе `e751955` сохранён в
+`refs/codex/snapshots/mobile-pre-roadmap-sync-20260719-205026` (`73131bb8`) и
+`C:\veil-backups\veil-mobile-pre-roadmap-sync-20260719-205026-e751955.bundle`,
+SHA-256 `48CA7F65ABD16DFA2F9893E2AB8D0DE2F25A59805D97EF3358DA2E1ED320827F`.
+Это восстановительная точка, а не authoritative head. Исходная pause-точка также
+сохранена: `f787b83` и
+`C:\veil-backups\veil-mobile-pause-2026-07-18-d271140.bundle`, SHA-256
+`ADE8C9F2293DEA5E5179417DDAA5BEA3ADFFABA93D16F7F5952A5748206FC7E8`.
+
+Опубликованный recovery checkpoint прошёл TypeScript/ESLint, изолированные
+16/16 Jest suites (91/91), Android JVM suite; после coordinator-barrier полный
+локальный `:app:testDebugUnitTest` прошёл 227/227. `lintDebug`, debug APK и
+androidTest APK также собираются. Connected instrumentation на реальном телефоне
+для recovery/vault/capture всё ещё открыта и не подменяется сборкой APK. Generic
+Gradle `connected*AndroidTest` теперь fail closed до выполнения task graph и
+разрешается только явным одноразовым подтверждением, когда `ANDROID_SERIAL`
+точно связывает AGP с единственным свежим single-user emulator без установленного/
+retained `io.veil.mobile` или `io.veil.mobile.tester`; проверка повторяется непосредственно перед connected
+task action, а task-level `--serial` разрешён только для того же проверенного
+emulator. Lifecycle connected tests может удалить target package вместе с
+Keystore, SQLCipher и app-private state. Физический телефон запрещён, а work
+profile на account-bearing handset не считается disposable boundary. Для явно
+разрешённого phone smoke `adb install -r` является лишь non-uninstalling update
+path: новый код/миграции всё равно способны изменить state. `firstInstallTime`
+и тот же account/vault проверяются после обновления, но не считаются
+instrumentation evidence. Все app-project Gradle `install*`/`uninstall*` tasks
+теперь безусловно блокируются до execution; guard по-прежнему не распространяется
+на manual `adb` и будущие managed-device providers. Для physical instrumentation
+нужен отдельный wiped/attested workflow.
+
+**Локальные checkpoints, ещё не на origin:** `d65927c` содержит mobile Island IA/
+settings, Circle/Space/Rooms/Voice `DESIGN PREVIEW` и нижний safe-area Direct
+composer; `8e31cc1` блокирует generic connected instrumentation на физических
+устройствах. Текущий PublicFailure/setup checkpoint не превращает preview-экраны
+в runtime-функции и не закрывает app-wide error semantics. Ограниченный Samsung
+S23 smoke подтверждает Pass registration, public-WebPKI WSS/signed REST, empty
+Direct и same-account force-stop reopen; полная cross-client physical matrix и
+signing открыты. Ни snapshot, ни debug/Metro APK не являются tester release.
+
+### Peer-prekey checkpoint 2026-07-19
+
+Pause checkpoint 2026-07-18 завершён двумя отдельными проверенными коммитами.
+Статусы ниже разделяют опубликованный код и ещё не реализованный scope; dirty
+worktree после публикации отсутствует.
+
+**Опубликовано и проверено в `codex/mobile-direct-preview`:**
+
+- authoritative head этого peer-prekey checkpoint — `f21c9c0`
+  (`feat(android): add explicit peer prekey transport`), его обязательный Rust
+  predecessor — `029d1e3`
+  (`feat(mobile): guard peer prekey capability in Rust`); `master` этими
+  checkpoint не изменялся;
+- mobile-only registration по Node Access Pass, Keystore-wrapped identity,
+  native SQLCipher/session runtime и exact origin/account binding;
+- own-prekey bootstrap, authenticated Direct directory, immutable history,
+  bounded gap-free history-to-live handoff, continuous FIFO replay и read-only
+  projection только явно выбранного Direct;
+- native advisory send readiness повторно проверяет live ratchet, lease/epoch,
+  durable scope, identity pin, quarantine/history, storage и connection state;
+- Rust one-shot peer-prekey capability допускает максимум одну released
+  signature, повторяет authoritative guards до/после signing и при install,
+  сохраняет exact lease/request binding, response limits и zeroization;
+- Android `establishDirectSession` привязан к exact lifecycle epoch и Direct
+  generation: prepare → одна signature → один bounded GET → install. Background,
+  reconnect и late callback отзывают lease и очищают body; OkHttp network guard
+  блокирует status-driven 503/421 follow-up до второго signed wire exchange;
+- exact `c9f2d06` прошёл Go, Coverage, Rust и Mobile CI. Security workflow красный
+  только на прежнем Cargo Audit baseline (те же 7 advisories и 19 разрешённых
+  warnings, без новой регрессии). CI debug APK является build evidence, а не
+  подписанным tester release и не physical-device evidence.
+
+**Локальная completion evidence для `029d1e3` + `f21c9c0`:**
+
+- `cargo fmt --all -- --check`, workspace clippy с `-D warnings`, полный
+  `cargo test --workspace --all-targets` и отдельный `veil-ffi` summary 65/65;
+- retained-outstanding/Ready, post-sign lease replacement, install/background,
+  reconnect/late-body, exactly-one signature/GET и prepare/sign/create-call
+  cleanup покрыты deterministic adversarial tests;
+- Android native libraries воспроизводимо пересобраны для `arm64-v8a` и
+  `x86_64`; `verifyVeilRustLibraries`, JVM 142/142, `lintDebug` с 0 errors и
+  `assembleDebug` для обеих ABI прошли без исключения `.so` preflight;
+- UniFFI regeneration byte-for-byte стабильна; contract version 29 и 68/68
+  checksums совпали для host DLL, обеих source `.so`, merged и stripped
+  intermediates;
+- ESLint, TypeScript и Jest 68/68 прошли после frozen pnpm install. Windows
+  virtual-store path policy не меняет dependency lock и Jest больше не зависит
+  от полного имени служебного `.pnpm` каталога;
+- два независимых exact-diff review после исправления OkHttp follow-up вернули
+  `P0/P1/P2: none`. Debug APK остаётся build evidence с debug key, а не tester
+  release и не physical-device evidence.
+
+### Idempotent Direct send/outbox checkpoint 2026-07-19
+
+Shared protocol/server/client core и Android send slice опубликованы четырьмя
+раздельными checkpoint. `master` не изменялся.
+
+**Опубликовано в `codex/mobile-direct-preview`:**
+
+- `6e128b3` (`feat(protocol): make Direct sends idempotent`) добавляет
+  `client_message_id` в Send/ACK/Error и серверную unique scope + exact request
+  digest. Повтор тех же bytes/ID возвращает прежние message ID/time без второго
+  insert или fan-out; конфликт reuse отклоняется;
+- `6a979ee` (`feat(client): persist exact Direct outbox`) атомарно сохраняет
+  advanced ratchet, local Sending row и exact serialized ciphertext outbox в
+  одной SQLCipher-транзакции. ACK/definite rejection reconcile-ятся атомарно,
+  retryable transport loss сохраняет исходные bytes/ID;
+- `9b11100` (`feat(ffi): bridge durable Direct send`) держит replay cursor только
+  в Rust, повторяет lock/authority guards в порядке `direct_sync → binding →
+  client` и не переносит message ID, sequence, ciphertext или timestamp через
+  FFI. Live quiescence больше не открывает Ready до bounded replay, который
+  подтвердил конец durable outbox;
+- `5d62f95` (`feat(android): enable native Direct text send`) добавляет один
+  lifecycle/generation-bound user intent, atomic native enqueue, ровно один
+  destructive peer-prekey GET и ровно один post-install retry. Kotlin plaintext
+  buffer стирается на accepted/rejected/revoke/background/late callback;
+- `AcceptedForReplay` означает успешное durable принятие ровно один раз, после
+  чего старая generation и binding немедленно отзываются. Отдельно исправлена и
+  listener-тестом закреплена публикация fail-closed snapshot после revoke;
+- React Native composer не создаёт optimistic UUID/row/time и не получает
+  protocol identifiers. Он очищает draft только после native accepted и затем
+  перечитывает authoritative SQLCipher projection; stale generation и второй
+  tap ничего не публикуют.
+
+**Completion evidence:**
+
+- полный `cargo test --workspace --all-targets`: 505 passed, 0 failed,
+  12 ignored; `veil-ffi` 70/70; workspace clippy с `-D warnings`, fmt и
+  `git diff --check` зелёные;
+- полный Go suite и race-набор `chat/db/gateway` прошли для protocol/server
+  checkpoint; свежая PostgreSQL migration/idempotency/concurrency матрица
+  проверена до публикации core;
+- native libraries воспроизводимо пересобраны для `arm64-v8a` и `x86_64`;
+  `verifyVeilRustLibraries`, полный JVM 151/151, `lintDebug` с 0 errors и
+  `assembleDebug` прошли без исключения `.so` preflight;
+- повторная UniFFI generation byte-for-byte стабильна, SHA-256 generated Kotlin
+  `A010945BFA506516D1F47CB36EACE3D6F48D8AF0ED59AD0C44B530204908053A`;
+- TypeScript, ESLint и Jest 80/80 зелёные. Adversarial tests покрывают bounded
+  outbox turns, storage/transport revoke, prekey one-shot, duplicate tap,
+  plaintext bounds/wipe, contentRevision races и отсутствие optimistic row;
+- независимый exact-diff review обнаружил и помог закрыть один Android P1
+  (непубликуемый revoke snapshot); повторный review вернул `P0/P1/P2: none`.
+
+Debug APK остаётся только build evidence с debug key. Он не является
+подписанным tester release и не заменяет physical-device evidence.
+
+**На момент этого checkpoint не было реализовано и не считалось готовым:**
+
+- monotonic ACK deadline для live transport correlation;
+- typed разделение ordinary transport loss, retryable connect failure,
+  protocol/auth anomaly и storage uncertainty. Строковые ошибки намеренно не
+  используются для решения о retry;
+- transient-only reconnect с full-jitter exponential backoff, reset только
+  после полного Ready + outbox barrier, lifecycle cancellation и проверкой
+  неизменного account ID;
+- process-death origin recovery и airplane-mode/reconnect physical matrix;
+- push publication, Circle, Space/Rooms, attachments, multi-device
+  enrollment/revoke;
+- release signing, standalone tester APK, чистая установка и physical-device
+  matrix. Ни текущий CI APK, ни локальный debug APK не являются tester release.
+
+**Следующий порядок на момент этого checkpoint:**
+
+1. Ввести typed connect/live/outbox stop taxonomy и native monotonic ACK
+   deadline, не retry-я protocol/storage/security failures.
+2. Добавить Kotlin-owned single reconnect plan с full jitter, exact lifecycle /
+   session/origin/account guards и отменой при background/lock/manual connect.
+3. Сохранять выбранный canonical origin native-side для безопасного
+   process-death recovery без Node Access Pass replay.
+4. Пройти airplane-mode/process-death/physical matrix и только после этого
+   собрать подписанный standalone tester APK.
+
+### Typed Direct terminal/ACK checkpoint 2026-07-19
+
+Typed live/connect/outbox taxonomy и monotonic ACK deadline опубликованы двумя
+раздельными checkpoint в `codex/mobile-direct-preview`; `master` не изменялся.
+
+**Опубликовано и проверено:**
+
+- `cbecd94` (`feat(client): harden Direct terminal reconciliation`) вводит
+  source-typed connect/WebSocket/send terminal causes и положительный retry
+  allowlist. Protocol/auth/security anomaly и storage uncertainty никогда не
+  становятся retryable по тексту ошибки; storage остаётся sticky fail-closed;
+- каждый durable Direct sequence получает отдельный monotonic ACK deadline и
+  конечный FIFO snapshot. Более поздние события не расширяют grace window,
+  staggered deadlines не делят один watermark, а ACK, уже попавший в очередь к
+  первому наблюдению expiry, получает ограниченный post-poll turn;
+- ACK/Error correlation сначала строит взаимоисключающий typed reconciliation
+  plan. Repeated durable receipt не может по старому `ref_seq` подтвердить
+  mutation, sender-key или новый command; mutation ACK обязан совпасть с exact
+  target message ID;
+- read-only SQLCipher receipt validation различает unknown/conflicting/opposite
+  protocol result и реальную storage uncertainty. UUID из другого
+  origin/user/device scope не alias-ится с текущим durable receipt;
+- ACK timestamp обязан давать положительный millisecond value, correlated Error
+  принимает только HTTP-like `400..=599`, а retry допускает только exact `429`,
+  exact unauthenticated `401` и `500..=599`;
+- `ad0713e` (`feat(android): classify accepted invalid Direct sessions`) добавляет
+  `AcceptedSessionInvalid` во FFI/UniFFI/Android contract. Intent уже принадлежит
+  SQLCipher и завершается как accepted ровно один раз, но Kotlin отзывает lease,
+  binding и public generation и не выдаёт automatic reconnect permission.
+
+**Completion evidence:**
+
+- `cargo test --workspace --all-targets` завершён без ошибок; отдельно
+  `veil-client` 165 passed / 11 ignored, `veil-ffi` 75/75 и `veil-store` 79/79;
+  workspace clippy с `-D warnings`, `cargo fmt --check` и `git diff --check`
+  зелёные;
+- UniFFI и Android native libraries дважды воспроизводимо пересобраны для
+  `arm64-v8a` и `x86_64`. SHA-256 generated Kotlin:
+  `2C18588C73F907E9AB7525BE9ABB8D8C6EFA990AD804DC520D115904B016F995`;
+- `verifyVeilRustLibraries`, полный JVM suite 152/152, `lintDebug` и
+  `assembleDebug` прошли без исключения `.so` preflight; собранный debug APK
+  содержит обе ABI;
+- TypeScript, ESLint и Jest 80/80 зелёные. Независимые ACK snapshot и
+  FFI/Android exact-diff аудиты после исправлений не нашли P0/P1/P2.
+
+Локальный debug APK остаётся только build evidence с debug key. Он не является
+подписанным tester release и не заменяет physical-device evidence.
+
+### Transient Direct reconnect checkpoint 2026-07-19
+
+Kotlin-owned transient reconnect зафиксирован отдельным code checkpoint
+`62451eb` (`feat(android): add typed Direct reconnect`) в
+`codex/mobile-direct-preview`; `master` не изменялся.
+
+**Опубликовано и проверено:**
+
+- production UniFFI adapter переводит в retry permission только generated
+  `MobileRetryable(Transport|AckDeadline)` и только на connect, live-buffer,
+  live-replay и outbox-replay границах. `Session`, protocol/auth/security и
+  storage failures остаются terminal независимо от слов в тексте ошибки;
+- одновременно существует не более одного reconnect plan с immutable scope из
+  exact session object, lifecycle epoch, canonical origin и expected account ID.
+  Повторная аутентификация всегда использует plain bound-account connect: Node
+  Access Pass не сохраняется в плане и никогда не replay-ится;
+- full-jitter cap растёт `1s → 2s → 4s → 8s → 16s → 32s → 60s` и насыщается на
+  60s. Backoff переживает typed connect/bootstrap failure и сбрасывается только
+  после нового `Ready` и завершённого durable outbox barrier;
+- exact `WAITING → CONNECTING → BOOTSTRAPPING` ownership, connect cancellation и
+  transport serialization не позволяют late task, HTTP callback или teardown
+  старого поколения отключить новый socket/lease. Background, explicit lock,
+  manual disconnect и manual connect отзывают план; другой валидный account и
+  `AcceptedSessionInvalid` завершаются fail-closed без retry;
+- initial и continuous replay отдельно отвергают противоречивый native DTO
+  `ready && outboxReplayRequired`. Scheduler rejection, выполнение task до
+  присвоения `ScheduledFuture`, same-account supersession и native success после
+  cancellation покрыты детерминированными adversarial tests.
+
+**Completion evidence:**
+
+- `cargo fmt --all -- --check`, workspace clippy с `-D warnings`, полный
+  `cargo test --workspace --all-targets` и `git diff --check` зелёные;
+- UniFFI и обе Android native ABI дважды воспроизводимо пересобраны. SHA-256:
+  generated Kotlin
+  `2C18588C73F907E9AB7525BE9ABB8D8C6EFA990AD804DC520D115904B016F995`,
+  `arm64-v8a` `.so`
+  `691BA9D41E500C46561A1193B30625510371F21AEF12884CC7930860C3B405EC`,
+  `x86_64` `.so`
+  `86B8368183ED1F494B95633ACF8D646E797C01A9E1CA35BAC47710B97547940E`;
+- `verifyVeilRustLibraries`, полный JVM suite 172/172, focused runtime 87/87,
+  `lintDebug` и `assembleDebug` прошли для `arm64-v8a,x86_64`; debug APK содержит
+  обе ABI;
+- frozen pnpm install, ESLint, TypeScript и Jest 80/80 зелёные. Независимые
+  security/race и test-matrix exact-diff аудиты после всех исправлений не нашли
+  P0/P1/P2.
+
+Локальный APK этого checkpoint остаётся build evidence с debug key. Он не
+является tester release и не заменяет clean-install/physical-device evidence.
+
+**Следующий порядок:**
+
+1. Сохранить выбранный canonical origin native-side для безопасного
+   process-death recovery без хранения или повторного использования Node Access
+   Pass; восстановление обязано повторно подтвердить тот же account ID.
+2. Пройти clean process restart, airplane-mode/reconnect и физическую
+   Desktop ↔ Android Direct matrix, включая late callback и lock/background.
+3. Только после этой матрицы собрать и проверить подписанный standalone tester
+   APK; затем переходить к push publication, Circle, Space/Rooms, attachments и
+   корректному multi-device.
+
+Ранее обязательные исправления проекта — текущий статус:
+
+- Закрыто: TypeScript использует совместимые `module: esnext` и
+  `moduleResolution: bundler`.
+- Закрыто: ESLint/Jest dependencies и unit/component/runtime suites подключены.
+- Закрыто для production boundary: raw JS crypto mock/sign/AEAD surface удалён;
+  отсутствие native module приводит к fail-closed ошибке.
+- Решение сохранено: React Navigation + StyleSheet остаются оболочкой; миграция
+  на NativeWind/Expo Router без измеримой пользы не планируется.
 
 ### Phase 5A — Android foundation
 
-**Foundation checkpoint 2026-07-14: в работе.** Android project теперь
+**Foundation checkpoint 2026-07-19: в работе.** Android project теперь
 versioned; Rust/UniFFI воспроизводимо собирается для `arm64-v8a` и `x86_64`.
 Удалён runtime crypto mock и raw sign/AEAD JS surface, release больше не может
 подписываться debug key. Recovery phrase хранится через Android Keystore-wrapped
 AES-GCM vault, backup отключён, secret screens используют `FLAG_SECURE`, copy в
 clipboard удалён и добавлено подтверждение слов. Состояния local identity и
 native failure разделены. Это закрывает первый пункт и часть пунктов 3–5 ниже,
-но не заменяет SQLCipher, lock policy и authenticated mobile runtime.
+а SQLCipher, lifecycle lock policy и authenticated mobile runtime теперь
+подключены. Fail-closed canonical-origin process-death recovery реализован,
+прошёл automated gate и физически восстановил тот же аккаунт без повторного
+Pass/нового device после принудительной остановки процесса. Standalone signing и
+оставшаяся airplane/background/biometric matrix открыты и не позволяют считать
+5A завершённой.
+
+**Physical Android TLS P1 2026-07-19 — исправлено и физически подтверждено:**
+stock Android подтвердил первый pre-network blocker: Rust path через
+`rustls-native-certs` не находит Android PEM CA bundle. После перевода Android на
+`webpki-roots` изолированный точный probe обнаружил второй blocker: feature graph
+содержал `rustls` только со `std`, без `ring` или `aws-lc-rs`, поэтому
+`ClientConfig::builder()` паниковал до TLS ClientHello. Это точно объясняет DNS без
+запроса в Nginx и generic secure-action error. Исправленный `arm64-v8a` runtime
+прошёл реальную WSS-аутентификацию, signed REST prekey count/upload и directory
+bootstrap через `veil.erez.pro` на Samsung S23; insecure fallback не вводился.
+
+Опубликованный checkpoint `6195c89` задаёт явный режим `PublicWebPKI`: per-connection
+`Connector::Rustls`, `ClientConfig::builder_with_provider(ring)`, непустые Android
+`webpki-roots`, target-specific native roots для desktop и один проверяемый набор
+TLS 1.2/1.3. Process-global `install_default`, trust-all, hostname/SNI bypass,
+HTTP fallback и принятие неизвестного CA запрещены. Certificate/provider/store
+failure остаётся terminal epoch failure и не может ослабляться reconnect-ом.
+
+Это ещё не общая поддержка произвольной self-hosted private CA. До такого claim
+нужен versioned `NodeTrustPolicyV1`, origin- и Node-identity-bound, хранимый в
+SQLCipher/Rust и одинаково применяемый к WSS, REST, uploads и push bootstrap.
+Минимальные режимы: `PublicWebPki`, явно enrolled `PrivateCa` и отдельно reviewed
+enterprise `AndroidManagedTrust`; Node Access Pass не является TLS trust proof.
+Сейчас Rust WSS и Android OkHttp REST имеют разные trust providers, что допустимо
+для Preview с одной валидной public chain только под cross-transport tests, но не
+для общего private-CA режима.
+
+**Atomic identity vault P1 — опубликовано в `f13ba4d`:** staged record проходит
+file fsync и readback, staging/parent directory fsync, затем атомарно публикуется
+rename-ом непустого каталога и повторно читается. Existing legacy file и уже
+непустой published directory никогда не перезаписываются. Unit gate и сборка
+instrumentation APK зелёные; connected concurrent-writer/power-loss/device
+instrumentation остаётся обязательной evidence.
+
+**Legacy REST-v1 authority compatibility P1 2026-07-19 — mitigated и
+опубликовано; protocol scope открыт:** Android подписывал
+canonical `veil.erez.pro:443`, а опубликованный desktop после WHATWG URL
+normalization подписывает `veil.erez.pro`; текущий Nginx `$host` передаёт upstream
+форму без порта. Жёсткий rewrite к `:443` исправил бы Android, но немедленно сломал
+бы текущий desktop 401. Поэтому managed transitional ingress обязан принимать
+ровно две legacy authority-формы через exact allowlist, передавать выбранный
+литеральный результат byte-for-byte и отвечать 421 на любое другое имя/порт.
+Checkpoint `91fd2f8` публикует exact-allowlist Nginx bridge, а `88c87bd` переводит
+desktop на единый effective-port authority. Bridge развёрнут на VPS и проверен
+HTTP/1.1/HTTP/2/WS harness-ом; Android physical signed REST probe прошёл.
+Остаются physical desktop ↔ Node compatibility probe и удаление transitional
+bridge после перехода на REST v2.
+
+Bridge не закрывает фундаментальный REST v1 scope. Дополнительно подтверждено,
+что gateway за HTTP reverse proxy выводит Veil Link URL из `r.TLS`/`r.Host` и
+может породить `http://veil.erez.pro:443/...`. До Space/Veil Link claim Node обязан
+получить fail-closed configured `VEIL_PUBLIC_ORIGIN`; REST v2 и WS v3 должны
+подписывать/проверять тот же origin независимо от входного Host.
+
+**Empty-account Direct Ready P1 2026-07-19 — исправлено и физически
+подтверждено:** первая закрытая регистрация полностью коммитила account, device и
+21 prekey, но после успешного пустого directory Android возвращался на экран
+Node. Причина была локальной: exact outbox replay ошибочно требовал presentation
+self-row из `identity_directory_v1`, которого у аккаунта без разговоров законно
+нет, и повышал отсутствие кэша до `StorageUncertain`. Authoritative immutable
+`authenticated_self_bindings_v1`, exact user, active device/installation markers,
+account keys и alias/conflict checks при этом были целы.
+
+Fix оставляет presentation self-row опциональным corroborating cache, но не
+ослабляет ни одну authoritative self/device/peer/ratchet проверку и не создаёт
+синтетический directory snapshot. Store regressions доказывают zero-row success и
+conflict fail-closed; полный UniFFI regression проходит
+`empty directory → terminal history → live quiescence → empty outbox → Ready`.
+На физическом Samsung S23 тот же сохранённый аккаунт открыл пустой Direct, затем
+пережил `am force-stop` и снова аутентифицировался без нового Pass/account/device;
+Node наблюдал полный bootstrap и одно активное соединение без auth failure.
+Исправление опубликовано отдельным checkpoint `7cae239`; чистая кандидатная
+worktree прошла `cargo fmt --check`, scoped `clippy -D warnings`, 82/82 теста
+`veil-ffi` и 90/90 тестов `veil-store`.
+
+### Whole-app lifecycle / Node Access Pass authority P1 2026-07-19
+
+**Исправлено, независимо проверено и опубликовано в `7a7802b`.** Старый
+`MainActivity.onStop` считал запуск внутренней `RecoveryActivity` уходом всего
+приложения в фон и мог стереть process-local Pass во время Pass-first identity
+ceremony. Дополнительный запоздалый React Native AppState callback мог выбрать
+background lock, а затем после медленного transport teardown стереть уже новый
+Pass, staged вернувшимся foreground Intent.
+
+Foreground/background authority теперь принадлежит process-wide Activity gate,
+который считает только exact `MainActivity` и `RecoveryActivity`; dependency,
+UnifiedPush и debug Activity не могут открыть или удержать native runtime.
+Внутренний handoff и configuration recreation не создают ложный background.
+Нулевое число доверенных Activity проверяется на следующем main-loop turn;
+foreground enrollment Intent пересекает native barrier **до** разбора/staging
+секретного fragment и получает fail-closed watchdog, если Activity так и не
+стартовала.
+
+Pass revocation, lifecycle epoch и выбор закрываемой session capability теперь
+линеаризуются под одним `stateLock`; поздний disconnect/close не может удалить
+Pass более нового foreground epoch. Explicit lock остаётся безусловным, а
+AppState bridge использует только conditional background companion.
+Независимый re-review завершён с `P0=0, P1=0`; exact шестефайловый кандидат в
+отдельной detached worktree прошёл `verifyVeilRustLibraries` и полный
+`:app:testDebugUnitTest` (`BUILD SUCCESSFUL`, 229 actionable tasks). Реальные
+`singleTask onNewIntent`, `Main → Recovery`, rotation и Home/background остаются
+обязательной instrumentation/physical матрицей до подписанного tester APK.
+
+### Native recovery, orphan lease и Ready capture 2026-07-19
+
+`0bd82d1` освобождает orphaned recovery lease в READY/TERMINAL после process
+recreation, но никогда не отбирает COMMITTING у worker. `3135297` разрешает
+capture только debug Ready shell с точной foreground generation; stale queued
+clear после pause/new Intent не может снять `FLAG_SECURE`, а release compile-time
+запрещает downgrade. `b029a1f` закрепляет native-only recovery UI, correlated
+terminal outcomes и строгую durable-presence проверку. Coordinator держит barrier
+на всём vault-read: READY/COMMITTING всегда дают unknown, поэтому UI не может
+посоветовать уничтожить единственную фразу до окончательного terminal результата.
+Физическая API ≤32/API 33+ OEM-матрица для screenshot/recording/Recents,
+process-death, autofill/accessibility и concurrent recovery остаётся открытой.
+
+### Public failure codes v1 — обязательный gate 5A/5B
+
+**Статус 2026-07-20: Android setup/runtime-gate и Direct send/delivery action
+slice реализованы host-only; app-wide consumer и общий rollout ещё не закрыты.**
+Machine-readable registry, immutable history, schema/append-only validator и CI
+синхронизируют точные Kotlin/TypeScript allowlist. Rust/UniFFI передаёт typed
+`Transport`, `AuthRejected`, `RegistrationClosed`, `InviteInvalid`, `EpochInvalid`
+и `StorageUncertain`; Android не анализирует exception/server text, разделяет
+локальные Pass/binding failures и публикует только sanitised internal code плюс
+`userInfo.publicFailureCodeV1` для secure runtime gate. React Native имеет reviewed
+catalog всех 18 кодов и в setup/runtime gate закрывает unknown/malformed/conflicting
+outcomes через `VEIL-RUNTIME-999`. Direct definite non-send и durable delivery
+unknown теперь разделены как `VEIL-DIRECT-001/002`; malformed/conflicting metadata,
+session и mixed unavailable outcomes остаются честным `VEIL-RUNTIME-999`.
+Desktop и Go consumers, локали кроме текущего Android catalog, более узкий Direct
+session outcome и общий cross-client conformance gate остаются открытыми.
+Exact routing, UI actions, host evidence и non-claims записаны в
+[`docs/reviews/android-direct-public-failure-action-contract.md`](docs/reviews/android-direct-public-failure-action-contract.md).
+
+До подписанного tester APK используется append-only `PublicFailureCodeV1` с единым
+machine-readable registry под `veil-proto`, одинаковым для Rust, Go, desktop,
+Android и будущих клиентов. Публичная карточка ошибки состоит из независимых
+`title + description + next action + code`; код ASCII, доступен для копирования,
+не переводится и не содержит идентификатор события. Текст и действие выбираются
+только из локального reviewed catalog по коду: native/server message, URL, HTTP
+body или `String(error)` никогда не рендерятся.
+
+Минимальный каталог для закрытия текущего Android Direct Preview:
+
+| Публичный код | Стабильная семантика и безопасное действие |
+|---|---|
+| `VEIL-SETUP-001` | protected ceremony UI не был показан; provisional native lease освобождён и durable identity change не подтверждён, закрыть Veil и повторить |
+| `VEIL-SETUP-002` | ceremony/lease/result либо публикация identity не подтверждены: сохранить phrase и блокировать новый setup; для BUSY/unknown start даже authoritative vault `absent` недостаточно, пока native не подтвердил settled ceremony/lease. Уничтожать новую create-фразу и начинать заново можно только после native-settled + authoritative `absent`, любая ошибка остаётся `unknown` |
+| `VEIL-LOCAL-001` | локальный аккаунт locked/not ready; открыть тот же аккаунт и повторить |
+| `VEIL-LOCAL-002` | encrypted vault/SQLCipher не открылся; перезапустить Veil, не создавать новую recovery phrase |
+| `VEIL-LOCAL-003` | локальное secure state нельзя подтвердить; lock/reopen, сеть и chat остаются закрытыми |
+| `VEIL-NODE-001` | Node origin не является точным canonical HTTPS origin; исправить адрес |
+| `VEIL-NODE-002` | только typed retryable transport; проверить сеть, безопасный reconnect использует тот же аккаунт |
+| `VEIL-NODE-003` | generic authentication rejection либо pre-proof failure; повторить с тем же local account без раскрытия account/Pass oracle |
+| `VEIL-NODE-004` | TLS/protocol/authenticated binding/epoch response не прошёл проверку; соединение отвергнуто |
+| `VEIL-PASS-001` | Node требует Access Pass; показывается только по typed `REGISTRATION_CLOSED` после account-key proof |
+| `VEIL-PASS-002` | Pass invalid/expired/already used; показывается только по typed `INVITE_INVALID` после account-key proof |
+| `VEIL-PASS-003` | pending Pass локально отсутствует, истёк или изменился; сохранить аккаунт и открыть свежий Pass |
+| `VEIL-RUNTIME-001` | предыдущая secure operation ещё завершается; подождать и повторить |
+| `VEIL-RUNTIME-002` | operation отменена lifecycle/lock; вернуться в Veil и повторить с тем же аккаунтом |
+| `VEIL-SYNC-001` | аккаунт аутентифицирован и сохранён, но Direct bootstrap не завершён; reconnect без нового Pass |
+| `VEIL-RUNTIME-999` | неизвестный, malformed или ещё не рассмотренный outcome; generic fail-closed fallback |
+| `VEIL-DIRECT-001` | typed definite non-send либо durable failed; сохранить/исправить текст, новый send только как новый explicit intent при отдельно подтверждённом текущем Ready generation |
+| `VEIL-DIRECT-002` | durable delivery unknown; исходное сообщение могло дойти, сохранить и ждать authenticated reconciliation без blind resend |
+
+Коды описывают только безопасную presentation/recovery семантику. **Публичный
+код никогда не разрешает retry, reconnect, Pass replay или ослабление trust.**
+Единственный источник такого разрешения — положительная типизированная native
+allowlist (`MobileRetryable(Transport|AckDeadline)` и её будущие reviewed
+версии); неизвестный enum/value всегда terminal. Безопасные enrollment-различия
+берутся из `AuthFailureReason`, проходят Rust/UniFFI как enum и никогда не
+восстанавливаются сравнением либо поиском подстроки.
+
+Registry хранит immutable code, semantic key, exposure gate, recovery-action key
+и retired/reserved state. Удалённый код и его numeric/string identity навсегда
+резервируются. Внутренние `E_VEIL_*`, HTTP status, серверные `publicerr` snake-case
+codes и tus `ERR_*` остаются отдельными слоями и сопоставляются явно; они не
+переименовываются автоматически в публичный код. Поле `Error.reason = 5` уже
+принадлежит correlated Direct send contract и не может быть перегружено общим
+public failure code; если WS v2/v3 понадобится новый wire field, он добавляется
+под новым protobuf number.
+
+Support diagnostics могут содержать public code, build/OS, bounded stage enum,
+typed private error class, reconnect ordinal, краткоживущий случайный
+`support_ref` и HMAC reference для origin. Recovery phrase, Pass/token/digest,
+ключи, ciphertext/plaintext, raw URL/path, account/device/message IDs и native
+exception text запрещены. `support_ref` показывается только если соответствующая
+санитизированная локальная запись действительно создана; публичный код сам по
+себе остаётся общей причиной, а не occurrence identifier.
+
+Обязательный CI/gate:
+
+- schema проверяет формат, уникальность, append-only history, reserved codes и
+  parity semantic/action keys; unknown всегда отображается как
+  `VEIL-RUNTIME-999` и остаётся terminal;
+- fixture каждого typed Rust/server outcome даёт один и тот же public code в
+  Android и desktop; mappings исчерпывающие, а Go/Rust/Kotlin/TypeScript не
+  распознают security outcome по тексту;
+- anti-oracle tests сводят все pre-proof/unknown auth failures к
+  `VEIL-NODE-003`; `VEIL-PASS-001/002` допустимы только после подтверждённого
+  account-key proof;
+- secret-canary tests запрещают перенос native/server cause, Pass, identity,
+  origin/path и SQL/crypto details в UI, logs, crash report и accessibility tree;
+- retry tests доказывают, что подмена public code, message, locale или server
+  payload не может создать reconnect capability; решение принимает только
+  typed native allowlist;
+- component/a11y tests проверяют title, понятное description, конкретный next
+  action, читаемый/копируемый code, long-text и deterministic English fallback.
 
 1. Воспроизводимый Rust build для `arm64-v8a` и `x86_64`, Expo config plugin
    либо versioned native Android project, плюс mobile CI.
@@ -1223,10 +2062,12 @@ native failure разделены. Это закрывает первый пун
    secret screens, скрывать preview в Recents и подтверждать несколько слов.
 5. Разделить состояния `identityExists`, `unlocked`, `connected`,
    `directoryReady`; текущий `isAuthenticated` слишком грубый.
-6. Реальный endpoint config, certificate validation, signed REST/WS,
-   reconnect/offline outbox и атомарные crypto+message SQLCipher transactions.
-7. Enrollment второго устройства и revoke flow как prerequisite для групп,
-   server channels и MLS.
+6. Реальный endpoint config, certificate validation, signed REST/WS, offline
+   outbox и атомарные crypto+message SQLCipher transactions подключены;
+   transient reconnect и automated process-death recovery подключены. Реальная
+   airplane/process-kill matrix остаётся release evidence.
+7. Enrollment второго устройства и revoke flow проходят отдельный secure QR
+   gate 5C как prerequisite для групп, server channels и MLS.
 8. Android Back закрывает dialog/sheet, затем возвращает к Rooms/Spaces либо
    предыдущему native route, и только потом покидает экран.
 9. Профилировать blur, HebrewRain и текущие четыре одновременно смонтированные
@@ -1236,12 +2077,58 @@ native failure разделены. Это закрывает первый пун
     список Circles/Spaces, Direct внутри Home, Circle сразу в chat, Space →
     Rooms → Room, Members и Identity как bottom sheets. Это меняет presentation/
     navigation, но не даёт JS доступ к crypto state.
+11. Разделить screen-capture boundaries: recovery phrase, Access Pass, device-link
+    secret/SAS, bootstrap/lock/reconnect и background всегда native-secure;
+    Recents snapshot всегда скрыт независимо. Полностью Ready content может
+    разрешать screenshot/recording только через отдельную явную privacy-настройку
+    (release default — запрещено), причём JS не может снять обязательную native
+    reason. Debug Preview может иметь отдельный compile-time opt-in для визуальной
+    обратной связи, не меняющий release policy. Android ≤12 и MediaProjection/
+    pause race требуют отдельной physical matrix до общего opt-in.
+12. До подписанного/public tester APK генерировать Android third-party notices,
+    включать полные upstream licenses (включая ISC/MIT Lucide/Feather) в APK и
+    `About → Open-source licenses`, а CI обязан сверять inventory с lockfile.
 
 Результат 5A: подписанный internal APK запускается на чистом устройстве,
 создаёт/восстанавливает identity, переживает restart, безопасно lock/unlock и
-соединяется с тестовым gateway без доступа JS к секретному состоянию.
+соединяется с тестовым gateway без доступа JS к секретному состоянию. Все
+setup/local/Node/Pass/runtime outcomes из каталога v1 имеют одинаковые code,
+description и next action на Android и desktop fixtures; неизвестный outcome
+остаётся `VEIL-RUNTIME-999`, а ни один публичный код не даёт retry authority.
 
 ### Phase 5B — Android messaging
+
+**Direct text checkpoint 2026-07-19: частично готов.** Настоящие Direct list,
+authenticated history, bounded live receive, native projection, X3DH one-shot
+peer-prekey и idempotent SQLCipher-owned send/outbox опубликованы в цепочке
+`029d1e3`…`aaaf1df`; `7cae239` отдельно закрывает automated true-empty Ready.
+Typed ACK deadline, transient reconnect и automated process-death recovery
+реализованы. Ограниченный S23 same-account force-stop smoke зелёный, но полная
+Desktop ↔ Android send/delivery/outbox/reconnect/airplane/background/process-death
+physical matrix, private groups и остальные пункты 5B не готовы.
+
+Process-death contract хранит в SQLCipher только singleton
+`canonical_server_origin + expected_user_id`, выбранный атомарно вместе с
+immutable authenticated-self binding после успешной mobile-аутентификации.
+Node Access Pass, WebSocket URL и ключи не персистятся. При новом процессе Rust
+повторно проверяет canonical origin, exact user, self binding и текущие
+mnemonic-derived identity/signing keys; legacy БД без явного singleton не
+угадывает target. Android создаёт один zero-delay plain reconnect, сохраняет
+typed backoff с ordinal 0 после первой разрешённой ошибки и линейно уступает
+новому staged Pass. Manual disconnect остаётся non-destructive и сохраняет
+target; отдельного `Forget Node / remain offline` API пока нет.
+
+Host-only precursor D03 от 2026-07-20 закрывает именно native persistence и
+ACK reconciliation для неоднозначной доставки: после первого accept в
+детерминированном server ledger полная `VeilMobileSession` уничтожается до
+локального ACK, затем тот же file-backed SQLCipher store открывается заново.
+Replay сохраняет exact client ID/header/ciphertext/encoded payload, ratchet
+остаётся продвинут ровно один раз, повторный accept возвращает прежний receipt,
+а production protobuf decoder и deferred FIFO сводят outbox и projection к
+одной `Sent` строке. Конфликт того же client ID с другими ciphertext bytes
+отклоняется без мутации ledger. Это automated test oracle, а не реальный Veil
+Node, Android OS process-death или physical-device evidence; строка D03
+физической матрицы и полный exit gate 5B остаются открыты.
 
 1. Сначала один честный Desktop ↔ Android DM: X3DH/Double Ratchet, history sync,
    ack/outbox, reconnect, airplane mode и process death.
@@ -1255,11 +2142,392 @@ native failure разделены. Это закрывает первый пун
    передаёт Android account session.
 6. Затем attachments, search, settings/Appearance и Space management.
 7. Device/instrumentation tests, signed AAB и закрытый beta rollout.
+8. Direct session/send/delivery, push, Circle, Space/Rooms, attachment и
+   multi-device failures расширяют тот же append-only registry до появления
+   соответствующего UI; новый transport не вводит параллельные коды или raw
+   server/native text.
+
+Exit gate 5B для честного Direct Preview дополнительно требует одинаковую
+Desktop ↔ Android failure matrix для prekey, directory, history, live replay,
+outbox/ACK и process-death reconnect. Post-auth failure показывает
+`VEIL-SYNC-001` и сохраняет точное указание «аккаунт сохранён; reconnect без
+нового Pass»; pre-auth, storage-uncertain и delivery-unknown outcomes не
+смешиваются с ним. Physical tests подтверждают, что code/description/action
+переживают locale и process restart, а retry по-прежнему определяется только
+typed native allowlist.
+
+### Phase 5C — Secure QR device linking / multi-device gate
+
+**Статус: не начато; blocking для корректного multi-device.** Сканирование QR
+само по себе не авторизует устройство. Уже активное доверенное устройство и новое
+устройство устанавливают отдельный versioned pairing-сеанс, сравнивают одинаковый
+SAS и только после явного подтверждения переводят новый device binding в active.
+Если активного устройства нет, используется отдельный reviewed recovery flow, а
+не ослабленная разновидность QR enrollment. Этот QR не является Veil Link, Node
+Access Pass или QR-проверкой чужого fingerprint и не переиспользует их parser/
+authority semantics.
+
+Обязательный контракт:
+
+- UI использует стандартный совместимый QR Code с сохранёнными quiet zone,
+  контрастом и error correction. Veil branding, правильный логотип, островная
+  рамка и countdown находятся вне машинно-читаемой области; custom QR alphabet
+  и декоративная подмена модулей запрещены;
+- QR содержит только versioned одноразовый pairing offer: exact canonical Node
+  origin, случайный challenge/offer ID, ephemeral public key, protocol version и
+  короткий expiry. Recovery phrase, mnemonic/root/account private key, SQLCipher
+  key, bearer/session token и постоянный секрет через QR, relay или clipboard не
+  передаются;
+- обе стороны создают независимые ephemeral keys. Canonical transcript включает
+  exact Node `(scheme, host, effective port)` и TLS identity, account binding,
+  offer/challenge, оба ephemeral keys, оба device IDs и device public keys,
+  запрошенные/разрешённые capabilities, protocol version и expiry. Любая смена
+  origin, relay, ключа, device или capability меняет transcript и SAS;
+- SAS выводится из подтверждённого transcript и показывается одинаковым коротким
+  кодом на обоих экранах. Пользователь сравнивает его и явно нажимает Approve на
+  обоих устройствах; scan, совпадение account name или ответ Node не являются
+  согласием. Mismatch/Cancel немедленно отзывает pairing-сеанс;
+- offer имеет короткий TTL, single-use compare-and-consume и bounded attempts.
+  Повтор, delayed relay, concurrent redemption, replay после Cancel/expiry и
+  второй transcript для того же offer отклоняются без создания активного device;
+- Node хранит state machine `pending → active | expired | cancelled`. Переход в
+  `active` атомарно проверяет обе approval proofs, неизменный transcript,
+  capability policy и ещё активное авторизующее устройство; crash/retry
+  идемпотентен и не оставляет частично активный roster/prekey/push state;
+- новый device получает только собственные device secrets и подписанное
+  разрешение аккаунта. Авторизующее устройство не экспортирует recovery/root
+  secret. После activation публикуются exact-device prekeys/capabilities; до
+  завершения roster reconciliation отправка, требующая нового roster, остаётся
+  fail closed;
+- Settings показывают device fingerprint, capabilities, время/способ enrollment
+  и last seen. Revoke требует явного подтверждения, немедленно блокирует новые
+  session/prekey/push операции устройства и запускает нужную key/roster rotation.
+  Pending/approve/activate/cancel/expire/revoke фиксируются в bounded audit без
+  секретов; Node audit не является единственным источником истины для клиентов.
+
+Security/physical exit matrix включает hostile Node и hostile relay: QR/origin/
+TLS substitution, MITM ephemeral-key swap, device/key/capability escalation или
+downgrade, SAS mismatch, malformed/oversized QR, expired/replayed/concurrently
+redeemed offer, authorizer revoke во время approval и reordered/duplicated
+responses. Process death, background/lock и network loss проверяются на каждом
+переходе: после восстановления получается либо тот же exact active binding, либо
+безопасно cancelled/expired pending, но никогда новый binding или activation с
+изменённым transcript.
+
+Accessibility fallback обязателен: camera permission можно отклонить, после чего
+доступен ручной ввод versioned pairing code с теми же TTL/transcript/SAS
+проверками; SAS читается screen reader, разбит на однозначные группы и не зависит
+от цвета/анимации. Large text, high contrast, reduced motion, TalkBack/VoiceOver
+и keyboard navigation входят в physical matrix. Gate закрывается только после
+Desktop ↔ Android и Android ↔ Android тестов, независимого security review и
+доказательства, что hostile Node/relay не может активировать, подменить или
+расширить capabilities нового устройства без совпавшего SAS и двух approvals.
 
 Оценка: закрытый Android DM-MVP — примерно 8–12 недель одного опытного
 разработчика. Groups/servers, push previews и attachments добавят ещё 4–8
 недель; полная desktop parity потребует отдельного многомесячного этапа и
 независимого security review.
+
+---
+
+## Phase 5S — Direct protocol assurance, `libsignal` decision и hostile Node
+
+**Статус 2026-07-20: открыт; блокирует stable и финальный multi-device design,
+но не требует аварийной замены работающего Preview-протокола.** X3DH, Double
+Ratchet и Sender Keys в Veil —
+собственные protocol implementations поверх стандартных примитивов. Текущие
+инварианты, тесты и fail-closed поведение снижают риск, но не заменяют независимый
+криптографический аудит и сами по себе не доказывают отсутствие protocol bug.
+На сегодня конкретный exploit в Direct cryptography не установлен. Отдельный
+подтверждённый cross-Node credential-scope P1 в WebSocket authentication и
+связанной REST authority-модели записан в 5S.3 и должен быть закрыт до
+production/multi-Node claims.
+
+**Checkpoint 5S.1A 2026-07-20:** добавлен immutable синтетический Direct-v1
+transcript с SHA-256, executable primitive oracle, production `veil-client`
+hydrate/encrypt/decrypt negative matrix и file-backed SQLCipher CAS `0 → 1`.
+Инъекция фиксированных X3DH/ratchet secrets в общие transitions доступна только
+crate-private `cfg(test)` коду, а fixed nonce используется отдельным test oracle;
+production randomness не ослаблена. Это покрывает shared Rust boundary, но ещё
+не Android FFI/UI или отдельный desktop runtime consumer. Точный scope, findings
+и non-claims записаны в
+[`docs/reviews/phase-5s-direct-v1-transcript-checkpoint.md`](docs/reviews/phase-5s-direct-v1-transcript-checkpoint.md).
+
+**Local checkpoint 5S.1B 2026-07-20:** findings 1–2 получили host-only
+hardening: public `VeilClient::establish_session` требует exact совпадение
+peer/bundle identity до mutation, а received ratchet DH проверяет фактический
+X25519 contributory result до публикации state. Frozen Direct-v1 SHA
+`DAD0A84E5D7366E5189B24C9FB230C4BDD4CC67245607C148B3E3003D9915C2E`, wire и
+stored-state format не изменились. Scope, host evidence и non-claims
+зафиксированы в
+[`docs/reviews/phase-5s-direct-v1-key-validation-checkpoint.md`](docs/reviews/phase-5s-direct-v1-key-validation-checkpoint.md).
+
+**Local checkpoint 5S.1C 2026-07-20:** finding 5 получил host-only hardening:
+persisted skipped keys имеют canonical bounded decoder/writer и deterministic
+capacity failure без eviction; все live transitions используют exact
+revision-and-bytes SQLCipher CAS, initial publication остаётся insert-only, а
+legacy rowid-backed `ratchet_sessions` losslessly мигрируется в `WITHOUT ROWID`
+в одной `BEGIN IMMEDIATE` transaction с capacity guards. Exact allowlist трёх
+исторических DDL-вариантов, PK topology и main/TEMP dependencies отклоняет
+future constraints, autoindexes и reserved-name collisions до любой mutation;
+для самой старой схемы `revision = 0` синтезируется только внутри rebuild.
+Stale history/general receivers, process reopen, malformed state, FFI
+recanonicalization и rollback покрыты executable tests. Frozen Direct-v1 SHA не
+изменился. Scope, физическая schema migration, residual risks и non-claims
+зафиксированы в
+[`docs/reviews/phase-5s-direct-v1-skipped-key-state-checkpoint.md`](docs/reviews/phase-5s-direct-v1-skipped-key-state-checkpoint.md).
+
+Findings 3–4, deterministic skipped-key expiry, whole-file rollback, hostile
+Node, key transparency, session lifecycle, cross-client consumption,
+full `libsignal` adapter/ABI/state spike и независимый внешний аудит остаются
+открытыми. Pinned upstream source/build checkpoint 5S.2A is recorded in
+[`docs/reviews/phase-5s-libsignal-isolated-spike.md`](docs/reviews/phase-5s-libsignal-isolated-spike.md);
+it did not integrate or activate the library.
+
+### 5S.1 — Зафиксировать и атаковать текущий Direct v1
+
+1. Опубликовать exact executable contract для identity/prekey bundle, X3DH
+   transcript, Double Ratchet header/AAD, state serialization, skipped-key bounds,
+   replay rules, atomic SQLCipher transitions и domain separation. Формулировки
+   «похоже на Signal» недостаточно: каждый byte и state transition должен быть
+   versioned и воспроизводим desktop/mobile fixtures.
+2. Сопоставить контракт с актуальными официальными спецификациями
+   [X3DH](https://signal.org/docs/specifications/x3dh/),
+   [Double Ratchet](https://signal.org/docs/specifications/doubleratchet/) и
+   [Sesame](https://signal.org/docs/specifications/sesame/). PQXDH и новые ratchet
+   variants исследуются отдельно и не выдаются за уже реализованные свойства.
+3. Добавить adversarial/property/fuzz corpus: forged/tampered header, invalid и
+   low-order keys, replay/stale one-time prekey, simultaneous initiation,
+   out-of-order/duplicate messages, skipped-key exhaustion, rollback/process death,
+   session replacement и downgrade. Ошибка никогда не переключает Direct на
+   plaintext и не коммитит candidate state до успешной authentication.
+4. Перед stable заказать независимый аудит как минимум `veil-crypto` Direct,
+   `veil-client` orchestration, SQLCipher transaction boundary, FFI serialization
+   и server prekey/envelope handling. Findings должны быть исправлены либо явно
+   приняты с owner, scope и сроком; внутренний review не закрывает этот пункт.
+5. Отдельно закрыть известный session-lifecycle availability gap: текущая модель
+   хранит одну ratchet-session на peer identity и не реализует Sesame-подобный
+   current/previous per-device session set. Simultaneous initiation, восстановление
+   и новый device не должны приводить к silent reset, undecryptable loop или
+   повторному использованию prekey; это требуется решить до proper multi-device.
+
+### 5S.2 — Изолированный официальный `libsignal` spike, не blind rewrite
+
+1. В отдельном crate/ветке проверить официальный
+   [`signalapp/libsignal`](https://github.com/signalapp/libsignal) на Android,
+   Windows и Linux: reproducible/pinned build, размер, latency, crash recovery,
+   SQLCipher-backed stores и совместимость с текущей Rust/UniFFI границей.
+2. Учесть, что upstream прямо считает external use unsupported, а API и bridge
+   могут меняться без предупреждения. Совместимая AGPL-лицензия и Rust core не
+   делают библиотеку drop-in или автоматически аудированной интеграцией Veil.
+   Актуальный upstream ориентирован на PQXDH/современный ratchet lifecycle, поэтому
+   он не является бинарно совместимой реализацией текущего Veil X3DH profile.
+3. Зафиксировать полный migration impact: server prekey API, protobuf/envelopes,
+   identity/device addressing, session serialization, local DB, desktop/mobile
+   bridges, Sender Keys и multi-device orchestration. Нельзя молча сбросить
+   существующие sessions или объявить старый ciphertext новым форматом.
+4. ADR выбирает один из двух честных результатов:
+   - audited/hardened Veil Direct v1 остаётся основным; либо
+   - появляется capability-negotiated `direct_v2_libsignal` с отдельным wire/state
+     version, no-downgrade правилом и проверяемой миграцией.
+   Production switch разрешён только после cross-client fixtures, rollback plan и
+   отдельного review самой интеграции.
+5. `libsignal` не решает Node credential scoping, canonical-origin enforcement,
+   REST request authentication, first-contact key transparency или авторизацию
+   membership epoch в Circle/Space. Эти независимые границы остаются blocking
+   gates при любом результате spike.
+
+### 5S.3 — Злонамеренный или скомпрометированный Veil Node
+
+Node не получает автоматического права расшифровать корректно установленную E2EE
+session, но остаётся активным противником, а не только relay. До закрытия gate
+нужно доказать безопасное поведение при следующих атаках:
+
+**Known cross-Node credential-scope P1 2026-07-19:** это одна граница доверия,
+проявляющаяся в обоих текущих transport authentication paths:
+
+- `veil-ws-auth-v2` подписывает server challenge, DH result и account/device proof,
+  но не включает exact canonical Node origin или TLS channel binding.
+  Злонамеренный Node A может в пределах challenge TTL переслать challenge Node B
+  подключившемуся к A клиенту и вернуть подписи в B. Relay применим не только когда
+  та же account identity уже существует на B: альтернативные prerequisites —
+  открытая регистрация B либо действующий B Node Access Pass, полученный A вне
+  proof. Registration intent и сам Pass/его commitment сейчас не входят в
+  подписанный transcript, поэтому Pass можно подставить на стороне B;
+- REST v1 server выводит security origin из request `Host` и принимает identity из
+  `X-Veil-User`, не подписанного как часть полного origin/user request context.
+  Безопасность такого forwarding зависит от ingress/gateway, а не от
+  самодостаточного end-to-end proof; доверять произвольному `Host` как собственному
+  public origin нельзя.
+
+Interim checkpoints `91fd2f8` и `88c87bd` закрывают конкретное legacy authority
+расхождение на управляемом ingress: allowlist принимает только bare host и
+canonical `:443`, передаёт literal Host/XFH и отклоняет остальное 421, а desktop
+подписывает effective port. Это не добавляет cryptographic canonical-origin/user
+binding и не закрывает WS v3/REST v2/two-Node hostile-relay exit gate.
+
+**Local checkpoint 5S.3A 2026-07-20:** без активации transport добавлен один
+binary exact-origin authentication contract для Rust и Go. Domain-separated
+Node Access Pass commitment связывает bearer с canonical origin; WS v3
+аутентифицирует origin, challenge, account keys, device id, предварительно
+проверенный binding commitment и явный existing/open/Pass intent двумя
+связанными account/device proofs; REST v2 подписывает origin, UUID пользователя,
+method, exact bounded request target, timestamp, fresh nonce и digest exact body.
+Immutable synthetic fixture
+`test-vectors/transport-auth/v1.json` с SHA-256
+`c90f7aac7619d178e06c0ac0d7aab6084511ceffb505b8fcf7058ba6812ad9bc`
+исполняется обоими runtime languages. Точный контракт и non-claims записаны в
+[`docs/adr/0003-origin-bound-transport-authentication.md`](docs/adr/0003-origin-bound-transport-authentication.md)
+и
+[`docs/reviews/phase-5s-hostile-node-auth-contract-checkpoint.md`](docs/reviews/phase-5s-hostile-node-auth-contract-checkpoint.md).
+Ни gateway/protobuf/middleware, ни Node config/deploy/compatibility policy этим
+checkpoint не меняются: P1 остаётся открытым до mandatory configured origin,
+live fail-closed cutover и реальной two-Node relay matrix.
+
+**Local checkpoint 5S.3B-1 2026-07-20:** добавлен обязательный
+`VEIL_PUBLIC_ORIGIN` с exact canonical explicit-port значениями для local
+Compose и managed deployment; оба gateway Compose path используют required
+substitution без production fallback, а документация фиксирует fail-closed
+startup boundary. Это только non-deployed configured-origin foundation:
+текущие `/ws` и signed REST остаются legacy Preview WS auth v2/REST auth v1,
+никакой live Node/config activation не выполнено, P1 и Phase 5S остаются
+открытыми. Phone/ADB/APK/Pass/recovery testing по-прежнему отложен до явного
+возобновления и подтверждённо записанной recovery phrase.
+
+**Local checkpoint 5S.3B-2 2026-07-20:** добавлен отдельный, намеренно
+неактивированный WS auth v3 foundation: append-only protobuf messages/tags,
+origin-bound one-shot challenge и private native account/device proof/result
+helpers с явным existing/open/Pass intent. Живой `/ws` по-прежнему создаёт и
+проверяет только legacy v2; canonical raw protobuf boundary, полный v3 verifier,
+atomic Pass/account transaction, transport dispatch и двухнодовая relay-матрица
+остаются blocking gates. Точные evidence и non-claims опубликованы в
+[`docs/reviews/phase-5s-ws-auth-v3-foundation-checkpoint.md`](docs/reviews/phase-5s-ws-auth-v3-foundation-checkpoint.md).
+
+**Local checkpoint 5S.3B-3 2026-07-20:** добавлен изолированный REST auth v2
+foundation. Private native preparer использует системные clock/CSPRNG, строит
+пять канонических header values и не имеет transport/FFI call site;
+transport-neutral Go verifier принимает уже захваченные bounded target/body,
+публикует principal только после strict Ed25519 proof и atomic replay claim.
+PostgreSQL migration хранит replay по exact `(account, nonce)` с пятиминутным
+retention и bounded expired-only cleanup, общими между процессами и restart.
+Это не HTTP activation: raw `RequestURI`/body capture and restore, route media
+policy, version dispatcher, desktop/Android transport, legacy cutover и real
+two-Node matrix остаются открытыми, а Node Access Pass принадлежит только
+будущему WS v3 registration verifier. Точный checkpoint:
+[`docs/reviews/phase-5s-rest-auth-v2-foundation-checkpoint.md`](docs/reviews/phase-5s-rest-auth-v2-foundation-checkpoint.md).
+
+**Local checkpoint 5S.3B-4 2026-07-20:** добавлены изолированный server WS auth
+v3 verifier и атомарный PostgreSQL admission. One-shot challenge, exact
+configured origin, account-signed active device binding, contributory
+account/device DH и chained Ed25519 proofs проверяются до любой registration
+policy или Pass lookup. Для новой identity account, device, immutable binding
+state и расход Pass входят в одну транзакцию; exact existing identity выигрывает
+до Pass и делает uncertain post-commit retry идемпотентным. Успех возвращает
+opaque verified result с principal, protocol, origin и signed intent из той же
+проверенной попытки. Repo-wide AST gate подтверждает отсутствие live
+`CreateChallengeV3`/`VerifyResponseV3` callsite. Живой `/ws` всё ещё v2; raw
+canonical protobuf, subprotocol/gateway dispatch, client consumption и реальная
+двухнодовая relay-матрица остаются blocking gates. Точный checkpoint:
+[`docs/reviews/phase-5s-ws-auth-v3-verifier-admission-checkpoint.md`](docs/reviews/phase-5s-ws-auth-v3-verifier-admission-checkpoint.md).
+
+**Local checkpoint 5S.3B-5 2026-07-20:** добавлены изолированные REST auth v2
+HTTP boundary и version dispatcher без live route. Boundary получает signed
+target только из raw `RequestURI`, собирает все case-insensitive header values,
+до body read выполняет canonical preflight/key lookup, затем один раз bounded
+читает и точно восстанавливает body под общей v1/v2 admission authority.
+Principal публикуется только после exact body signature, повторной freshness
+проверки, 60-секундного monotonic staged-proof bound и durable replay winner.
+Явный `not found` отделён от timeout/cancel/storage failure: первый даёт generic
+401, неопределённость — generic 503. `V2Only` не допускает downgrade;
+`PreviewDual` имеет owner, максимум 30 дней, monotonic deadline и sticky
+fail-closed expiry без fallback. Это всё ещё не activation: route/media table,
+ServeMux/redirect guard, bounded key-lookup concurrency, short absolute body
+read deadline, telemetry/config wiring, desktop/Android transport и реальная
+two-Node matrix остаются blocking gates. Точный checkpoint:
+[`docs/reviews/phase-5s-rest-auth-v2-http-boundary-checkpoint.md`](docs/reviews/phase-5s-rest-auth-v2-http-boundary-checkpoint.md).
+
+**Beta checkpoint 5S.3C 2026-08-04:** baseline `f6dbf5a` регистрирует отдельный
+`/v3/events` в gateway и добавляет Rust supervisor, FFI controller и Android
+background-service consumer. Legacy `/ws` остаётся отдельным v2 путём, REST v2
+не активирован. Этот срез ещё не проходит полный workspace build, generated
+Kotlin bindings отстают, а endpoint-level, cross-client и hostile two-Node
+evidence отсутствуют. Поэтому checkpoint расширяет integration surface, но не
+закрывает cross-Node P1, live cutover или Exit gate 5S. Точные blockers и
+проверки записаны в
+[`docs/reviews/beta-integration-macos-2026-08-04.md`](docs/reviews/beta-integration-macos-2026-08-04.md).
+
+Private/E2EE keys при этом не извлекаются, но A может получить authenticated
+control/metadata context на B и злоупотреблять server-authoritative actions,
+receipts или availability. Единое обязательное исправление:
+
+1. Node стартует только с явно configured canonical public origin; runtime не
+   выводит trust scope из request `Host`. Gateway/TLS строго проверяют ожидаемые
+   Host и SNI, не нормализуют чужой origin и не допускают origin-changing redirect.
+2. Versioned `veil-ws-auth-v3` включает server-declared и client-verified canonical
+   origin в challenge, account proof и device proof, а registration path — явный
+   intent и domain-separated commitment B Pass без раскрытия Pass в подписи.
+3. Versioned REST v2 подписывает как минимум exact canonical origin, `user_id`,
+   method, canonical request target/body commitment, timestamp/nonce и protocol
+   version. Server сравнивает подписанные origin/user с собственной конфигурацией
+   и authenticated account; `X-Veil-User` не является отдельным источником доверия.
+4. Missing/mismatched version/origin/user и downgrade отклоняются. Временный v1/v2
+   dual-stack допустим только под явным Preview compatibility flag с конечным
+   сроком; production принимает только WS v3 + REST v2. Обязательны two-Node relay,
+   B-account/open-registration/B-Pass и Host/SNI/downgrade adversarial tests.
+
+- first-contact identity/prekey substitution и equivocation, когда Node показывает
+  разным клиентам разные ключи одного пользователя;
+- stale/replayed prekeys, повторная выдача one-time prekey, forged key-change и
+  device-roster события, rollback revision и удаление/reordering ciphertext;
+- registration/pass abuse, selective denial of service и подмена canonical origin;
+- сбор неизбежных transport metadata: IP, время/размер трафика, membership,
+  conversation/Room routing и delivery state. E2EE не должна описываться как
+  защита этих метаданных.
+
+До security claim для Circle или Space требуется отдельная malicious-roster
+boundary. Server-authoritative ACL/roster и Sender Key сами по себе не доказывают,
+что все клиенты видят один и тот же авторизованный состав: злонамеренный Node не
+может подделать account-signed device уже закреплённого честного аккаунта, но может
+добавить свой новый легитимный account/device, показать разные roster views и
+добиться раздачи следующего Sender Key этому участнику. Нужны monotonic signed
+membership epochs с проверкой authorization, consistency и client
+gossip/witnessing либо MLS application-authorization contract с эквивалентной
+защитой от rollback/equivocation. Сам переход на MLS или `libsignal` эту product
+authorization boundary автоматически не закрывает.
+
+Минимальный пользовательский baseline: versioned safety number/fingerprint для
+каждого account/device, QR/внеполосная проверка, заметное key-change событие и
+fail-closed pause до подтверждения. Отдельный ADR выбирает проверяемую
+key-transparency модель для self-hosted Node: append-only proofs, consistency
+checks и client gossip/witnessing должны выявлять equivocation; подписи самого
+злонамеренного Node без независимой проверки недостаточно.
+
+Android обязан закрыть этот baseline реальным mobile flow: показать и сравнить
+полный account/device fingerprint, поддержать QR show/scan и явно подтверждённую
+внеполосную проверку, затем сохранить verification в SQLCipher по exact
+`(canonical origin, local account, peer account/device, identity key)`. Restart
+сохраняет proof, а любое key/device/origin change переводит его в blocking
+`Identity changed` до нового сравнения; один лишь display fingerprint gate не
+закрывает.
+
+### Exit gate 5S
+
+- принят ADR `Veil Direct v1 vs direct_v2_libsignal` с threat model и миграцией;
+- exact protocol fixtures одинаково проходят desktop и Android;
+- hostile-Node/two-client matrix доказывает отсутствие silent key replacement,
+  plaintext fallback, state rollback и downgrade;
+- configured canonical public origin, strict Host/SNI, `veil-ws-auth-v3` и REST v2
+  exact-origin/user proofs проходят двухнодовую credential relay matrix, а
+  production Node не принимает origin-unbound WS v2 или ingress-dependent REST v1;
+- Android fingerprint compare/QR/persistence и key-change fail-closed matrix зелёны;
+- Circle/Space membership epochs либо MLS authorization/consistency/gossip contract
+  выдерживают malicious-Node roster equivocation/rollback matrix;
+- независимый аудит завершён, а обязательные findings закрыты;
+- документация честно разделяет confidentiality содержимого, authentication
+  первого контакта, availability и metadata privacy.
+
+До выполнения exit gate разрешены только явно помеченные Preview/internal builds.
+MLS остаётся выключенным и не используется как обход незакрытого Direct review.
 
 ---
 
@@ -1353,8 +2621,11 @@ Compose: `livekit` + `coturn` (для ~10% за NAT). Codec: Opus + VP8. H.264 �
 ## Phase 8 — Полировка и релиз
 
 **Статус:** security CI, dependency locks и fail-closed Windows release/signing
-workflow уже есть. Без сертификата workflow не должен выпускать артефакт.
-Visual regression, updater, полный signed matrix и public beta ещё не готовы.
+workflow уже есть. 2026-08-04 локально воспроизведены x86_64 `Veil.app` и DMG
+0.1.4; DMG прошёл `hdiutil verify`, но app не подписан, не notarized и не имеет
+arm64/universal варианта. Это development evidence, а не public artifact. Без
+сертификата workflow не должен выпускать артефакт. Visual regression, updater,
+полный signed matrix и public beta ещё не готовы.
 
 - Grafana dashboard для метрик фаз 2-7, JSON в `grafana-dashboards/`
 - Playwright visual regression baseline, запускается в CI на каждом PR
@@ -1441,10 +2712,11 @@ path. Все сетевые обращения наружу либо отсут�
   работает в LAN без WAN и не проксирует invite secret через центральный сайт;
 - браузерного клиента Veil не будет. Помимо статических product/docs/download
   страниц и локальной gateway landing разрешены только два узких capability-
-  oriented web flow: one-time Share Viewer с собственным ограниченным threat
-  model и unauthenticated allowlisted Veil Link preview. Ни один из них не
-  становится web messenger и не получает account identity/session, recovery
-  flow или keys.
+  oriented web flow: будущий Secure Share Viewer с собственным ограниченным
+  threat model и существующий unauthenticated allowlisted Veil Link preview.
+  Ни один из них не становится web messenger и не получает account identity/
+  session, recovery flow или keys. Наличие prototype `veil-share-viewer` не
+  считается production surface до completion gate Phase 4G.
 
 Компрометация сайта не должна позволять выдать изменённый клиент за Veil:
 подпись приложения проверяется ОС, hashes/signing metadata дублируются в
@@ -1457,8 +2729,10 @@ GitHub release, а updater использует отдельную подпис�
 как полноценно поддерживаемая локаль. Чтобы поздняя локализация не потребовала
 переписывать протоколы, до Phase 8 сохраняются следующие правила:
 
-- сервер возвращает стабильные machine-readable error/event codes; локализует
-  их клиент, wire values, IDs, keys, origins и crypto labels не переводятся;
+- сервер возвращает стабильные machine-readable error/event codes, а клиенты
+  сопоставляют их с append-only `PublicFailureCodeV1`; public codes, wire values,
+  IDs, keys, origins и crypto labels не переводятся и не переиспользуются,
+  локализуются только reviewed title/description/next-action keys;
 - новые UI-фразы не собираются конкатенацией из грамматических фрагментов;
   пользовательские имена/текст передаются отдельными variables и изолируются
   по направлению, но никогда не переводятся;
@@ -1478,9 +2752,10 @@ GitHub release, а updater использует отдельную подпис�
    translation/code loading.
 3. Последовательный перенос onboarding → shell/chat → identity/settings →
    server/mobile → installer/site/docs без смешанного языка внутри одного flow.
-4. CI проверяет missing/unused keys, variable parity и forbidden raw strings;
-   pseudo-locale/long-text, `en`, `ru`, 125–200% scale и RTL/bidi isolation
-   входят в component/visual/accessibility matrix.
+4. CI проверяет missing/unused keys, variable parity, forbidden raw strings и
+   полное покрытие `PublicFailureCodeV1` во всех локалях без изменения recovery
+   semantics; pseudo-locale/long-text, `en`, `ru`, 125–200% scale и RTL/bidi
+   isolation входят в component/visual/accessibility matrix.
 5. Security review подтверждает, что локализация не меняет ACL/crypto decisions,
    не скрывает identity-change warnings и не вставляет переводы как HTML.
 

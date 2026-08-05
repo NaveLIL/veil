@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use subtle::ConstantTimeEq;
@@ -11,10 +11,15 @@ use tauri_plugin_deep_link::DeepLinkExt;
 use tauri_plugin_notification::NotificationExt;
 use veil_client::api::{
     DeviceBindingCandidateV1, DeviceRosterCandidateV1, DeviceRosterEntryV1,
-    MessageSecurityContextV1, OfflineSenderKeyRefresh, SenderKeyMessageSecurityContextV1,
-    VeilClient,
+    MembershipEpochChainCandidateV1, MembershipEpochRecordCandidateV1, MessageSecurityContextV1,
+    OfflineSenderKeyRefresh, PreparedMembershipEpochV1, SenderKeyMessageSecurityContextV1,
+    SenderKeyMessageSecurityContextV6, VeilClient,
 };
 use veil_client::connection::ConnectionEvent;
+use veil_crypto::membership::{
+    MembershipEpochSignatureV1, MembershipEpochV1, MembershipPolicySignerV1, MembershipPolicyV1,
+    MEMBERSHIP_CRYPTO_ERA_V1, MEMBERSHIP_CRYPTO_PROFILE_SENDER_KEY_V6,
+};
 use veil_search::{
     Indexer, SearchCoverageSnapshot, SearchDocument, SearchError, SearchHit, MAX_INDEXED_MESSAGES,
     MAX_INDEX_SOURCE_BYTES,
@@ -317,7 +322,6 @@ const PIN_SALT_ACCOUNT: &str = "veil-pin-salt";
 const PIN_THROTTLE_ACCOUNT: &str = "veil-pin-throttle-v1";
 const AUTO_LOCK_ACCOUNT: &str = "veil-auto-lock-seconds";
 const DEFAULT_AUTO_LOCK_SECONDS: u64 = 5 * 60;
-static LAST_REST_TIMESTAMP_MS: AtomicI64 = AtomicI64::new(0);
 const MAX_REST_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_AVATAR_INPUT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_AVATAR_RESPONSE_BYTES: usize = 256 * 1024;
@@ -478,6 +482,23 @@ fn invalidate_disconnected_binding(
         return false;
     }
     *current = None;
+    true
+}
+
+/// Fail closed only when the terminal event-stream failure belongs to the
+/// currently published transport generation. A delayed failure from an older
+/// socket must not tear down a replacement binding or its readiness.
+fn invalidate_terminal_poll_generation(
+    current: &mut Option<RestBinding>,
+    renderer_confirmed: &mut Option<RestBinding>,
+    ready: &AtomicBool,
+    failed: &RestBinding,
+) -> bool {
+    if !invalidate_disconnected_binding(current, failed) {
+        return false;
+    }
+    invalidate_disconnected_binding(renderer_confirmed, failed);
+    ready.store(false, Ordering::SeqCst);
     true
 }
 
@@ -2019,6 +2040,7 @@ fn get_conversations(state: State<'_, AppState>) -> Result<Vec<serde_json::Value
                 "peerUserId": c.peer_user_id,
                 "serverOrigin": c.server_origin,
                 "lastMessageAt": c.last_message_at,
+                "unreadCount": c.unread_count,
             })
         })
         .collect();
@@ -2027,6 +2049,33 @@ fn get_conversations(state: State<'_, AppState>) -> Result<Vec<serde_json::Value
     }
     require_session_still_unlocked(&state)?;
     Ok(result)
+}
+
+/// Persist device-local read state for the exact published origin. The
+/// protobuf MessageRead shape has no implemented server/client contract yet;
+/// this command intentionally emits no cross-device receipt.
+#[tauri::command]
+fn mark_conversation_read(
+    state: State<'_, AppState>,
+    conversation_id: String,
+    expected_server_origin: String,
+    expected_binding_generation: String,
+) -> Result<Option<String>, String> {
+    let live_action_binding = capture_confirmed_live_action_binding(&state)?;
+    validate_expected_live_action_binding(
+        &live_action_binding,
+        &expected_server_origin,
+        &expected_binding_generation,
+    )?;
+    let client = state.client.lock().map_err(|error| error.to_string())?;
+    require_confirmed_live_action_binding_current(&state, &live_action_binding)?;
+    require_authenticated_conversation_origin(&state, &client, &conversation_id)?;
+    let last_read_message_id = client
+        .db()
+        .ok_or("database not initialized")?
+        .mark_conversation_read(&conversation_id, &expected_server_origin)?;
+    require_confirmed_live_action_binding_current(&state, &live_action_binding)?;
+    Ok(last_read_message_id)
 }
 
 /// Return conversation-scoped crypto quarantine without hiding locally stored
@@ -2224,17 +2273,6 @@ fn upload_prekeys(state: State<'_, AppState>, server_http_url: String) -> Result
     Ok(())
 }
 
-#[derive(serde::Deserialize)]
-struct PreKeyBundleResponse {
-    identity_key: String,
-    signing_key: String,
-    signed_prekey: String,
-    signed_prekey_signature: String,
-    signed_prekey_id: u32,
-    one_time_prekey: Option<String>,
-    one_time_prekey_id: Option<u32>,
-}
-
 fn decode_b64_array<const N: usize>(field: &str, value: &str) -> Result<[u8; N], String> {
     use base64::Engine;
     let bytes = base64::engine::general_purpose::STANDARD
@@ -2245,73 +2283,111 @@ fn decode_b64_array<const N: usize>(field: &str, value: &str) -> Result<[u8; N],
         .map_err(|v: Vec<u8>| format!("invalid {field} length: expected {N}, got {}", v.len()))
 }
 
-fn parse_prekey_bundle(
-    value: serde_json::Value,
-    expected_identity_key: &[u8; 32],
-) -> Result<veil_crypto::x3dh::PreKeyBundle, String> {
-    let response: PreKeyBundleResponse =
-        serde_json::from_value(value).map_err(|e| format!("parse prekey bundle: {e}"))?;
-    let identity_key = decode_b64_array::<32>("identity_key", &response.identity_key)?;
-    if &identity_key != expected_identity_key {
-        return Err("prekey bundle identity does not match requested peer".to_string());
+fn configured_transparency_witness_policy_v1(
+) -> Result<Option<veil_client::transparency::TransparencyWitnessPolicyV1>, String> {
+    const KEYS_ENV: &str = "VEIL_IDENTITY_TRANSPARENCY_WITNESS_KEYS";
+    const QUORUM_ENV: &str = "VEIL_IDENTITY_TRANSPARENCY_WITNESS_QUORUM";
+    let keys = std::env::var(KEYS_ENV).ok();
+    let quorum = std::env::var(QUORUM_ENV).ok();
+    let (keys, quorum) = match (keys, quorum) {
+        (Some(keys), Some(quorum)) => (keys, quorum),
+        (None, None) => return Ok(None),
+        _ => {
+            return Err(
+                "transparency witness keys and quorum must be configured together".to_string(),
+            );
+        }
+    };
+    if keys.is_empty() || keys.len() > 32 * 65 - 1 {
+        return Err("transparency witness key list is invalid".to_string());
     }
-
-    let one_time_prekey = response
-        .one_time_prekey
-        .as_deref()
-        .map(|value| decode_b64_array::<32>("one_time_prekey", value))
-        .transpose()?;
-    if one_time_prekey.is_some() != response.one_time_prekey_id.is_some() {
-        return Err("incomplete one-time prekey in server response".to_string());
+    let parsed_quorum = quorum
+        .parse::<u16>()
+        .map_err(|_| "transparency witness quorum is invalid".to_string())?;
+    if parsed_quorum.to_string() != quorum {
+        return Err("transparency witness quorum is not canonical".to_string());
     }
-
-    Ok(veil_crypto::x3dh::PreKeyBundle {
-        identity_key,
-        signing_key: decode_b64_array::<32>("signing_key", &response.signing_key)?,
-        signed_prekey: decode_b64_array::<32>("signed_prekey", &response.signed_prekey)?,
-        signed_prekey_signature: decode_b64_array::<64>(
-            "signed_prekey_signature",
-            &response.signed_prekey_signature,
-        )?,
-        signed_prekey_id: response.signed_prekey_id,
-        one_time_prekey,
-        one_time_prekey_id: response.one_time_prekey_id,
-    })
+    let mut parsed_keys = Vec::new();
+    for encoded in keys.split(',') {
+        parsed_keys.push(decode_lower_hex_fixed::<32>(
+            "configured transparency witness key",
+            encoded,
+        )?);
+    }
+    veil_client::transparency::TransparencyWitnessPolicyV1::new(parsed_quorum, parsed_keys)
+        .map(Some)
 }
 
 fn establish_session_for_peer(
     state: &AppState,
     server_http_url: &str,
+    conversation_id: &str,
+    peer_user_id: &str,
     peer_identity_key: [u8; 32],
-    expected_signing_key: Option<[u8; 32]>,
+    expected_signing_key: [u8; 32],
     live_action_binding: &RestBinding,
 ) -> Result<(), String> {
-    let user_id = {
+    require_confirmed_live_action_binding_current(state, live_action_binding)?;
+    let canonical_server_origin = live_action_binding.origin.canonical_server_origin();
+    let witness_policy = configured_transparency_witness_policy_v1()?;
+    // Read the OS-secure monotonic head without holding the native client
+    // mutex. A locked/unavailable keychain is not authoritative absence and
+    // therefore fails closed before any first-contact request is made.
+    let rollback_anchor =
+        keychain::get_identity_transparency_rollback_anchor_v1(&canonical_server_origin)?;
+    let (user_id, transparency_from_size) = {
         let client = state.client.lock().map_err(|e| e.to_string())?;
         require_confirmed_live_action_binding_current(state, live_action_binding)?;
-        client.authenticated_user_id()?
+        let from_size = match rollback_anchor.as_ref() {
+            Some(anchor) => {
+                veil_client::transparency::identity_transparency_request_from_size_with_anchor_v1(
+                    client.db().ok_or("database not initialized")?,
+                    &canonical_server_origin,
+                    anchor,
+                )?
+            }
+            None => client.identity_transparency_request_from_size_v1()?,
+        };
+        (client.authenticated_user_id()?, from_size)
     };
-    let value = state.runtime.block_on(rest_send_json_for_binding(
-        state,
-        reqwest::Method::GET,
+    let prekey_url = format!(
+        "{}?transparency_from_size={transparency_from_size}",
         rest_api_url(
             server_http_url,
             &["v1", "prekeys", &hex::encode(peer_identity_key)],
         )?,
+    );
+    let value = state.runtime.block_on(rest_send_json_for_binding(
+        state,
+        reqwest::Method::GET,
+        prekey_url,
         &user_id,
         None,
         live_action_binding,
     ))?;
-    let bundle = parse_prekey_bundle(value, &peer_identity_key)?;
-    if let Some(expected) = expected_signing_key {
-        if bundle.signing_key != expected {
-            return Err("prekey signing key does not match the authenticated DM peer".to_string());
-        }
-    }
+    let response = serde_json::to_vec(&value)
+        .map_err(|error| format!("encode authenticated prekey response: {error}"))?;
     let mut client = state.client.lock().map_err(|e| e.to_string())?;
     require_confirmed_live_action_binding_current(state, live_action_binding)?;
-    client.pin_peer_signing_key(peer_identity_key, bundle.signing_key)?;
-    client.establish_session(&peer_identity_key, &bundle)
+    client.bind_dm_conversation(conversation_id, peer_identity_key)?;
+    veil_client::direct::install_authenticated_direct_prekey_bundle_with_security_policy_v1(
+        &mut client,
+        peer_user_id,
+        peer_identity_key,
+        expected_signing_key,
+        &response,
+        rollback_anchor.as_ref(),
+        witness_policy.as_ref(),
+    )?;
+    let accepted_head = client
+        .db()
+        .ok_or("database not initialized")?
+        .identity_transparency_pinned_head_v1(&canonical_server_origin)?;
+    drop(client);
+    if let Some(head) = accepted_head {
+        keychain::store_identity_transparency_rollback_anchor_v1(&head)?;
+    }
+    Ok(())
 }
 
 // ─── Connection ───────────────────────────────────────
@@ -2368,6 +2444,19 @@ struct DeviceDirectoryWire {
     required_capabilities: String,
     member_user_ids: Vec<String>,
     devices: Vec<DeviceDirectoryEntryWire>,
+    crypto_profile: String,
+    membership_activated: bool,
+    membership_ready: bool,
+    #[serde(default)]
+    membership_epoch: Option<String>,
+    #[serde(default)]
+    membership_epoch_hash: Option<String>,
+    #[serde(default)]
+    membership_conversation_kind: Option<u8>,
+    #[serde(default)]
+    membership_bootstrap_owner_id: Option<String>,
+    #[serde(default)]
+    membership_bootstrap_owner_signing_key: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -2400,6 +2489,59 @@ struct DeviceBindingWire {
     created_at: String,
 }
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MembershipPolicySignerWireV1 {
+    account_id: String,
+    account_signing_key: String,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MembershipEpochSignatureWireV1 {
+    signer_account_id: String,
+    signature: String,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MembershipEpochWireV1 {
+    version: u8,
+    canonical_origin: String,
+    conversation_id: String,
+    conversation_kind: u8,
+    epoch: String,
+    predecessor_hash: String,
+    roster_version: String,
+    roster_commitment: String,
+    policy_threshold: u16,
+    policy_signers: Vec<MembershipPolicySignerWireV1>,
+    crypto_profile: String,
+    crypto_era: String,
+    mutation_nonce: String,
+    epoch_hash: String,
+    signatures: Vec<MembershipEpochSignatureWireV1>,
+    #[serde(default)]
+    bootstrap_owner: Option<MembershipPolicySignerWireV1>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MembershipEpochPageWireV1 {
+    version: u8,
+    head_epoch: String,
+    head_hash: String,
+    epochs: Vec<MembershipEpochWireV1>,
+    has_more: bool,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MembershipEpochStoreResponseWireV1 {
+    stored: bool,
+    membership_epoch: MembershipEpochWireV1,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ParsedDeviceBinding {
     device_id: [u8; 16],
@@ -2428,9 +2570,17 @@ struct ParsedDeviceRoster {
     roster_commitment: [u8; 32],
     required_capabilities: u64,
     ready: bool,
+    device_set_ready: bool,
     unavailable_reason: Option<String>,
     member_user_ids: Vec<[u8; 16]>,
     devices: Vec<ParsedDeviceRosterEntry>,
+    crypto_profile: String,
+    membership_activated: bool,
+    membership_ready: bool,
+    membership_epoch: u64,
+    membership_epoch_hash: [u8; 32],
+    membership_conversation_kind: Option<u8>,
+    membership_bootstrap_owner: Option<MembershipPolicySignerV1>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2483,6 +2633,11 @@ impl From<ParsedDeviceRoster> for DeviceRosterCandidateV1 {
             ready: roster.ready,
             member_user_ids: roster.member_user_ids,
             devices: roster.devices.into_iter().map(Into::into).collect(),
+            crypto_profile: roster.crypto_profile,
+            membership_activated: roster.membership_activated,
+            membership_ready: roster.membership_ready,
+            membership_epoch: roster.membership_epoch,
+            membership_epoch_hash: roster.membership_epoch_hash,
         }
     }
 }
@@ -2551,6 +2706,26 @@ struct SyncMessage {
     sender_device_id: Option<String>,
     #[serde(default)]
     sender_binding_version: Option<String>,
+    #[serde(default)]
+    sender_device_identity_key: Option<String>,
+    #[serde(default)]
+    sender_device_signing_key: Option<String>,
+    #[serde(default)]
+    sender_device_capabilities: Option<String>,
+    #[serde(default)]
+    sender_device_binding_status: Option<u8>,
+    #[serde(default)]
+    sender_account_signature: Option<String>,
+    #[serde(default)]
+    target_device_id: Option<String>,
+    #[serde(default)]
+    target_binding_version: Option<String>,
+    #[serde(default)]
+    direct_session_id: Option<String>,
+    #[serde(default)]
+    membership_epoch: Option<String>,
+    #[serde(default)]
+    membership_epoch_hash: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -2571,7 +2746,7 @@ struct SyncAttachment {
     content_type: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum ParsedMessageCryptoContext {
     LegacyUnknown,
     SenderKeyV5 {
@@ -2580,6 +2755,15 @@ enum ParsedMessageCryptoContext {
         sender_device_id: [u8; 16],
         sender_binding_version: u64,
     },
+    SenderKeyV6 {
+        roster_version: u64,
+        roster_commitment: [u8; 32],
+        sender_device_id: [u8; 16],
+        sender_binding_version: u64,
+        membership_epoch: u64,
+        membership_epoch_hash: [u8; 32],
+    },
+    DirectV2(veil_client::api::DirectMessageSecurityContextV2),
 }
 
 #[derive(Default)]
@@ -2827,25 +3011,80 @@ fn parse_decimal_u63(field: &str, value: &str, allow_zero: bool) -> Result<u64, 
     Ok(parsed)
 }
 
-fn parse_message_crypto_context(
-    profile: &str,
-    era: Option<&str>,
-    roster_version: Option<&str>,
-    roster_commitment: Option<&str>,
-    sender_device_id: Option<&str>,
-    sender_binding_version: Option<&str>,
+struct MessageCryptoContextWire<'a> {
+    profile: &'a str,
+    sender_user_id: &'a str,
+    era: Option<&'a str>,
+    roster_version: Option<&'a str>,
+    roster_commitment: Option<&'a str>,
+    sender_device_id: Option<&'a str>,
+    sender_binding_version: Option<&'a str>,
+    sender_device_identity_key: Option<&'a str>,
+    sender_device_signing_key: Option<&'a str>,
+    sender_device_capabilities: Option<&'a str>,
+    sender_device_binding_status: Option<u8>,
+    sender_account_signature: Option<&'a str>,
+    target_device_id: Option<&'a str>,
+    target_binding_version: Option<&'a str>,
+    direct_session_id: Option<&'a str>,
+    membership_epoch: Option<&'a str>,
+    membership_epoch_hash: Option<&'a str>,
+}
+
+fn parse_message_crypto_context_wire(
+    wire: MessageCryptoContextWire<'_>,
 ) -> Result<ParsedMessageCryptoContext, String> {
+    let MessageCryptoContextWire {
+        profile,
+        sender_user_id,
+        era,
+        roster_version,
+        roster_commitment,
+        sender_device_id,
+        sender_binding_version,
+        sender_device_identity_key,
+        sender_device_signing_key,
+        sender_device_capabilities,
+        sender_device_binding_status,
+        sender_account_signature,
+        target_device_id,
+        target_binding_version,
+        direct_session_id,
+        membership_epoch,
+        membership_epoch_hash,
+    } = wire;
     let all_absent = era.is_none()
         && roster_version.is_none()
         && roster_commitment.is_none()
         && sender_device_id.is_none()
-        && sender_binding_version.is_none();
+        && sender_binding_version.is_none()
+        && sender_device_identity_key.is_none()
+        && sender_device_signing_key.is_none()
+        && sender_device_capabilities.is_none()
+        && sender_device_binding_status.is_none()
+        && sender_account_signature.is_none()
+        && target_device_id.is_none()
+        && target_binding_version.is_none()
+        && direct_session_id.is_none()
+        && membership_epoch.is_none()
+        && membership_epoch_hash.is_none();
     match profile {
         "legacy_unknown" if all_absent => Ok(ParsedMessageCryptoContext::LegacyUnknown),
         "legacy_unknown" => {
             Err("legacy message crypto profile carries a partial modern context".to_string())
         }
-        "sender_key_v5" => {
+        "sender_key_v5"
+            if sender_device_identity_key.is_none()
+                && sender_device_signing_key.is_none()
+                && sender_device_capabilities.is_none()
+                && sender_device_binding_status.is_none()
+                && sender_account_signature.is_none()
+                && target_device_id.is_none()
+                && target_binding_version.is_none()
+                && direct_session_id.is_none()
+                && membership_epoch.is_none()
+                && membership_epoch_hash.is_none() =>
+        {
             let era = parse_decimal_u63(
                 "message crypto_era",
                 era.ok_or("sender-key message is missing crypto_era")?,
@@ -2880,12 +3119,187 @@ fn parse_message_crypto_context(
                 )?,
             })
         }
+        "sender_key_v6"
+            if sender_device_identity_key.is_none()
+                && sender_device_signing_key.is_none()
+                && sender_device_capabilities.is_none()
+                && sender_device_binding_status.is_none()
+                && sender_account_signature.is_none()
+                && target_device_id.is_none()
+                && target_binding_version.is_none()
+                && direct_session_id.is_none() =>
+        {
+            let era = parse_decimal_u63(
+                "message crypto_era",
+                era.ok_or("Sender-Key v6 message is missing crypto_era")?,
+                false,
+            )?;
+            if era != 1 {
+                return Err("Sender-Key v6 message has an unsupported crypto era".to_string());
+            }
+            let sender_device_id = decode_lower_hex_fixed::<16>(
+                "message sender_device_id",
+                sender_device_id.ok_or("Sender-Key v6 message is missing sender_device_id")?,
+            )?;
+            let membership_epoch_hash = decode_lower_hex_fixed::<32>(
+                "message membership_epoch_hash",
+                membership_epoch_hash
+                    .ok_or("Sender-Key v6 message is missing membership_epoch_hash")?,
+            )?;
+            if sender_device_id == [0u8; 16] || membership_epoch_hash == [0u8; 32] {
+                return Err("Sender-Key v6 message contains a zero coordinate".to_string());
+            }
+            Ok(ParsedMessageCryptoContext::SenderKeyV6 {
+                roster_version: parse_decimal_u63(
+                    "message roster_version",
+                    roster_version.ok_or("Sender-Key v6 message is missing roster_version")?,
+                    false,
+                )?,
+                roster_commitment: decode_lower_hex_fixed::<32>(
+                    "message roster_commitment",
+                    roster_commitment
+                        .ok_or("Sender-Key v6 message is missing roster_commitment")?,
+                )?,
+                sender_device_id,
+                sender_binding_version: parse_decimal_u63(
+                    "message sender_binding_version",
+                    sender_binding_version
+                        .ok_or("Sender-Key v6 message is missing sender_binding_version")?,
+                    false,
+                )?,
+                membership_epoch: parse_decimal_u63(
+                    "message membership_epoch",
+                    membership_epoch.ok_or("Sender-Key v6 message is missing membership_epoch")?,
+                    false,
+                )?,
+                membership_epoch_hash,
+            })
+        }
+        "direct_v2"
+            if roster_version.is_none()
+                && roster_commitment.is_none()
+                && membership_epoch.is_none()
+                && membership_epoch_hash.is_none() =>
+        {
+            decode_canonical_uuid("Direct v2 history sender user id", sender_user_id)?;
+            let era = parse_decimal_u63(
+                "message crypto_era",
+                era.ok_or("Direct v2 message is missing crypto_era")?,
+                false,
+            )?;
+            if era != 1 {
+                return Err("Direct v2 message has an unsupported crypto era".to_string());
+            }
+            let sender_device_id = decode_lower_hex_fixed::<16>(
+                "message sender_device_id",
+                sender_device_id.ok_or("Direct v2 message is missing sender_device_id")?,
+            )?;
+            let sender_device_identity_key = decode_lower_hex_fixed::<32>(
+                "message sender_device_identity_key",
+                sender_device_identity_key
+                    .ok_or("Direct v2 message is missing sender device identity key")?,
+            )?;
+            let sender_device_signing_key = decode_lower_hex_fixed::<32>(
+                "message sender_device_signing_key",
+                sender_device_signing_key
+                    .ok_or("Direct v2 message is missing sender device signing key")?,
+            )?;
+            let sender_account_signature = decode_lower_hex_fixed::<64>(
+                "message sender_account_signature",
+                sender_account_signature
+                    .ok_or("Direct v2 message is missing sender account signature")?,
+            )?;
+            let target_device_id = decode_lower_hex_fixed::<16>(
+                "message target_device_id",
+                target_device_id.ok_or("Direct v2 message is missing target_device_id")?,
+            )?;
+            let direct_session_id = decode_lower_hex_fixed::<32>(
+                "message direct_session_id",
+                direct_session_id.ok_or("Direct v2 message is missing direct_session_id")?,
+            )?;
+            let sender_device_binding_status = sender_device_binding_status
+                .ok_or("Direct v2 message is missing sender binding status")?;
+            let sender_device_capabilities = parse_decimal_u63(
+                "message sender_device_capabilities",
+                sender_device_capabilities
+                    .ok_or("Direct v2 message is missing sender capabilities")?,
+                false,
+            )?;
+            if sender_device_id == [0u8; 16]
+                || target_device_id == [0u8; 16]
+                || sender_device_id == target_device_id
+                || sender_device_identity_key == [0u8; 32]
+                || sender_device_signing_key == [0u8; 32]
+                || sender_device_identity_key == sender_device_signing_key
+                || sender_account_signature == [0u8; 64]
+                || direct_session_id == [0u8; 32]
+                || sender_device_binding_status
+                    != veil_client::api::DIRECT_DEVICE_BINDING_STATUS_ACTIVE_V2
+            {
+                return Err("Direct v2 message contains an invalid device coordinate".to_string());
+            }
+            Ok(ParsedMessageCryptoContext::DirectV2(
+                veil_client::api::DirectMessageSecurityContextV2 {
+                    sender_user_id: sender_user_id.to_string(),
+                    sender_device_id,
+                    sender_binding_version: parse_decimal_u63(
+                        "message sender_binding_version",
+                        sender_binding_version
+                            .ok_or("Direct v2 message is missing sender_binding_version")?,
+                        false,
+                    )?,
+                    sender_device_identity_key,
+                    sender_device_signing_key,
+                    sender_device_capabilities,
+                    sender_device_binding_status,
+                    sender_account_signature,
+                    target_device_id,
+                    target_binding_version: parse_decimal_u63(
+                        "message target_binding_version",
+                        target_binding_version
+                            .ok_or("Direct v2 message is missing target_binding_version")?,
+                        false,
+                    )?,
+                    direct_session_id,
+                },
+            ))
+        }
         _ => Err("message has an unknown crypto profile".to_string()),
     }
 }
 
+#[cfg(test)]
+fn parse_message_crypto_context(
+    profile: &str,
+    era: Option<&str>,
+    roster_version: Option<&str>,
+    roster_commitment: Option<&str>,
+    sender_device_id: Option<&str>,
+    sender_binding_version: Option<&str>,
+) -> Result<ParsedMessageCryptoContext, String> {
+    parse_message_crypto_context_wire(MessageCryptoContextWire {
+        profile,
+        sender_user_id: "",
+        era,
+        roster_version,
+        roster_commitment,
+        sender_device_id,
+        sender_binding_version,
+        sender_device_identity_key: None,
+        sender_device_signing_key: None,
+        sender_device_capabilities: None,
+        sender_device_binding_status: None,
+        sender_account_signature: None,
+        target_device_id: None,
+        target_binding_version: None,
+        direct_session_id: None,
+        membership_epoch: None,
+        membership_epoch_hash: None,
+    })
+}
+
 fn client_message_security_context(
-    parsed: ParsedMessageCryptoContext,
+    parsed: &ParsedMessageCryptoContext,
     target_device_id: [u8; 16],
 ) -> Option<MessageSecurityContextV1> {
     match parsed {
@@ -2897,13 +3311,34 @@ fn client_message_security_context(
             sender_binding_version,
         } => Some(MessageSecurityContextV1::SenderKeyV5(
             SenderKeyMessageSecurityContextV1 {
-                roster_version,
-                roster_commitment,
-                sender_device_id,
+                roster_version: *roster_version,
+                roster_commitment: *roster_commitment,
+                sender_device_id: *sender_device_id,
                 target_device_id,
-                sender_binding_version,
+                sender_binding_version: *sender_binding_version,
             },
         )),
+        ParsedMessageCryptoContext::SenderKeyV6 {
+            roster_version,
+            roster_commitment,
+            sender_device_id,
+            sender_binding_version,
+            membership_epoch,
+            membership_epoch_hash,
+        } => Some(MessageSecurityContextV1::SenderKeyV6(
+            SenderKeyMessageSecurityContextV6 {
+                roster_version: *roster_version,
+                roster_commitment: *roster_commitment,
+                sender_device_id: *sender_device_id,
+                target_device_id,
+                sender_binding_version: *sender_binding_version,
+                membership_epoch: *membership_epoch,
+                membership_epoch_hash: *membership_epoch_hash,
+            },
+        )),
+        ParsedMessageCryptoContext::DirectV2(context) => {
+            Some(MessageSecurityContextV1::DirectV2(context.clone()))
+        }
     }
 }
 
@@ -2912,11 +3347,18 @@ fn validate_live_message_security_context(
     context: Option<&MessageSecurityContextV1>,
 ) -> Result<(), String> {
     match (sender_key_mode, context) {
-        (false, None) | (true, Some(MessageSecurityContextV1::SenderKeyV5(_))) => Ok(()),
-        (false, Some(_)) => Err("DM message carries a Sender-Key security context".to_string()),
-        (true, None) => {
-            Err("group/channel message is missing its Sender-Key v5 context".to_string())
+        (false, None)
+        | (false, Some(MessageSecurityContextV1::DirectV2(_)))
+        | (true, Some(MessageSecurityContextV1::SenderKeyV5(_)))
+        | (true, Some(MessageSecurityContextV1::SenderKeyV6(_))) => Ok(()),
+        (false, Some(MessageSecurityContextV1::SenderKeyV5(_)))
+        | (false, Some(MessageSecurityContextV1::SenderKeyV6(_))) => {
+            Err("DM message carries a Sender-Key security context".to_string())
         }
+        (true, Some(MessageSecurityContextV1::DirectV2(_))) => {
+            Err("group/channel message carries a Direct v2 context".to_string())
+        }
+        (true, None) => Err("group/channel message is missing its Sender-Key context".to_string()),
     }
 }
 
@@ -3354,6 +3796,36 @@ fn parse_device_directory(
         &wire.required_capabilities,
         false,
     )?;
+    let (membership_epoch, membership_epoch_hash) = match wire.membership_activated {
+        false
+            if wire.crypto_profile == "sender_key_v5"
+                && wire.membership_ready
+                && wire.membership_epoch.is_none()
+                && wire.membership_epoch_hash.is_none() =>
+        {
+            (0, [0u8; 32])
+        }
+        true if wire.crypto_profile == "sender_key_v6" => {
+            let epoch = parse_decimal_u63(
+                "device directory membership_epoch",
+                wire.membership_epoch
+                    .as_deref()
+                    .ok_or("activated device directory omitted membership_epoch")?,
+                false,
+            )?;
+            let hash = decode_lower_hex_fixed::<32>(
+                "device directory membership_epoch_hash",
+                wire.membership_epoch_hash
+                    .as_deref()
+                    .ok_or("activated device directory omitted membership_epoch_hash")?,
+            )?;
+            if hash == [0u8; 32] {
+                return Err("device directory membership epoch hash is zero".to_string());
+            }
+            (epoch, hash)
+        }
+        _ => return Err("device directory membership profile is inconsistent".to_string()),
+    };
     if let Some(reason) = wire.reason.as_deref() {
         validate_directory_reason("device directory reason", reason)?;
     }
@@ -3530,10 +4002,41 @@ fn parse_device_directory(
         });
     }
 
+    let (membership_conversation_kind, membership_bootstrap_owner) = match (
+        wire.membership_conversation_kind,
+        wire.membership_bootstrap_owner_id.as_deref(),
+        wire.membership_bootstrap_owner_signing_key.as_deref(),
+    ) {
+        (None, None, None) if !wire.membership_activated => (None, None),
+        (Some(kind @ (1 | 2)), Some(owner_id), Some(owner_signing_key)) => {
+            let owner_id =
+                decode_canonical_uuid("device directory membership_bootstrap_owner_id", owner_id)?;
+            let owner_signing_key = decode_lower_hex_fixed::<32>(
+                "device directory membership_bootstrap_owner_signing_key",
+                owner_signing_key,
+            )?;
+            if account_keys.get(&owner_id).map(|keys| keys.1) != Some(owner_signing_key) {
+                return Err("membership bootstrap owner is absent or key-substituted".to_string());
+            }
+            (
+                Some(kind),
+                Some(MembershipPolicySignerV1 {
+                    account_id: owner_id,
+                    account_signing_key: owner_signing_key,
+                }),
+            )
+        }
+        _ => {
+            return Err(
+                "device directory membership bootstrap scope is incomplete or invalid".to_string(),
+            );
+        }
+    };
+
     let member_without_eligible_device = member_user_ids
         .iter()
         .any(|member| eligible_by_member.get(member).copied().unwrap_or_default() == 0);
-    let derived_reason = if has_legacy {
+    let base_reason = if has_legacy {
         Some("legacy_unbound_device")
     } else if has_missing_capabilities {
         Some("active_device_missing_required_capabilities")
@@ -3541,6 +4044,11 @@ fn parse_device_directory(
         Some("member_has_no_eligible_active_device")
     } else {
         None
+    };
+    let derived_reason = if wire.membership_activated && !wire.membership_ready {
+        Some("membership_epoch_pending")
+    } else {
+        base_reason
     };
     if wire.ready != derived_reason.is_none() || wire.reason.as_deref() != derived_reason {
         return Err(
@@ -3554,10 +4062,362 @@ fn parse_device_directory(
         roster_commitment,
         required_capabilities,
         ready: wire.ready,
+        device_set_ready: base_reason.is_none(),
         unavailable_reason: wire.reason,
         member_user_ids,
         devices,
+        crypto_profile: wire.crypto_profile,
+        membership_activated: wire.membership_activated,
+        membership_ready: wire.membership_ready,
+        membership_epoch,
+        membership_epoch_hash,
+        membership_conversation_kind,
+        membership_bootstrap_owner,
     })
+}
+
+fn parse_membership_signer_v1(
+    wire: MembershipPolicySignerWireV1,
+) -> Result<MembershipPolicySignerV1, String> {
+    Ok(MembershipPolicySignerV1 {
+        account_id: decode_canonical_uuid("membership signer account_id", &wire.account_id)?,
+        account_signing_key: decode_lower_hex_fixed::<32>(
+            "membership signer account_signing_key",
+            &wire.account_signing_key,
+        )?,
+    })
+}
+
+fn parse_membership_epoch_record_v1(
+    wire: MembershipEpochWireV1,
+    expected_origin: &str,
+    expected_conversation_id: &str,
+    expected_epoch: u64,
+) -> Result<MembershipEpochRecordCandidateV1, String> {
+    if wire.version != 1
+        || wire.canonical_origin != expected_origin
+        || wire.conversation_id != expected_conversation_id
+        || wire.crypto_profile != "sender_key_v6"
+    {
+        return Err("membership epoch scope or version is invalid".to_string());
+    }
+    let conversation_id =
+        decode_canonical_uuid("membership epoch conversation_id", &wire.conversation_id)?;
+    let epoch_number = parse_decimal_u63("membership epoch", &wire.epoch, false)?;
+    if epoch_number != expected_epoch {
+        return Err("membership epoch page is non-contiguous".to_string());
+    }
+    let crypto_era = parse_decimal_u63("membership crypto_era", &wire.crypto_era, false)?;
+    if crypto_era != u64::from(MEMBERSHIP_CRYPTO_ERA_V1) {
+        return Err("membership crypto era is unsupported".to_string());
+    }
+    let policy_signers = wire
+        .policy_signers
+        .into_iter()
+        .map(parse_membership_signer_v1)
+        .collect::<Result<Vec<_>, _>>()?;
+    let epoch = MembershipEpochV1 {
+        canonical_origin: wire.canonical_origin,
+        conversation_id,
+        conversation_kind: wire.conversation_kind,
+        epoch: epoch_number,
+        predecessor_hash: decode_lower_hex_fixed::<32>(
+            "membership predecessor_hash",
+            &wire.predecessor_hash,
+        )?,
+        roster_version: parse_decimal_u63(
+            "membership roster_version",
+            &wire.roster_version,
+            false,
+        )?,
+        roster_commitment: decode_lower_hex_fixed::<32>(
+            "membership roster_commitment",
+            &wire.roster_commitment,
+        )?,
+        successor_policy: MembershipPolicyV1 {
+            threshold: wire.policy_threshold,
+            signers: policy_signers,
+        },
+        crypto_profile: MEMBERSHIP_CRYPTO_PROFILE_SENDER_KEY_V6,
+        crypto_era: MEMBERSHIP_CRYPTO_ERA_V1,
+        mutation_nonce: decode_lower_hex_fixed::<32>(
+            "membership mutation_nonce",
+            &wire.mutation_nonce,
+        )?,
+    };
+    epoch.validate()?;
+    let epoch_hash = decode_lower_hex_fixed::<32>("membership epoch_hash", &wire.epoch_hash)?;
+    if epoch_hash == [0u8; 32] || epoch.hash()? != epoch_hash {
+        return Err("membership epoch hash does not match canonical contents".to_string());
+    }
+    let signatures = wire
+        .signatures
+        .into_iter()
+        .map(|signature| {
+            Ok(MembershipEpochSignatureV1 {
+                signer_account_id: decode_canonical_uuid(
+                    "membership signature signer_account_id",
+                    &signature.signer_account_id,
+                )?,
+                signature: decode_lower_hex_fixed::<64>(
+                    "membership epoch signature",
+                    &signature.signature,
+                )?,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let bootstrap_owner = wire
+        .bootstrap_owner
+        .map(parse_membership_signer_v1)
+        .transpose()?;
+    Ok(MembershipEpochRecordCandidateV1 {
+        epoch,
+        epoch_hash,
+        signatures,
+        bootstrap_owner,
+    })
+}
+
+fn fetch_authenticated_membership_epoch_chain_v1(
+    state: &AppState,
+    server_http_url: &str,
+    user_id: &str,
+    canonical_origin: &str,
+    conversation_id: &str,
+    expected_head_epoch: u64,
+    expected_head_hash: [u8; 32],
+) -> Result<MembershipEpochChainCandidateV1, String> {
+    const PAGE_LIMIT: usize = 100;
+    const MAX_EPOCHS: usize = 100_000;
+    let base_url = rest_api_url(
+        server_http_url,
+        &["v1", "conversations", conversation_id, "membership-epochs"],
+    )?;
+    let mut after_epoch = 0u64;
+    let mut records = Vec::new();
+    loop {
+        if records.len() >= MAX_EPOCHS {
+            return Err("membership epoch history exceeds the client limit".to_string());
+        }
+        let url = format!("{base_url}?after_epoch={after_epoch}&limit={PAGE_LIMIT}");
+        let value = state.runtime.block_on(rest_send_json(
+            state,
+            reqwest::Method::GET,
+            url,
+            user_id,
+            None,
+        ))?;
+        let page: MembershipEpochPageWireV1 = serde_json::from_value(value)
+            .map_err(|error| format!("invalid membership epoch response: {error}"))?;
+        let head_epoch = parse_decimal_u63("membership head_epoch", &page.head_epoch, false)?;
+        let head_hash = decode_lower_hex_fixed::<32>("membership head_hash", &page.head_hash)?;
+        if page.version != 1
+            || head_epoch != expected_head_epoch
+            || head_hash != expected_head_hash
+            || page.epochs.is_empty()
+            || page.epochs.len() > PAGE_LIMIT
+        {
+            return Err("membership epoch page head or size changed".to_string());
+        }
+        for wire in page.epochs {
+            let expected_epoch = after_epoch
+                .checked_add(1)
+                .ok_or("membership epoch number overflow")?;
+            records.push(parse_membership_epoch_record_v1(
+                wire,
+                canonical_origin,
+                conversation_id,
+                expected_epoch,
+            )?);
+            after_epoch = expected_epoch;
+        }
+        if page.has_more {
+            if after_epoch >= head_epoch {
+                return Err("membership epoch pagination contradicts its head".to_string());
+            }
+            continue;
+        }
+        if after_epoch != head_epoch {
+            return Err("membership epoch history ended before its head".to_string());
+        }
+        return Ok(MembershipEpochChainCandidateV1 {
+            canonical_origin: canonical_origin.to_string(),
+            conversation_id: conversation_id.to_string(),
+            head_epoch,
+            head_hash,
+            records,
+        });
+    }
+}
+
+fn encode_uuid_bytes_v1(value: &[u8; 16]) -> String {
+    let encoded = hex::encode(value);
+    format!(
+        "{}-{}-{}-{}-{}",
+        &encoded[0..8],
+        &encoded[8..12],
+        &encoded[12..16],
+        &encoded[16..20],
+        &encoded[20..32]
+    )
+}
+
+fn membership_epoch_request_json_v1(prepared: &PreparedMembershipEpochV1) -> serde_json::Value {
+    let epoch = &prepared.epoch;
+    serde_json::json!({
+        "version": 1,
+        "canonical_origin": epoch.canonical_origin,
+        "conversation_id": encode_uuid_bytes_v1(&epoch.conversation_id),
+        "conversation_kind": epoch.conversation_kind,
+        "epoch": epoch.epoch.to_string(),
+        "predecessor_hash": hex::encode(epoch.predecessor_hash),
+        "roster_version": epoch.roster_version.to_string(),
+        "roster_commitment": hex::encode(epoch.roster_commitment),
+        "policy_threshold": epoch.successor_policy.threshold,
+        "policy_signers": epoch.successor_policy.signers.iter().map(|signer| serde_json::json!({
+            "account_id": encode_uuid_bytes_v1(&signer.account_id),
+            "account_signing_key": hex::encode(signer.account_signing_key),
+        })).collect::<Vec<_>>(),
+        "crypto_profile": "sender_key_v6",
+        "crypto_era": epoch.crypto_era.to_string(),
+        "mutation_nonce": hex::encode(epoch.mutation_nonce),
+        "signatures": prepared.signatures.iter().map(|signature| serde_json::json!({
+            "signer_account_id": encode_uuid_bytes_v1(&signature.signer_account_id),
+            "signature": hex::encode(signature.signature),
+        })).collect::<Vec<_>>(),
+    })
+}
+
+fn submit_membership_epoch_v1(
+    state: &AppState,
+    server_http_url: &str,
+    user_id: &str,
+    conversation_id: &str,
+    prepared: &PreparedMembershipEpochV1,
+) -> Result<(), String> {
+    let url = rest_api_url(
+        server_http_url,
+        &["v1", "conversations", conversation_id, "membership-epochs"],
+    )?;
+    let response = state.runtime.block_on(rest_send_json(
+        state,
+        reqwest::Method::POST,
+        url,
+        user_id,
+        Some(membership_epoch_request_json_v1(prepared)),
+    ))?;
+    let response: MembershipEpochStoreResponseWireV1 = serde_json::from_value(response)
+        .map_err(|error| format!("invalid membership epoch store response: {error}"))?;
+    let record = parse_membership_epoch_record_v1(
+        response.membership_epoch,
+        &prepared.epoch.canonical_origin,
+        conversation_id,
+        prepared.epoch.epoch,
+    )?;
+    if record.epoch != prepared.epoch
+        || record.epoch_hash != prepared.epoch_hash
+        || record.signatures != prepared.signatures
+        || (prepared.epoch.epoch == 1) != record.bootstrap_owner.is_some()
+    {
+        return Err("membership epoch store response changed the signed candidate".to_string());
+    }
+    let _ = response.stored;
+    Ok(())
+}
+
+fn try_advance_membership_epoch_v1(
+    state: &AppState,
+    server_http_url: &str,
+    user_id: &str,
+    canonical_origin: &str,
+    parsed: &ParsedDeviceRoster,
+) -> Result<bool, String> {
+    if !parsed.device_set_ready {
+        return Ok(false);
+    }
+    let (membership_conversation_kind, membership_bootstrap_owner) = match (
+        parsed.membership_conversation_kind,
+        parsed.membership_bootstrap_owner,
+    ) {
+        (None, None) if !parsed.membership_activated => return Ok(false),
+        (Some(kind @ (1 | 2)), Some(owner)) => (kind, owner),
+        _ => return Err("device directory membership bootstrap scope is invalid".to_string()),
+    };
+    let user_id_bytes = decode_canonical_uuid("authenticated membership signer", user_id)?;
+    let all_devices_support_v6 = parsed.devices.iter().all(|entry| {
+        entry
+            .binding
+            .as_ref()
+            .is_none_or(|binding| binding.status != 1 || binding.capabilities & 4 != 0)
+    });
+    if !parsed.membership_activated {
+        if !parsed.ready
+            || !all_devices_support_v6
+            || membership_bootstrap_owner.account_id != user_id_bytes
+        {
+            return Ok(false);
+        }
+        let prepared = {
+            let client = state.client.lock().map_err(|error| error.to_string())?;
+            client.prepare_membership_epoch_bootstrap_v1(
+                &parsed.conversation_id,
+                membership_conversation_kind,
+                parsed.roster_version,
+                parsed.roster_commitment,
+                membership_bootstrap_owner,
+            )?
+        };
+        submit_membership_epoch_v1(
+            state,
+            server_http_url,
+            user_id,
+            &parsed.conversation_id,
+            &prepared,
+        )?;
+        return Ok(true);
+    }
+    if parsed.membership_ready || !all_devices_support_v6 {
+        return Ok(false);
+    }
+    let chain = fetch_authenticated_membership_epoch_chain_v1(
+        state,
+        server_http_url,
+        user_id,
+        canonical_origin,
+        &parsed.conversation_id,
+        parsed.membership_epoch,
+        parsed.membership_epoch_hash,
+    )?;
+    let predecessor = &chain
+        .records
+        .last()
+        .ok_or("membership predecessor is missing")?
+        .epoch;
+    if predecessor.successor_policy.threshold != 1
+        || !predecessor
+            .successor_policy
+            .signers
+            .iter()
+            .any(|signer| signer.account_id == user_id_bytes)
+    {
+        return Ok(false);
+    }
+    let prepared = {
+        let client = state.client.lock().map_err(|error| error.to_string())?;
+        client.prepare_membership_epoch_transition_v1(
+            predecessor,
+            parsed.roster_version,
+            parsed.roster_commitment,
+        )?
+    };
+    submit_membership_epoch_v1(
+        state,
+        server_http_url,
+        user_id,
+        &parsed.conversation_id,
+        &prepared,
+    )?;
+    Ok(true)
 }
 
 fn current_target_admission_evidence(
@@ -3635,7 +4495,7 @@ enum SenderKeyHistoryInspectionOutcome {
 
 #[allow(clippy::too_many_arguments)]
 fn reconcile_sender_key_history_inspection(
-    client: &VeilClient,
+    client: &mut VeilClient,
     inspection: &veil_client::api::SenderKeyMessageContextInspectionV1,
     current_target_admission: Option<&CurrentTargetAdmissionEvidence>,
     message_created_at: &str,
@@ -4444,6 +5304,138 @@ fn pin_and_persist_sync_conversation(
     Ok((directory, sender_key_refresh))
 }
 
+fn local_conversation_is_missing(
+    client: &VeilClient,
+    conversation_id: &str,
+) -> Result<bool, String> {
+    Ok(!client
+        .db()
+        .ok_or("database not initialized")?
+        .get_conversations()?
+        .iter()
+        .any(|conversation| conversation.id == conversation_id))
+}
+
+/// Resolve one presentation-free live hint through the exact signed REST
+/// directory. This is intentionally not a mini trust path: it reuses the same
+/// account pins, origin binding, ACL-filtered member directory and device
+/// roster admission as offline sync before any live SKDM/message can consume
+/// cryptographic state.
+fn hydrate_exact_live_conversation(
+    state: &AppState,
+    binding: &RestBinding,
+    event_app: &AuthenticatedEventAppHandle,
+    conversation_id: &str,
+) -> Result<(), String> {
+    decode_canonical_uuid("live conversation discovery id", conversation_id)?;
+    let canonical_server_origin = binding.origin.canonical_server_origin();
+    let authenticated_user_id = {
+        let client = state.client.lock().map_err(|error| error.to_string())?;
+        client.authenticated_user_id()?
+    };
+    let value = state.runtime.block_on(rest_send_json_for_binding(
+        state,
+        reqwest::Method::GET,
+        rest_api_url(
+            &canonical_server_origin,
+            &["v1", "conversations", conversation_id],
+        )?,
+        &authenticated_user_id,
+        None,
+        binding,
+    ))?;
+    let conversation: SyncConversation = serde_json::from_value(value)
+        .map_err(|error| format!("invalid exact conversation discovery response: {error}"))?;
+    if conversation.id != conversation_id {
+        return Err("exact conversation discovery changed its conversation id".to_string());
+    }
+
+    let (directory, sender_key_refresh) = pin_and_persist_sync_conversation(
+        state,
+        &authenticated_user_id,
+        &canonical_server_origin,
+        &conversation,
+        event_app,
+    )?;
+
+    let projection = {
+        let client = state.client.lock().map_err(|error| error.to_string())?;
+        client
+            .db()
+            .ok_or("database not initialized")?
+            .get_conversations()?
+            .into_iter()
+            .find(|candidate| candidate.id == conversation_id)
+            .ok_or("hydrated conversation is absent from the encrypted directory")?
+    };
+
+    // Publish the now-authoritative directory row even when a device roster is
+    // temporarily not ready. The Circle remains visible with its existing
+    // crypto quarantine instead of disappearing until an unrelated reconnect.
+    event_app.emit(
+        "veil://conversation-available",
+        serde_json::json!({
+            "conversationId": projection.id,
+            "conversationType": match projection.conv_type {
+                veil_store::models::ConversationType::DM => "dm",
+                veil_store::models::ConversationType::Group => "group",
+                veil_store::models::ConversationType::Channel => "channel",
+            },
+            "conversationName": projection.name.unwrap_or_default(),
+            "conversationPeerUserId": projection.peer_user_id,
+            "serverOrigin": projection.server_origin,
+        }),
+    )?;
+
+    if sender_key_refresh.is_some() {
+        match fetch_and_install_authenticated_device_directory(
+            state,
+            &binding.origin.canonical_server_origin(),
+            &authenticated_user_id,
+            conversation_id,
+            &directory,
+            Some(binding),
+        )? {
+            DeviceDirectoryInstallOutcome::Ready(_) => {}
+            DeviceDirectoryInstallOutcome::NotReady(reason) => {
+                return Err(format!(
+                    "live conversation device roster is not ready: {reason}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn report_live_conversation_hydration_failure(
+    state: &AppState,
+    event_app: &AuthenticatedEventAppHandle,
+    conversation_id: &str,
+    error: &str,
+) {
+    let detail = format!("live conversation directory refresh failed: {error}");
+    if let Ok(mut client) = state.client.lock() {
+        let sender_key_mode = client.is_channel_conversation(conversation_id);
+        let _ = quarantine_live_conversation(
+            state,
+            event_app,
+            &mut client,
+            conversation_id,
+            sender_key_mode,
+            "live_directory_refresh_required",
+            &detail,
+        );
+    }
+    let _ = event_app.emit(
+        "veil://error",
+        serde_json::json!({ "code": 4003, "message": detail }),
+    );
+    let _ = event_app.emit(
+        "veil://membership-refresh-required",
+        serde_json::json!({ "conversationId": conversation_id }),
+    );
+}
+
 struct OfflineConversationSyncScope<'a> {
     server_http_url: &'a str,
     authenticated_user_id: &'a str,
@@ -4587,14 +5579,25 @@ fn sync_conversation_messages(
                     message.id
                 ));
             }
-            let crypto_context = parse_message_crypto_context(
-                &message.crypto_profile,
-                message.crypto_era.as_deref(),
-                message.roster_version.as_deref(),
-                message.roster_commitment.as_deref(),
-                message.sender_device_id.as_deref(),
-                message.sender_binding_version.as_deref(),
-            )?;
+            let crypto_context = parse_message_crypto_context_wire(MessageCryptoContextWire {
+                profile: &message.crypto_profile,
+                sender_user_id: &message.sender_id,
+                era: message.crypto_era.as_deref(),
+                roster_version: message.roster_version.as_deref(),
+                roster_commitment: message.roster_commitment.as_deref(),
+                sender_device_id: message.sender_device_id.as_deref(),
+                sender_binding_version: message.sender_binding_version.as_deref(),
+                sender_device_identity_key: message.sender_device_identity_key.as_deref(),
+                sender_device_signing_key: message.sender_device_signing_key.as_deref(),
+                sender_device_capabilities: message.sender_device_capabilities.as_deref(),
+                sender_device_binding_status: message.sender_device_binding_status,
+                sender_account_signature: message.sender_account_signature.as_deref(),
+                target_device_id: message.target_device_id.as_deref(),
+                target_binding_version: message.target_binding_version.as_deref(),
+                direct_session_id: message.direct_session_id.as_deref(),
+                membership_epoch: message.membership_epoch.as_deref(),
+                membership_epoch_hash: message.membership_epoch_hash.as_deref(),
+            })?;
 
             let response_identity =
                 decode_lower_hex_32("message sender_identity_key", &message.sender_identity_key)?;
@@ -4654,12 +5657,24 @@ fn sync_conversation_messages(
             let mut client = state.client.lock().map_err(|e| e.to_string())?;
             let sender_key_mode = client.is_channel_conversation(conversation_id);
             let message_security_context =
-                client_message_security_context(crypto_context, client.device_id());
+                client_message_security_context(&crypto_context, client.device_id());
             if let Some((header, _)) = encrypted_wire.as_ref() {
                 let valid_header = if sender_key_mode {
                     header.as_slice() == [0x05]
                 } else {
-                    matches!(header.first(), Some(0x01 | 0x02))
+                    match &crypto_context {
+                        ParsedMessageCryptoContext::LegacyUnknown => {
+                            (header.first() == Some(&0x01) && header.len() == 82)
+                                || (header.first() == Some(&0x02) && header.len() == 42)
+                        }
+                        ParsedMessageCryptoContext::DirectV2(context) => {
+                            ((header.first() == Some(&0x11) && header.len() == 114)
+                                || (header.first() == Some(&0x12) && header.len() == 74))
+                                && header.get(1..33) == Some(context.direct_session_id.as_slice())
+                        }
+                        ParsedMessageCryptoContext::SenderKeyV5 { .. }
+                        | ParsedMessageCryptoContext::SenderKeyV6 { .. } => false,
+                    }
                 };
                 if !valid_header {
                     return Err(format!(
@@ -4699,7 +5714,29 @@ fn sync_conversation_messages(
 
             match (sender_key_mode, crypto_context) {
                 (false, ParsedMessageCryptoContext::LegacyUnknown) => {}
-                (false, ParsedMessageCryptoContext::SenderKeyV5 { .. }) => {
+                (false, ParsedMessageCryptoContext::DirectV2(ref context)) => {
+                    if remote_state == veil_store::models::RemoteMessageStateKind::Active
+                        && message.sender_id != authenticated_user_id
+                        && (context.target_device_id != client.device_id()
+                            || client.current_device_binding_version_v1()
+                                != Some(context.target_binding_version))
+                    {
+                        client.reconcile_remote_message_metadata(
+                            &message.id,
+                            conversation_id,
+                            &response_identity,
+                            &metadata,
+                            veil_store::models::RemoteMessageStateKind::Unavailable,
+                        )?;
+                        stats.unavailable_history += 1;
+                        continue;
+                    }
+                }
+                (
+                    false,
+                    ParsedMessageCryptoContext::SenderKeyV5 { .. }
+                    | ParsedMessageCryptoContext::SenderKeyV6 { .. },
+                ) => {
                     return Err(format!(
                         "DM message {} carries a sender-key security context",
                         message.id
@@ -4753,7 +5790,17 @@ fn sync_conversation_messages(
                     continue;
                 }
                 (true, ParsedMessageCryptoContext::LegacyUnknown) => {}
-                (true, ParsedMessageCryptoContext::SenderKeyV5 { .. }) => {
+                (true, ParsedMessageCryptoContext::DirectV2(_)) => {
+                    return Err(format!(
+                        "group/channel message {} carries a Direct v2 security context",
+                        message.id
+                    ));
+                }
+                (
+                    true,
+                    ParsedMessageCryptoContext::SenderKeyV5 { .. }
+                    | ParsedMessageCryptoContext::SenderKeyV6 { .. },
+                ) => {
                     if remote_state == veil_store::models::RemoteMessageStateKind::Active {
                         let existing_local_self = message.sender_id == authenticated_user_id
                             && client
@@ -4773,7 +5820,7 @@ fn sync_conversation_messages(
                                     .ok_or("Sender-Key message context conversion failed")?,
                             )?;
                             if reconcile_sender_key_history_inspection(
-                                &client,
+                                &mut client,
                                 &validation,
                                 current_target_admission,
                                 &message.created_at,
@@ -5502,13 +6549,48 @@ fn connect_to_server(
                     Ok(event) => event,
                     Err(error) => {
                         drop(client);
+                        // `poll_event` errors are terminal for this authenticated
+                        // stream (including fail-closed protocol violations).
+                        // Invalidate the exact generation before notifying the
+                        // renderer so its disconnected handler can reconnect.
+                        // The session-transition guard prevents a replacement
+                        // connection from publishing between the scope check and
+                        // this teardown; the explicit binding comparison also
+                        // protects against any delayed old-generation failure.
+                        let invalidated = {
+                            let mut binding = state_inner
+                                .authenticated_rest_origin
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            let mut renderer_binding = state_inner
+                                .renderer_confirmed_rest_binding
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            invalidate_terminal_poll_generation(
+                                &mut binding,
+                                &mut renderer_binding,
+                                &state_inner.offline_sync_ready,
+                                &event_binding,
+                            )
+                        };
+                        state_inner.authenticated_rest_origin.clear_poison();
+                        state_inner.renderer_confirmed_rest_binding.clear_poison();
+                        let detail = format!("failed to reconcile server event: {error}");
                         let _ = app_handle.emit(
                             "veil://error",
                             serde_json::json!({
                                 "code": 5001,
-                                "message": format!("failed to reconcile server event: {error}"),
+                                "message": detail,
                             }),
                         );
+                        if invalidated {
+                            let _ = app_handle.emit(
+                                "veil://disconnected",
+                                serde_json::json!({
+                                    "reason": format!("native event stream terminated: {error}"),
+                                }),
+                            );
+                        }
                         continue;
                     }
                 };
@@ -5532,9 +6614,52 @@ fn connect_to_server(
                             header,
                             server_timestamp,
                             reply_to_id,
+                            // The shared transport preserves optional wire-policy
+                            // presence for mobile's fail-closed replay boundary.
+                            // Desktop already reconciles type/expiry through its
+                            // attachment and revision-history paths; acknowledge
+                            // the fields explicitly so future event additions still
+                            // break this exhaustive consumer at compile time.
+                            msg_type: _,
+                            ttl_seconds: _,
+                            sealed: _,
                             attachments,
                             security_context,
                         } => {
+                            match local_conversation_is_missing(&client, &conversation_id) {
+                                Ok(true) => {
+                                    drop(client);
+                                    if let Err(error) = hydrate_exact_live_conversation(
+                                        &state_inner,
+                                        &event_binding,
+                                        &app_handle,
+                                        &conversation_id,
+                                    ) {
+                                        report_live_conversation_hydration_failure(
+                                            &state_inner,
+                                            &app_handle,
+                                            &conversation_id,
+                                            &error,
+                                        );
+                                        continue;
+                                    }
+                                    client = match state_inner.client.lock() {
+                                        Ok(client) => client,
+                                        Err(_) => break,
+                                    };
+                                }
+                                Ok(false) => {}
+                                Err(error) => {
+                                    drop(client);
+                                    report_live_conversation_hydration_failure(
+                                        &state_inner,
+                                        &app_handle,
+                                        &conversation_id,
+                                        &error,
+                                    );
+                                    continue;
+                                }
+                            }
                             if !live_conversation_origin_is_current(
                                 &state_inner,
                                 &app_handle,
@@ -5629,6 +6754,44 @@ fn connect_to_server(
                                     serde_json::json!({ "conversationId": conversation_id }),
                                 );
                                 continue;
+                            }
+                            if sender_key_mode {
+                                let validation = security_context
+                                    .as_ref()
+                                    .ok_or_else(|| {
+                                        "live group message is missing its security context"
+                                            .to_string()
+                                    })
+                                    .and_then(|context| {
+                                        client.validate_live_sender_key_security_context_v1(
+                                            &conversation_id,
+                                            context,
+                                        )
+                                    });
+                                if let Err(error) = validation {
+                                    let detail = format!(
+                                        "live membership epoch validation rejected: {error}"
+                                    );
+                                    let _ = quarantine_live_conversation(
+                                        &state_inner,
+                                        &app_handle,
+                                        &mut client,
+                                        &conversation_id,
+                                        true,
+                                        "live_membership_epoch_rejected",
+                                        &detail,
+                                    );
+                                    drop(client);
+                                    let _ = app_handle.emit(
+                                        "veil://error",
+                                        serde_json::json!({"code": 4004, "message": detail}),
+                                    );
+                                    let _ = app_handle.emit(
+                                        "veil://membership-refresh-required",
+                                        serde_json::json!({ "conversationId": conversation_id }),
+                                    );
+                                    continue;
+                                }
                             }
                             let author_snapshot = match client
                                 .db()
@@ -6524,6 +7687,22 @@ fn connect_to_server(
                                 }),
                             );
                         }
+                        ConnectionEvent::ConversationAvailable { conversation_id } => {
+                            drop(client);
+                            if let Err(error) = hydrate_exact_live_conversation(
+                                &state_inner,
+                                &event_binding,
+                                &app_handle,
+                                &conversation_id,
+                            ) {
+                                report_live_conversation_hydration_failure(
+                                    &state_inner,
+                                    &app_handle,
+                                    &conversation_id,
+                                    &error,
+                                );
+                            }
+                        }
                         ConnectionEvent::ServerEvent {
                             event_type,
                             server_id,
@@ -6682,6 +7861,40 @@ fn connect_to_server(
                             route,
                         } => {
                             let conversation_id = route.conversation_id.clone();
+                            match local_conversation_is_missing(&client, &conversation_id) {
+                                Ok(true) => {
+                                    drop(client);
+                                    if let Err(error) = hydrate_exact_live_conversation(
+                                        &state_inner,
+                                        &event_binding,
+                                        &app_handle,
+                                        &conversation_id,
+                                    ) {
+                                        report_live_conversation_hydration_failure(
+                                            &state_inner,
+                                            &app_handle,
+                                            &conversation_id,
+                                            &error,
+                                        );
+                                        continue;
+                                    }
+                                    client = match state_inner.client.lock() {
+                                        Ok(client) => client,
+                                        Err(_) => break,
+                                    };
+                                }
+                                Ok(false) => {}
+                                Err(error) => {
+                                    drop(client);
+                                    report_live_conversation_hydration_failure(
+                                        &state_inner,
+                                        &app_handle,
+                                        &conversation_id,
+                                        &error,
+                                    );
+                                    continue;
+                                }
+                            }
                             if !live_conversation_origin_is_current(
                                 &state_inner,
                                 &app_handle,
@@ -7826,8 +9039,10 @@ fn create_dm(
         establish_session_for_peer(
             &state,
             &server_http_url,
+            &conversation_id,
+            &peer_user_id,
             peer_identity_key,
-            Some(peer_signing_key),
+            peer_signing_key,
             &live_action_binding,
         )?;
         let mut client = state.client.lock().map_err(|e| e.to_string())?;
@@ -8347,6 +9562,26 @@ fn fetch_and_install_authenticated_device_directory(
     account_directory: &std::collections::HashMap<String, PinnedDirectoryMember>,
     live_action_binding: Option<&RestBinding>,
 ) -> Result<DeviceDirectoryInstallOutcome, String> {
+    fetch_and_install_authenticated_device_directory_inner(
+        state,
+        server_http_url,
+        user_id,
+        conversation_id,
+        account_directory,
+        live_action_binding,
+        true,
+    )
+}
+
+fn fetch_and_install_authenticated_device_directory_inner(
+    state: &AppState,
+    server_http_url: &str,
+    user_id: &str,
+    conversation_id: &str,
+    account_directory: &std::collections::HashMap<String, PinnedDirectoryMember>,
+    live_action_binding: Option<&RestBinding>,
+    allow_epoch_advance: bool,
+) -> Result<DeviceDirectoryInstallOutcome, String> {
     let parsed = match fetch_authenticated_device_directory(
         state,
         server_http_url,
@@ -8360,6 +9595,34 @@ fn fetch_and_install_authenticated_device_directory(
             return Err(error);
         }
     };
+    if let Err(error) = verify_device_directory_account_keys(&parsed, account_directory) {
+        invalidate_device_roster_for_binding(state, conversation_id, live_action_binding)?;
+        return Err(error);
+    }
+    let canonical_origin = rest_origin(
+        &reqwest::Url::parse(server_http_url)
+            .map_err(|error| format!("invalid membership REST origin: {error}"))?,
+    )?
+    .canonical_server_origin();
+    if allow_epoch_advance
+        && try_advance_membership_epoch_v1(
+            state,
+            server_http_url,
+            user_id,
+            &canonical_origin,
+            &parsed,
+        )?
+    {
+        return fetch_and_install_authenticated_device_directory_inner(
+            state,
+            server_http_url,
+            user_id,
+            conversation_id,
+            account_directory,
+            live_action_binding,
+            false,
+        );
+    }
     if !parsed.ready {
         let reason = parsed
             .unavailable_reason
@@ -8368,10 +9631,25 @@ fn fetch_and_install_authenticated_device_directory(
         invalidate_device_roster_for_binding(state, conversation_id, live_action_binding)?;
         return Ok(DeviceDirectoryInstallOutcome::NotReady(reason));
     }
-    if let Err(error) = verify_device_directory_account_keys(&parsed, account_directory) {
-        invalidate_device_roster_for_binding(state, conversation_id, live_action_binding)?;
-        return Err(error);
-    }
+    let membership_chain = if parsed.membership_activated {
+        match fetch_authenticated_membership_epoch_chain_v1(
+            state,
+            server_http_url,
+            user_id,
+            &canonical_origin,
+            conversation_id,
+            parsed.membership_epoch,
+            parsed.membership_epoch_hash,
+        ) {
+            Ok(chain) => Some(chain),
+            Err(error) => {
+                invalidate_device_roster_for_binding(state, conversation_id, live_action_binding)?;
+                return Err(error);
+            }
+        }
+    } else {
+        None
+    };
     let mut client = state.client.lock().map_err(|error| error.to_string())?;
     if let Some(binding) = live_action_binding {
         require_confirmed_live_action_binding_current(state, binding)?;
@@ -8391,7 +9669,16 @@ fn fetch_and_install_authenticated_device_directory(
             return Err(error);
         }
     };
-    client.install_device_roster_v1(parsed.into())?;
+    if let Err(error) = client.install_device_roster_v1(parsed.into()) {
+        client.invalidate_device_roster_v1(conversation_id);
+        return Err(error);
+    }
+    if let Some(chain) = membership_chain {
+        if let Err(error) = client.install_membership_epoch_chain_v1(chain) {
+            client.invalidate_device_roster_v1(conversation_id);
+            return Err(error);
+        }
+    }
     require_session_still_unlocked(state)?;
     Ok(DeviceDirectoryInstallOutcome::Ready(evidence))
 }
@@ -8518,8 +9805,12 @@ fn validate_server_endpoint_pair(ws_raw: &str, rest_raw: &str) -> Result<(), Str
         || ws.password().is_some()
         || ws.query().is_some()
         || ws.fragment().is_some()
+        || ws.path() != "/v3/events"
     {
-        return Err("WebSocket URL must not contain userinfo, query or fragment".to_string());
+        return Err(
+            "WebSocket URL must be an exact /v3/events endpoint without userinfo, query or fragment"
+                .to_string(),
+        );
     }
     if rest.query().is_some()
         || rest.fragment().is_some()
@@ -8551,103 +9842,10 @@ fn validate_server_endpoint_pair(ws_raw: &str, rest_raw: &str) -> Result<(), Str
     Ok(())
 }
 
-fn explicit_url_port(raw_url: &str) -> Result<Option<u16>, String> {
-    let (_, remainder) = raw_url
-        .split_once("://")
-        .ok_or_else(|| "REST URL is missing a scheme separator".to_string())?;
-    let authority_end = remainder.find(['/', '?', '#']).unwrap_or(remainder.len());
-    let authority = &remainder[..authority_end];
-    let port = if authority.starts_with('[') {
-        let close = authority
-            .find(']')
-            .ok_or_else(|| "invalid bracketed IPv6 authority".to_string())?;
-        let suffix = &authority[close + 1..];
-        if suffix.is_empty() {
-            None
-        } else {
-            Some(
-                suffix
-                    .strip_prefix(':')
-                    .ok_or_else(|| "invalid IPv6 authority suffix".to_string())?,
-            )
-        }
-    } else {
-        authority
-            .rsplit_once(':')
-            .and_then(|(_, port)| port.chars().all(|c| c.is_ascii_digit()).then_some(port))
-    };
-    port.map(|value| {
-        value
-            .parse::<u16>()
-            .map_err(|_| "invalid REST URL port".to_string())
-    })
-    .transpose()
-}
-
-fn rest_authority(url: &reqwest::Url, raw_url: &str) -> Result<String, String> {
-    let host = url
-        .host_str()
-        .ok_or_else(|| "REST URL is missing a host".to_string())?;
-    let unbracketed = host.trim_start_matches('[').trim_end_matches(']');
-    let mut authority = if unbracketed.contains(':') {
-        format!("[{}]", unbracketed.to_ascii_lowercase())
-    } else {
-        unbracketed.to_ascii_lowercase()
-    };
-    if let Some(port) = explicit_url_port(raw_url)? {
-        authority.push(':');
-        authority.push_str(&port.to_string());
-    }
-    Ok(authority)
-}
-
 fn rest_request_target(url: &reqwest::Url) -> String {
     match url.query() {
         Some(query) => format!("{}?{query}", url.path()),
         None => url.path().to_string(),
-    }
-}
-
-fn rest_canonical(
-    method: &reqwest::Method,
-    authority: &str,
-    request_target: &str,
-    timestamp_ms: i64,
-    body_hash_hex: &str,
-) -> String {
-    format!(
-        "veil-rest-v1\n{}\n{}\n{}\n{}\n{}",
-        method.as_str(),
-        authority,
-        request_target,
-        timestamp_ms,
-        body_hash_hex
-    )
-}
-
-fn next_rest_timestamp_ms() -> Result<i64, String> {
-    let now: i64 = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|_| "system clock is before Unix epoch".to_string())?
-        .as_millis()
-        .try_into()
-        .map_err(|_| "system clock exceeds signed millisecond range".to_string())?;
-    let mut previous = LAST_REST_TIMESTAMP_MS.load(Ordering::Acquire);
-    loop {
-        let next = now.max(
-            previous
-                .checked_add(1)
-                .ok_or_else(|| "REST timestamp allocator exhausted".to_string())?,
-        );
-        match LAST_REST_TIMESTAMP_MS.compare_exchange_weak(
-            previous,
-            next,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => return Ok(next),
-            Err(actual) => previous = actual,
-        }
     }
 }
 
@@ -8739,9 +9937,6 @@ async fn rest_send_raw_for_binding(
     payload: RawRestPayload,
     expected_binding: &RestBinding,
 ) -> Result<(reqwest::header::HeaderMap, Vec<u8>), String> {
-    use base64::Engine;
-    use sha2::{Digest, Sha256};
-
     require_unlocked(state)?;
     let parsed_url = reqwest::Url::parse(&url).map_err(|e| format!("invalid REST URL: {e}"))?;
     let rest_binding = require_authenticated_rest_origin(state, &parsed_url)?;
@@ -8756,33 +9951,27 @@ async fn rest_send_raw_for_binding(
     if user_id != authenticated_user_id {
         return Err("REST user id does not match the authenticated WebSocket session".into());
     }
-    let authority = rest_authority(&parsed_url, &url)?;
     let request_target = rest_request_target(&parsed_url);
-    let ts_ms = next_rest_timestamp_ms()?;
-    let canonical = rest_canonical(
-        &method,
-        &authority,
-        &request_target,
-        ts_ms,
-        &hex::encode(Sha256::digest(&payload.body)),
-    );
-    let signature = {
+    let auth_headers = {
         let client = state.client.lock().map_err(|e| e.to_string())?;
         require_session_still_unlocked(state)?;
         require_same_rest_binding(state, &parsed_url, &rest_binding)?;
         require_confirmed_live_action_binding_current(state, expected_binding)?;
         client
-            .sign_message(canonical.as_bytes())
-            .map(|signature| base64::engine::general_purpose::STANDARD.encode(signature))
-            .map_err(|e| format!("identity not initialized - cannot sign request: {e}"))?
+            .prepare_authenticated_rest_headers_v2(method.as_str(), &request_target, &payload.body)
+            .map_err(|e| format!("cannot authenticate REST v2 request: {e}"))?
     };
+    if auth_headers.user_id() != authenticated_user_id {
+        return Err("REST v2 signer changed the authenticated account".into());
+    }
     let mut request = state
         .http
         .request(method, parsed_url.clone())
-        .header(reqwest::header::HOST, &authority)
-        .header("X-Veil-User", &authenticated_user_id)
-        .header("X-Veil-Timestamp", ts_ms.to_string())
-        .header("X-Veil-Signature", signature);
+        .header("X-Veil-REST-Auth-Version", auth_headers.version())
+        .header("X-Veil-User", auth_headers.user_id())
+        .header("X-Veil-Timestamp", auth_headers.timestamp_ms())
+        .header("X-Veil-Nonce", auth_headers.nonce())
+        .header("X-Veil-Signature", auth_headers.signature());
     if let Some(content_type) = payload.content_type {
         request = request.header(reqwest::header::CONTENT_TYPE, content_type);
     }
@@ -8835,9 +10024,6 @@ async fn rest_send_json_with_expected_binding(
     body: Option<serde_json::Value>,
     expected_binding: Option<&RestBinding>,
 ) -> Result<serde_json::Value, String> {
-    use base64::Engine;
-    use sha2::{Digest, Sha256};
-
     require_unlocked(state)?;
     let parsed_url = reqwest::Url::parse(&url).map_err(|e| format!("invalid REST URL: {e}"))?;
     let rest_binding = require_authenticated_rest_origin(state, &parsed_url)?;
@@ -8855,31 +10041,16 @@ async fn rest_send_json_with_expected_binding(
         return Err("REST user id does not match the authenticated WebSocket session".into());
     }
 
-    // 1. Compute body bytes + hash up-front (so signing covers the wire body).
+    // Compute the exact wire body up-front so authentication covers it.
     let body_bytes: Vec<u8> = match body.as_ref() {
         Some(b) => serde_json::to_vec(b).map_err(|e| format!("serialize body: {e}"))?,
         None => Vec::new(),
     };
-    let body_hash = Sha256::digest(&body_bytes);
-
-    // 2. Canonical request context. Query parameters and authority are signed
-    // so authenticated requests cannot be redirected across users/origins.
-    let authority = rest_authority(&parsed_url, &url)?;
+    // The target is the exact path-and-query bytes seen by the HTTP client.
+    // Origin, account and freshness are supplied by the authenticated native
+    // session and cannot be chosen by the renderer.
     let request_target = rest_request_target(&parsed_url);
-    let ts_ms = next_rest_timestamp_ms()?;
-
-    let canonical = rest_canonical(
-        &method,
-        &authority,
-        &request_target,
-        ts_ms,
-        &hex::encode(body_hash),
-    );
-
-    // 3. Sign — short-lived client lock, dropped before async send.
-    //    Signing is REQUIRED: the server's allowUnsigned bypass has been
-    //    removed, so a missing signature would 401 every request anyway.
-    let sig_b64 = {
+    let auth_headers = {
         let client = state.client.lock().map_err(|e| e.to_string())?;
         require_session_still_unlocked(state)?;
         require_same_rest_binding(state, &parsed_url, &rest_binding)?;
@@ -8887,19 +10058,22 @@ async fn rest_send_json_with_expected_binding(
             require_confirmed_live_action_binding_current(state, expected)?;
         }
         client
-            .sign_message(canonical.as_bytes())
-            .map(|sig| base64::engine::general_purpose::STANDARD.encode(sig))
-            .map_err(|e| format!("identity not initialized — cannot sign request: {e}"))?
+            .prepare_authenticated_rest_headers_v2(method.as_str(), &request_target, &body_bytes)
+            .map_err(|e| format!("cannot authenticate REST v2 request: {e}"))?
     };
+    if auth_headers.user_id() != authenticated_user_id {
+        return Err("REST v2 signer changed the authenticated account".into());
+    }
 
     // 4. Build & send request via shared HTTP client (connection pooling).
     let mut req = state
         .http
         .request(method, parsed_url.clone())
-        .header(reqwest::header::HOST, &authority)
-        .header("X-Veil-User", &authenticated_user_id)
-        .header("X-Veil-Timestamp", ts_ms.to_string())
-        .header("X-Veil-Signature", sig_b64);
+        .header("X-Veil-REST-Auth-Version", auth_headers.version())
+        .header("X-Veil-User", auth_headers.user_id())
+        .header("X-Veil-Timestamp", auth_headers.timestamp_ms())
+        .header("X-Veil-Nonce", auth_headers.nonce())
+        .header("X-Veil-Signature", auth_headers.signature());
     if !body_bytes.is_empty() {
         req = req
             .header("Content-Type", "application/json")
@@ -10035,7 +11209,10 @@ fn kick_server_member(
     expected_server_origin: String,
     expected_binding_generation: String,
 ) -> Result<(), String> {
-    let body = reason.map(|r| serde_json::json!({ "reason": r }));
+    let body = Some(match reason {
+        Some(value) => serde_json::json!({ "reason": value }),
+        None => serde_json::json!({}),
+    });
     let request_url = rest_api_url(
         &server_http_url,
         &["v1", "servers", &server_id, "members", &target_user_id],
@@ -10073,7 +11250,10 @@ fn ban_server_member(
     expected_server_origin: String,
     expected_binding_generation: String,
 ) -> Result<(), String> {
-    let body = reason.map(|value| serde_json::json!({ "reason": value }));
+    let body = Some(match reason {
+        Some(value) => serde_json::json!({ "reason": value }),
+        None => serde_json::json!({}),
+    });
     let request_url = rest_api_url(
         &server_http_url,
         &["v1", "servers", &server_id, "bans", &target_user_id],
@@ -11083,7 +12263,10 @@ fn distribute_pinned_sender_key(
     let mut seen = std::collections::HashSet::new();
     let mut sent = 0u32;
     let started = Instant::now();
-    client.buffer_connection_events_during_sync();
+    if let Err(error) = client.buffer_connection_events_during_sync() {
+        client.mark_sender_key_distribution_failed(conversation_id);
+        return Err(error.to_string());
+    }
     for target in targets {
         if let Some(binding) = live_action_binding {
             if let Err(error) = require_confirmed_live_action_binding_current(state, binding) {
@@ -11117,7 +12300,10 @@ fn distribute_pinned_sender_key(
         }
         sent += 1;
         if sent.is_multiple_of(128) {
-            client.buffer_connection_events_during_sync();
+            if let Err(error) = client.buffer_connection_events_during_sync() {
+                client.mark_sender_key_distribution_failed(conversation_id);
+                return Err(error.to_string());
+            }
         }
     }
     if sent == 0 {
@@ -11361,10 +12547,23 @@ struct SearchHitDto {
     id: String,
     #[serde(rename = "conversationId")]
     conversation_id: String,
+    #[serde(rename = "conversationType")]
+    conversation_type: &'static str,
+    #[serde(rename = "conversationName")]
+    conversation_name: Option<String>,
+    #[serde(rename = "serverId")]
+    server_id: Option<String>,
     body: String,
     ts: i64,
     score: f32,
     author: Option<SearchAuthorDto>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SearchConversationMetadata {
+    conversation_type: &'static str,
+    conversation_name: Option<String>,
+    server_id: Option<String>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -11473,18 +12672,21 @@ fn get_search_coverage(state: State<'_, AppState>) -> Result<Option<SearchCovera
 fn validated_search_hit_dto(
     hit: SearchHit,
     stored: Message,
+    conversation: &veil_store::models::Conversation,
     canonical_server_origin: &str,
 ) -> Option<SearchHitDto> {
     if decode_canonical_uuid("search hit message id", &hit.id).is_err()
         || decode_canonical_uuid("search hit conversation id", &hit.conversation_id).is_err()
         || stored.id != hit.id
         || stored.conversation_id != hit.conversation_id
+        || conversation.id != hit.conversation_id
         || stored.plaintext != hit.body
         || stored.sender_key.len() != 32
         || hex::encode(&stored.sender_key) != hit.sender
     {
         return None;
     }
+    let metadata = validated_search_conversation_metadata(conversation, canonical_server_origin)?;
     let author_context = stored.author_context.map(MessageAuthorContext::wire_label);
     let author = match stored.author {
         Some(author) => {
@@ -11510,10 +12712,51 @@ fn validated_search_hit_dto(
     Some(SearchHitDto {
         id: hit.id,
         conversation_id: hit.conversation_id,
+        conversation_type: metadata.conversation_type,
+        conversation_name: metadata.conversation_name,
+        server_id: metadata.server_id,
         body: hit.body,
         ts: hit.ts,
         score: hit.score,
         author,
+    })
+}
+
+fn validated_search_conversation_metadata(
+    conversation: &veil_store::models::Conversation,
+    canonical_server_origin: &str,
+) -> Option<SearchConversationMetadata> {
+    if decode_canonical_uuid("search conversation id", &conversation.id).is_err()
+        || conversation.server_origin.as_deref() != Some(canonical_server_origin)
+    {
+        return None;
+    }
+    let (conversation_type, server_id) = match conversation.conv_type {
+        ConversationType::DM if conversation.server_id.is_none() => ("dm", None),
+        ConversationType::Group if conversation.server_id.is_none() => ("group", None),
+        ConversationType::Channel => {
+            let server_id = conversation.server_id.as_ref()?;
+            if decode_canonical_uuid("search channel server id", server_id).is_err() {
+                return None;
+            }
+            ("channel", Some(server_id.clone()))
+        }
+        _ => return None,
+    };
+    let conversation_name = conversation.name.as_ref().and_then(|name| {
+        let trimmed = name.trim();
+        if trimmed.is_empty()
+            || validate_profile_text("search conversation name", name, 512, false).is_err()
+        {
+            None
+        } else {
+            Some(name.clone())
+        }
+    });
+    Some(SearchConversationMetadata {
+        conversation_type,
+        conversation_name,
+        server_id,
     })
 }
 
@@ -11634,16 +12877,6 @@ fn search_messages(
     }
     let search_binding = authenticated_rest_binding(&state)?;
     let canonical_server_origin = search_binding.origin.canonical_server_origin();
-    let allowed_conversations: std::collections::HashSet<String> = client
-        .db()
-        .ok_or("database not initialized")?
-        .get_conversations()?
-        .into_iter()
-        .filter(|conversation| {
-            conversation.server_origin.as_deref() == Some(canonical_server_origin.as_str())
-        })
-        .map(|conversation| conversation.id)
-        .collect();
     drop(client);
     let hits = state
         .indexer
@@ -11654,17 +12887,27 @@ fn search_messages(
     }
     let client = state.client.lock().map_err(|e| e.to_string())?;
     let db = client.db().ok_or("database not initialized")?;
+    let allowed_conversations: std::collections::HashMap<String, veil_store::models::Conversation> =
+        db.get_conversations()?
+            .into_iter()
+            .filter(|conversation| {
+                conversation.server_origin.as_deref() == Some(canonical_server_origin.as_str())
+            })
+            .map(|conversation| (conversation.id.clone(), conversation))
+            .collect();
     let mut result = Vec::with_capacity(hits.len());
     for hit in hits {
-        if !allowed_conversations.contains(&hit.conversation_id) {
+        let Some(conversation) = allowed_conversations.get(&hit.conversation_id) else {
             continue;
-        }
+        };
         let Some(stored) =
             db.get_message_for_search(&hit.id, &hit.conversation_id, &canonical_server_origin)?
         else {
             continue;
         };
-        if let Some(hit) = validated_search_hit_dto(hit, stored, &canonical_server_origin) {
+        if let Some(hit) =
+            validated_search_hit_dto(hit, stored, conversation, &canonical_server_origin)
+        {
             result.push(hit);
         }
     }
@@ -12276,6 +13519,7 @@ pub fn run() {
             set_auto_lock_seconds,
             init_from_seed,
             get_conversations,
+            mark_conversation_read,
             get_conversation_crypto_diagnostics,
             get_messages,
             upload_prekeys,
@@ -12375,24 +13619,25 @@ mod e2ee_rest_tests {
         canonical_profile_version, clear_node_access_pass_after_success,
         consume_pending_lock_event, current_target_admission_evidence,
         exact_confirmed_live_action_binding, invalidate_disconnected_binding,
-        lock_transition_requires_sensitive_reset, node_access_attempt_for_origin, offline_sync_url,
-        parse_device_directory, parse_expected_dm_peer_identity_key, parse_media_plaintext_range,
+        invalidate_terminal_poll_generation, lock_transition_requires_sensitive_reset,
+        node_access_attempt_for_origin, offline_sync_url, parse_device_directory,
+        parse_expected_dm_peer_identity_key, parse_media_plaintext_range,
         parse_message_crypto_context, parse_network_profile_response,
-        parse_pending_node_access_pass, parse_pending_veil_link, parse_prekey_bundle,
-        parse_push_subscription_views, pending_node_access_pass_view, pending_veil_link_view,
-        preserve_created_group_outcome, proves_future_only_sender_key_history,
-        publish_unlocked_session, renderer_message_json, require_matching_identity_fingerprint,
-        require_pending_veil_link_flow, reset_sensitive_state_locked, resolve_auto_lock_seconds,
-        rest_api_url, rest_authority, rest_canonical, rest_origin, rest_request_target,
-        restore_expected_node_access_pass, run_blocking_native_task, run_bounded_search_backfill,
-        take_expected_node_access_pass, valid_auto_lock_seconds, valid_unlock_pin,
-        validate_authenticated_binding_commit, validate_created_dm_account_directory,
-        validate_expected_dm_peer_identity_key, validate_expected_live_action_binding,
-        validate_expected_rest_binding, validate_live_action_rest_origin,
-        validate_live_message_security_context, validate_next_cursor,
-        validate_persisted_message_conversation, validate_pinned_directory_self,
-        validate_profile_avatar_jpeg, validate_rest_url, validate_search_context_session,
-        validate_server_endpoint_pair, validate_utc_rfc3339_nano, validated_search_coverage,
+        parse_pending_node_access_pass, parse_pending_veil_link, parse_push_subscription_views,
+        pending_node_access_pass_view, pending_veil_link_view, preserve_created_group_outcome,
+        proves_future_only_sender_key_history, publish_unlocked_session, renderer_message_json,
+        require_matching_identity_fingerprint, require_pending_veil_link_flow,
+        reset_sensitive_state_locked, resolve_auto_lock_seconds, rest_api_url, rest_origin,
+        rest_request_target, restore_expected_node_access_pass, run_blocking_native_task,
+        run_bounded_search_backfill, take_expected_node_access_pass, valid_auto_lock_seconds,
+        valid_unlock_pin, validate_authenticated_binding_commit,
+        validate_created_dm_account_directory, validate_expected_dm_peer_identity_key,
+        validate_expected_live_action_binding, validate_expected_rest_binding,
+        validate_live_action_rest_origin, validate_live_message_security_context,
+        validate_next_cursor, validate_persisted_message_conversation,
+        validate_pinned_directory_self, validate_profile_avatar_jpeg, validate_rest_url,
+        validate_search_context_session, validate_server_endpoint_pair, validate_utc_rfc3339_nano,
+        validated_search_conversation_metadata, validated_search_coverage,
         validated_search_hit_dto, verify_device_directory_account_keys, AppState,
         AuthenticatedSessionScope, ConversationSyncIsolation, CurrentTargetAdmissionEvidence,
         ParsedMessageCryptoContext, PinnedDirectoryMember, PublishedSearchBinding, RestBinding,
@@ -12403,8 +13648,9 @@ mod e2ee_rest_tests {
     use ed25519_dalek::SigningKey;
     use veil_search::{SearchCoverageSnapshot, SearchDocument, SearchHit};
     use veil_store::models::{
-        AccountSnapshot, AccountSnapshotSource, Message, MessageAttachment, MessageAuthorContext,
-        MessageStatus, ProfileLocator, SearchIndexDocument,
+        AccountSnapshot, AccountSnapshotSource, Conversation, ConversationType, Message,
+        MessageAttachment, MessageAuthorContext, MessageStatus, ProfileLocator,
+        SearchIndexDocument,
     };
 
     fn authenticated_test_binding(host: &str, generation: u64) -> RestBinding {
@@ -12929,26 +14175,6 @@ mod e2ee_rest_tests {
     }
 
     #[test]
-    fn prekey_bundle_requires_base64_lengths_and_requested_identity() {
-        let b64 = base64::engine::general_purpose::STANDARD;
-        let expected_identity = [1u8; 32];
-        let value = serde_json::json!({
-            "identity_key": b64.encode(expected_identity),
-            "signing_key": b64.encode([2u8; 32]),
-            "signed_prekey": b64.encode([3u8; 32]),
-            "signed_prekey_signature": b64.encode([4u8; 64]),
-            "signed_prekey_id": 7,
-            "one_time_prekey": b64.encode([5u8; 32]),
-            "one_time_prekey_id": 9,
-        });
-
-        let bundle = parse_prekey_bundle(value.clone(), &expected_identity).unwrap();
-        assert_eq!(bundle.signed_prekey_id, 7);
-        assert_eq!(bundle.one_time_prekey_id, Some(9));
-        assert!(parse_prekey_bundle(value, &[8u8; 32]).is_err());
-    }
-
-    #[test]
     fn expected_dm_peer_identity_key_accepts_an_exact_authenticated_match() {
         let authenticated = [0x2au8; 32];
         let encoded = hex::encode(authenticated);
@@ -13134,38 +14360,44 @@ mod e2ee_rest_tests {
     #[test]
     fn websocket_and_rest_endpoints_must_share_a_secure_origin() {
         assert!(validate_server_endpoint_pair(
-            "wss://chat.example.test:9443/ws",
+            "wss://chat.example.test:9443/v3/events",
             "https://chat.example.test:9443"
         )
         .is_ok());
-        assert!(
-            validate_server_endpoint_pair("ws://127.0.0.1:9080/ws", "http://127.0.0.1:9080/")
-                .is_ok()
-        );
+        assert!(validate_server_endpoint_pair(
+            "ws://127.0.0.1:9080/v3/events",
+            "http://127.0.0.1:9080/",
+        )
+        .is_ok());
 
         assert!(validate_server_endpoint_pair(
-            "wss://chat.example.test/ws",
+            "wss://chat.example.test/v3/events",
             "https://evil.example.test"
         )
         .is_err());
         assert!(validate_server_endpoint_pair(
-            "wss://chat.example.test:9443/ws",
+            "wss://chat.example.test:9443/v3/events",
             "https://chat.example.test:8443"
         )
         .is_err());
         assert!(validate_server_endpoint_pair(
-            "ws://chat.example.test/ws",
+            "ws://chat.example.test/v3/events",
             "http://chat.example.test"
         )
         .is_err());
         assert!(validate_server_endpoint_pair(
-            "wss://chat.example.test/ws?token=secret",
+            "wss://chat.example.test/v3/events?token=secret",
             "https://chat.example.test"
         )
         .is_err());
         assert!(validate_server_endpoint_pair(
-            "wss://chat.example.test/ws",
+            "wss://chat.example.test/v3/events",
             "https://chat.example.test/api"
+        )
+        .is_err());
+        assert!(validate_server_endpoint_pair(
+            "wss://chat.example.test/ws",
+            "https://chat.example.test",
         )
         .is_err());
     }
@@ -13619,9 +14851,25 @@ mod e2ee_rest_tests {
             ts: 7,
             score: 1.0,
         };
+        let conversation = Conversation {
+            id: stored.conversation_id.clone(),
+            conv_type: ConversationType::DM,
+            peer_identity_key: Some(identity_key.to_vec()),
+            server_id: None,
+            server_origin: Some(origin.to_string()),
+            peer_user_id: Some("550e8400-e29b-41d4-a716-446655440000".to_string()),
+            name: Some("Alice".to_string()),
+            last_message_at: None,
+            unread_count: 0,
+            last_read_message_id: None,
+            created_at: "2026-07-13T12:00:00Z".to_string(),
+        };
 
-        let dto = validated_search_hit_dto(hit.clone(), stored.clone(), origin)
+        let dto = validated_search_hit_dto(hit.clone(), stored.clone(), &conversation, origin)
             .expect("exact search binding must resolve");
+        assert_eq!(dto.conversation_type, "dm");
+        assert_eq!(dto.conversation_name.as_deref(), Some("Alice"));
+        assert_eq!(dto.server_id, None);
         let author = dto.author.expect("author locator must be present");
         assert_eq!(author.canonical_server_origin, origin);
         assert_eq!(author.identity_key, hex::encode(identity_key));
@@ -13633,11 +14881,16 @@ mod e2ee_rest_tests {
 
         let mut stale_sender = hit.clone();
         stale_sender.sender = hex::encode([0x41; 32]);
-        assert!(validated_search_hit_dto(stale_sender, stored.clone(), origin).is_none());
+        assert!(
+            validated_search_hit_dto(stale_sender, stored.clone(), &conversation, origin,)
+                .is_none()
+        );
 
         let mut stale_body = hit;
         stale_body.body = "stale index plaintext".to_string();
-        assert!(validated_search_hit_dto(stale_body, stored.clone(), origin).is_none());
+        assert!(
+            validated_search_hit_dto(stale_body, stored.clone(), &conversation, origin,).is_none()
+        );
 
         let mut cross_origin_author = stored;
         cross_origin_author
@@ -13656,9 +14909,85 @@ mod e2ee_rest_tests {
                 score: 1.0,
             },
             cross_origin_author,
+            &conversation,
             origin,
         )
         .is_none());
+    }
+
+    #[test]
+    fn search_conversation_metadata_is_origin_scoped_and_has_safe_fallbacks() {
+        let origin = "https://chat.example.test:443";
+        let conversation_id = "550e8400-e29b-41d4-a716-446655440112";
+        let server_id = "550e8400-e29b-41d4-a716-446655440113";
+        let base = Conversation {
+            id: conversation_id.to_string(),
+            conv_type: ConversationType::DM,
+            peer_identity_key: Some(vec![0x31; 32]),
+            server_id: None,
+            server_origin: Some(origin.to_string()),
+            peer_user_id: Some("550e8400-e29b-41d4-a716-446655440000".to_string()),
+            name: Some("Alice".to_string()),
+            last_message_at: None,
+            unread_count: 0,
+            last_read_message_id: None,
+            created_at: "2026-07-13T12:00:00Z".to_string(),
+        };
+
+        let dm = validated_search_conversation_metadata(&base, origin).expect("DM metadata");
+        assert_eq!(dm.conversation_type, "dm");
+        assert_eq!(dm.conversation_name.as_deref(), Some("Alice"));
+        assert_eq!(dm.server_id, None);
+
+        let group = Conversation {
+            conv_type: ConversationType::Group,
+            peer_identity_key: None,
+            peer_user_id: None,
+            name: Some("Trusted circle".to_string()),
+            ..base.clone()
+        };
+        assert_eq!(
+            validated_search_conversation_metadata(&group, origin)
+                .expect("Circle metadata")
+                .conversation_type,
+            "group",
+        );
+
+        let channel = Conversation {
+            conv_type: ConversationType::Channel,
+            peer_identity_key: None,
+            peer_user_id: None,
+            server_id: Some(server_id.to_string()),
+            name: Some("general".to_string()),
+            ..base.clone()
+        };
+        let channel_metadata =
+            validated_search_conversation_metadata(&channel, origin).expect("Room metadata");
+        assert_eq!(channel_metadata.conversation_type, "channel");
+        assert_eq!(channel_metadata.server_id.as_deref(), Some(server_id));
+
+        let unsafe_name = Conversation {
+            name: Some("safe\u{202e}spoof".to_string()),
+            ..base.clone()
+        };
+        assert_eq!(
+            validated_search_conversation_metadata(&unsafe_name, origin)
+                .expect("unsafe presentation falls back without losing the hit")
+                .conversation_name,
+            None,
+        );
+        assert!(
+            validated_search_conversation_metadata(&base, "https://other.example.test:443",)
+                .is_none()
+        );
+
+        let invalid_non_channel_server = Conversation {
+            server_id: Some(server_id.to_string()),
+            ..base
+        };
+        assert!(
+            validated_search_conversation_metadata(&invalid_non_channel_server, origin).is_none()
+        );
     }
 
     #[test]
@@ -13890,6 +15219,40 @@ mod e2ee_rest_tests {
     }
 
     #[test]
+    fn terminal_poll_failure_invalidates_only_its_exact_transport_generation() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let failed = authenticated_test_binding("chat.example.test", 7);
+        let replacement = authenticated_test_binding("chat.example.test", 8);
+        let ready = AtomicBool::new(true);
+        let mut current = Some(failed.clone());
+        let mut renderer_confirmed = Some(failed.clone());
+
+        assert!(invalidate_terminal_poll_generation(
+            &mut current,
+            &mut renderer_confirmed,
+            &ready,
+            &failed,
+        ));
+        assert_eq!(current, None);
+        assert_eq!(renderer_confirmed, None);
+        assert!(!ready.load(Ordering::Acquire));
+
+        current = Some(replacement.clone());
+        renderer_confirmed = Some(replacement.clone());
+        ready.store(true, Ordering::Release);
+        assert!(!invalidate_terminal_poll_generation(
+            &mut current,
+            &mut renderer_confirmed,
+            &ready,
+            &failed,
+        ));
+        assert_eq!(current, Some(replacement.clone()));
+        assert_eq!(renderer_confirmed, Some(replacement));
+        assert!(ready.load(Ordering::Acquire));
+    }
+
+    #[test]
     fn successful_unlock_suppresses_a_stale_pending_lock_event() {
         use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -13908,23 +15271,13 @@ mod e2ee_rest_tests {
     }
 
     #[test]
-    fn rest_canonical_matches_server_vector_and_signs_query() {
-        let raw = "https://Example.COM:0443/v1/prekeys?device=7";
-        let url = reqwest::Url::parse(raw).unwrap();
-        let authority = rest_authority(&url, raw).unwrap();
-        let target = rest_request_target(&url);
-        let canonical = rest_canonical(
-            &reqwest::Method::POST,
-            &authority,
-            &target,
-            1_700_000_000_123,
-            "5041bf1f713df204784353e82f6a4a535931cb64f1f4b4a5aeaffcb720918b22",
-        );
-        assert_eq!(authority, "example.com:443");
-        assert_eq!(target, "/v1/prekeys?device=7");
+    fn rest_v2_request_target_preserves_the_exact_path_and_query() {
+        let url =
+            reqwest::Url::parse("https://Example.COM/v1/prekeys?device=7&cursor=opaque%2B%2F%3D")
+                .unwrap();
         assert_eq!(
-            canonical,
-            "veil-rest-v1\nPOST\nexample.com:443\n/v1/prekeys?device=7\n1700000000123\n5041bf1f713df204784353e82f6a4a535931cb64f1f4b4a5aeaffcb720918b22"
+            rest_request_target(&url),
+            "/v1/prekeys?device=7&cursor=opaque%2B%2F%3D"
         );
     }
 
@@ -14018,6 +15371,13 @@ mod e2ee_rest_tests {
             "roster_commitment": "abababababababababababababababababababababababababababababababab",
             "ready": true,
             "required_capabilities": "3",
+            "crypto_profile": "sender_key_v5",
+            "membership_activated": false,
+            "membership_ready": true,
+            "membership_conversation_kind": 1,
+            "membership_bootstrap_owner_id": "00000000-0000-0000-0000-000000000001",
+            "membership_bootstrap_owner_signing_key":
+                "1212121212121212121212121212121212121212121212121212121212121212",
             "member_user_ids": [
                 "00000000-0000-0000-0000-000000000001",
                 "00000000-0000-0000-0000-000000000002"
@@ -14098,6 +15458,30 @@ mod e2ee_rest_tests {
         let candidate: veil_client::api::DeviceRosterCandidateV1 = parsed.into();
         assert_eq!(candidate.devices[0].binding.as_ref().unwrap().status, 1);
         assert_eq!(candidate.devices[1].user_id[15], 2);
+    }
+
+    #[test]
+    fn direct_device_directory_omits_membership_scope_and_partial_scope_fails_closed() {
+        let conversation_id = "00000000-0000-0000-0000-000000000010";
+        let mut direct = ready_device_directory_fixture();
+        let object = direct.as_object_mut().unwrap();
+        object.remove("membership_conversation_kind");
+        object.remove("membership_bootstrap_owner_id");
+        object.remove("membership_bootstrap_owner_signing_key");
+        let parsed = parse_device_directory(direct.clone(), conversation_id).unwrap();
+        assert_eq!(parsed.membership_conversation_kind, None);
+        assert_eq!(parsed.membership_bootstrap_owner, None);
+        assert!(!parsed.membership_activated);
+
+        direct["membership_conversation_kind"] = serde_json::json!(1);
+        assert!(parse_device_directory(direct.clone(), conversation_id).is_err());
+        direct["membership_conversation_kind"] = serde_json::Value::Null;
+        direct["membership_activated"] = serde_json::json!(true);
+        direct["crypto_profile"] = serde_json::json!("sender_key_v6");
+        direct["membership_epoch"] = serde_json::json!("1");
+        direct["membership_epoch_hash"] =
+            serde_json::json!("3434343434343434343434343434343434343434343434343434343434343434");
+        assert!(parse_device_directory(direct, conversation_id).is_err());
     }
 
     #[test]
@@ -14287,7 +15671,7 @@ mod e2ee_rest_tests {
 
         assert_eq!(
             super::reconcile_sender_key_history_inspection(
-                &client,
+                &mut client,
                 &missing,
                 Some(&evidence),
                 "2026-07-13T19:05:17.714128999Z",
@@ -14331,7 +15715,7 @@ mod e2ee_rest_tests {
 
         assert_eq!(
             super::reconcile_sender_key_history_inspection(
-                &client,
+                &mut client,
                 &SenderKeyMessageContextInspectionV1::Verified,
                 Some(&evidence),
                 "2026-07-13T19:05:18Z",

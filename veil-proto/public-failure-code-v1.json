@@ -1,0 +1,131 @@
+{
+  "version": 1,
+  "codes": [
+    {
+      "code": "VEIL-SETUP-001",
+      "semantic_key": "setup_protected_identity_not_started",
+      "exposure_gate": "typed_native_setup_start_failure",
+      "recovery_action_key": "close_veil_and_retry",
+      "state": "active"
+    },
+    {
+      "code": "VEIL-SETUP-002",
+      "semantic_key": "protected_setup_state_unconfirmed",
+      "exposure_gate": "setup_state_not_authoritatively_confirmed",
+      "recovery_action_key": "preserve_phrase_until_native_settled_and_vault_verified",
+      "state": "active"
+    },
+    {
+      "code": "VEIL-LOCAL-001",
+      "semantic_key": "local_account_locked_or_not_ready",
+      "exposure_gate": "typed_native_account_state",
+      "recovery_action_key": "reopen_same_account",
+      "state": "active"
+    },
+    {
+      "code": "VEIL-LOCAL-002",
+      "semantic_key": "encrypted_vault_open_failed",
+      "exposure_gate": "typed_native_vault_open_failure",
+      "recovery_action_key": "restart_without_new_recovery_phrase",
+      "state": "active"
+    },
+    {
+      "code": "VEIL-LOCAL-003",
+      "semantic_key": "local_secure_state_unconfirmed",
+      "exposure_gate": "typed_native_secure_state_failure",
+      "recovery_action_key": "lock_and_reopen_same_account",
+      "state": "active"
+    },
+    {
+      "code": "VEIL-NODE-001",
+      "semantic_key": "node_origin_not_canonical_https",
+      "exposure_gate": "exact_origin_preflight_rejection",
+      "recovery_action_key": "edit_node_origin",
+      "state": "active"
+    },
+    {
+      "code": "VEIL-NODE-002",
+      "semantic_key": "node_retryable_transport_failure",
+      "exposure_gate": "typed_retryable_transport_failure",
+      "recovery_action_key": "check_network_and_reconnect_same_account",
+      "state": "active"
+    },
+    {
+      "code": "VEIL-NODE-003",
+      "semantic_key": "node_authentication_rejected",
+      "exposure_gate": "typed_authentication_or_pre_proof_failure",
+      "recovery_action_key": "retry_same_local_account",
+      "state": "active"
+    },
+    {
+      "code": "VEIL-NODE-004",
+      "semantic_key": "node_authenticated_binding_rejected",
+      "exposure_gate": "typed_tls_protocol_binding_or_epoch_failure",
+      "recovery_action_key": "keep_connection_rejected",
+      "state": "active"
+    },
+    {
+      "code": "VEIL-PASS-001",
+      "semantic_key": "node_access_pass_required",
+      "exposure_gate": "post_account_key_proof_registration_closed",
+      "recovery_action_key": "enter_node_access_pass",
+      "state": "active"
+    },
+    {
+      "code": "VEIL-PASS-002",
+      "semantic_key": "node_access_pass_rejected",
+      "exposure_gate": "post_account_key_proof_invite_invalid",
+      "recovery_action_key": "replace_node_access_pass",
+      "state": "active"
+    },
+    {
+      "code": "VEIL-PASS-003",
+      "semantic_key": "pending_node_access_pass_unavailable",
+      "exposure_gate": "typed_local_pending_access_pass_failure",
+      "recovery_action_key": "open_fresh_node_access_pass",
+      "state": "active"
+    },
+    {
+      "code": "VEIL-RUNTIME-001",
+      "semantic_key": "secure_operation_in_progress",
+      "exposure_gate": "typed_native_operation_busy",
+      "recovery_action_key": "wait_and_retry",
+      "state": "active"
+    },
+    {
+      "code": "VEIL-RUNTIME-002",
+      "semantic_key": "secure_operation_cancelled_by_lifecycle",
+      "exposure_gate": "typed_native_lifecycle_cancellation",
+      "recovery_action_key": "return_and_retry_same_account",
+      "state": "active"
+    },
+    {
+      "code": "VEIL-SYNC-001",
+      "semantic_key": "authenticated_direct_bootstrap_incomplete",
+      "exposure_gate": "typed_authenticated_direct_bootstrap_failure",
+      "recovery_action_key": "reconnect_same_account_without_access_pass",
+      "state": "active"
+    },
+    {
+      "code": "VEIL-RUNTIME-999",
+      "semantic_key": "unknown_or_malformed_outcome",
+      "exposure_gate": "generic_fail_closed_fallback",
+      "recovery_action_key": "remain_closed_and_retry",
+      "state": "active"
+    },
+    {
+      "code": "VEIL-DIRECT-001",
+      "semantic_key": "direct_message_definitely_not_sent",
+      "exposure_gate": "bounded_local_or_typed_native_direct_definite_non_acceptance",
+      "recovery_action_key": "keep_or_edit_then_send_new_intent_only_when_ready",
+      "state": "active"
+    },
+    {
+      "code": "VEIL-DIRECT-002",
+      "semantic_key": "direct_delivery_unknown",
+      "exposure_gate": "typed_native_direct_delivery_unknown",
+      "recovery_action_key": "keep_original_and_wait_without_blind_resend",
+      "state": "active"
+    }
+  ]
+}

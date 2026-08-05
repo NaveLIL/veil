@@ -16,6 +16,7 @@ func (c *Client) handleSenderKeyReceipt(ctx context.Context, seq uint64, receipt
 	if receipt == nil || receipt.ConversationId == "" || len(receipt.OwnerDeviceId) != 16 ||
 		len(receipt.TargetDeviceId) != 16 || receipt.Generation == 0 ||
 		receipt.RosterVersion == 0 || len(receipt.EnvelopeCommitment) != 32 ||
+		!validMembershipCoordinateForWireV1(receipt.MembershipEpoch, receipt.MembershipEpochHash) ||
 		!c.perDeviceSecure || c.deviceBindingStatus != db.DeviceBindingActive ||
 		len(c.deviceKey) != 16 || !bytes.Equal(receipt.TargetDeviceId, c.deviceKey) {
 		c.sendError(seq, 400, "invalid sender key receipt")
@@ -26,9 +27,10 @@ func (c *Client) handleSenderKeyReceipt(ctx context.Context, seq uint64, receipt
 		c.sendError(seq, 404, "sender device not found")
 		return
 	}
-	if err := c.hub.chatSvc.DB().AcknowledgeSenderKey(
+	if err := c.hub.chatSvc.DB().AcknowledgeSenderKeyForMembership(
 		ctx, receipt.ConversationId, owner.ID, c.deviceID,
 		receipt.Generation, receipt.RosterVersion, receipt.EnvelopeCommitment,
+		receipt.MembershipEpoch, receipt.MembershipEpochHash,
 	); err != nil {
 		c.sendPublicError(seq, 409, publicerr.New(
 			409, "sender_key_receipt_mismatch", "sender key receipt does not match retained distribution", err,
@@ -47,6 +49,8 @@ func (c *Client) handleSenderKeyReceipt(ctx context.Context, seq uint64, receipt
 			SenderKeyGeneration: &generation,
 			RosterVersion:       &rosterVersion,
 			EnvelopeCommitment:  append([]byte(nil), receipt.EnvelopeCommitment...),
+			MembershipEpoch:     membershipEpochPointerV1(receipt.MembershipEpoch),
+			MembershipEpochHash: append([]byte(nil), receipt.MembershipEpochHash...),
 		}},
 	})
 }
