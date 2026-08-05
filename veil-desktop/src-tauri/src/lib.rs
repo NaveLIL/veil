@@ -2451,9 +2451,12 @@ struct DeviceDirectoryWire {
     membership_epoch: Option<String>,
     #[serde(default)]
     membership_epoch_hash: Option<String>,
-    membership_conversation_kind: u8,
-    membership_bootstrap_owner_id: String,
-    membership_bootstrap_owner_signing_key: String,
+    #[serde(default)]
+    membership_conversation_kind: Option<u8>,
+    #[serde(default)]
+    membership_bootstrap_owner_id: Option<String>,
+    #[serde(default)]
+    membership_bootstrap_owner_signing_key: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -2576,8 +2579,8 @@ struct ParsedDeviceRoster {
     membership_ready: bool,
     membership_epoch: u64,
     membership_epoch_hash: [u8; 32],
-    membership_conversation_kind: u8,
-    membership_bootstrap_owner: MembershipPolicySignerV1,
+    membership_conversation_kind: Option<u8>,
+    membership_bootstrap_owner: Option<MembershipPolicySignerV1>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3999,22 +4002,36 @@ fn parse_device_directory(
         });
     }
 
-    if !matches!(wire.membership_conversation_kind, 1 | 2) {
-        return Err("device directory membership conversation kind is invalid".to_string());
-    }
-    let membership_owner_id = decode_canonical_uuid(
-        "device directory membership_bootstrap_owner_id",
-        &wire.membership_bootstrap_owner_id,
-    )?;
-    let membership_owner_signing_key = decode_lower_hex_fixed::<32>(
-        "device directory membership_bootstrap_owner_signing_key",
-        &wire.membership_bootstrap_owner_signing_key,
-    )?;
-    if account_keys.get(&membership_owner_id).map(|keys| keys.1)
-        != Some(membership_owner_signing_key)
-    {
-        return Err("membership bootstrap owner is absent or key-substituted".to_string());
-    }
+    let (membership_conversation_kind, membership_bootstrap_owner) = match (
+        wire.membership_conversation_kind,
+        wire.membership_bootstrap_owner_id.as_deref(),
+        wire.membership_bootstrap_owner_signing_key.as_deref(),
+    ) {
+        (None, None, None) if !wire.membership_activated => (None, None),
+        (Some(kind @ (1 | 2)), Some(owner_id), Some(owner_signing_key)) => {
+            let owner_id =
+                decode_canonical_uuid("device directory membership_bootstrap_owner_id", owner_id)?;
+            let owner_signing_key = decode_lower_hex_fixed::<32>(
+                "device directory membership_bootstrap_owner_signing_key",
+                owner_signing_key,
+            )?;
+            if account_keys.get(&owner_id).map(|keys| keys.1) != Some(owner_signing_key) {
+                return Err("membership bootstrap owner is absent or key-substituted".to_string());
+            }
+            (
+                Some(kind),
+                Some(MembershipPolicySignerV1 {
+                    account_id: owner_id,
+                    account_signing_key: owner_signing_key,
+                }),
+            )
+        }
+        _ => {
+            return Err(
+                "device directory membership bootstrap scope is incomplete or invalid".to_string(),
+            );
+        }
+    };
 
     let member_without_eligible_device = member_user_ids
         .iter()
@@ -4054,11 +4071,8 @@ fn parse_device_directory(
         membership_ready: wire.membership_ready,
         membership_epoch,
         membership_epoch_hash,
-        membership_conversation_kind: wire.membership_conversation_kind,
-        membership_bootstrap_owner: MembershipPolicySignerV1 {
-            account_id: membership_owner_id,
-            account_signing_key: membership_owner_signing_key,
-        },
+        membership_conversation_kind,
+        membership_bootstrap_owner,
     })
 }
 
@@ -4321,6 +4335,14 @@ fn try_advance_membership_epoch_v1(
     if !parsed.device_set_ready {
         return Ok(false);
     }
+    let (membership_conversation_kind, membership_bootstrap_owner) = match (
+        parsed.membership_conversation_kind,
+        parsed.membership_bootstrap_owner,
+    ) {
+        (None, None) if !parsed.membership_activated => return Ok(false),
+        (Some(kind @ (1 | 2)), Some(owner)) => (kind, owner),
+        _ => return Err("device directory membership bootstrap scope is invalid".to_string()),
+    };
     let user_id_bytes = decode_canonical_uuid("authenticated membership signer", user_id)?;
     let all_devices_support_v6 = parsed.devices.iter().all(|entry| {
         entry
@@ -4331,7 +4353,7 @@ fn try_advance_membership_epoch_v1(
     if !parsed.membership_activated {
         if !parsed.ready
             || !all_devices_support_v6
-            || parsed.membership_bootstrap_owner.account_id != user_id_bytes
+            || membership_bootstrap_owner.account_id != user_id_bytes
         {
             return Ok(false);
         }
@@ -4339,10 +4361,10 @@ fn try_advance_membership_epoch_v1(
             let client = state.client.lock().map_err(|error| error.to_string())?;
             client.prepare_membership_epoch_bootstrap_v1(
                 &parsed.conversation_id,
-                parsed.membership_conversation_kind,
+                membership_conversation_kind,
                 parsed.roster_version,
                 parsed.roster_commitment,
-                parsed.membership_bootstrap_owner,
+                membership_bootstrap_owner,
             )?
         };
         submit_membership_epoch_v1(
@@ -15349,6 +15371,13 @@ mod e2ee_rest_tests {
             "roster_commitment": "abababababababababababababababababababababababababababababababab",
             "ready": true,
             "required_capabilities": "3",
+            "crypto_profile": "sender_key_v5",
+            "membership_activated": false,
+            "membership_ready": true,
+            "membership_conversation_kind": 1,
+            "membership_bootstrap_owner_id": "00000000-0000-0000-0000-000000000001",
+            "membership_bootstrap_owner_signing_key":
+                "1212121212121212121212121212121212121212121212121212121212121212",
             "member_user_ids": [
                 "00000000-0000-0000-0000-000000000001",
                 "00000000-0000-0000-0000-000000000002"
@@ -15429,6 +15458,30 @@ mod e2ee_rest_tests {
         let candidate: veil_client::api::DeviceRosterCandidateV1 = parsed.into();
         assert_eq!(candidate.devices[0].binding.as_ref().unwrap().status, 1);
         assert_eq!(candidate.devices[1].user_id[15], 2);
+    }
+
+    #[test]
+    fn direct_device_directory_omits_membership_scope_and_partial_scope_fails_closed() {
+        let conversation_id = "00000000-0000-0000-0000-000000000010";
+        let mut direct = ready_device_directory_fixture();
+        let object = direct.as_object_mut().unwrap();
+        object.remove("membership_conversation_kind");
+        object.remove("membership_bootstrap_owner_id");
+        object.remove("membership_bootstrap_owner_signing_key");
+        let parsed = parse_device_directory(direct.clone(), conversation_id).unwrap();
+        assert_eq!(parsed.membership_conversation_kind, None);
+        assert_eq!(parsed.membership_bootstrap_owner, None);
+        assert!(!parsed.membership_activated);
+
+        direct["membership_conversation_kind"] = serde_json::json!(1);
+        assert!(parse_device_directory(direct.clone(), conversation_id).is_err());
+        direct["membership_conversation_kind"] = serde_json::Value::Null;
+        direct["membership_activated"] = serde_json::json!(true);
+        direct["crypto_profile"] = serde_json::json!("sender_key_v6");
+        direct["membership_epoch"] = serde_json::json!("1");
+        direct["membership_epoch_hash"] =
+            serde_json::json!("3434343434343434343434343434343434343434343434343434343434343434");
+        assert!(parse_device_directory(direct, conversation_id).is_err());
     }
 
     #[test]

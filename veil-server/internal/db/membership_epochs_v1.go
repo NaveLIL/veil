@@ -76,6 +76,12 @@ func (db *DB) MembershipBootstrapAuthorityForRequesterV1(
 	if !allowed {
 		return nil, ErrMembershipEpochUnauthorized
 	}
+	if conversationKind == 0 {
+		if err := tx.Commit(ctx); err != nil {
+			return nil, err
+		}
+		return nil, nil
+	}
 	owner, err := conversationMembershipOwnerV1(ctx, tx, conversationID, conversationKind)
 	if err != nil {
 		return nil, err

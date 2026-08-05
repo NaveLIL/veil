@@ -155,6 +155,15 @@ func TestDeviceDirectoryLifecycle(t *testing.T) {
 	}
 
 	legacy := requireDirectory(t, h, alice, conversationID, 1, false)
+	for _, field := range []string{
+		"membership_conversation_kind",
+		"membership_bootstrap_owner_id",
+		"membership_bootstrap_owner_signing_key",
+	} {
+		if _, present := legacy[field]; present {
+			t.Fatalf("Direct directory unexpectedly exposed %s", field)
+		}
+	}
 	if reason, _ := legacy["reason"].(string); reason != "legacy_unbound_device" {
 		t.Fatalf("legacy directory reason = %q", reason)
 	}

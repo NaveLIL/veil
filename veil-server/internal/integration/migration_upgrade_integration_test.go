@@ -1712,7 +1712,7 @@ func TestMigrationUpgradePreflights(t *testing.T) {
 			   roster_version, roster_commitment,
 			   owner_binding_version, target_binding_version,
 			   membership_epoch
-			 ) SELECT $1::uuid, $2::uuid, $3::uuid, $4, 2, digest($4, 'sha256'),
+			 ) SELECT $1::uuid, $2::uuid, $3::uuid, $4::bytea, 2, digest($4::bytea, 'sha256'),
 			          roster_version, roster_commitment,
 			          owner_binding_version, target_binding_version, 1
 			     FROM sender_keys
@@ -1760,7 +1760,7 @@ func TestMigrationUpgradePreflights(t *testing.T) {
 			   encrypted_key, generation, envelope_commitment,
 			   roster_version, roster_commitment,
 			   owner_binding_version, target_binding_version
-			 ) SELECT $1::uuid, $2::uuid, $3::uuid, $4, 2, digest($4, 'sha256'),
+			 ) SELECT $1::uuid, $2::uuid, $3::uuid, $4::bytea, 2, digest($4::bytea, 'sha256'),
 			          roster_version, roster_commitment,
 			          owner_binding_version, target_binding_version
 			     FROM sender_keys WHERE conversation_id=$1::uuid LIMIT 1`,
@@ -1776,7 +1776,7 @@ func TestMigrationUpgradePreflights(t *testing.T) {
 			   roster_version, roster_commitment,
 			   owner_binding_version, target_binding_version,
 			   membership_epoch, membership_epoch_hash
-			 ) SELECT $1::uuid, $2::uuid, $3::uuid, $4, 2, digest($4, 'sha256'),
+			 ) SELECT $1::uuid, $2::uuid, $3::uuid, $4::bytea, 2, digest($4::bytea, 'sha256'),
 			          roster_version, roster_commitment,
 			          owner_binding_version, target_binding_version, 1, $5
 			     FROM sender_keys WHERE conversation_id=$1::uuid LIMIT 1`,

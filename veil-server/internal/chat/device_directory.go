@@ -49,9 +49,9 @@ type deviceDirectoryJSON struct {
 	MembershipReady                    bool                  `json:"membership_ready"`
 	MembershipEpoch                    string                `json:"membership_epoch,omitempty"`
 	MembershipEpochHash                string                `json:"membership_epoch_hash,omitempty"`
-	MembershipConversationKind         uint8                 `json:"membership_conversation_kind"`
-	MembershipBootstrapOwnerID         string                `json:"membership_bootstrap_owner_id"`
-	MembershipBootstrapOwnerSigningKey string                `json:"membership_bootstrap_owner_signing_key"`
+	MembershipConversationKind         uint8                 `json:"membership_conversation_kind,omitempty"`
+	MembershipBootstrapOwnerID         string                `json:"membership_bootstrap_owner_id,omitempty"`
+	MembershipBootstrapOwnerSigningKey string                `json:"membership_bootstrap_owner_signing_key,omitempty"`
 }
 
 func (h *Handler) GetDeviceDirectory(w http.ResponseWriter, r *http.Request) {
@@ -91,25 +91,27 @@ func (h *Handler) GetDeviceDirectory(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, errorResp("failed to resolve membership bootstrap authority"))
 		return
 	}
-	response.MembershipConversationKind = bootstrap.ConversationKind
-	response.MembershipBootstrapOwnerID = bootstrap.OwnerID
-	response.MembershipBootstrapOwnerSigningKey = hex.EncodeToString(bootstrap.OwnerSigningKey[:])
-	membershipStatus, err := h.svc.db.MembershipEpochRosterStatusForRequesterV1(
-		r.Context(), conversationID, requesterID, roster.Version, roster.Commitment,
-	)
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, errorResp("failed to resolve membership authorization"))
-		return
-	}
-	if membershipStatus.Activated {
-		response.MembershipActivated = true
-		response.MembershipReady = membershipStatus.Ready
-		response.MembershipEpoch = strconv.FormatUint(membershipStatus.Epoch, 10)
-		response.MembershipEpochHash = hex.EncodeToString(membershipStatus.Hash[:])
-		response.CryptoProfile = db.MessageCryptoProfileSenderKeyV6
-		if !membershipStatus.Ready {
-			response.Ready = false
-			response.Reason = "membership_epoch_pending"
+	if bootstrap != nil {
+		response.MembershipConversationKind = bootstrap.ConversationKind
+		response.MembershipBootstrapOwnerID = bootstrap.OwnerID
+		response.MembershipBootstrapOwnerSigningKey = hex.EncodeToString(bootstrap.OwnerSigningKey[:])
+		membershipStatus, err := h.svc.db.MembershipEpochRosterStatusForRequesterV1(
+			r.Context(), conversationID, requesterID, roster.Version, roster.Commitment,
+		)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, errorResp("failed to resolve membership authorization"))
+			return
+		}
+		if membershipStatus.Activated {
+			response.MembershipActivated = true
+			response.MembershipReady = membershipStatus.Ready
+			response.MembershipEpoch = strconv.FormatUint(membershipStatus.Epoch, 10)
+			response.MembershipEpochHash = hex.EncodeToString(membershipStatus.Hash[:])
+			response.CryptoProfile = db.MessageCryptoProfileSenderKeyV6
+			if !membershipStatus.Ready {
+				response.Ready = false
+				response.Reason = "membership_epoch_pending"
+			}
 		}
 	}
 	for _, member := range roster.Members {
