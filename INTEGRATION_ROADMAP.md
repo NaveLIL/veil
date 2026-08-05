@@ -1,6 +1,6 @@
 # Дорожная карта Veil
 
-> Актуально на 2026-08-04. Это основной продуктовый и интеграционный план.
+> Актуально на 2026-08-05. Это основной продуктовый и интеграционный план.
 > [`ROADMAP.md`](ROADMAP.md) сохранён как исторический security/infra backlog;
 > при расхождении приоритетов главным считается этот документ.
 
@@ -10,6 +10,12 @@
 [`docs/reviews/beta-integration-macos-2026-08-04.md`](docs/reviews/beta-integration-macos-2026-08-04.md).
 Успешная локальная сборка неподписанного DMG не закрывает Phase 8, а наличие
 endpoint/UI scaffolding не закрывает Android parity или hostile-Node gate 5S.
+
+Итог security-hardening диапазона `b8ed439..92fc1c3`, точные проверки и
+оставшиеся release blockers зафиксированы в
+[`docs/reviews/security-hardening-audit-handoff-2026-08-05.md`](docs/reviews/security-hardening-audit-handoff-2026-08-05.md).
+На `92fc1c3` полный GitHub CI и beta artifact matrix зелёные; это инженерное
+свидетельство, а не замена независимому аудиту, подписи релиза или physical gate.
 
 Базовый принцип Veil: интерфейс обязан правдиво показывать фактически
 используемый режим защиты. Нельзя молча откатываться на plaintext или более
@@ -58,22 +64,27 @@ Veil ещё не выпускался, поэтому runtime backward compatibi
    public-WebPKI transport, empty Direct и same-account force-stop reopen, но
    полный Desktop ↔ Android E2EE/send/ACK/outbox/reconnect/airplane/background/
    process-death gate и connected recovery/capture matrix остаются открыты.
-   Изолированный release-like tester packaging/verifier/CI-контракт уже
-   реализован, но стабильный подписанный APK ещё не произведён и не проверен.
+   Полный workspace, UniFFI/Kotlin bindings, обе native ABI и debug APK теперь
+   собираются и проверяются Mobile CI. Короткоживущий `veil-mobile-debug-ci`
+   пригоден для диагностики, но стабильный подписанный tester APK ещё не
+   произведён и не проверен.
    Точный checkpoint приведён в Phase 5.
    Следующий функциональный parity-срез — native contacts → identity check →
    friend request → create Direct. В beta baseline `f6dbf5a` уже есть UI,
-   FFI/Kotlin и request scaffolding, но это не рабочий flow: Kotlin bindings
-   не синхронизированы, create-Direct route и identity header расходятся с Go,
-   а подготовленный friend-request REST route отсутствует. Текущий Android
+   FFI/Kotlin и request scaffolding, но это не рабочий flow: create-Direct route,
+   identity header и friend-request REST contract ещё не сведены в один
+   production flow. Текущий Android
    по-прежнему надёжно обслуживает только существующий authenticated Direct
    directory. Контракт, запрещающий renderer-only или cross-origin fallback,
    зафиксирован в
    [`android-native-contacts-direct-initiation-contract.md`](docs/reviews/android-native-contacts-direct-initiation-contract.md).
-9. Параллельно с physical Direct gate провести Phase 5S: зафиксировать точный
-   protocol transcript, проверить hostile-Node модель, выполнить изолированный
-   `libsignal` spike и заказать независимый аудит. До решения 5S текущий Direct
-   остаётся Preview-only, а stable/critical-use claims заблокированы.
+9. Реализация security baseline 5S существенно закрыта: production переведён
+   на origin/account/device-bound WS v3 и REST v2 без legacy network fallback;
+   hostile two-Node, Direct v2, transparency/witness/gossip и membership-epoch
+   contracts покрыты точными fixtures и CI. До release exit остаются независимый
+   аудит, deployable independent witnesses, Direct-vs-`libsignal` ADR и physical
+   Android fingerprint/QR/key-change matrix. Поэтому stable/critical-use claims
+   по-прежнему заблокированы.
 10. Затем довести MLS runtime, звонки и release polish.
 
 ## Статус по фазам
@@ -91,13 +102,13 @@ Veil ещё не выпускался, поэтому runtime backward compatibi
 | 4E | Veil Spaces Experience | implementation/automated gate закрыты; manual two-device Veil Link matrix pending |
 | 4F | Node Administration, Moderation & Reports | запланировано: Space moderation существует, Node console/report queue отсутствуют |
 | 4G | Secure Share for guests | prototype foundation существует; production gateway/viewer/large-file lifecycle отсутствуют |
-| 5A | Android foundation | core runtime, TLS, atomic vault, lifecycle/Pass authority, native recovery и debug Ready-capture checkpoints опубликованы; durable setup-result reconciliation реализован и host-tested; отдельный v3 background-events controller существует, но полный workspace не компилирует `veil-ffi`, generated Kotlin bindings отстают, stable signed APK и deferred A04/A05/recovery/vault/capture physical matrix открыты |
+| 5A | Android foundation | core runtime, TLS, atomic vault, lifecycle/Pass authority, native recovery и debug Ready-capture checkpoints опубликованы; полный workspace, UniFFI/Kotlin bindings, `arm64-v8a`/`x86_64` payloads и short-lived debug APK зелёные в Mobile CI; stable signed tester APK и deferred A04/A05/recovery/vault/capture physical matrix открыты |
 | 5B | Android messaging | automated receive/read, one-shot peer-prekey, idempotent native send/outbox, typed ACK, transient reconnect и true-empty Ready опубликованы; contacts/create-Direct UI и native request scaffolding добавлены, но route/header/friend-request/UniFFI contracts не состыкованы; полная Desktop ↔ Android E2EE/airplane/background/process-death matrix открыта |
 | 5C | Secure QR device linking / multi-device | отдельный blocking gate не начат: second-device enrollment, SAS approval, atomic activation, revoke и hostile-relay matrix обязательны до корректного multi-device |
-| 5S | Direct protocol assurance & hostile Node | immutable Direct-v1 transcript/SQLCipher, shared Rust↔Go exact-origin contract, mandatory configured origin, WS v3 verifier/atomic admission, отдельный экспериментальный `/v3/events` endpoint/client controller и REST v2 HTTP/version-dispatch foundations реализованы; legacy `/ws` и REST v1 остаются основными путями, а endpoint/FFI/Android contract, two-Node relay, REST route cutover, `libsignal` adapter/ABI/state spike, key-transparency ADR и независимый аудит открыты; cross-Node credential-scope P1 не закрыт |
+| 5S | Direct protocol assurance & hostile Node | production WS v3/REST v2 cutover выполнен, legacy `/ws`/REST v1 fail closed, cross-Node credential-scope P1 и hostile two-Node relay matrix закрыты; Direct v2, transparency/witness/gossip, membership epochs и Sender-Key v6 реализованы и покрыты frozen vectors/CI; release exit открыт до Direct-vs-`libsignal` ADR, independently operated witnesses, physical Android trust/QR matrix и независимого аудита |
 | 6 | OpenMLS | фундамент готов, runtime-ветвление выключено |
 | 7 | LiveKit звонки | не начато |
-| 8 | Полировка, релиз | частично: CI и Windows release workflow готовы; локальный неподписанный macOS 0.1.4 x86_64 app/DMG собран и проверен, но universal/arm64, Apple signing/notarization и public gate отсутствуют |
+| 8 | Полировка, релиз | частично: полный CI и beta artifact matrix зелёные на `92fc1c3`, short-lived debug APK и unsigned desktop artifacts доступны; stable signing/notarization, signed tester APK, physical matrices и public release gate отсутствуют |
 
 ---
 

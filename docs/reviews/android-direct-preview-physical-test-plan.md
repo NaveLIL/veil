@@ -1,8 +1,9 @@
 # Android Direct Preview physical test plan
 
 > **PLAN ONLY — NOT EXECUTED.** Passing unit, JVM, Rust, emulator, or build
-> checks does not satisfy this gate. This document does not claim that a tester
-> APK or production-ready Android client exists.
+> checks does not satisfy this gate. Mobile CI now publishes a short-lived debug
+> `veil-mobile-debug-ci` APK for diagnostic evidence; it is not the signed tester
+> artifact required by this plan and does not establish production readiness.
 
 Execution was explicitly deferred on 2026-07-20. Until the user resumes this
 gate, no ADB/device command, install, uninstall, package-data clear, connected

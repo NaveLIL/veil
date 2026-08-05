@@ -1,9 +1,9 @@
 # Security hardening audit handoff — 2026-08-05
 
 - Branch: `ds/beta-all-2026-07-21`
-- Implementation range: `b8ed439..HEAD` on the named beta branch
+- Security implementation range: `b8ed439..92fc1c3` on the named beta branch
 - Current status: internal implementation and regression hardening complete;
-  final CI evidence for the current head is being collected
+  the full exact-head CI and beta artifact matrix passed on `92fc1c3`
 - Security claim: pre-release engineering evidence, not an independent audit
 
 ## What changed
@@ -128,19 +128,22 @@ Additional local evidence:
 
 ## CI and artifact evidence
 
-The authoritative target is the commit containing this handoff; evidence from
-an earlier checkpoint must not be substituted for a current-head result.
-The final handoff must record successful current-head runs for:
+The authoritative security implementation target is `92fc1c3`. Documentation
+or artifact-packaging-only follow-ups do not change the reviewed runtime range.
+The exact target passed:
 
 - Go CI, including Docker integration and security fuzz smoke;
 - Rust CI on Linux, macOS, Windows, WASM, and benchmark/build guards;
 - Security Audit, Protocol Contracts, Coverage, Desktop UI, and Mobile CI;
-- Beta Artifacts: Linux `.deb`/AppImage, Windows NSIS/MSI, Android APK, share
-  viewer WASM, and the multi-architecture gateway OCI build.
+- Beta Artifacts: Linux `.deb`/AppImage, Windows NSIS/MSI, share viewer WASM,
+  and the multi-architecture gateway OCI build;
+- Mobile CI: short-lived `veil-mobile-debug-ci` APK with both reviewed native
+  ABI payloads. It is debug evidence, not a signed tester/release artifact.
 
-An earlier security checkpoint already produced all Beta Artifacts and passed
-the complete dependency audit. That evidence is useful diagnostically but is
-not substituted for a green current-head run.
+Exact-head successful workflow runs were Protocol Contracts `31032510371`, Go
+CI `31032510377`, Coverage `31032510453`, Security Audit `31032510575`, Mobile
+CI `31032510562`, Rust CI `31032510579`, Desktop UI `31032510728`, and Beta
+Artifacts `31032507521`.
 
 ## Residual release blockers
 
