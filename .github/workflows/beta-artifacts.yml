@@ -215,11 +215,16 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y skopeo
           archive="${RUNNER_TEMP}/veil-gateway-beta.oci.tar"
           test -s "$archive"
-          raw="$(skopeo inspect --raw "oci-archive:$archive")"
+          layout="$(tar -xOf "$archive" index.json)"
+          index_digest="$(
+            jq -er '[.manifests[]
+              | select(.mediaType == "application/vnd.oci.image.index.v1+json")
+              | .digest][0] // empty' <<< "$layout"
+          )"
+          [[ "$index_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          raw="$(tar -xOf "$archive" "blobs/sha256/${index_digest#sha256:}")"
           jq -e '[.manifests[].platform | select(.os == "linux") | .architecture] | index("amd64") != null' <<< "$raw"
           jq -e '[.manifests[].platform | select(.os == "linux") | .architecture] | index("arm64") != null' <<< "$raw"
 

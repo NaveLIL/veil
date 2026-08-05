@@ -19,6 +19,7 @@
 | `155ecd1` | Superseded push/PR workflow runs cancel by source branch instead of consuming the CI queue |
 | `1a46787` | Permanently retired WS v2 and standalone REST v1 binaries; removed the WS rollback switch, post-auth re-verification, and REST `PreviewDual` dispatch; corrected the SQLCipher restart fixture |
 | current follow-up commit | Preserved optional no-reason moderation requests under REST v2 while keeping their signed-body boundary unambiguous; closed nullable PostgreSQL security-context checks for both fresh and already-upgraded databases; made Android foreground-service registration unambiguous to variant-aware lint |
+| current CI reliability commit | Verifies the exported multi-architecture OCI layout directly with runner-provided `tar` and `jq`; no post-build `apt` or mutable third-party runner repository can invalidate an already successful image build |
 
 Schema migrations introduced by this security range are:
 
