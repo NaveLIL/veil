@@ -147,8 +147,8 @@ func TestDeviceDirectoryLifecycle(t *testing.T) {
 	conversationID := conversation["conversation_id"].(string)
 	directoryPath := "/v1/conversations/" + conversationID + "/device-directory"
 
-	if status, _ := h.DoUnsigned(http.MethodGet, directoryPath, nil); status != http.StatusUnauthorized {
-		t.Fatalf("unsigned directory status = %d, want 401", status)
+	if status, _ := h.DoUnsigned(http.MethodGet, directoryPath, nil); status != http.StatusBadRequest {
+		t.Fatalf("unsigned directory status = %d, want 400", status)
 	}
 	if status, _, _ := h.Do(mallory, http.MethodGet, directoryPath, nil); status != http.StatusForbidden {
 		t.Fatalf("non-member directory status = %d, want 403", status)

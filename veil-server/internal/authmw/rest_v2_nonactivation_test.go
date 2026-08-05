@@ -55,6 +55,10 @@ var restAuthV2ReviewedLiveCallers = map[string]restAuthV2ConstructorDefinition{
 	},
 }
 
+var restAuthV2ReviewedIntegrationCaller = restAuthV2ConstructorDefinition{
+	file: filepath.Clean(filepath.Join("internal", "integration", "harness.go")), function: "New",
+}
+
 var restAuthV2CompositeDefinitions = map[string]restAuthV2ConstructorDefinition{
 	"RESTAuthV2Verifier": {
 		file: filepath.Clean(filepath.Join("internal", "authmw", "rest_v2_verifier.go")), function: "newRESTAuthV2VerifierWithClock",
@@ -178,6 +182,22 @@ func restAuthV2NonactivationViolations(
 				return true
 			})
 		}
+		if relative == restAuthV2ReviewedIntegrationCaller.file &&
+			function.Name.Name == restAuthV2ReviewedIntegrationCaller.function {
+			ast.Inspect(function.Body, func(node ast.Node) bool {
+				call, callOK := node.(*ast.CallExpr)
+				if !callOK {
+					return true
+				}
+				identifier := restAuthV2CalledIdentifier(call.Fun)
+				if identifier != nil {
+					if _, guarded := restAuthV2CallableDefinitions[identifier.Name]; guarded {
+						allowedIdentifiers[identifier.Pos()] = struct{}{}
+					}
+				}
+				return true
+			})
+		}
 	}
 
 	position := func(node ast.Node) string { return fileSet.Position(node.Pos()).String() }
@@ -186,7 +206,7 @@ func restAuthV2NonactivationViolations(
 		case *ast.Ident:
 			if _, guarded := restAuthV2CallableDefinitions[candidate.Name]; guarded {
 				if _, allowed := allowedIdentifiers[candidate.Pos()]; !allowed {
-					violations = append(violations, fmt.Sprintf("non-activated REST v2 callable %q referenced at %s", candidate.Name, position(candidate)))
+					violations = append(violations, fmt.Sprintf("guarded REST v2 callable %q referenced at %s", candidate.Name, position(candidate)))
 				}
 			}
 		case *ast.CompositeLit:

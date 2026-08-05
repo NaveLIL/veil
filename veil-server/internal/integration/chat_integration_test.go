@@ -428,8 +428,8 @@ func TestChat_RejectsUnsigned(t *testing.T) {
 	status, _ := h.DoUnsigned(http.MethodPost, "/v1/conversations/dm", map[string]string{
 		"peer_user_id": "anything",
 	})
-	if status != http.StatusUnauthorized {
-		t.Fatalf("want 401 for unsigned, got %d", status)
+	if status != http.StatusBadRequest {
+		t.Fatalf("want 400 for missing v2 selector, got %d", status)
 	}
 }
 

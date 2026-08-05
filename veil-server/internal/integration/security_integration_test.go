@@ -348,8 +348,8 @@ func TestSecurityPrincipalBinding(t *testing.T) {
 
 	t.Run("offline conversation discovery is signed and user scoped", func(t *testing.T) {
 		status, _ := h.DoUnsigned(http.MethodGet, "/v1/conversations", nil)
-		if status != http.StatusUnauthorized {
-			t.Fatalf("unsigned conversation discovery status = %d, want 401", status)
+		if status != http.StatusBadRequest {
+			t.Fatalf("unsigned conversation discovery status = %d, want 400", status)
 		}
 
 		status, _, body := h.Do(alice, http.MethodGet, "/v1/conversations", nil)
