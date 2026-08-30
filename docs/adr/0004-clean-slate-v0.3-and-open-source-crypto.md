@@ -109,6 +109,23 @@ the desktop surfaces it without requiring security choices during ordinary
 messaging. An unknown newer epoch or malformed marker aborts without deleting
 any row.
 
+## Implementation checkpoint: production protocol cut
+
+Implemented on 2026-08-31. Product builds require Direct v2 for authenticated
+prekey establishment, outgoing DMs, durable outbox replay, live/offline receive,
+REST history, and encrypted edits. The outbox validates the exact profile/era,
+target device binding, session commitment, and embedded wire commitment before
+retrying bytes. Edit events preserve the same outer Direct v2 security context
+as new messages.
+
+Sender-Key v5 live/history decoding and v5 roster installation are excluded
+from product builds. A v5-labelled, pre-activation device directory remains a
+control-plane bootstrap marker only: the owner automatically signs membership
+epoch 1, refetches the directory as Sender-Key v6, and no messaging roster is
+installed before that succeeds. Frozen v1/v5 primitives and vectors remain in
+`cfg(test)`/`test-utils` where they protect the active ratchet and downgrade
+invariants; they are not a runtime fallback.
+
 ## MLS integration gates
 
 OpenMLS runtime activation requires all of the following:

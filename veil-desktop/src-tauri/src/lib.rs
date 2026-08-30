@@ -3063,6 +3063,7 @@ fn parse_message_crypto_context_wire(
         membership_epoch,
         membership_epoch_hash,
     } = wire;
+    #[cfg(test)]
     let all_absent = era.is_none()
         && roster_version.is_none()
         && roster_commitment.is_none()
@@ -3079,10 +3080,13 @@ fn parse_message_crypto_context_wire(
         && membership_epoch.is_none()
         && membership_epoch_hash.is_none();
     match profile {
+        #[cfg(test)]
         "legacy_unknown" if all_absent => Ok(ParsedMessageCryptoContext::LegacyUnknown),
+        #[cfg(test)]
         "legacy_unknown" => {
             Err("legacy message crypto profile carries a partial modern context".to_string())
         }
+        #[cfg(test)]
         "sender_key_v5"
             if sender_device_identity_key.is_none()
                 && sender_device_signing_key.is_none()
@@ -3357,10 +3361,10 @@ fn validate_live_message_security_context(
     context: Option<&MessageSecurityContextV1>,
 ) -> Result<(), String> {
     match (sender_key_mode, context) {
-        (false, None)
-        | (false, Some(MessageSecurityContextV1::DirectV2(_)))
-        | (true, Some(MessageSecurityContextV1::SenderKeyV5(_)))
+        (false, Some(MessageSecurityContextV1::DirectV2(_)))
         | (true, Some(MessageSecurityContextV1::SenderKeyV6(_))) => Ok(()),
+        #[cfg(test)]
+        (false, None) | (true, Some(MessageSecurityContextV1::SenderKeyV5(_))) => Ok(()),
         (false, Some(MessageSecurityContextV1::SenderKeyV5(_)))
         | (false, Some(MessageSecurityContextV1::SenderKeyV6(_))) => {
             Err("DM message carries a Sender-Key security context".to_string())
@@ -3807,6 +3811,9 @@ fn parse_device_directory(
         false,
     )?;
     let (membership_epoch, membership_epoch_hash) = match wire.membership_activated {
+        // This is a control-plane bootstrap marker, not permission to install
+        // or use Sender-Key v5 traffic. The owner signs epoch 1 and the
+        // directory is fetched again as Sender-Key v6 before roster install.
         false
             if wire.crypto_profile == "sender_key_v5"
                 && wire.membership_ready
@@ -6049,6 +6056,7 @@ fn sync_conversation_messages(
                         Some(&author_snapshot),
                         Some(author_context),
                         sender_key_mode,
+                        message_security_context.as_ref(),
                         header,
                         ciphertext,
                         Some(&metadata),
@@ -7066,6 +7074,7 @@ fn connect_to_server(
                             ciphertext,
                             header,
                             edit_timestamp,
+                            security_context,
                         } => {
                             if !live_conversation_origin_is_current(
                                 &state_inner,
@@ -7273,6 +7282,7 @@ fn connect_to_server(
                                 Some(&author_snapshot),
                                 Some(MessageAuthorContext::DirectoryMemberAtObservation),
                                 sender_key_mode,
+                                security_context.as_ref(),
                                 &header,
                                 &ciphertext,
                                 Some(&metadata),

@@ -10,10 +10,13 @@
 > поддерживаемых open-source реализаций открытых стандартов, но проходят
 > собственную проверку application boundaries.
 >
-> Текущий шаг: удалить низкорисковый runtime legacy (PIN 4-5, Android vault
-> migration, retired `/ws`), ввести явные clean-slate version barriers и
-> зафиксировать тестами отсутствие downgrade. Следующий шаг: обновление и
-> hardening изолированного `veil-mls`; живой MLS runtime пока не включается.
+> Низкорисковый runtime legacy (PIN 4-5, Android vault migration, retired
+> `/ws`), messaging-state epoch и production-пути Direct v1/Sender-Key v5 уже
+> удалены. Direct v2 обязателен для отправки, outbox, live/offline receive и
+> edit; группы устанавливаются для traffic только после membership-bound
+> Sender-Key v6. Старые primitive/vector ветки остаются только в test build.
+> Текущий шаг: обновление и hardening изолированного `veil-mls`; живой MLS
+> runtime пока не включается.
 >
 > **Dependency checkpoint 2026-08-30:** patched the actionable desktop/mobile
 > `nanoid` and `js-yaml` advisories with narrow pnpm overrides. Mobile CI keeps
@@ -22,9 +25,9 @@
 > low-or-higher pnpm advisory remains blocking. Frozen-lockfile validation,
 > desktop audit, mobile audit, mobile TypeScript, ESLint, and all 233 mobile
 > tests pass locally. The persisted messaging-state version/epoch barrier is
-> now implemented; the next Clean Slate work items are removing the history-only
-> Direct v1/Sender-Key v5 paths and hardening `veil-mls` persistence/rollback
-> before any MLS runtime promotion.
+> now implemented. Product decoding, outgoing Direct and roster installation
+> no longer admit Direct v1/Sender-Key v5; retained storage/schema cleanup and
+> `veil-mls` persistence/rollback hardening remain before MLS promotion.
 > The first protected-branch run additionally found reachable Go 1.26.5
 > standard-library advisories; every pinned CI/release/container toolchain was
 > advanced to the fixed Go 1.26.6 patch release before merge.
@@ -42,14 +45,24 @@
 > surfaces one concise post-unlock notice and otherwise keeps reconnect/send UX
 > automatic.
 >
+> **Protocol-runtime checkpoint 2026-08-31:** production builds require exact
+> Direct v2 device/session context for prekey establishment, send, durable
+> outbox replay, live/offline history and encrypted edits. Sender-Key v5 live
+> events and history are rejected; a pre-activation v5-labelled device
+> directory may be parsed only as a control-plane bootstrap marker and is never
+> installed for traffic. The owner automatically signs membership epoch 1,
+> refetches the directory as Sender-Key v6 and only then enables messaging.
+> Frozen Direct v1/Sender-Key v5 vectors remain under `cfg(test)`/`test-utils`
+> to guard downgrade rejection and the active Direct v2 ratchet primitives.
+>
 > **Checkpoint 2026-08-30:** ADR и open-source policy зафиксированы; desktop
 > PIN 4–5, Android SharedPreferences vault migration и зарегистрированный
 > `/ws` tombstone удалены. Desktop TypeScript boundary проходит локально.
 > Rust/Go/Android проверки должны пройти в CI, так как локальный Windows host
-> не предоставляет эти toolchains. Messaging-state epoch и OpenMLS hardening —
-> следующий незавершённый шаг; Sender Keys и Direct не удалялись.
+> не предоставляет эти toolchains. Этот исторический checkpoint superseded
+> двумя checkpoint от 2026-08-31 выше.
 
-> Актуально на 2026-08-30. Это основной продуктовый и интеграционный план.
+> Актуально на 2026-08-31. Это основной продуктовый и интеграционный план.
 > [`ROADMAP.md`](ROADMAP.md) сохранён как исторический security/infra backlog;
 > при расхождении приоритетов главным считается этот документ.
 
@@ -174,7 +187,7 @@ origin, identity, границы доступа и фактический crypto
 |---|---|---|
 | **Home** | личный центр: поиск людей, друзья, запросы и Direct | UI-контекст, не создаваемый контейнер |
 | **Direct** | защищённый разговор один на один | `dm`, X3DH + Double Ratchet |
-| **Circle** | небольшая приватная группа с одной непрерывной беседой | `group`, Sender Keys v5 |
+| **Circle** | небольшая приватная группа с одной непрерывной беседой | `group`, membership-bound Sender Keys v6; переход на MLS запланирован |
 | **Space** | структурированное совместное пространство с участниками, ролями и Rooms | `server` как access/metadata container |
 | **Room** | функциональный контекст внутри Space | text Room сейчас соответствует `channel` и отдельной conversation/security domain |
 | **Veil Node** | self-hosted инфраструктура и canonical origin аккаунта | exact `(scheme, host, effective port)` origin |
@@ -428,10 +441,10 @@ Security disposition и причины, по которым общий server tr
 settings не выданы за готовый core: они выделены в **Phase 4E — Veil Spaces
 Experience**.
 
-Текущий runtime:
+Текущий runtime (обновлён Clean Slate checkpoint 2026-08-31):
 
-- DM: X3DH + Double Ratchet.
-- Приватные группы: authenticated Sender Keys v5.
+- DM: origin/account/device-bound Direct v2 поверх X3DH + Double Ratchet.
+- Приватные группы: membership-bound authenticated Sender Keys v6.
 - Сервер — контейнер метаданных, ролей и каналов, а не одна криптогруппа.
 - Каждый text channel привязан к отдельной conversation и сейчас шифруется
   Sender Keys. При незавершённой раздаче/ротации отправка блокируется.
@@ -546,6 +559,11 @@ role/overwrite/device change инвалидирует roster proof; новое �
 только затронутый conversation, сохраняет draft и не объявляет receipt
 подтверждением полной истории.
 
+Этот v5 baseline является историческим этапом проектирования. Clean Slate
+checkpoint 2026-08-31 исключил v5 из product decoding/roster installation;
+текущий промежуточный runtime — membership-bound Sender Keys v6, после
+OpenMLS gates он удаляется вместе с Sender-Key storage.
+
 Оставшиеся security hardening задачи не переопределяют baseline: service-
 mediated TOFU/key transparency не входит в закрытую Phase 4D и требует отдельного
 pre-production protocol/security gate; глобальный storage budget/compaction — к
@@ -554,7 +572,7 @@ Phase 8, а ручная физическая multi-device matrix — к Phase 4
 ### Безопасный baseline ближайшего релиза
 
 - Сервер остаётся контейнером; каждый text channel — отдельный security domain.
-- Зашифрованные каналы продолжают использовать authenticated Sender Keys v5.
+- Зашифрованные каналы используют membership-bound Sender Keys v6.
 - MLS не включается автоматически в server channels до готовой multi-device
   orchestration и измерений churn/размера roster.
 - Plaintext/public channel не входит в baseline первого server-релиза. Если он
@@ -1152,7 +1170,7 @@ commits не являются вложенными фазами.
 - Вместо двусмысленного `public/private channel` интерфейс использует:
   - `Space-wide` — Room доступен всем текущим участникам Space и остаётся E2EE;
   - `Restricted` — Room доступен только разрешённым ролям/участникам и тоже E2EE.
-- Text Room остаётся отдельной Sender Keys v5 security domain. UI одинаково
+- Text Room остаётся отдельной Sender Keys v6 security domain. UI одинаково
   правдиво показывает `encrypted`, `rotation pending`, `quarantined` и
   `unavailable`; future-only history не обещает старые ключи новому участнику.
 - Room type делается расширяемым, но 4E активирует только реально работающий

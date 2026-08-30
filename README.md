@@ -137,7 +137,8 @@ integration blockers и локальной macOS x86_64 сборкой опуб�
   canonical Node origin, оба account UUID/identity, оба device binding и X3DH
   transcript; после durable v2 commitment downgrade к Direct v1 запрещён.
   После авторизованной membership-активации группы и text Rooms используют
-  Sender Keys v6 с точным epoch/hash; v5 сохраняется для history. Изменение
+  Sender Keys v6 с точным epoch/hash; product runtime не читает v5 history.
+  Старые v1/v5-векторы остаются только в test build. Изменение
   roster/access требует ротации, а незавершённая раздача блокирует отправку.
 - Локальный поиск не создаёт persistent plaintext index: Tantivy живёт только
   в памяти процесса, перестраивается из SQLCipher для exact authenticated

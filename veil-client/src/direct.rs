@@ -722,13 +722,6 @@ pub fn install_authenticated_direct_prekey_bundle_classified_with_security_polic
         }
     };
 
-    #[cfg(not(any(test, feature = "test-utils")))]
-    if peer_device.is_none() {
-        return Err(DirectPreKeyInstallErrorV1::rejected(
-            "Direct v2 device binding metadata is required",
-        ));
-    }
-
     match wire.identity_transparency {
         Some(transparency) => {
             let canonical_server_origin = client
@@ -829,22 +822,30 @@ pub fn install_authenticated_direct_prekey_bundle_classified_with_security_polic
         }
     }
 
-    let establishment = if let Some(peer_device) = peer_device {
-        let conversation_id = client
-            .direct_v2_conversation_for_peer(&expected_peer_identity_key)
-            .map_err(DirectPreKeyInstallErrorV1::rejected)?;
-        let context = client
-            .direct_v2_initiator_context(
-                &conversation_id,
-                peer_user_id,
-                expected_peer_identity_key,
-                expected_peer_signing_key,
-                peer_device,
-            )
-            .map_err(DirectPreKeyInstallErrorV1::rejected)?;
-        client.establish_session_classified_v2(&expected_peer_identity_key, &bundle, context)
-    } else {
-        client.establish_session_classified_v1(&expected_peer_identity_key, &bundle)
+    let establishment = match peer_device {
+        Some(peer_device) => {
+            let conversation_id = client
+                .direct_v2_conversation_for_peer(&expected_peer_identity_key)
+                .map_err(DirectPreKeyInstallErrorV1::rejected)?;
+            let context = client
+                .direct_v2_initiator_context(
+                    &conversation_id,
+                    peer_user_id,
+                    expected_peer_identity_key,
+                    expected_peer_signing_key,
+                    peer_device,
+                )
+                .map_err(DirectPreKeyInstallErrorV1::rejected)?;
+            client.establish_session_classified_v2(&expected_peer_identity_key, &bundle, context)
+        }
+        #[cfg(any(test, feature = "test-utils"))]
+        None => client.establish_session_classified_v1(&expected_peer_identity_key, &bundle),
+        #[cfg(not(any(test, feature = "test-utils")))]
+        None => {
+            return Err(DirectPreKeyInstallErrorV1::rejected(
+                "Direct v2 device binding metadata is required",
+            ));
+        }
     };
     match establishment {
         Ok(()) => Ok(DirectPreKeyInstallResult::Established),
