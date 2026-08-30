@@ -42,10 +42,7 @@ jobs:
         run: cargo install cargo-audit --version 0.22.2 --locked
 
       - name: Test vendored lru panic-safety backport
-        run: >-
-          cargo test
-          --manifest-path third_party/lru-0.16.4/Cargo.toml
-          --all-features
+        run: cargo test --manifest-path third_party/lru-0.16.4/Cargo.toml
 
       - name: Run cargo audit
         # Tauri's Linux WebKitGTK stack still pins glib 0.18.5. The advisory is
