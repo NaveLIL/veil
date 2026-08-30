@@ -8,9 +8,10 @@
 //!
 //! * **Cipher suite:** `MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519`
 //!   ([`CIPHERSUITE`]). Documented in `INTEGRATION_ROADMAP.md` Phase 6.
-//! * **Credential type:** `BasicCredential` carrying
-//!   `user_id::device_label` (the caller is expected to blake3-hash the
-//!   pair before constructing [`LeafIdentity`]).
+//! * **Credential type:** `BasicCredential` carrying an exact 32-byte
+//!   application-derived [`LeafIdentity`]. The future runtime binding must
+//!   include canonical origin, account, device, binding version and accepted
+//!   transparency state; this crate rejects every other leaf length.
 //! * **Storage:** opaque, compare-and-swap [`MlsKeyStore`] checkpoints.
 //!   Production must wire this to SQLCipher; tests use [`InMemoryStore`].
 //! * **Serialization:** all wire types ([`KeyPackageBlob`],
@@ -43,6 +44,12 @@ pub const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_
 /// Domain label used to derive auxiliary secrets (e.g. for LiveKit in
 /// Phase 7) from the MLS exporter.
 pub const EXPORTER_LABEL: &str = "veil-exporter-v1";
+pub const MLS_GROUP_ID_BYTES: usize = 16;
+pub const MLS_LEAF_IDENTITY_BYTES: usize = 32;
+pub const MAX_KEY_PACKAGE_BYTES: usize = 64 * 1024;
+pub const MAX_MLS_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_EXPORTER_CONTEXT_BYTES: usize = 64 * 1024;
+pub const MAX_EXPORTER_SECRET_BYTES: usize = 1024;
 
 /// Error type for all MLS operations.
 #[derive(Debug, Error)]
@@ -67,6 +74,15 @@ fn tls_err<E: std::fmt::Display>(e: E) -> MlsError {
     MlsError::Encoding(e.to_string())
 }
 
+fn ensure_max_len(label: &str, actual: usize, maximum: usize) -> Result<()> {
+    if actual > maximum {
+        return Err(MlsError::Invalid(format!(
+            "{label} exceeds the {maximum}-byte limit"
+        )));
+    }
+    Ok(())
+}
+
 /// A serialized KeyPackage published to the server so other clients can
 /// add this device to a group.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,24 +103,45 @@ pub struct MlsCiphertext(pub Vec<u8>);
 /// Group identifier round-tripped as raw bytes (server uses the
 /// conversation UUID directly).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct MlsGroupId(pub Vec<u8>);
+pub struct MlsGroupId(Vec<u8>);
 
 impl MlsGroupId {
-    pub fn from_uuid_bytes(bytes: &[u8]) -> Self {
-        Self(bytes.to_vec())
+    pub fn from_uuid_bytes(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() != MLS_GROUP_ID_BYTES {
+            return Err(MlsError::Invalid(
+                "MLS group id must be exactly 16 UUID bytes".into(),
+            ));
+        }
+        Ok(Self(bytes.to_vec()))
     }
-    fn as_openmls(&self) -> GroupId {
-        GroupId::from_slice(&self.0)
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    fn as_openmls(&self) -> Result<GroupId> {
+        if self.0.len() != MLS_GROUP_ID_BYTES {
+            return Err(MlsError::Invalid(
+                "MLS group id must be exactly 16 UUID bytes".into(),
+            ));
+        }
+        Ok(GroupId::from_slice(&self.0))
     }
 }
 
 /// Stable per-device identity used in the BasicCredential.
 #[derive(Debug, Clone, Zeroize, ZeroizeOnDrop)]
-pub struct LeafIdentity(pub Vec<u8>);
+pub struct LeafIdentity(Vec<u8>);
 
 impl LeafIdentity {
-    pub fn new(bytes: impl Into<Vec<u8>>) -> Self {
-        Self(bytes.into())
+    pub fn new(bytes: impl Into<Vec<u8>>) -> Result<Self> {
+        let bytes = bytes.into();
+        if bytes.len() != MLS_LEAF_IDENTITY_BYTES {
+            return Err(MlsError::Invalid(
+                "MLS leaf identity must be exactly 32 derived bytes".into(),
+            ));
+        }
+        Ok(Self(bytes))
     }
 }
 
@@ -200,6 +237,7 @@ impl<S: MlsKeyStore> MlsClient<S> {
                 .key_package()
                 .tls_serialize_detached()
                 .map_err(tls_err)?;
+            ensure_max_len("MLS KeyPackage", serialized.len(), MAX_KEY_PACKAGE_BYTES)?;
             Ok(KeyPackageBlob(serialized))
         })
     }
@@ -207,6 +245,7 @@ impl<S: MlsKeyStore> MlsClient<S> {
     /// Create a brand-new group.
     pub fn create_group(&mut self, group_id: &MlsGroupId) -> Result<()> {
         let leaf = self.leaf.0.clone();
+        let openmls_group_id = group_id.as_openmls()?;
         self.transact(|provider, signer| {
             let credential = BasicCredential::new(leaf);
             let credential_with_key = CredentialWithKey {
@@ -222,7 +261,7 @@ impl<S: MlsKeyStore> MlsClient<S> {
                 provider,
                 signer,
                 &cfg,
-                group_id.as_openmls(),
+                openmls_group_id,
                 credential_with_key,
             )
             .map_err(|e| MlsError::Protocol(format!("create group: {e:?}")))?;
@@ -236,6 +275,7 @@ impl<S: MlsKeyStore> MlsClient<S> {
         group_id: &MlsGroupId,
         joiner_kp: &KeyPackageBlob,
     ) -> Result<(CommitBlob, WelcomeBlob)> {
+        ensure_max_len("MLS KeyPackage", joiner_kp.0.len(), MAX_KEY_PACKAGE_BYTES)?;
         self.transact(|provider, signer| {
             let mut group = Self::load_group_from(provider, group_id)?;
             let kp_in = KeyPackageIn::tls_deserialize_exact_bytes(joiner_kp.0.as_slice())
@@ -254,12 +294,15 @@ impl<S: MlsKeyStore> MlsClient<S> {
 
             let commit_bytes = commit.tls_serialize_detached().map_err(tls_err)?;
             let welcome_bytes = welcome.tls_serialize_detached().map_err(tls_err)?;
+            ensure_max_len("MLS Commit", commit_bytes.len(), MAX_MLS_MESSAGE_BYTES)?;
+            ensure_max_len("MLS Welcome", welcome_bytes.len(), MAX_MLS_MESSAGE_BYTES)?;
             Ok((CommitBlob(commit_bytes), WelcomeBlob(welcome_bytes)))
         })
     }
 
     /// Process an incoming Welcome and join the group it carries.
     pub fn process_welcome(&mut self, welcome: &WelcomeBlob) -> Result<MlsGroupId> {
+        ensure_max_len("MLS Welcome", welcome.0.len(), MAX_MLS_MESSAGE_BYTES)?;
         self.transact(|provider, _signer| {
             let msg =
                 MlsMessageIn::tls_deserialize_exact_bytes(welcome.0.as_slice()).map_err(tls_err)?;
@@ -276,12 +319,13 @@ impl<S: MlsKeyStore> MlsClient<S> {
             let group = staged
                 .into_group(provider)
                 .map_err(|e| MlsError::Protocol(format!("install welcome: {e:?}")))?;
-            Ok(MlsGroupId(group.group_id().as_slice().to_vec()))
+            MlsGroupId::from_uuid_bytes(group.group_id().as_slice())
         })
     }
 
     /// Process an incoming Commit. Advances the group epoch.
     pub fn process_commit(&mut self, group_id: &MlsGroupId, commit: &CommitBlob) -> Result<()> {
+        ensure_max_len("MLS Commit", commit.0.len(), MAX_MLS_MESSAGE_BYTES)?;
         self.transact(|provider, _signer| {
             let mut group = Self::load_group_from(provider, group_id)?;
             let msg =
@@ -294,25 +338,27 @@ impl<S: MlsKeyStore> MlsClient<S> {
             let processed = group
                 .process_message(provider, protocol_msg)
                 .map_err(|e| MlsError::Protocol(format!("process: {e:?}")))?;
-            if let ProcessedMessageContent::StagedCommitMessage(staged_commit) =
-                processed.into_content()
-            {
-                group
+            match processed.into_content() {
+                ProcessedMessageContent::StagedCommitMessage(staged_commit) => group
                     .merge_staged_commit(provider, *staged_commit)
-                    .map_err(|e| MlsError::Protocol(format!("merge: {e:?}")))?;
+                    .map_err(|e| MlsError::Protocol(format!("merge: {e:?}"))),
+                _ => Err(MlsError::Invalid(
+                    "handshake message is not an MLS Commit".into(),
+                )),
             }
-            Ok(())
         })
     }
 
     /// Encrypt an application message.
     pub fn encrypt(&mut self, group_id: &MlsGroupId, plaintext: &[u8]) -> Result<MlsCiphertext> {
+        ensure_max_len("MLS plaintext", plaintext.len(), MAX_MLS_MESSAGE_BYTES)?;
         self.transact(|provider, signer| {
             let mut group = Self::load_group_from(provider, group_id)?;
             let msg = group
                 .create_message(provider, signer, plaintext)
                 .map_err(|e| MlsError::Protocol(format!("encrypt: {e:?}")))?;
             let bytes = msg.tls_serialize_detached().map_err(tls_err)?;
+            ensure_max_len("MLS ciphertext", bytes.len(), MAX_MLS_MESSAGE_BYTES)?;
             Ok(MlsCiphertext(bytes))
         })
     }
@@ -323,6 +369,7 @@ impl<S: MlsKeyStore> MlsClient<S> {
         group_id: &MlsGroupId,
         ciphertext: &MlsCiphertext,
     ) -> Result<Vec<u8>> {
+        ensure_max_len("MLS ciphertext", ciphertext.0.len(), MAX_MLS_MESSAGE_BYTES)?;
         self.transact(|provider, _signer| {
             let mut group = Self::load_group_from(provider, group_id)?;
             let msg = MlsMessageIn::tls_deserialize_exact_bytes(ciphertext.0.as_slice())
@@ -336,7 +383,11 @@ impl<S: MlsKeyStore> MlsClient<S> {
                 .process_message(provider, protocol_msg)
                 .map_err(|e| MlsError::Protocol(format!("decrypt: {e:?}")))?;
             match processed.into_content() {
-                ProcessedMessageContent::ApplicationMessage(app) => Ok(app.into_bytes()),
+                ProcessedMessageContent::ApplicationMessage(app) => {
+                    let plaintext = app.into_bytes();
+                    ensure_max_len("MLS plaintext", plaintext.len(), MAX_MLS_MESSAGE_BYTES)?;
+                    Ok(plaintext)
+                }
                 _ => Err(MlsError::Invalid("not an application message".into())),
             }
         })
@@ -349,6 +400,16 @@ impl<S: MlsKeyStore> MlsClient<S> {
         context: &[u8],
         length: usize,
     ) -> Result<Vec<u8>> {
+        ensure_max_len(
+            "MLS exporter context",
+            context.len(),
+            MAX_EXPORTER_CONTEXT_BYTES,
+        )?;
+        if length == 0 || length > MAX_EXPORTER_SECRET_BYTES {
+            return Err(MlsError::Invalid(
+                "MLS exporter length must be between 1 and 1024 bytes".into(),
+            ));
+        }
         let group = Self::load_group_from(&self.provider, group_id)?;
         group
             .export_secret(self.provider.crypto(), EXPORTER_LABEL, context, length)
@@ -435,7 +496,7 @@ impl<S: MlsKeyStore> MlsClient<S> {
     }
 
     fn load_group_from(provider: &OpenMlsRustCrypto, group_id: &MlsGroupId) -> Result<MlsGroup> {
-        MlsGroup::load(provider.storage(), &group_id.as_openmls())
+        MlsGroup::load(provider.storage(), &group_id.as_openmls()?)
             .map_err(|e| MlsError::Storage(format!("load group: {e:?}")))?
             .ok_or_else(|| MlsError::GroupNotFound(hex::encode(&group_id.0)))
     }
@@ -444,6 +505,7 @@ impl<S: MlsKeyStore> MlsClient<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
@@ -475,12 +537,17 @@ mod tests {
         }
     }
 
+    fn test_leaf(label: &str) -> LeafIdentity {
+        LeafIdentity::new(Sha256::digest(label.as_bytes()).to_vec()).expect("test leaf")
+    }
+
+    fn test_group(label: &str) -> MlsGroupId {
+        let digest = Sha256::digest(label.as_bytes());
+        MlsGroupId::from_uuid_bytes(&digest[..MLS_GROUP_ID_BYTES]).expect("test group")
+    }
+
     fn fresh_client(label: &str) -> MlsClient<InMemoryStore> {
-        MlsClient::create(
-            LeafIdentity::new(label.as_bytes().to_vec()),
-            InMemoryStore::default(),
-        )
-        .expect("create client")
+        MlsClient::create(test_leaf(label), InMemoryStore::default()).expect("create client")
     }
 
     #[test]
@@ -489,7 +556,7 @@ mod tests {
         let mut bob = fresh_client("bob::desktop");
 
         let bob_kp = bob.generate_key_package().expect("kp");
-        let group_id = MlsGroupId::from_uuid_bytes(b"test-group-uuid-aaaa");
+        let group_id = test_group("two-party");
 
         alice.create_group(&group_id).expect("create");
         let (_commit, welcome) = alice.add_member(&group_id, &bob_kp).expect("add");
@@ -506,6 +573,40 @@ mod tests {
         let ct = bob.encrypt(&group_id, b"hello alice").expect("enc");
         let pt = alice.decrypt(&group_id, &ct).expect("dec");
         assert_eq!(pt, b"hello alice");
+
+        // A private application message is not a Commit. Rejecting it through
+        // the handshake API must also roll back the receive secret tree so the
+        // same ciphertext remains decryptable through the correct API.
+        let application = alice.encrypt(&group_id, b"not a commit").expect("enc");
+        let bob_generation = bob.checkpoint_generation();
+        assert!(bob
+            .process_commit(&group_id, &CommitBlob(application.0.clone()))
+            .is_err());
+        assert_eq!(bob.checkpoint_generation(), bob_generation);
+        assert_eq!(
+            bob.decrypt(&group_id, &application)
+                .expect("correct decrypt"),
+            b"not a commit"
+        );
+    }
+
+    #[test]
+    fn identifiers_and_public_inputs_are_bounded() {
+        assert!(LeafIdentity::new(vec![0; MLS_LEAF_IDENTITY_BYTES - 1]).is_err());
+        assert!(MlsGroupId::from_uuid_bytes(&[0; MLS_GROUP_ID_BYTES - 1]).is_err());
+
+        let mut client = fresh_client("bounded-inputs");
+        let group_id = test_group("bounded-inputs");
+        client.create_group(&group_id).expect("group");
+        assert!(client
+            .decrypt(
+                &group_id,
+                &MlsCiphertext(vec![0; MAX_MLS_MESSAGE_BYTES + 1]),
+            )
+            .is_err());
+        assert!(client
+            .export_secret(&group_id, b"context", MAX_EXPORTER_SECRET_BYTES + 1)
+            .is_err());
     }
 
     /// Async-add catch-up: alice adds bob, then later adds charlie.
@@ -518,7 +619,7 @@ mod tests {
         let mut bob = fresh_client("bob::desktop");
         let mut charlie = fresh_client("charlie::desktop");
 
-        let group_id = MlsGroupId::from_uuid_bytes(b"async-catch-up-uuid-");
+        let group_id = test_group("async-catch-up");
         alice.create_group(&group_id).expect("create");
 
         // Round 1: bob joins.
@@ -590,7 +691,7 @@ mod tests {
             let mut gid = b"pool-test-uuid-".to_vec();
             gid.push(i as u8);
             gid.resize(16, 0);
-            let group_id = MlsGroupId(gid);
+            let group_id = MlsGroupId::from_uuid_bytes(&gid).expect("group id");
             alice.create_group(&group_id).expect("create");
             alice.add_member(&group_id, kp).expect("consume kp");
         }
@@ -602,7 +703,7 @@ mod tests {
     fn restore_preserves_identity() {
         let store = InMemoryStore::default();
         let restore_store = store.clone();
-        let leaf = LeafIdentity::new(b"persistent::desktop".to_vec());
+        let leaf = test_leaf("persistent::desktop");
 
         let original = MlsClient::create(leaf.clone(), store).expect("create");
         let pub_key = original.signature_public().to_vec();
@@ -615,9 +716,9 @@ mod tests {
     fn persistence_failure_rolls_back_before_output_is_released() {
         let store = RejectingStore::default();
         let controls = store.clone();
-        let leaf = LeafIdentity::new(b"rollback::desktop".to_vec());
+        let leaf = test_leaf("rollback::desktop");
         let mut client = MlsClient::create(leaf, store).expect("create");
-        let group_id = MlsGroupId::from_uuid_bytes(b"rollback-group-id");
+        let group_id = test_group("rollback-group");
 
         controls.reject_writes.store(true, Ordering::SeqCst);
         assert!(client.create_group(&group_id).is_err());
@@ -637,7 +738,7 @@ mod tests {
     fn restore_rejects_checkpoint_older_than_external_anchor() {
         let store = InMemoryStore::default();
         let restore_store = store.clone();
-        let leaf = LeafIdentity::new(b"anchored::desktop".to_vec());
+        let leaf = test_leaf("anchored::desktop");
         let client = MlsClient::create(leaf.clone(), store).expect("create");
         assert_eq!(client.checkpoint_generation(), 0);
 
@@ -653,13 +754,13 @@ mod tests {
     #[test]
     fn snapshot_restore_preserves_group_state() {
         let mut alice = fresh_client("alice::snap");
-        let bob_leaf = LeafIdentity::new(b"bob::snap".to_vec());
+        let bob_leaf = test_leaf("bob::snap");
         let bob_store = InMemoryStore::default();
         let bob_restore_store = bob_store.clone();
         let mut bob = MlsClient::create(bob_leaf.clone(), bob_store).expect("bob");
 
         let bob_kp = bob.generate_key_package().expect("kp");
-        let group_id = MlsGroupId::from_uuid_bytes(b"snap-restore-uuid-aa");
+        let group_id = test_group("snapshot-restore");
         alice.create_group(&group_id).expect("create");
         let (_c, w) = alice.add_member(&group_id, &bob_kp).expect("add");
         bob.process_welcome(&w).expect("welcome");

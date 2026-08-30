@@ -28,6 +28,10 @@ restores the exact pre-operation provider state.
 - Added checkpoint format `VMLSCP01`: explicit version/flags/generation,
   SHA-256 leaf binding and body integrity, deterministic key ordering, exact
   length/trailing-byte checks, and hard total/entry/key/value/signer limits.
+- Enforced exact 16-byte conversation UUIDs, exact 32-byte derived leaf IDs,
+  and hard KeyPackage/handshake/application/exporter limits before parsing or
+  allocation. The commit API rejects every processed content type except a
+  staged MLS Commit and rolls the receive tree back on mismatch.
 - Combined the TLS-encoded signature key and all OpenMLS provider entries in
   one zeroizing secret-bearing blob.
 - Changed mutating client APIs to exclusive `&mut` access and added exact
