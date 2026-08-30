@@ -127,7 +127,7 @@ func (r *responseRecorder) Flush() {
 }
 
 // Hijack implements http.Hijacker so that handlers performing protocol
-// upgrades (e.g. the WebSocket gateway at /ws) keep working when wrapped by
+// upgrades (e.g. the WebSocket gateway at /v3/events) keep working when wrapped by
 // AccessLog. Without this, gorilla/websocket's Upgrade returns 500.
 //
 // Once the connection is hijacked we mark the request as handled with the

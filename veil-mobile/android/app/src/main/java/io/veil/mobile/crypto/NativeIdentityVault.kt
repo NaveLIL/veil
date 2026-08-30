@@ -1,10 +1,8 @@
 package io.veil.mobile.crypto
 
 import android.content.Context
-import android.content.SharedPreferences
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
-import android.util.Base64
 import java.io.File
 import java.security.KeyStore
 import javax.crypto.Cipher
@@ -22,14 +20,9 @@ internal interface NativeIdentityVaultAccess {
 internal class NativeIdentityVault(context: Context) : NativeIdentityVaultAccess {
   private val repository =
     IdentityRecordRepository(
-      storage =
-        WriteOnceIdentityRecordStorage(
-          AndroidDurableIdentityFileOps(File(context.noBackupFilesDir, RECORD_FILE_NAME)),
-        ),
-      legacy =
-        SharedPreferencesLegacyIdentitySource(
-          context.getSharedPreferences(LEGACY_PREFERENCES_NAME, Context.MODE_PRIVATE),
-        ),
+      WriteOnceIdentityRecordStorage(
+        AndroidDurableIdentityFileOps(File(context.noBackupFilesDir, RECORD_FILE_NAME)),
+      ),
     )
 
   override fun hasIdentity(): Boolean = NativeIdentityVaultProcessLock.withLock {
@@ -132,88 +125,11 @@ internal class NativeIdentityVault(context: Context) : NativeIdentityVaultAccess
 
   companion object {
     private const val RECORD_FILE_NAME = "veil_native_identity_v1.bin"
-    private const val LEGACY_PREFERENCES_NAME = "veil_native_identity_v1"
     private const val KEYSTORE_PROVIDER = "AndroidKeyStore"
     private const val KEY_ALIAS = "veil.mobile.identity.v1"
     private const val TRANSFORMATION = "AES/GCM/NoPadding"
     private const val GCM_TAG_BITS = 128
     private const val MAX_MNEMONIC_BYTES = 24 * 9
-  }
-}
-
-/** Read-only compatibility adapter for the legacy SharedPreferences record. */
-internal class SharedPreferencesLegacyIdentitySource(
-  private val preferences: SharedPreferences,
-) : LegacyIdentitySource {
-  override fun hasAny(): Boolean = LEGACY_KEYS.any(preferences::contains)
-
-  override fun read(): LegacyIdentityState {
-    val present = LEGACY_KEYS.count(preferences::contains)
-    if (present == 0) return LegacyIdentityState.Empty
-    if (present != LEGACY_KEYS.size) return LegacyIdentityState.Partial
-
-    val version =
-      try {
-        preferences.getInt(KEY_VERSION, 0)
-      } catch (error: ClassCastException) {
-        throw IdentityVaultException("legacy identity vault version is invalid", error)
-      }
-    if (version != LEGACY_FORMAT_VERSION) {
-      throw IdentityVaultException("unsupported legacy identity vault version")
-    }
-
-    val iv = decode(KEY_IV, MAX_LEGACY_IV_BYTES)
-    try {
-      val ciphertext = decode(KEY_CIPHERTEXT, MAX_LEGACY_CIPHERTEXT_BYTES)
-      return LegacyIdentityState.Complete(EncryptedIdentityRecord(iv, ciphertext))
-    } catch (error: Throwable) {
-      iv.fill(0)
-      throw error
-    }
-  }
-
-  override fun clear(): Boolean = preferences.edit().clear().commit()
-
-  private fun decode(key: String, maximumDecodedBytes: Int): ByteArray {
-    val value =
-      try {
-        preferences.getString(key, null)
-      } catch (error: ClassCastException) {
-        throw IdentityVaultException("legacy identity vault encoding is invalid", error)
-      } ?: throw IdentityVaultException("legacy identity vault is incomplete")
-
-    val maximumEncodedCharacters = ((maximumDecodedBytes + 2) / 3) * 4
-    if (
-      value.isEmpty() ||
-        value.length > maximumEncodedCharacters ||
-        value.length % 4 != 0 ||
-        !BASE64_PATTERN.matches(value)
-    ) {
-      throw IdentityVaultException("legacy identity vault encoding is invalid")
-    }
-
-    val decoded =
-      try {
-        Base64.decode(value, Base64.NO_WRAP)
-      } catch (error: IllegalArgumentException) {
-        throw IdentityVaultException("legacy identity vault encoding is invalid", error)
-      }
-    if (decoded.size > maximumDecodedBytes) {
-      decoded.fill(0)
-      throw IdentityVaultException("legacy identity vault field is too large")
-    }
-    return decoded
-  }
-
-  companion object {
-    private const val LEGACY_FORMAT_VERSION = 1
-    private const val KEY_VERSION = "version"
-    private const val KEY_IV = "iv"
-    private const val KEY_CIPHERTEXT = "ciphertext"
-    private const val MAX_LEGACY_IV_BYTES = 32
-    private const val MAX_LEGACY_CIPHERTEXT_BYTES = 8 * 1024
-    private val LEGACY_KEYS = listOf(KEY_VERSION, KEY_IV, KEY_CIPHERTEXT)
-    private val BASE64_PATTERN = Regex("^[A-Za-z0-9+/]*={0,2}$")
   }
 }
 

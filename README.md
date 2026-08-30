@@ -204,7 +204,7 @@ Gateway разработки публикуется только на `127.0.0.1
 Live transport переведён на origin-bound контракты: desktop и Android используют
 `/v3/events` для единого authenticated command/event socket, а signed REST
 routes принимают только REST v2 с durable PostgreSQL replay protection. Legacy
-`/ws` окончательно выведен из эксплуатации и отвечает `410`; runtime-флага для
+`/ws` окончательно удалён и больше не регистрируется; runtime-флага для
 возврата origin-unbound WS v2 больше нет, а его присутствие в окружении блокирует
 запуск как устаревшую небезопасную конфигурацию. Клиенты downgrade не делают.
 Полный cross-client/hostile two-Node evidence и независимый review всё

@@ -14,6 +14,13 @@
 > migration, retired `/ws`), ввести явные clean-slate version barriers и
 > зафиксировать тестами отсутствие downgrade. Следующий шаг: обновление и
 > hardening изолированного `veil-mls`; живой MLS runtime пока не включается.
+>
+> **Checkpoint 2026-08-30:** ADR и open-source policy зафиксированы; desktop
+> PIN 4–5, Android SharedPreferences vault migration и зарегистрированный
+> `/ws` tombstone удалены. Desktop TypeScript boundary проходит локально.
+> Rust/Go/Android проверки должны пройти в CI, так как локальный Windows host
+> не предоставляет эти toolchains. Messaging-state epoch и OpenMLS hardening —
+> следующий незавершённый шаг; Sender Keys и Direct не удалялись.
 
 > Актуально на 2026-08-30. Это основной продуктовый и интеграционный план.
 > [`ROADMAP.md`](ROADMAP.md) сохранён как исторический security/infra backlog;

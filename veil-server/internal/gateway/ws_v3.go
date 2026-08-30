@@ -82,8 +82,7 @@ const wsV3AuthReadTimeout = 8 * time.Second
 func HandleWebSocketV3(hub *Hub, w http.ResponseWriter, r *http.Request) {
 	ip := wsClientIP(r)
 
-	// Same pre-upgrade per-IP budget as /ws — shared across both endpoints so
-	// mixing transports cannot double the cap.
+	// Enforce the pre-upgrade per-IP budget before any WebSocket allocation.
 	if !hub.tryAcquireIP(ip) {
 		metrics.WSRefusedTotal.WithLabelValues("ip_cap").Inc()
 		http.Error(w, "too many connections from this address", http.StatusTooManyRequests)

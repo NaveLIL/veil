@@ -330,7 +330,7 @@ const PROJECT_SOURCE_URL: &str = match option_env!("VEIL_PROJECT_SOURCE_URL") {
     Some(url) => url,
     None => PROJECT_REPOSITORY_URL,
 };
-const LEGACY_MIN_PIN_LEN: usize = 4;
+const MIN_PIN_LEN: usize = 6;
 const MAX_PIN_LEN: usize = 12;
 
 fn stage_attachment_drop(
@@ -1492,14 +1492,14 @@ fn clear_persistent_pin_throttle() -> Result<(), String> {
 }
 
 fn valid_unlock_pin(pin: &str) -> bool {
-    (LEGACY_MIN_PIN_LEN..=MAX_PIN_LEN).contains(&pin.len())
+    (MIN_PIN_LEN..=MAX_PIN_LEN).contains(&pin.len())
         && pin.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 async fn verify_pin_throttled(state: &AppState, mut pin: String) -> Result<bool, String> {
     if !valid_unlock_pin(&pin) {
         pin.zeroize();
-        return Err("PIN must contain 4 to 12 digits (4–5 only for legacy PINs)".to_string());
+        return Err("PIN must contain 6 to 12 digits".to_string());
     }
     // Read keychain material before reserving a permit so an OS keychain
     // failure cannot strand the single verification slot.
@@ -14293,12 +14293,12 @@ mod e2ee_rest_tests {
     }
 
     #[test]
-    fn native_unlock_pin_boundary_matches_legacy_and_current_ui() {
-        assert!(valid_unlock_pin("1234"));
-        assert!(valid_unlock_pin("12345"));
+    fn native_unlock_pin_boundary_matches_current_ui() {
         assert!(valid_unlock_pin("123456"));
         assert!(valid_unlock_pin("123456789012"));
         assert!(!valid_unlock_pin("123"));
+        assert!(!valid_unlock_pin("1234"));
+        assert!(!valid_unlock_pin("12345"));
         assert!(!valid_unlock_pin("1234567890123"));
         assert!(!valid_unlock_pin("１２３４５６"));
         assert!(!valid_unlock_pin("12a456"));

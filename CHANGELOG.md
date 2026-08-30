@@ -5,6 +5,25 @@ minor releases may intentionally remove obsolete protocol paths when keeping
 them would weaken security or complicate the product without serving deployed
 users.
 
+## Unreleased - v0.3.0 Clean Slate
+
+### In progress
+
+- Accepted ADR-0004: maintained open-source implementations of open security
+  standards are preferred over new Veil-specific protocol generations when
+  their application boundaries, licensing, persistence, and platform behavior
+  pass Veil's gates.
+- Removed desktop support for 4-5 digit legacy PIN unlock; the single supported
+  PIN policy is now 6-12 ASCII digits.
+- Removed the Android SharedPreferences identity-vault migration adapter. The
+  current durable no-backup-file format remains write-once and fail-closed.
+- Removed the retired `/ws` route and compatibility response completely;
+  `/v3/events` is the only registered WebSocket transport.
+
+This is an intentionally breaking pre-release line. Message/ratchet/Sender-Key
+history cutover and the OpenMLS runtime remain pending and are tracked in
+ADR-0004 and `INTEGRATION_ROADMAP.md`.
+
 ## 0.2.0 Preview — 2026-08-05
 
 This release promotes the integrated beta line to the default development
