@@ -19892,7 +19892,9 @@ mod tests {
         ] {
             let count: i64 = db
                 .conn
-                .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| row.get(0))
+                .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
                 .unwrap();
             assert_eq!(count, 0, "{table} survived the v0.3 reset");
         }
@@ -19940,7 +19942,9 @@ mod tests {
 
         let count: i64 = db
             .conn
-            .query_row("SELECT count(*) FROM ratchet_sessions", [], |row| row.get(0))
+            .query_row("SELECT count(*) FROM ratchet_sessions", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(count, 1);
         assert!(!db.messaging_state_reset_notice_pending_v3().unwrap());
@@ -19949,7 +19953,9 @@ mod tests {
     #[test]
     fn newer_or_malformed_messaging_epoch_fails_closed_without_mutation() {
         for encoded in [
-            (CURRENT_MESSAGING_STATE_EPOCH_V3 + 1).to_be_bytes().to_vec(),
+            (CURRENT_MESSAGING_STATE_EPOCH_V3 + 1)
+                .to_be_bytes()
+                .to_vec(),
             vec![0x03],
         ] {
             let db = VeilDb::open_memory(&[0xE3; 32]).unwrap();
@@ -19971,7 +19977,9 @@ mod tests {
             assert!(db.reconcile_messaging_state_epoch_v3().is_err());
             let count: i64 = db
                 .conn
-                .query_row("SELECT count(*) FROM ratchet_sessions", [], |row| row.get(0))
+                .query_row("SELECT count(*) FROM ratchet_sessions", [], |row| {
+                    row.get(0)
+                })
                 .unwrap();
             assert_eq!(count, 1);
             assert!(!db.messaging_state_reset_notice_pending_v3().unwrap());
