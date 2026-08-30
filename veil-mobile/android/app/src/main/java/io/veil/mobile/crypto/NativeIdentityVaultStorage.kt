@@ -515,49 +515,17 @@ private class AndroidDurableIdentityTempOutput(
   override fun close() = output.close()
 }
 
-internal sealed interface LegacyIdentityState {
-  data object Empty : LegacyIdentityState
-
-  data object Partial : LegacyIdentityState
-
-  class Complete(val record: EncryptedIdentityRecord) : LegacyIdentityState
-}
-
-internal interface LegacyIdentitySource {
-  /** Does not parse legacy values; used only to retry cleanup after migration. */
-  fun hasAny(): Boolean
-
-  fun read(): LegacyIdentityState
-
-  /** Returns true only after the legacy data is durably removed. */
-  fun clear(): Boolean
-}
-
-/** Coordinates authoritative durable reads and one-way legacy migration. */
+/** Owns the single current-format, write-once identity record. */
 internal class IdentityRecordRepository(
   private val storage: IdentityRecordStorage,
-  private val legacy: LegacyIdentitySource,
 ) {
   /** Returns an owned record which the caller must clear. */
   fun load(): EncryptedIdentityRecord? {
-    storage.readOrNull()?.let { encoded ->
-      val record =
-        try {
-          IdentityVaultRecordCodec.decode(encoded)
-        } finally {
-          encoded.fill(0)
-        }
-      // The verified durable record is authoritative. Cleanup must never turn
-      // it into a load failure; a later load retries if this attempt fails.
-      bestEffortLegacyCleanup(knownPresent = false)
-      return record
-    }
-
-    return when (val state = legacy.read()) {
-      LegacyIdentityState.Empty -> null
-      LegacyIdentityState.Partial ->
-        throw IdentityVaultException("legacy identity vault is incomplete")
-      is LegacyIdentityState.Complete -> migrate(state.record)
+    val encoded = storage.readOrNull() ?: return null
+    return try {
+      IdentityVaultRecordCodec.decode(encoded)
+    } finally {
+      encoded.fill(0)
     }
   }
 
@@ -567,36 +535,6 @@ internal class IdentityRecordRepository(
       throw IdentityVaultException("an identity already exists on this device")
     }
     writeRecord(record)
-  }
-
-  private fun migrate(record: EncryptedIdentityRecord): EncryptedIdentityRecord {
-    try {
-      writeRecord(record)
-      bestEffortLegacyCleanup(knownPresent = true)
-      return record
-    } catch (error: Throwable) {
-      record.clear()
-      throw error
-    }
-  }
-
-  private fun bestEffortLegacyCleanup(knownPresent: Boolean) {
-    val shouldClear =
-      if (knownPresent) {
-        true
-      } else {
-        try {
-          legacy.hasAny()
-        } catch (_: Exception) {
-          false
-        }
-      }
-    if (!shouldClear) return
-    try {
-      legacy.clear()
-    } catch (_: Exception) {
-      // The verified durable file remains authoritative. Retry on next load.
-    }
   }
 
   private fun writeRecord(record: EncryptedIdentityRecord) {

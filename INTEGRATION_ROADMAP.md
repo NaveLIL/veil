@@ -1,6 +1,45 @@
 # Дорожная карта Veil
 
-> Актуально на 2026-08-05. Это основной продуктовый и интеграционный план.
+> **Clean Slate v0.3 — начат 2026-08-30.** Принят
+> [`ADR-0004`](docs/adr/0004-clean-slate-v0.3-and-open-source-crypto.md): история
+> сообщений и старое crypto-state не являются целью совместимости; identity,
+> device trust и Node configuration сохраняются только через явно проверенные
+> инварианты. Группы переходят на MLS/OpenMLS после persistence/rollback/
+> offline/Android gates. Direct v2 остаётся рабочим до отдельного двухстороннего
+> MLS решения. Новые security-компоненты по умолчанию выбираются из
+> поддерживаемых open-source реализаций открытых стандартов, но проходят
+> собственную проверку application boundaries.
+>
+> Текущий шаг: удалить низкорисковый runtime legacy (PIN 4-5, Android vault
+> migration, retired `/ws`), ввести явные clean-slate version barriers и
+> зафиксировать тестами отсутствие downgrade. Следующий шаг: обновление и
+> hardening изолированного `veil-mls`; живой MLS runtime пока не включается.
+>
+> **Dependency checkpoint 2026-08-30:** patched the actionable desktop/mobile
+> `nanoid` and `js-yaml` advisories with narrow pnpm overrides. Mobile CI keeps
+> only the two exact, time-bounded `image-size` build-tool exceptions documented
+> in `docs/reviews/mobile-image-size-audit-exception-2026-08-30.md`; every other
+> low-or-higher pnpm advisory remains blocking. Frozen-lockfile validation,
+> desktop audit, mobile audit, mobile TypeScript, ESLint, and all 233 mobile
+> tests pass locally. The next Clean Slate work item is the explicit persisted
+> messaging-state version/epoch barrier, followed by `veil-mls` persistence and
+> rollback hardening before any MLS runtime promotion.
+> The first protected-branch run additionally found reachable Go 1.26.5
+> standard-library advisories; every pinned CI/release/container toolchain was
+> advanced to the fixed Go 1.26.6 patch release before merge.
+> The same run found `RUSTSEC-2026-0253` in Tantivy's pinned `lru 0.16.4`.
+> Until Tantivy accepts the fixed 0.18 line, Veil carries only upstream's exact
+> detach-before-drop patch and regression test in `third_party/lru-0.16.4`;
+> the temporary Cargo patch and scanner suppression are provenance-documented.
+>
+> **Checkpoint 2026-08-30:** ADR и open-source policy зафиксированы; desktop
+> PIN 4–5, Android SharedPreferences vault migration и зарегистрированный
+> `/ws` tombstone удалены. Desktop TypeScript boundary проходит локально.
+> Rust/Go/Android проверки должны пройти в CI, так как локальный Windows host
+> не предоставляет эти toolchains. Messaging-state epoch и OpenMLS hardening —
+> следующий незавершённый шаг; Sender Keys и Direct не удалялись.
+
+> Актуально на 2026-08-30. Это основной продуктовый и интеграционный план.
 > [`ROADMAP.md`](ROADMAP.md) сохранён как исторический security/infra backlog;
 > при расхождении приоритетов главным считается этот документ.
 

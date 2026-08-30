@@ -241,7 +241,7 @@ func TestCORS_PreflightHandled(t *testing.T) {
 
 // hijackableRecorder is an httptest.ResponseRecorder that also implements
 // http.Hijacker, so we can verify AccessLog forwards Hijack() correctly.
-// This guards against the regression where /ws upgrades returned 500.
+// This guards against the regression where /v3/events upgrades returned 500.
 type hijackableRecorder struct {
 	*httptest.ResponseRecorder
 	hijacked bool
@@ -271,7 +271,7 @@ func TestAccessLog_PreservesHijacker(t *testing.T) {
 	}))
 
 	rec := &hijackableRecorder{ResponseRecorder: httptest.NewRecorder()}
-	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/ws", nil))
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v3/events", nil))
 
 	if !rec.hijacked {
 		t.Fatal("underlying Hijack was not called")

@@ -60,14 +60,6 @@ var sitemapXML []byte
 
 const projectRepositoryURL = "https://github.com/NaveLIL/veil"
 
-func retiredWebSocketHandler() http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Connection", "close")
-		w.Header().Set("Cache-Control", "no-store")
-		http.Error(w, "legacy WebSocket transport was removed; use /v3/events", http.StatusGone)
-	}
-}
-
 // buildCommit is replaced with the exact source commit by the release image
 // workflow. Local development builds deliberately fall back to the repository
 // root instead of constructing a misleading source URL.
@@ -256,7 +248,6 @@ func main() {
 
 	// HTTP routes
 	mux := http.NewServeMux()
-	mux.HandleFunc("/ws", retiredWebSocketHandler())
 	mux.HandleFunc("/v3/events", func(w http.ResponseWriter, r *http.Request) {
 		gateway.HandleWebSocketV3(hub, w, r)
 	})

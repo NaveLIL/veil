@@ -41,8 +41,8 @@ Substantial Preview implementations exist for:
 - origin-scoped SQLCipher storage and a process-memory-only local search index;
 - origin/account/device-bound REST v2 and WebSocket v3 transport with durable
   replay protection and Protobuf contracts. `/v3/events` is the live client
-  endpoint; legacy `/ws` is disabled unless an explicit server-only emergency
-  rollback flag is set, and clients never auto-downgrade;
+  endpoint; the removed `/ws` endpoint is no longer registered and clients
+  never auto-downgrade;
 - Direct, Circle, and structured Space/Room product surfaces and ACLs;
 - a Tauri v2 desktop client with a SolidJS interface;
 - a Go Veil Node gateway with PostgreSQL, uploads, push wake-ups, profiles,

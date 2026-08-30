@@ -1,4 +1,4 @@
-import { Component, createSignal, Show, For, onCleanup, onMount } from "solid-js";
+import { Component, createSignal, For, onCleanup, onMount } from "solid-js";
 import { appStore } from "@/stores/app";
 import { appearanceStore } from "@/stores/appearance";
 import { VeilMark } from "@/components/brand/VeilMark";
@@ -21,8 +21,7 @@ interface RainDrop {
   duration: number; size: number; opacity: number;
 }
 
-const LEGACY_MIN_PIN = 4;
-const STANDARD_MIN_PIN = 6;
+const MIN_PIN = 6;
 const MAX_PIN = 12;
 const PIN_PROGRESS_SLOTS = Array.from({ length: MAX_PIN }, (_, index) => index);
 
@@ -82,7 +81,7 @@ export const LockScreen: Component = () => {
   });
 
   const handleSubmit = async (currentPin: string) => {
-    if (submitting || currentPin.length < LEGACY_MIN_PIN) return;
+    if (submitting || currentPin.length < MIN_PIN) return;
     submitting = true;
     setLoading(true);
 
@@ -146,7 +145,7 @@ export const LockScreen: Component = () => {
 
   const handleConfirm = () => {
     const current = pin();
-    if (current.length >= LEGACY_MIN_PIN && !inputDisabled() && !submitting) {
+    if (current.length >= MIN_PIN && !inputDisabled() && !submitting) {
       void handleSubmit(current);
     }
   };
@@ -173,9 +172,8 @@ export const LockScreen: Component = () => {
     const length = pin().length;
     if (loading()) return "Checking PIN…";
     if (success()) return "Unlocked";
-    if (length === 0) return "Enter 6–12 digits · legacy 4–5 supported";
-    if (length < LEGACY_MIN_PIN) return `${length} of at least ${LEGACY_MIN_PIN} digits`;
-    if (length < STANDARD_MIN_PIN) return "Legacy 4–5 digit PIN · press Enter to unlock";
+    if (length === 0) return "Enter 6–12 digits";
+    if (length < MIN_PIN) return `${length} of at least ${MIN_PIN} digits`;
     if (length < MAX_PIN) return `${length} of ${MAX_PIN} digits · press Enter to unlock`;
     return `${MAX_PIN} of ${MAX_PIN} digits`;
   };
@@ -495,8 +493,7 @@ export const LockScreen: Component = () => {
           </button>
         </div>
 
-        {/* 4–5 digits remain available only for legacy PIN compatibility. */}
-        <Show when={pin().length >= LEGACY_MIN_PIN && pin().length < MAX_PIN && !inputDisabled()}>
+        {pin().length >= MIN_PIN && pin().length < MAX_PIN && !inputDisabled() && (
           <button
             type="button"
             style={{
@@ -517,9 +514,9 @@ export const LockScreen: Component = () => {
             onMouseEnter={(e) => { e.currentTarget.style.transform = "translateY(-1px)"; e.currentTarget.style.boxShadow = "0 6px 24px rgba(var(--veil-accent-rgb),0.35)"; }}
             onMouseLeave={(e) => { e.currentTarget.style.transform = ""; e.currentTarget.style.boxShadow = "0 4px 16px rgba(var(--veil-accent-rgb),0.25)"; }}
           >
-            {pin().length < STANDARD_MIN_PIN ? "Unlock legacy PIN" : "Unlock"}
+            Unlock
           </button>
-        </Show>
+        )}
 
         {/* Error / status message */}
         <div

@@ -42,8 +42,8 @@ for commands and events, and all signed REST handlers use the REST v2 profile
 with the durable PostgreSQL replay store. Missing, legacy, mixed, duplicate, or
 unknown REST authentication fields fail closed.
 
-The legacy `/ws` route is permanently retired and returns HTTP 410 without
-upgrading. There is no runtime switch that can re-enable origin-unbound WS v2;
+The legacy `/ws` route is no longer registered. There is no runtime switch that
+can re-enable origin-unbound WS v2;
 setting the removed `VEIL_ALLOW_LEGACY_WS_V2` variable fails startup so stale
 deployment configuration cannot silently weaken the Node. Post-handshake auth
 frames also close the v3 socket instead of entering a second verifier. Hostile

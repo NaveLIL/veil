@@ -6,7 +6,6 @@ Allow: /terms
 Allow: /.well-known/security.txt
 Disallow: /downloads/
 Disallow: /v1/
-Disallow: /ws
 Disallow: /v3/events
 Disallow: /health
 Disallow: /tus/

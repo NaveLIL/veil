@@ -21,6 +21,7 @@ evidence для completion gates. Veil остаётся pre-release проект
 - [ADR-0001: Authenticated Sender Keys v5 for server channels](adr/0001-authenticated-sender-keys-v5-for-server-channels.md)
 - [ADR-0002: Origin-bound one-time Node Access Passes](adr/0002-origin-bound-node-access-passes.md)
 - [ADR-0003: Origin-bound transport authentication](adr/0003-origin-bound-transport-authentication.md)
+- [ADR-0004: Clean Slate v0.3 and open-source protocol preference](adr/0004-clean-slate-v0.3-and-open-source-crypto.md)
 - [ADR: Witnessed key transparency and authorized membership epochs](adr/0002-witnessed-key-transparency-and-membership-epochs.md)
 
 ADR фиксирует принятое решение и причины. Изменение такого решения должно
@@ -48,6 +49,7 @@ ADR фиксирует принятое решение и причины. Изм
 ## Reviews и completion gates
 
 - [Security hardening audit handoff — 2026-08-05](reviews/security-hardening-audit-handoff-2026-08-05.md)
+- [Mobile image-size audit exception — 2026-08-30](reviews/mobile-image-size-audit-exception-2026-08-30.md)
 - [Security hardening checkpoint — 2026-08-04](reviews/security-hardening-checkpoint-2026-08-04.md)
 - [Beta integration and macOS checkpoint — 2026-08-04](reviews/beta-integration-macos-2026-08-04.md)
 - [Phase 1–4C completion gate](reviews/phase-1-4c-completion-gate.md)

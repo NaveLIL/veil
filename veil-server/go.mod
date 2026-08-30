@@ -2,7 +2,7 @@ module github.com/NaveLIL/veil/veil-server
 
 go 1.26.0
 
-toolchain go1.26.5
+toolchain go1.26.6
 
 require (
 	filippo.io/edwards25519 v1.2.0
