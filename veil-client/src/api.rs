@@ -63,6 +63,7 @@ const HEADER_SENDER_KEY: u8 = 0x05; // Group/channel sender-key encrypted messag
 // Inner type bytes (inside ratchet-decrypted plaintext for pairwise channel)
 const INNER_TEXT: u8 = 0x00; // UTF-8 text message
 const INNER_SKDM: u8 = 0x01; // Sender Key Distribution Message (JSON)
+#[cfg(any(test, feature = "test-utils"))]
 const RATCHET_AD_DOMAIN: &[u8] = b"veil-ratchet-message-v1";
 const DIRECT_CRYPTO_PROFILE_V2: &str = "direct_v2";
 const DIRECT_CRYPTO_ERA_V2: u64 = 1;
@@ -186,6 +187,7 @@ impl Drop for ReceiveCryptoSnapshot {
     }
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 fn ratchet_associated_data(
     conversation_id: &str,
     sender_identity_key: &[u8; 32],
