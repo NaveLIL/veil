@@ -11,6 +11,7 @@ members = [
     "veil-mls",
 ]
 exclude = [
+    "third_party/lru-0.16.4",
     "third_party/openmls_rust_crypto-0.4.4",
     "third_party/wayland-scanner-0.31.10",
 ]
@@ -24,6 +25,12 @@ homepage = "https://veil.erez.pro"
 publish = false
 
 [patch.crates-io]
+# Tantivy 0.26 pins lru 0.16, while the upstream panic-safety fix is only
+# published in lru 0.18.2. Keep the released 0.16.4 API with upstream's exact
+# detach-before-drop fix until Tantivy accepts the maintained lru line.
+# See third_party/lru-0.16.4/UPSTREAM.md.
+lru = { path = "third_party/lru-0.16.4" }
+
 # The published OpenMLS 0.7 provider pins hpke-rs 0.6, whose lock graph keeps
 # vulnerable libcrux 0.0.x crates. Upstream fixed the graph by moving the three
 # HPKE crates to 0.7 without changing provider code. Keep that dependency-only

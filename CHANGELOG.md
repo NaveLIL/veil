@@ -23,6 +23,9 @@ users.
   advisories with narrow version overrides and reproducible lockfile updates.
 - Upgraded the pinned Go toolchain and server build image from 1.26.5 to
   1.26.6 after `govulncheck` found reachable standard-library advisories.
+- Replaced Tantivy's transitive `lru 0.16.4` with the published source plus
+  upstream's tested panic-safety fix for `RUSTSEC-2026-0253`; the local patch
+  is removed when Tantivy accepts `lru >=0.18.2`.
 - Kept only two exact, time-bounded mobile `image-size` build-tool audit
   exceptions; their reachability, controls, expiry, and removal gate are
   documented in `docs/reviews/mobile-image-size-audit-exception-2026-08-30.md`.

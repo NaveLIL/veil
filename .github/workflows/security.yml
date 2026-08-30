@@ -41,13 +41,24 @@ jobs:
       - name: Install cargo-audit
         run: cargo install cargo-audit --version 0.22.2 --locked
 
+      - name: Test vendored lru panic-safety backport
+        run: >-
+          cargo test
+          --manifest-path third_party/lru-0.16.4/Cargo.toml
+          --all-features
+
       - name: Run cargo audit
         # Tauri's Linux WebKitGTK stack still pins glib 0.18.5. The advisory is
         # limited to VariantStrIter methods Veil does not call and cannot be
         # upgraded independently of the Tauri runtime. Keep that single,
         # reviewed exception explicit while making every new unsound advisory
-        # a hard failure.
-        run: cargo audit --deny unsound --ignore RUSTSEC-2024-0429
+        # a hard failure. RUSTSEC-2026-0253 is suppressed only because its
+        # registry source is replaced by the exact tested upstream patch; see
+        # third_party/lru-0.16.4/UPSTREAM.md.
+        run: >-
+          cargo audit --deny unsound
+          --ignore RUSTSEC-2024-0429
+          --ignore RUSTSEC-2026-0253
 
   cargo-deny:
     name: Cargo Deny (licenses + advisories)
