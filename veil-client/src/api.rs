@@ -14320,11 +14320,36 @@ mod tests {
                 .bind_dm_conversation(&conversation_id, peer_identity_key)
                 .unwrap();
 
+            let peer_device_id = [0xE7; 16];
+            let peer_stored_device =
+                DeviceIdentityV1::generate_stored(&peer_identity, peer_device_id).unwrap();
+            let peer_device =
+                DeviceIdentityV1::from_stored(&peer_identity, peer_stored_device).unwrap();
+            let peer_binding = peer_device.binding().clone();
             let mut peer = VeilClient::from_identity(peer_identity);
+            peer.device_id = peer_device_id;
+            peer.device_identity = Some(peer_device);
             let peer_prekeys = peer.generate_prekeys().unwrap();
             let (one_time_prekey, one_time_prekey_id) = peer_prekeys.otk_publics[0];
+            let direct_context = client
+                .direct_v2_initiator_context(
+                    &conversation_id,
+                    &peer_user_id,
+                    peer_identity_key,
+                    peer_signing_key,
+                    DirectDeviceCoordinateV2 {
+                        device_id: peer_binding.device_id,
+                        binding_version: peer_binding.version,
+                        capabilities: peer_binding.capabilities,
+                        status: peer_binding.status,
+                        identity_key: peer_binding.device_identity_key,
+                        signing_key: peer_binding.device_signing_key,
+                        account_signature: peer_binding.account_signature,
+                    },
+                )
+                .unwrap();
             client
-                .establish_session(
+                .establish_session_classified_v2(
                     &peer_identity_key,
                     &x3dh::PreKeyBundle {
                         identity_key: peer_identity_key,
@@ -14335,6 +14360,7 @@ mod tests {
                         one_time_prekey: Some(one_time_prekey),
                         one_time_prekey_id: Some(one_time_prekey_id),
                     },
+                    direct_context,
                 )
                 .unwrap();
             let outbound = client.test_only_install_queued_connection();
@@ -16293,7 +16319,10 @@ mod tests {
     struct DirectLivePeerFixture {
         sender: VeilClient,
         sender_identity_key: [u8; 32],
+        sender_user_id: String,
         receiver_identity_key: [u8; 32],
+        receiver_device_id: [u8; 16],
+        receiver_binding_version: u64,
         conversation_id: String,
         username: String,
         next_message: u128,
@@ -16305,11 +16334,24 @@ mod tests {
                 .sender
                 .encrypt_outgoing(&self.conversation_id, text)
                 .unwrap();
-            if header.first() == Some(&HEADER_INITIAL) {
+            if header.first() == Some(&HEADER_INITIAL_V2) {
                 self.sender
                     .test_only_confirm_peer_session_possession(&self.receiver_identity_key)
                     .unwrap();
             }
+            let sender_binding = self
+                .sender
+                .device_identity
+                .as_ref()
+                .unwrap()
+                .binding()
+                .clone();
+            let direct_session_id = self
+                .sender
+                .direct_v2_sessions
+                .get(&self.receiver_identity_key)
+                .unwrap()
+                .session_id();
             self.next_message += 1;
             ConnectionEvent::MessageReceived {
                 message_id: uuid::Uuid::from_u128(self.next_message).to_string(),
@@ -16325,7 +16367,21 @@ mod tests {
                 ttl_seconds: None,
                 sealed: Some(false),
                 attachments: Vec::new(),
-                security_context: None,
+                security_context: Some(MessageSecurityContextV1::DirectV2(
+                    DirectMessageSecurityContextV2 {
+                        sender_user_id: self.sender_user_id.clone(),
+                        sender_device_id: sender_binding.device_id,
+                        sender_binding_version: sender_binding.version,
+                        sender_device_identity_key: sender_binding.device_identity_key,
+                        sender_device_signing_key: sender_binding.device_signing_key,
+                        sender_device_capabilities: sender_binding.capabilities,
+                        sender_device_binding_status: sender_binding.status,
+                        sender_account_signature: sender_binding.account_signature,
+                        target_device_id: self.receiver_device_id,
+                        target_binding_version: self.receiver_binding_version,
+                        direct_session_id,
+                    },
+                )),
             }
         }
     }
@@ -16351,7 +16407,16 @@ mod tests {
             let receiver_signing_key = receiver_identity.ed25519_public_bytes();
             let receiver_user_id =
                 uuid::Uuid::from_u128(0x1000_0000_0000_0000_0000_0000_0000_0001).to_string();
+            let receiver_device_id = [0x91; 16];
+            let receiver_stored_device =
+                DeviceIdentityV1::generate_stored(&receiver_identity, receiver_device_id).unwrap();
+            db.create_device_identity_v1(&receiver_stored_device)
+                .unwrap();
+            let receiver_device =
+                DeviceIdentityV1::from_stored(&receiver_identity, receiver_stored_device).unwrap();
             let mut receiver = VeilClient::from_identity(receiver_identity);
+            receiver.device_id = receiver_device_id;
+            receiver.device_identity = Some(receiver_device);
             db.bind_authenticated_self(
                 DIRECT_LIVE_TEST_ORIGIN,
                 &receiver_user_id,
@@ -16398,9 +16463,9 @@ mod tests {
             let sender_identity = IdentityKeyPair::generate();
             let sender_identity_key = sender_identity.x25519_public_bytes();
             let sender_signing_key = sender_identity.ed25519_public_bytes();
-            let sender_user_id =
-                uuid::Uuid::from_u128(0x2000_0000_0000_0000_0000_0000_0000_0000 + index)
-                    .to_string();
+            let sender_user_uuid =
+                uuid::Uuid::from_u128(0x2000_0000_0000_0000_0000_0000_0000_0000 + index);
+            let sender_user_id = sender_user_uuid.to_string();
             let conversation_id =
                 uuid::Uuid::from_u128(0x3000_0000_0000_0000_0000_0000_0000_0000 + index)
                     .to_string();
@@ -16452,9 +16517,56 @@ mod tests {
 
             let prekeys = self.receiver.generate_prekeys().unwrap();
             let (one_time_prekey, one_time_prekey_id) = prekeys.otk_publics[0];
-            let mut sender = VeilClient::from_identity(sender_identity);
+            let sender_device_marker = u8::try_from(0xA0u128 + index).unwrap();
+            let sender_device_id = [sender_device_marker; 16];
+            let mut sender = memory_client_with_device(
+                sender_identity,
+                sender_user_uuid,
+                sender_device_id,
+                [sender_device_marker; 32],
+            );
+            sender.authenticated_server_origin = Some(DIRECT_LIVE_TEST_ORIGIN.to_string());
             sender
-                .establish_session(
+                .remember_user_identity(
+                    self.receiver
+                        .authenticated_user_id
+                        .as_deref()
+                        .expect("receiver is authenticated"),
+                    self.receiver_identity_key,
+                )
+                .unwrap();
+            sender
+                .pin_peer_signing_key(self.receiver_identity_key, self.receiver_signing_key)
+                .unwrap();
+            sender
+                .bind_dm_conversation(&conversation_id, self.receiver_identity_key)
+                .unwrap();
+            let receiver_binding = self
+                .receiver
+                .device_identity
+                .as_ref()
+                .unwrap()
+                .binding()
+                .clone();
+            let direct_context = sender
+                .direct_v2_initiator_context(
+                    &conversation_id,
+                    self.receiver.authenticated_user_id.as_deref().unwrap(),
+                    self.receiver_identity_key,
+                    self.receiver_signing_key,
+                    DirectDeviceCoordinateV2 {
+                        device_id: receiver_binding.device_id,
+                        binding_version: receiver_binding.version,
+                        capabilities: receiver_binding.capabilities,
+                        status: receiver_binding.status,
+                        identity_key: receiver_binding.device_identity_key,
+                        signing_key: receiver_binding.device_signing_key,
+                        account_signature: receiver_binding.account_signature,
+                    },
+                )
+                .unwrap();
+            sender
+                .establish_session_classified_v2(
                     &self.receiver_identity_key,
                     &x3dh::PreKeyBundle {
                         identity_key: self.receiver_identity_key,
@@ -16465,15 +16577,16 @@ mod tests {
                         one_time_prekey: Some(one_time_prekey),
                         one_time_prekey_id: Some(one_time_prekey_id),
                     },
+                    direct_context,
                 )
-                .unwrap();
-            sender
-                .bind_dm_conversation(&conversation_id, self.receiver_identity_key)
                 .unwrap();
             self.peers.push(DirectLivePeerFixture {
                 sender,
                 sender_identity_key,
+                sender_user_id,
                 receiver_identity_key: self.receiver_identity_key,
+                receiver_device_id: receiver_binding.device_id,
+                receiver_binding_version: receiver_binding.version,
                 conversation_id,
                 username,
                 next_message: 0x4000_0000_0000_0000_0000_0000_0000_0000 + (index << 32),
@@ -19215,6 +19328,19 @@ mod tests {
         bob.trusted_signing_keys.insert(alice_key, alice_signing);
         bob.dm_conversations
             .insert(conversation_id.to_string(), alice_key);
+        bob.db()
+            .unwrap()
+            .upsert_directory_conversation(
+                conversation_id,
+                ConversationType::DM as u8,
+                origin,
+                Some("Alice"),
+                Some(&alice_user.to_string()),
+                Some(&alice_key),
+                None,
+                "2026-08-30T00:00:00Z",
+            )
+            .unwrap();
 
         let bob_prekeys = bob.generate_prekeys().unwrap();
         let (one_time_prekey, one_time_prekey_id) = bob_prekeys.otk_publics[0];
@@ -19943,7 +20069,7 @@ mod tests {
                 None,
             )
             .unwrap_err();
-        assert!(rejected.contains("invalid Direct history ratchet header length"));
+        assert!(rejected.contains("missing authenticated Direct v2 security context"));
         assert!(!fixture.bob.direct_live_storage_uncertain);
         assert!(fixture.bob.db().is_some());
         assert!(fixture.bob.identity.is_some());
