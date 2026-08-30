@@ -29,7 +29,7 @@ use openmls_rust_crypto::OpenMlsRustCrypto;
 use openmls_traits::OpenMlsProvider;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 pub mod store;
 
@@ -99,7 +99,7 @@ impl MlsGroupId {
 }
 
 /// Stable per-device identity used in the BasicCredential.
-#[derive(Debug, Clone, Zeroize)]
+#[derive(Debug, Clone, Zeroize, ZeroizeOnDrop)]
 pub struct LeafIdentity(pub Vec<u8>);
 
 impl LeafIdentity {
@@ -362,7 +362,7 @@ impl<S: MlsKeyStore> MlsClient<S> {
     }
 
     fn checkpoint(&self, generation: u64) -> Result<CheckpointBlob> {
-        let signer = self.signer.tls_serialize_detached().map_err(tls_err)?;
+        let signer = Zeroizing::new(self.signer.tls_serialize_detached().map_err(tls_err)?);
         let values = self
             .provider
             .storage()

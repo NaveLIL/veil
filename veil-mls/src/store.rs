@@ -328,7 +328,7 @@ mod tests {
 
     fn sample_checkpoint() -> CheckpointBlob {
         let values = HashMap::from([
-            (b"beta".to_vec(), b"two".to_vec()),
+            (b"bravo".to_vec(), b"two".to_vec()),
             (b"alpha".to_vec(), b"one".to_vec()),
         ]);
         encode_checkpoint(b"leaf-a", 7, b"signer", &values).expect("encode")
@@ -344,7 +344,7 @@ mod tests {
         assert_eq!(decoded.generation, 7);
         assert_eq!(decoded.signer, b"signer");
         assert_eq!(decoded.entries[0].0, b"alpha");
-        assert_eq!(decoded.entries[1].0, b"beta");
+        assert_eq!(decoded.entries[1].0, b"bravo");
 
         assert!(decode_checkpoint(b"leaf-b", &first).is_err());
         let wrong_generation =
@@ -372,6 +372,29 @@ mod tests {
         trailing.push(0);
         let trailing = CheckpointBlob::from_parts(7, trailing).expect("blob");
         assert!(decode_checkpoint(b"leaf-a", &trailing).is_err());
+    }
+
+    #[test]
+    fn checkpoint_rejects_declared_oversize_and_duplicate_keys() {
+        let checkpoint = sample_checkpoint();
+
+        let mut oversized = checkpoint.as_bytes().to_vec();
+        let signer_length_offset = 8 + 2 + 2 + 8 + 32;
+        oversized[signer_length_offset..signer_length_offset + 4]
+            .copy_from_slice(&((MAX_CHECKPOINT_SIGNER_BYTES as u32) + 1).to_be_bytes());
+        let oversized = CheckpointBlob::from_parts(7, oversized).expect("blob");
+        assert!(decode_checkpoint(b"leaf-a", &oversized).is_err());
+
+        let mut duplicate = checkpoint.as_bytes().to_vec();
+        let signer_len = 6;
+        let first_record_len = 8 + 5 + 3;
+        let second_key_offset = CHECKPOINT_HEADER_BYTES + signer_len + first_record_len + 8;
+        duplicate[second_key_offset..second_key_offset + 5].copy_from_slice(b"alpha");
+        let body_digest = Sha256::digest(&duplicate[CHECKPOINT_HEADER_BYTES..]);
+        let digest_offset = CHECKPOINT_HEADER_BYTES - 32;
+        duplicate[digest_offset..CHECKPOINT_HEADER_BYTES].copy_from_slice(&body_digest);
+        let duplicate = CheckpointBlob::from_parts(7, duplicate).expect("blob");
+        assert!(decode_checkpoint(b"leaf-a", &duplicate).is_err());
     }
 
     #[test]
