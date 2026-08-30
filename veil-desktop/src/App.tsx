@@ -1958,6 +1958,7 @@ const App: Component = () => {
       } else {
         const key = await invoke<string>("init_from_seed");
         appStore.setIdentity(key);
+        await appStore.notifyMessagingStateReset();
         appStore.setScreen("chat");
         await appStore.loadConversations();
         appStore.connectToServer().catch((e) => console.warn("secure connect failed:", e));

@@ -21,9 +21,10 @@
 > in `docs/reviews/mobile-image-size-audit-exception-2026-08-30.md`; every other
 > low-or-higher pnpm advisory remains blocking. Frozen-lockfile validation,
 > desktop audit, mobile audit, mobile TypeScript, ESLint, and all 233 mobile
-> tests pass locally. The next Clean Slate work item is the explicit persisted
-> messaging-state version/epoch barrier, followed by `veil-mls` persistence and
-> rollback hardening before any MLS runtime promotion.
+> tests pass locally. The persisted messaging-state version/epoch barrier is
+> now implemented; the next Clean Slate work items are removing the history-only
+> Direct v1/Sender-Key v5 paths and hardening `veil-mls` persistence/rollback
+> before any MLS runtime promotion.
 > The first protected-branch run additionally found reachable Go 1.26.5
 > standard-library advisories; every pinned CI/release/container toolchain was
 > advanced to the fixed Go 1.26.6 patch release before merge.
@@ -31,6 +32,15 @@
 > Until Tantivy accepts the fixed 0.18 line, Veil carries only upstream's exact
 > detach-before-drop patch and regression test in `third_party/lru-0.16.4`;
 > the temporary Cargo patch and scanner suppression are provenance-documented.
+>
+> **Messaging-state checkpoint 2026-08-31:** SQLCipher now owns an explicit
+> big-endian v0.3 epoch marker. Older/unversioned vaults atomically clear only
+> disposable messages, ratchets, Direct outbox, Sender-Key/MLS prototype state
+> and the process-memory search projection. Account/device identity, trust,
+> transparency, membership epochs, Node caches and conversation metadata are
+> retained. A newer or malformed epoch fails closed without mutation. Desktop
+> surfaces one concise post-unlock notice and otherwise keeps reconnect/send UX
+> automatic.
 >
 > **Checkpoint 2026-08-30:** ADR и open-source policy зафиксированы; desktop
 > PIN 4–5, Android SharedPreferences vault migration и зарегистрированный

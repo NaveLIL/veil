@@ -1416,11 +1416,27 @@ impl VeilClient {
 
     /// Attach a local search index. Subsequent message inserts/edits/deletes
     /// will be mirrored into it on a best-effort basis.
-    pub fn set_indexer(&mut self, indexer: Arc<Indexer>) {
+    pub fn set_indexer(&mut self, indexer: Arc<Indexer>) -> Result<(), String> {
         if self.direct_live_storage_uncertain {
-            return;
+            return Err("cannot attach a search index after uncertain durable storage".to_string());
+        }
+        let reset_pending = self
+            .db
+            .as_ref()
+            .map(|db| db.messaging_state_reset_notice_pending_v3())
+            .transpose()?
+            .unwrap_or(false);
+        if reset_pending {
+            // The index contains derived plaintext outside SQLCipher. Never
+            // expose pre-cutover search hits after the encrypted messaging
+            // epoch was reset. A clear failure aborts initialization and keeps
+            // the durable notice pending for a complete retry.
+            indexer
+                .clear()
+                .map_err(|error| format!("clear pre-v0.3 search index: {error}"))?;
         }
         self.indexer = Some(indexer);
+        Ok(())
     }
 
     /// Borrow the local search index, if attached.

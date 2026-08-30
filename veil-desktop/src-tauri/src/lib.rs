@@ -722,6 +722,16 @@ fn get_identity_key(state: State<'_, AppState>) -> Result<String, String> {
 }
 
 #[tauri::command]
+fn take_messaging_state_reset_notice(state: State<'_, AppState>) -> Result<bool, String> {
+    require_unlocked(&state)?;
+    let client = state.client.lock().map_err(|e| e.to_string())?;
+    let db = client.db().ok_or("database not initialized")?;
+    let pending = db.take_messaging_state_reset_notice_v3()?;
+    require_session_still_unlocked(&state)?;
+    Ok(pending)
+}
+
+#[tauri::command]
 fn store_seed(state: State<'_, AppState>, mnemonic: String) -> Result<(), String> {
     let mnemonic = Zeroizing::new(mnemonic);
     require_unlocked(&state)?;
@@ -1368,7 +1378,7 @@ fn initialize_client(state: &AppState, mnemonic: &str) -> Result<String, String>
     let db_path = account_database_path(state, mnemonic)?;
     let mut fresh = VeilClient::new();
     fresh.init_with_mnemonic(mnemonic, &db_path)?;
-    fresh.set_indexer(state.indexer.clone());
+    fresh.set_indexer(state.indexer.clone())?;
     let identity_key = fresh.identity_key()?;
     let key = hex::encode(identity_key);
     *state.client.lock().map_err(|e| e.to_string())? = fresh;
@@ -13518,6 +13528,7 @@ pub fn run() {
             get_auto_lock_seconds,
             set_auto_lock_seconds,
             init_from_seed,
+            take_messaging_state_reset_notice,
             get_conversations,
             mark_conversation_read,
             get_conversation_crypto_diagnostics,

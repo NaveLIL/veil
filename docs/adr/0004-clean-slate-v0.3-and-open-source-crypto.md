@@ -93,6 +93,22 @@ and the reason for every security-critical fork or vendored copy.
 - fail-closed parsers, hostile-Node tests, transparency proofs, rollback
   barriers, and audit evidence.
 
+## Implementation checkpoint: persisted messaging epoch
+
+Implemented on 2026-08-31. SQLCipher `client_state` stores the current epoch as
+an exact eight-byte big-endian value. Opening an older or unversioned vault
+performs one `BEGIN IMMEDIATE` transaction that removes messages, attachments,
+ratchets, pending headers/outboxes, Sender-Key material and inactive MLS
+prototype state, then publishes the v0.3 marker. The transaction retains
+account/device identity, explicit trust, transparency state, membership epoch
+history, Node configuration/cache and conversation metadata.
+
+The derived plaintext search index is cleared before it can be attached to the
+new client epoch. A durable one-time notice is acknowledged only after unlock;
+the desktop surfaces it without requiring security choices during ordinary
+messaging. An unknown newer epoch or malformed marker aborts without deleting
+any row.
+
 ## MLS integration gates
 
 OpenMLS runtime activation requires all of the following:
