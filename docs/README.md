@@ -21,6 +21,7 @@ evidence для completion gates. Veil остаётся pre-release проект
 - [ADR-0001: Authenticated Sender Keys v5 for server channels](adr/0001-authenticated-sender-keys-v5-for-server-channels.md)
 - [ADR-0002: Origin-bound one-time Node Access Passes](adr/0002-origin-bound-node-access-passes.md)
 - [ADR-0003: Origin-bound transport authentication](adr/0003-origin-bound-transport-authentication.md)
+- [ADR-0004: Clean Slate v0.3 and open-source protocol preference](adr/0004-clean-slate-v0.3-and-open-source-crypto.md)
 - [ADR: Witnessed key transparency and authorized membership epochs](adr/0002-witnessed-key-transparency-and-membership-epochs.md)
 
 ADR фиксирует принятое решение и причины. Изменение такого решения должно

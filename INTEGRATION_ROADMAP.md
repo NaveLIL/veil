@@ -1,6 +1,21 @@
 # Дорожная карта Veil
 
-> Актуально на 2026-08-05. Это основной продуктовый и интеграционный план.
+> **Clean Slate v0.3 — начат 2026-08-30.** Принят
+> [`ADR-0004`](docs/adr/0004-clean-slate-v0.3-and-open-source-crypto.md): история
+> сообщений и старое crypto-state не являются целью совместимости; identity,
+> device trust и Node configuration сохраняются только через явно проверенные
+> инварианты. Группы переходят на MLS/OpenMLS после persistence/rollback/
+> offline/Android gates. Direct v2 остаётся рабочим до отдельного двухстороннего
+> MLS решения. Новые security-компоненты по умолчанию выбираются из
+> поддерживаемых open-source реализаций открытых стандартов, но проходят
+> собственную проверку application boundaries.
+>
+> Текущий шаг: удалить низкорисковый runtime legacy (PIN 4-5, Android vault
+> migration, retired `/ws`), ввести явные clean-slate version barriers и
+> зафиксировать тестами отсутствие downgrade. Следующий шаг: обновление и
+> hardening изолированного `veil-mls`; живой MLS runtime пока не включается.
+
+> Актуально на 2026-08-30. Это основной продуктовый и интеграционный план.
 > [`ROADMAP.md`](ROADMAP.md) сохранён как исторический security/infra backlog;
 > при расхождении приоритетов главным считается этот документ.
 
