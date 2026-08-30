@@ -108,8 +108,8 @@ release matrices ещё входят в открытые Preview gates.
   transcript в session commitment и запрещает sticky downgrade после первого
   durable v2 состояния.
 - Circle и text Room используют membership-bound Sender Keys v6 после
-  авторизованной активации; Sender Keys v5 сохраняется только для явной
-  исторической совместимости.
+  авторизованной активации. Product runtime не принимает Sender Keys v5;
+  замороженные v5-векторы остаются только в test build для downgrade coverage.
 - Space/Room access задаётся server-side ACL, но presentation metadata не
   участвует в crypto trust.
 - Изменение roster/access требует корректной key rotation/distribution.

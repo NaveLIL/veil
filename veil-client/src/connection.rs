@@ -520,6 +520,7 @@ pub enum ConnectionEvent {
         ciphertext: Vec<u8>,
         header: Vec<u8>,
         edit_timestamp: u64,
+        security_context: Option<crate::api::MessageSecurityContextV1>,
     },
     /// A message was deleted by its sender.
     MessageDeleted {
@@ -2829,6 +2830,9 @@ fn message_security_context_from_proto(
         return Some(None);
     }
     match message.crypto_profile.as_str() {
+        // Retained only for legacy protocol-vector tests. Product event
+        // decoding accepts Sender-Key v6 after the clean-slate epoch.
+        #[cfg(any(test, feature = "test-utils"))]
         "sender_key_v5" => {
             if message.crypto_era != 1
                 || message.roster_version == 0
@@ -3128,6 +3132,7 @@ pub(crate) fn connection_event_from_envelope(
                     ciphertext: me.ciphertext.unwrap_or_default(),
                     header: me.header.unwrap_or_default(),
                     edit_timestamp: me.edit_timestamp.unwrap_or(me.server_timestamp),
+                    security_context,
                 },
                 proto::message_event::EventType::Deleted if !me.attachments.is_empty() => {
                     return Err(protocol_violation("MessageEvent"));
@@ -4360,6 +4365,24 @@ mod tests {
                 security_context: Some(crate::api::MessageSecurityContextV1::DirectV2(_)),
                 ..
             }))
+        ));
+        let mut direct_edit = direct.clone();
+        direct_edit.event_type = proto::message_event::EventType::Edited as i32;
+        direct_edit.edit_timestamp = Some(2);
+        assert!(matches!(
+            connection_event_from_envelope(proto::Envelope {
+                payload: Some(proto::envelope::Payload::MessageEvent(direct_edit)),
+                ..Default::default()
+            }),
+            Ok(Some(ConnectionEvent::MessageEdited {
+                security_context: Some(crate::api::MessageSecurityContextV1::DirectV2(
+                    crate::api::DirectMessageSecurityContextV2 {
+                        direct_session_id,
+                        ..
+                    }
+                )),
+                ..
+            })) if direct_session_id == [0x66; 32]
         ));
         direct.direct_session_id.pop();
         assert!(connection_event_from_envelope(proto::Envelope {

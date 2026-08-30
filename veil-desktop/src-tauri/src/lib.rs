@@ -12,8 +12,8 @@ use tauri_plugin_notification::NotificationExt;
 use veil_client::api::{
     DeviceBindingCandidateV1, DeviceRosterCandidateV1, DeviceRosterEntryV1,
     MembershipEpochChainCandidateV1, MembershipEpochRecordCandidateV1, MessageSecurityContextV1,
-    OfflineSenderKeyRefresh, PreparedMembershipEpochV1, SenderKeyMessageSecurityContextV1,
-    SenderKeyMessageSecurityContextV6, VeilClient,
+    OfflineSenderKeyRefresh, PreparedMembershipEpochV1, SenderKeyMessageSecurityContextV6,
+    VeilClient,
 };
 use veil_client::connection::ConnectionEvent;
 use veil_crypto::membership::{
@@ -2758,13 +2758,6 @@ struct SyncAttachment {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ParsedMessageCryptoContext {
-    LegacyUnknown,
-    SenderKeyV5 {
-        roster_version: u64,
-        roster_commitment: [u8; 32],
-        sender_device_id: [u8; 16],
-        sender_binding_version: u64,
-    },
     SenderKeyV6 {
         roster_version: u64,
         roster_commitment: [u8; 32],
@@ -3063,72 +3056,7 @@ fn parse_message_crypto_context_wire(
         membership_epoch,
         membership_epoch_hash,
     } = wire;
-    let all_absent = era.is_none()
-        && roster_version.is_none()
-        && roster_commitment.is_none()
-        && sender_device_id.is_none()
-        && sender_binding_version.is_none()
-        && sender_device_identity_key.is_none()
-        && sender_device_signing_key.is_none()
-        && sender_device_capabilities.is_none()
-        && sender_device_binding_status.is_none()
-        && sender_account_signature.is_none()
-        && target_device_id.is_none()
-        && target_binding_version.is_none()
-        && direct_session_id.is_none()
-        && membership_epoch.is_none()
-        && membership_epoch_hash.is_none();
     match profile {
-        "legacy_unknown" if all_absent => Ok(ParsedMessageCryptoContext::LegacyUnknown),
-        "legacy_unknown" => {
-            Err("legacy message crypto profile carries a partial modern context".to_string())
-        }
-        "sender_key_v5"
-            if sender_device_identity_key.is_none()
-                && sender_device_signing_key.is_none()
-                && sender_device_capabilities.is_none()
-                && sender_device_binding_status.is_none()
-                && sender_account_signature.is_none()
-                && target_device_id.is_none()
-                && target_binding_version.is_none()
-                && direct_session_id.is_none()
-                && membership_epoch.is_none()
-                && membership_epoch_hash.is_none() =>
-        {
-            let era = parse_decimal_u63(
-                "message crypto_era",
-                era.ok_or("sender-key message is missing crypto_era")?,
-                false,
-            )?;
-            if era != 1 {
-                return Err("sender-key message has an unsupported crypto era".to_string());
-            }
-            let sender_device_id = decode_lower_hex_fixed::<16>(
-                "message sender_device_id",
-                sender_device_id.ok_or("sender-key message is missing sender_device_id")?,
-            )?;
-            if sender_device_id == [0u8; 16] {
-                return Err("sender-key message has an invalid zero sender device id".to_string());
-            }
-            Ok(ParsedMessageCryptoContext::SenderKeyV5 {
-                roster_version: parse_decimal_u63(
-                    "message roster_version",
-                    roster_version.ok_or("sender-key message is missing roster_version")?,
-                    false,
-                )?,
-                roster_commitment: decode_lower_hex_fixed::<32>(
-                    "message roster_commitment",
-                    roster_commitment.ok_or("sender-key message is missing roster_commitment")?,
-                )?,
-                sender_device_id,
-                sender_binding_version: parse_decimal_u63(
-                    "message sender_binding_version",
-                    sender_binding_version
-                        .ok_or("sender-key message is missing sender_binding_version")?,
-                    false,
-                )?,
-            })
-        }
         "sender_key_v6"
             if sender_device_identity_key.is_none()
                 && sender_device_signing_key.is_none()
@@ -3313,21 +3241,6 @@ fn client_message_security_context(
     target_device_id: [u8; 16],
 ) -> Option<MessageSecurityContextV1> {
     match parsed {
-        ParsedMessageCryptoContext::LegacyUnknown => None,
-        ParsedMessageCryptoContext::SenderKeyV5 {
-            roster_version,
-            roster_commitment,
-            sender_device_id,
-            sender_binding_version,
-        } => Some(MessageSecurityContextV1::SenderKeyV5(
-            SenderKeyMessageSecurityContextV1 {
-                roster_version: *roster_version,
-                roster_commitment: *roster_commitment,
-                sender_device_id: *sender_device_id,
-                target_device_id,
-                sender_binding_version: *sender_binding_version,
-            },
-        )),
         ParsedMessageCryptoContext::SenderKeyV6 {
             roster_version,
             roster_commitment,
@@ -3357,10 +3270,12 @@ fn validate_live_message_security_context(
     context: Option<&MessageSecurityContextV1>,
 ) -> Result<(), String> {
     match (sender_key_mode, context) {
-        (false, None)
-        | (false, Some(MessageSecurityContextV1::DirectV2(_)))
-        | (true, Some(MessageSecurityContextV1::SenderKeyV5(_)))
+        (false, Some(MessageSecurityContextV1::DirectV2(_)))
         | (true, Some(MessageSecurityContextV1::SenderKeyV6(_))) => Ok(()),
+        (false, None) => Err("DM message is missing its Direct v2 context".to_string()),
+        (true, Some(MessageSecurityContextV1::SenderKeyV5(_))) => {
+            Err("group/channel message uses the removed Sender-Key v5 profile".to_string())
+        }
         (false, Some(MessageSecurityContextV1::SenderKeyV5(_)))
         | (false, Some(MessageSecurityContextV1::SenderKeyV6(_))) => {
             Err("DM message carries a Sender-Key security context".to_string())
@@ -3807,6 +3722,9 @@ fn parse_device_directory(
         false,
     )?;
     let (membership_epoch, membership_epoch_hash) = match wire.membership_activated {
+        // This is a control-plane bootstrap marker, not permission to install
+        // or use Sender-Key v5 traffic. The owner signs epoch 1 and the
+        // directory is fetched again as Sender-Key v6 before roster install.
         false
             if wire.crypto_profile == "sender_key_v5"
                 && wire.membership_ready
@@ -5673,17 +5591,12 @@ fn sync_conversation_messages(
                     header.as_slice() == [0x05]
                 } else {
                     match &crypto_context {
-                        ParsedMessageCryptoContext::LegacyUnknown => {
-                            (header.first() == Some(&0x01) && header.len() == 82)
-                                || (header.first() == Some(&0x02) && header.len() == 42)
-                        }
                         ParsedMessageCryptoContext::DirectV2(context) => {
                             ((header.first() == Some(&0x11) && header.len() == 114)
                                 || (header.first() == Some(&0x12) && header.len() == 74))
                                 && header.get(1..33) == Some(context.direct_session_id.as_slice())
                         }
-                        ParsedMessageCryptoContext::SenderKeyV5 { .. }
-                        | ParsedMessageCryptoContext::SenderKeyV6 { .. } => false,
+                        ParsedMessageCryptoContext::SenderKeyV6 { .. } => false,
                     }
                 };
                 if !valid_header {
@@ -5723,7 +5636,6 @@ fn sync_conversation_messages(
             }
 
             match (sender_key_mode, crypto_context) {
-                (false, ParsedMessageCryptoContext::LegacyUnknown) => {}
                 (false, ParsedMessageCryptoContext::DirectV2(ref context)) => {
                     if remote_state == veil_store::models::RemoteMessageStateKind::Active
                         && message.sender_id != authenticated_user_id
@@ -5742,75 +5654,19 @@ fn sync_conversation_messages(
                         continue;
                     }
                 }
-                (
-                    false,
-                    ParsedMessageCryptoContext::SenderKeyV5 { .. }
-                    | ParsedMessageCryptoContext::SenderKeyV6 { .. },
-                ) => {
+                (false, ParsedMessageCryptoContext::SenderKeyV6 { .. }) => {
                     return Err(format!(
                         "DM message {} carries a sender-key security context",
                         message.id
                     ));
                 }
-                (true, ParsedMessageCryptoContext::LegacyUnknown)
-                    if remote_state == veil_store::models::RemoteMessageStateKind::Active =>
-                {
-                    let has_local_plaintext = client
-                        .db()
-                        .ok_or("database not initialized")?
-                        .message_exists(&message.id)?;
-                    if has_local_plaintext {
-                        // Migration 018 labels pre-context rows explicitly as
-                        // legacy_unknown. An already-decrypted local row is
-                        // still trustworthy at the same authenticated
-                        // revision: preserve its plaintext/index and reconcile
-                        // reactions as Active. A newer encrypted edit cannot
-                        // be applied, so retain the old local body while
-                        // recording only the newer remote revision as
-                        // unavailable.
-                        match client.reconcile_remote_message_metadata(
-                            &message.id,
-                            conversation_id,
-                            &response_identity,
-                            &metadata,
-                            veil_store::models::RemoteMessageStateKind::Active,
-                        )? {
-                            veil_client::api::RemoteReconcileAction::Unchanged
-                            | veil_client::api::RemoteReconcileAction::SelfStateOnly => {
-                                stats.duplicates += 1;
-                                continue;
-                            }
-                            veil_client::api::RemoteReconcileAction::NeedsEncryptedEdit => {}
-                            unexpected => {
-                                return Err(format!(
-                                    "legacy message {} produced unexpected local reconciliation {unexpected:?}",
-                                    message.id
-                                ));
-                            }
-                        }
-                    }
-                    client.reconcile_remote_message_metadata(
-                        &message.id,
-                        conversation_id,
-                        &response_identity,
-                        &metadata,
-                        veil_store::models::RemoteMessageStateKind::Unavailable,
-                    )?;
-                    stats.unavailable_history += 1;
-                    continue;
-                }
-                (true, ParsedMessageCryptoContext::LegacyUnknown) => {}
                 (true, ParsedMessageCryptoContext::DirectV2(_)) => {
                     return Err(format!(
                         "group/channel message {} carries a Direct v2 security context",
                         message.id
                     ));
                 }
-                (
-                    true,
-                    ParsedMessageCryptoContext::SenderKeyV5 { .. }
-                    | ParsedMessageCryptoContext::SenderKeyV6 { .. },
-                ) => {
+                (true, ParsedMessageCryptoContext::SenderKeyV6 { .. }) => {
                     if remote_state == veil_store::models::RemoteMessageStateKind::Active {
                         let existing_local_self = message.sender_id == authenticated_user_id
                             && client
@@ -6049,6 +5905,7 @@ fn sync_conversation_messages(
                         Some(&author_snapshot),
                         Some(author_context),
                         sender_key_mode,
+                        message_security_context.as_ref(),
                         header,
                         ciphertext,
                         Some(&metadata),
@@ -7066,6 +6923,7 @@ fn connect_to_server(
                             ciphertext,
                             header,
                             edit_timestamp,
+                            security_context,
                         } => {
                             if !live_conversation_origin_is_current(
                                 &state_inner,
@@ -7273,6 +7131,7 @@ fn connect_to_server(
                                 Some(&author_snapshot),
                                 Some(MessageAuthorContext::DirectoryMemberAtObservation),
                                 sender_key_mode,
+                                security_context.as_ref(),
                                 &header,
                                 &ciphertext,
                                 Some(&metadata),
@@ -13651,9 +13510,9 @@ mod e2ee_rest_tests {
         validated_search_conversation_metadata, validated_search_coverage,
         validated_search_hit_dto, verify_device_directory_account_keys, AppState,
         AuthenticatedSessionScope, ConversationSyncIsolation, CurrentTargetAdmissionEvidence,
-        ParsedMessageCryptoContext, PinnedDirectoryMember, PublishedSearchBinding, RestBinding,
-        RestOrigin, SearchCoverage, SearchRebuildReport, SearchResultContextDto,
-        DEFAULT_AUTO_LOCK_SECONDS, MAX_MEDIA_RANGE_BYTES, SEARCH_MAX_SOURCE_BYTES,
+        PinnedDirectoryMember, PublishedSearchBinding, RestBinding, RestOrigin, SearchCoverage,
+        SearchRebuildReport, SearchResultContextDto, DEFAULT_AUTO_LOCK_SECONDS,
+        MAX_MEDIA_RANGE_BYTES, SEARCH_MAX_SOURCE_BYTES,
     };
     use base64::Engine;
     use ed25519_dalek::SigningKey;
@@ -15844,10 +15703,9 @@ mod e2ee_rest_tests {
     }
 
     #[test]
-    fn persisted_message_crypto_context_is_strictly_all_or_none() {
-        assert_eq!(
-            parse_message_crypto_context("legacy_unknown", None, None, None, None, None).unwrap(),
-            ParsedMessageCryptoContext::LegacyUnknown
+    fn persisted_message_crypto_context_rejects_removed_profiles() {
+        assert!(
+            parse_message_crypto_context("legacy_unknown", None, None, None, None, None).is_err()
         );
         assert!(
             parse_message_crypto_context("legacy_unknown", Some("1"), None, None, None, None,)
@@ -15858,7 +15716,7 @@ mod e2ee_rest_tests {
         );
         assert!(parse_message_crypto_context("unknown", None, None, None, None, None).is_err());
 
-        let parsed = parse_message_crypto_context(
+        assert!(parse_message_crypto_context(
             "sender_key_v5",
             Some("1"),
             Some("7"),
@@ -15866,21 +15724,15 @@ mod e2ee_rest_tests {
             Some("10101010101010101010101010101010"),
             Some("9"),
         )
-        .unwrap();
-        assert_eq!(
-            parsed,
-            ParsedMessageCryptoContext::SenderKeyV5 {
-                roster_version: 7,
-                roster_commitment: [0xab; 32],
-                sender_device_id: [0x10; 16],
-                sender_binding_version: 9,
-            }
-        );
+        .is_err());
     }
 
     #[test]
     fn live_message_mode_never_accepts_a_missing_or_cross_protocol_context() {
-        use veil_client::api::{MessageSecurityContextV1, SenderKeyMessageSecurityContextV1};
+        use veil_client::api::{
+            MessageSecurityContextV1, SenderKeyMessageSecurityContextV1,
+            SenderKeyMessageSecurityContextV6,
+        };
 
         let sender_key = MessageSecurityContextV1::SenderKeyV5(SenderKeyMessageSecurityContextV1 {
             roster_version: 7,
@@ -15889,8 +15741,19 @@ mod e2ee_rest_tests {
             target_device_id: [0x20; 16],
             sender_binding_version: 9,
         });
-        validate_live_message_security_context(false, None).unwrap();
-        validate_live_message_security_context(true, Some(&sender_key)).unwrap();
+        let sender_key_v6 =
+            MessageSecurityContextV1::SenderKeyV6(SenderKeyMessageSecurityContextV6 {
+                roster_version: 8,
+                roster_commitment: [0xbc; 32],
+                sender_device_id: [0x11; 16],
+                target_device_id: [0x21; 16],
+                sender_binding_version: 10,
+                membership_epoch: 1,
+                membership_epoch_hash: [0xcd; 32],
+            });
+        validate_live_message_security_context(true, Some(&sender_key_v6)).unwrap();
+        assert!(validate_live_message_security_context(false, None).is_err());
+        assert!(validate_live_message_security_context(true, Some(&sender_key)).is_err());
         assert!(validate_live_message_security_context(true, None).is_err());
         assert!(validate_live_message_security_context(false, Some(&sender_key)).is_err());
     }

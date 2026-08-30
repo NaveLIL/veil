@@ -63,6 +63,7 @@ const HEADER_SENDER_KEY: u8 = 0x05; // Group/channel sender-key encrypted messag
 // Inner type bytes (inside ratchet-decrypted plaintext for pairwise channel)
 const INNER_TEXT: u8 = 0x00; // UTF-8 text message
 const INNER_SKDM: u8 = 0x01; // Sender Key Distribution Message (JSON)
+#[cfg(any(test, feature = "test-utils"))]
 const RATCHET_AD_DOMAIN: &[u8] = b"veil-ratchet-message-v1";
 const DIRECT_CRYPTO_PROFILE_V2: &str = "direct_v2";
 const DIRECT_CRYPTO_ERA_V2: u64 = 1;
@@ -186,6 +187,7 @@ impl Drop for ReceiveCryptoSnapshot {
     }
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 fn ratchet_associated_data(
     conversation_id: &str,
     sender_identity_key: &[u8; 32],
@@ -1887,6 +1889,7 @@ impl VeilClient {
             return Err("device roster is not ready for encrypted traffic".to_string());
         }
         match candidate.membership_activated {
+            #[cfg(any(test, feature = "test-utils"))]
             false
                 if candidate.crypto_profile == "sender_key_v5"
                     && candidate.membership_epoch == 0
@@ -4214,15 +4217,27 @@ impl VeilClient {
             .map_err(|_| {
                 DirectSendErrorV1::storage("durable Direct outbox payload is not SendMessage")
             })?;
+        let direct_state = self
+            .direct_v2_sessions
+            .get(&pending.peer_identity_key)
+            .ok_or_else(|| {
+                DirectSendErrorV1::storage(
+                    "durable Direct outbox has no authenticated Direct v2 session",
+                )
+            })?;
+        let valid_direct_header = matches!(
+            decoded.header.as_slice(),
+            [HEADER_INITIAL_V2, ..] | [HEADER_RATCHET_V2, ..]
+        ) && ((decoded.header[0] == HEADER_INITIAL_V2
+            && decoded.header.len() == 114)
+            || (decoded.header[0] == HEADER_RATCHET_V2 && decoded.header.len() == 74))
+            && decoded.header.get(1..33) == Some(decoded.direct_session_id.as_slice());
         if decoded.encode_to_vec() != pending.exact_send_message_payload
             || decoded.conversation_id != pending.conversation_id
             || decoded.client_message_id != pending.client_message_id
             || decoded.ciphertext.is_empty()
             || decoded.header.is_empty()
-            || !matches!(
-                decoded.header.first(),
-                Some(&HEADER_INITIAL) | Some(&HEADER_RATCHET)
-            )
+            || !valid_direct_header
             || decoded.msg_type != proto::MessageType::Text as i32
             || decoded.reply_to_id.is_some()
             || decoded.ttl_seconds.is_some()
@@ -4230,6 +4245,13 @@ impl VeilClient {
             || decoded.sealed
             || decoded.roster_version != 0
             || !decoded.roster_commitment.is_empty()
+            || decoded.crypto_profile != DIRECT_CRYPTO_PROFILE_V2
+            || decoded.crypto_era != DIRECT_CRYPTO_ERA_V2
+            || decoded.target_device_id != direct_state.peer().device.device_id
+            || decoded.target_binding_version != direct_state.peer().device.binding_version
+            || decoded.direct_session_id != direct_state.session_id()
+            || decoded.membership_epoch != 0
+            || !decoded.membership_epoch_hash.is_empty()
         {
             return Err(DirectSendErrorV1::storage(
                 "durable Direct outbox payload violates the Direct text contract",
@@ -5816,7 +5838,7 @@ impl VeilClient {
         // Encrypt first (needs mutable borrow)
         let (ciphertext, header_bytes) =
             self.encrypt_outgoing_classified_v1(conversation_id, &encrypted_plaintext)?;
-        let initial_peer = (header_bytes.first() == Some(&HEADER_INITIAL))
+        let initial_peer = (header_bytes.first() == Some(&HEADER_INITIAL_V2))
             .then(|| self.dm_conversations.get(conversation_id).copied())
             .flatten();
         let our_key = self.identity_key().map_err(DirectSendErrorV1::rejected)?;
@@ -5911,6 +5933,16 @@ impl VeilClient {
                 Ok((head.epoch, head.hash))
             })
             .transpose()?;
+        let direct_state = if roster_proof.is_none() {
+            let peer = self.dm_conversations.get(conversation_id).ok_or_else(|| {
+                DirectSendErrorV1::rejected("Direct conversation has no authenticated peer route")
+            })?;
+            Some(self.direct_v2_sessions.get(peer).ok_or_else(|| {
+                DirectSendErrorV1::rejected("Direct v2 session is required for outgoing traffic")
+            })?)
+        } else {
+            None
+        };
         let send_msg = proto::SendMessage {
             conversation_id: conversation_id.to_string(),
             ciphertext,
@@ -5941,37 +5973,15 @@ impl VeilClient {
                 .map_or_else(Vec::new, |roster| roster.commitment.to_vec()),
             client_message_id: local_message_id.clone(),
             crypto_profile: membership_proof.map_or_else(
-                || {
-                    self.dm_conversations
-                        .get(conversation_id)
-                        .and_then(|peer| self.direct_v2_sessions.get(peer))
-                        .map_or_else(String::new, |_| DIRECT_CRYPTO_PROFILE_V2.to_string())
-                },
+                || DIRECT_CRYPTO_PROFILE_V2.to_string(),
                 |_| "sender_key_v6".to_string(),
             ),
-            crypto_era: membership_proof.map_or_else(
-                || {
-                    self.dm_conversations
-                        .get(conversation_id)
-                        .and_then(|peer| self.direct_v2_sessions.get(peer))
-                        .map_or(0, |_| DIRECT_CRYPTO_ERA_V2)
-                },
-                |_| 1,
-            ),
-            target_device_id: self
-                .dm_conversations
-                .get(conversation_id)
-                .and_then(|peer| self.direct_v2_sessions.get(peer))
+            crypto_era: membership_proof.map_or(DIRECT_CRYPTO_ERA_V2, |_| 1),
+            target_device_id: direct_state
                 .map_or_else(Vec::new, |state| state.peer().device.device_id.to_vec()),
-            target_binding_version: self
-                .dm_conversations
-                .get(conversation_id)
-                .and_then(|peer| self.direct_v2_sessions.get(peer))
+            target_binding_version: direct_state
                 .map_or(0, |state| state.peer().device.binding_version),
-            direct_session_id: self
-                .dm_conversations
-                .get(conversation_id)
-                .and_then(|peer| self.direct_v2_sessions.get(peer))
+            direct_session_id: direct_state
                 .map_or_else(Vec::new, |state| state.session_id().to_vec()),
             membership_epoch: membership_proof.map_or(0, |proof| proof.0),
             membership_epoch_hash: membership_proof.map_or_else(Vec::new, |proof| proof.1.to_vec()),
@@ -7664,28 +7674,35 @@ impl VeilClient {
                 )
                 .map_err(DirectSendErrorV1::rejected)?
         } else {
-            if pending.is_some_and(|initial| initial.direct_v2_session_id.is_some()) {
-                return Err(DirectSendErrorV1::rejected(
-                    "Direct v2 pending state lost its sticky session binding",
-                ));
+            #[cfg(not(any(test, feature = "test-utils")))]
+            return Err(DirectSendErrorV1::rejected(
+                "Direct v2 session is required for outgoing traffic",
+            ));
+            #[cfg(any(test, feature = "test-utils"))]
+            {
+                if pending.is_some_and(|initial| initial.direct_v2_session_id.is_some()) {
+                    return Err(DirectSendErrorV1::rejected(
+                        "Direct v2 pending state lost its sticky session binding",
+                    ));
+                }
+                if let Some(initial) = pending {
+                    wire_prefix.push(HEADER_INITIAL);
+                    wire_prefix.extend_from_slice(&initial.ephemeral_public);
+                    wire_prefix.extend_from_slice(&initial.signed_prekey_id.to_be_bytes());
+                    wire_prefix.extend_from_slice(
+                        &initial.one_time_prekey_id.unwrap_or(u32::MAX).to_be_bytes(),
+                    );
+                } else {
+                    wire_prefix.push(HEADER_RATCHET);
+                }
+                ratchet_associated_data(
+                    conversation_id,
+                    &our_identity_key,
+                    peer_identity_key,
+                    &wire_prefix,
+                )
+                .map_err(DirectSendErrorV1::rejected)?
             }
-            if let Some(initial) = pending {
-                wire_prefix.push(HEADER_INITIAL);
-                wire_prefix.extend_from_slice(&initial.ephemeral_public);
-                wire_prefix.extend_from_slice(&initial.signed_prekey_id.to_be_bytes());
-                wire_prefix.extend_from_slice(
-                    &initial.one_time_prekey_id.unwrap_or(u32::MAX).to_be_bytes(),
-                );
-            } else {
-                wire_prefix.push(HEADER_RATCHET);
-            }
-            ratchet_associated_data(
-                conversation_id,
-                &our_identity_key,
-                peer_identity_key,
-                &wire_prefix,
-            )
-            .map_err(DirectSendErrorV1::rejected)?
         };
         let mut candidate = self
             .ratchet_sessions
@@ -8307,6 +8324,7 @@ impl VeilClient {
                 ciphertext,
                 security_context,
             ),
+            #[cfg(any(test, feature = "test-utils"))]
             HEADER_INITIAL => {
                 // Parse X3DH init header
                 if header.len() != 1 + 32 + 4 + 4 + 41 {
@@ -8391,6 +8409,7 @@ impl VeilClient {
 
                 self.process_ratchet_plaintext_classified_v1(sender_identity_key, plaintext)
             }
+            #[cfg(any(test, feature = "test-utils"))]
             HEADER_RATCHET => {
                 if header.len() != 1 + 41 {
                     return Err(DirectHistoryMutationError::rejected(format!(
@@ -8504,6 +8523,7 @@ impl VeilClient {
     /// from an uncertain SQLCipher write without parsing human-readable
     /// errors. Candidate ratchets are persisted inside the caller's receive
     /// savepoint and published to memory only after authentication succeeds.
+    #[cfg(any(test, feature = "test-utils"))]
     fn decrypt_direct_history_text_classified(
         &mut self,
         sender_identity_key: &[u8; 32],
@@ -10171,9 +10191,10 @@ impl VeilClient {
                     MessageSecurityContextV1::SenderKeyV5(_)
                     | MessageSecurityContextV1::SenderKeyV6(_),
                 ),
-            )
-            | (false, None)
-            | (false, Some(MessageSecurityContextV1::DirectV2(_))) => {}
+            ) => {}
+            (false, Some(MessageSecurityContextV1::DirectV2(_))) => {}
+            #[cfg(any(test, feature = "test-utils"))]
+            (false, None) => {}
             _ => {
                 return Err(DirectHistoryMutationError::rejected(
                     "inbound message security context conflicts with the conversation type",
@@ -10287,12 +10308,21 @@ impl VeilClient {
                             }
                         }
                     } else {
-                        client.decrypt_direct_history_text_classified(
-                            sender_identity_key,
-                            conversation_id,
-                            header,
-                            ciphertext,
-                        )?
+                        #[cfg(any(test, feature = "test-utils"))]
+                        {
+                            client.decrypt_direct_history_text_classified(
+                                sender_identity_key,
+                                conversation_id,
+                                header,
+                                ciphertext,
+                            )?
+                        }
+                        #[cfg(not(any(test, feature = "test-utils")))]
+                        {
+                            return Err(DirectHistoryMutationError::rejected(
+                                "Direct v2 history is missing its exact device/session context",
+                            ));
+                        }
                     }
                 }
             });
@@ -10642,6 +10672,7 @@ impl VeilClient {
         author_snapshot: Option<&AccountSnapshot>,
         author_context: Option<MessageAuthorContext>,
         sender_key_mode: bool,
+        security_context: Option<&MessageSecurityContextV1>,
         header: &[u8],
         ciphertext: &[u8],
         remote_metadata: Option<&RemoteMessageMetadata<'_>>,
@@ -10654,6 +10685,7 @@ impl VeilClient {
             author_snapshot,
             author_context,
             sender_key_mode,
+            security_context,
             header,
             ciphertext,
             remote_metadata,
@@ -10669,6 +10701,7 @@ impl VeilClient {
         author_snapshot: Option<&AccountSnapshot>,
         author_context: Option<MessageAuthorContext>,
         sender_key_mode: bool,
+        security_context: Option<&MessageSecurityContextV1>,
         header: &[u8],
         ciphertext: &[u8],
         remote_metadata: Option<&RemoteMessageMetadata<'_>>,
@@ -10680,6 +10713,7 @@ impl VeilClient {
             author_snapshot,
             author_context,
             sender_key_mode,
+            security_context,
             header,
             ciphertext,
             remote_metadata,
@@ -10701,6 +10735,7 @@ impl VeilClient {
         author_snapshot: Option<&AccountSnapshot>,
         author_context: Option<MessageAuthorContext>,
         sender_key_mode: bool,
+        security_context: Option<&MessageSecurityContextV1>,
         header: &[u8],
         ciphertext: &[u8],
         remote_metadata: Option<&RemoteMessageMetadata<'_>>,
@@ -10747,12 +10782,20 @@ impl VeilClient {
                     None,
                 )
                 .map_err(DirectHistoryMutationError::storage)?;
-            let plaintext = client.decrypt_direct_history_text_classified(
+            let plaintext = match client.decrypt_from_with_security_context_classified_v1(
                 sender_identity_key,
                 conversation_id,
                 header,
                 ciphertext,
-            )?;
+                security_context,
+            )? {
+                DecryptedPayload::Text(plaintext) => plaintext,
+                DecryptedPayload::Control => {
+                    return Err(DirectHistoryMutationError::rejected(
+                        "control frame is not valid in a Direct edit",
+                    ));
+                }
+            };
             let plaintext = match String::from_utf8(plaintext) {
                 Ok(plaintext) => Zeroizing::new(plaintext),
                 Err(error) => {
@@ -10864,7 +10907,7 @@ impl VeilClient {
             ));
         }
         let (ciphertext, header_bytes) = self.encrypt_outgoing(conversation_id, new_text)?;
-        let initial_peer = (header_bytes.first() == Some(&HEADER_INITIAL))
+        let initial_peer = (header_bytes.first() == Some(&HEADER_INITIAL_V2))
             .then(|| self.dm_conversations.get(conversation_id).copied())
             .flatten();
 
@@ -14277,11 +14320,36 @@ mod tests {
                 .bind_dm_conversation(&conversation_id, peer_identity_key)
                 .unwrap();
 
+            let peer_device_id = [0xE7; 16];
+            let peer_stored_device =
+                DeviceIdentityV1::generate_stored(&peer_identity, peer_device_id).unwrap();
+            let peer_device =
+                DeviceIdentityV1::from_stored(&peer_identity, peer_stored_device).unwrap();
+            let peer_binding = peer_device.binding().clone();
             let mut peer = VeilClient::from_identity(peer_identity);
+            peer.device_id = peer_device_id;
+            peer.device_identity = Some(peer_device);
             let peer_prekeys = peer.generate_prekeys().unwrap();
             let (one_time_prekey, one_time_prekey_id) = peer_prekeys.otk_publics[0];
+            let direct_context = client
+                .direct_v2_initiator_context(
+                    &conversation_id,
+                    &peer_user_id,
+                    peer_identity_key,
+                    peer_signing_key,
+                    DirectDeviceCoordinateV2 {
+                        device_id: peer_binding.device_id,
+                        binding_version: peer_binding.version,
+                        capabilities: peer_binding.capabilities,
+                        status: peer_binding.status,
+                        identity_key: peer_binding.device_identity_key,
+                        signing_key: peer_binding.device_signing_key,
+                        account_signature: peer_binding.account_signature,
+                    },
+                )
+                .unwrap();
             client
-                .establish_session(
+                .establish_session_classified_v2(
                     &peer_identity_key,
                     &x3dh::PreKeyBundle {
                         identity_key: peer_identity_key,
@@ -14292,6 +14360,7 @@ mod tests {
                         one_time_prekey: Some(one_time_prekey),
                         one_time_prekey_id: Some(one_time_prekey_id),
                     },
+                    direct_context,
                 )
                 .unwrap();
             let outbound = client.test_only_install_queued_connection();
@@ -16250,7 +16319,10 @@ mod tests {
     struct DirectLivePeerFixture {
         sender: VeilClient,
         sender_identity_key: [u8; 32],
+        sender_user_id: String,
         receiver_identity_key: [u8; 32],
+        receiver_device_id: [u8; 16],
+        receiver_binding_version: u64,
         conversation_id: String,
         username: String,
         next_message: u128,
@@ -16262,11 +16334,24 @@ mod tests {
                 .sender
                 .encrypt_outgoing(&self.conversation_id, text)
                 .unwrap();
-            if header.first() == Some(&HEADER_INITIAL) {
+            if header.first() == Some(&HEADER_INITIAL_V2) {
                 self.sender
                     .test_only_confirm_peer_session_possession(&self.receiver_identity_key)
                     .unwrap();
             }
+            let sender_binding = self
+                .sender
+                .device_identity
+                .as_ref()
+                .unwrap()
+                .binding()
+                .clone();
+            let direct_session_id = self
+                .sender
+                .direct_v2_sessions
+                .get(&self.receiver_identity_key)
+                .unwrap()
+                .session_id();
             self.next_message += 1;
             ConnectionEvent::MessageReceived {
                 message_id: uuid::Uuid::from_u128(self.next_message).to_string(),
@@ -16282,7 +16367,21 @@ mod tests {
                 ttl_seconds: None,
                 sealed: Some(false),
                 attachments: Vec::new(),
-                security_context: None,
+                security_context: Some(MessageSecurityContextV1::DirectV2(
+                    DirectMessageSecurityContextV2 {
+                        sender_user_id: self.sender_user_id.clone(),
+                        sender_device_id: sender_binding.device_id,
+                        sender_binding_version: sender_binding.version,
+                        sender_device_identity_key: sender_binding.device_identity_key,
+                        sender_device_signing_key: sender_binding.device_signing_key,
+                        sender_device_capabilities: sender_binding.capabilities,
+                        sender_device_binding_status: sender_binding.status,
+                        sender_account_signature: sender_binding.account_signature,
+                        target_device_id: self.receiver_device_id,
+                        target_binding_version: self.receiver_binding_version,
+                        direct_session_id,
+                    },
+                )),
             }
         }
     }
@@ -16308,7 +16407,16 @@ mod tests {
             let receiver_signing_key = receiver_identity.ed25519_public_bytes();
             let receiver_user_id =
                 uuid::Uuid::from_u128(0x1000_0000_0000_0000_0000_0000_0000_0001).to_string();
+            let receiver_device_id = [0x91; 16];
+            let receiver_stored_device =
+                DeviceIdentityV1::generate_stored(&receiver_identity, receiver_device_id).unwrap();
+            db.create_device_identity_v1(&receiver_stored_device)
+                .unwrap();
+            let receiver_device =
+                DeviceIdentityV1::from_stored(&receiver_identity, receiver_stored_device).unwrap();
             let mut receiver = VeilClient::from_identity(receiver_identity);
+            receiver.device_id = receiver_device_id;
+            receiver.device_identity = Some(receiver_device);
             db.bind_authenticated_self(
                 DIRECT_LIVE_TEST_ORIGIN,
                 &receiver_user_id,
@@ -16355,9 +16463,9 @@ mod tests {
             let sender_identity = IdentityKeyPair::generate();
             let sender_identity_key = sender_identity.x25519_public_bytes();
             let sender_signing_key = sender_identity.ed25519_public_bytes();
-            let sender_user_id =
-                uuid::Uuid::from_u128(0x2000_0000_0000_0000_0000_0000_0000_0000 + index)
-                    .to_string();
+            let sender_user_uuid =
+                uuid::Uuid::from_u128(0x2000_0000_0000_0000_0000_0000_0000_0000 + index);
+            let sender_user_id = sender_user_uuid.to_string();
             let conversation_id =
                 uuid::Uuid::from_u128(0x3000_0000_0000_0000_0000_0000_0000_0000 + index)
                     .to_string();
@@ -16409,9 +16517,58 @@ mod tests {
 
             let prekeys = self.receiver.generate_prekeys().unwrap();
             let (one_time_prekey, one_time_prekey_id) = prekeys.otk_publics[0];
+            let sender_device_marker = u8::try_from(0xA0u128 + index).unwrap();
+            let sender_device_id = [sender_device_marker; 16];
+            let sender_stored_device =
+                DeviceIdentityV1::generate_stored(&sender_identity, sender_device_id).unwrap();
+            let sender_device =
+                DeviceIdentityV1::from_stored(&sender_identity, sender_stored_device).unwrap();
             let mut sender = VeilClient::from_identity(sender_identity);
+            sender.device_id = sender_device_id;
+            sender.device_identity = Some(sender_device);
+            sender.authenticated_user_id = Some(sender_user_uuid.to_string());
+            sender.authenticated_server_origin = Some(DIRECT_LIVE_TEST_ORIGIN.to_string());
             sender
-                .establish_session(
+                .remember_user_identity(
+                    self.receiver
+                        .authenticated_user_id
+                        .as_deref()
+                        .expect("receiver is authenticated"),
+                    self.receiver_identity_key,
+                )
+                .unwrap();
+            sender
+                .pin_peer_signing_key(self.receiver_identity_key, self.receiver_signing_key)
+                .unwrap();
+            sender
+                .bind_dm_conversation(&conversation_id, self.receiver_identity_key)
+                .unwrap();
+            let receiver_binding = self
+                .receiver
+                .device_identity
+                .as_ref()
+                .unwrap()
+                .binding()
+                .clone();
+            let direct_context = sender
+                .direct_v2_initiator_context(
+                    &conversation_id,
+                    self.receiver.authenticated_user_id.as_deref().unwrap(),
+                    self.receiver_identity_key,
+                    self.receiver_signing_key,
+                    DirectDeviceCoordinateV2 {
+                        device_id: receiver_binding.device_id,
+                        binding_version: receiver_binding.version,
+                        capabilities: receiver_binding.capabilities,
+                        status: receiver_binding.status,
+                        identity_key: receiver_binding.device_identity_key,
+                        signing_key: receiver_binding.device_signing_key,
+                        account_signature: receiver_binding.account_signature,
+                    },
+                )
+                .unwrap();
+            sender
+                .establish_session_classified_v2(
                     &self.receiver_identity_key,
                     &x3dh::PreKeyBundle {
                         identity_key: self.receiver_identity_key,
@@ -16422,15 +16579,16 @@ mod tests {
                         one_time_prekey: Some(one_time_prekey),
                         one_time_prekey_id: Some(one_time_prekey_id),
                     },
+                    direct_context,
                 )
-                .unwrap();
-            sender
-                .bind_dm_conversation(&conversation_id, self.receiver_identity_key)
                 .unwrap();
             self.peers.push(DirectLivePeerFixture {
                 sender,
                 sender_identity_key,
+                sender_user_id,
                 receiver_identity_key: self.receiver_identity_key,
+                receiver_device_id: receiver_binding.device_id,
+                receiver_binding_version: receiver_binding.version,
                 conversation_id,
                 username,
                 next_message: 0x4000_0000_0000_0000_0000_0000_0000_0000 + (index << 32),
@@ -16830,6 +16988,7 @@ mod tests {
             sender_identity_key,
             ciphertext,
             header,
+            security_context,
             reply_to_id,
             ..
         } = &late_two
@@ -16845,7 +17004,7 @@ mod tests {
                 None,
                 None,
                 false,
-                None,
+                security_context.as_ref(),
                 None,
                 header,
                 ciphertext,
@@ -18059,6 +18218,7 @@ mod tests {
             ciphertext: vec![1],
             header: vec![HEADER_RATCHET],
             edit_timestamp: 1_700_000_000_000_000_000 + message_suffix as u64,
+            security_context: None,
         };
         let healthy = fixture.peers[healthy_peer].next_event("healthy after blocked mutations");
         fixture.enqueue(vec![edit(1), edit(2), healthy]);
@@ -19171,6 +19331,19 @@ mod tests {
         bob.trusted_signing_keys.insert(alice_key, alice_signing);
         bob.dm_conversations
             .insert(conversation_id.to_string(), alice_key);
+        bob.db()
+            .unwrap()
+            .upsert_directory_conversation(
+                conversation_id,
+                ConversationType::DM as u8,
+                origin,
+                Some("Alice"),
+                Some(&alice_user.to_string()),
+                Some(&alice_key),
+                None,
+                "2026-08-30T00:00:00Z",
+            )
+            .unwrap();
 
         let bob_prekeys = bob.generate_prekeys().unwrap();
         let (one_time_prekey, one_time_prekey_id) = bob_prekeys.otk_publics[0];
@@ -19235,6 +19408,41 @@ mod tests {
             DecryptedPayload::Text(plaintext) => assert_eq!(plaintext, b"v2 first"),
             DecryptedPayload::Control => panic!("Direct v2 text decoded as control"),
         }
+        bob.db()
+            .unwrap()
+            .insert_message(
+                "550e8400-e29b-41d4-a716-446655440213",
+                conversation_id,
+                &alice_key,
+                "before edit",
+                false,
+                Some(1),
+                None,
+            )
+            .unwrap();
+        let (edit_ciphertext, edit_header) = alice
+            .encrypt_outgoing(conversation_id, "v2 edited")
+            .unwrap();
+        assert_eq!(
+            bob.receive_and_persist_edit(
+                "550e8400-e29b-41d4-a716-446655440213",
+                conversation_id,
+                &alice_key,
+                None,
+                None,
+                false,
+                Some(&alice_to_bob),
+                &edit_header,
+                &edit_ciphertext,
+                None,
+            )
+            .unwrap(),
+            "v2 edited"
+        );
+        assert_eq!(
+            bob.db().unwrap().get_messages(conversation_id, 10).unwrap()[0].plaintext,
+            "v2 edited"
+        );
         assert_eq!(
             bob.direct_v2_sessions.get(&alice_key).unwrap().session_id(),
             session_id
@@ -19858,12 +20066,13 @@ mod tests {
                 Some(&fixture.author),
                 Some(MessageAuthorContext::DirectoryMemberAtObservation),
                 false,
+                None,
                 &[HEADER_RATCHET],
                 &[0xFF],
                 None,
             )
             .unwrap_err();
-        assert!(rejected.contains("invalid Direct history ratchet header length"));
+        assert!(rejected.contains("invalid ratchet header length: expected 42, got 1"));
         assert!(!fixture.bob.direct_live_storage_uncertain);
         assert!(fixture.bob.db().is_some());
         assert!(fixture.bob.identity.is_some());
@@ -19887,6 +20096,7 @@ mod tests {
                     Some(&fixture.author),
                     Some(MessageAuthorContext::DirectoryMemberAtObservation),
                     false,
+                    None,
                     &header,
                     &ciphertext,
                     None,
@@ -19944,6 +20154,7 @@ mod tests {
                 Some(&fixture.author),
                 Some(MessageAuthorContext::DirectoryMemberAtObservation),
                 false,
+                None,
                 &header,
                 &ciphertext,
                 None,

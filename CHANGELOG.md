@@ -36,10 +36,19 @@ users.
   trust, transparency, membership continuity, Node settings and conversation
   metadata. Newer or malformed epochs fail closed without mutation, and the
   desktop UI explains the one-time history reset after a successful unlock.
+- Cut Direct v1 and Sender-Key v5 out of production message decoding and new
+  roster installation. Legacy ratchet/profile code remains compiled only for
+  frozen test vectors; live messages and REST history now require Direct v2 or
+  membership-bound Sender-Key v6 context.
+- Made Direct v2 mandatory for outgoing DMs and durable outbox replay, including
+  exact profile/era, target device binding, session commitment, and wire-header
+  validation. Direct edits now retain and verify the same outer security
+  context as new messages instead of falling through a history-only decryptor.
 
 This is an intentionally breaking pre-release line. Direct v1/Sender-Key v5
-history-path removal and the OpenMLS runtime remain pending and are tracked in
-ADR-0004 and `INTEGRATION_ROADMAP.md`.
+storage deletion and the OpenMLS runtime remain pending and are tracked in
+ADR-0004 and `INTEGRATION_ROADMAP.md`; production traffic no longer uses those
+legacy profiles.
 
 ## 0.2.0 Preview — 2026-08-05
 

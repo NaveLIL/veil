@@ -569,6 +569,7 @@ fn validate_message(
             DirectHistoryRejectCode::UnsupportedMessage,
         ));
     }
+    #[cfg(any(test, feature = "test-utils"))]
     let all_direct_fields_absent = wire.sender_device_identity_key.is_none()
         && wire.sender_device_signing_key.is_none()
         && wire.sender_device_capabilities.is_none()
@@ -578,6 +579,10 @@ fn validate_message(
         && wire.target_binding_version.is_none()
         && wire.direct_session_id.is_none();
     let security_context = match wire.crypto_profile.as_str() {
+        // Kept only for legacy cryptographic fixtures. Product builds reject
+        // history rows without an authenticated Direct v2 device/session
+        // coordinate before any ratchet or SQLCipher mutation.
+        #[cfg(any(test, feature = "test-utils"))]
         "legacy_unknown"
             if wire.crypto_era.is_none()
                 && wire.roster_version.is_none()
@@ -801,11 +806,14 @@ fn validate_message(
         )
         .map_err(|_| DirectHistoryInstallError::rejected(DirectHistoryRejectCode::InvalidPage))?;
         let valid_header = match security_context.as_ref() {
+            #[cfg(any(test, feature = "test-utils"))]
             None => {
                 matches!(header.as_slice(), [0x01, ..] | [0x02, ..])
                     && ((header[0] == 0x01 && header.len() == 82)
                         || (header[0] == 0x02 && header.len() == 42))
             }
+            #[cfg(not(any(test, feature = "test-utils")))]
+            None => false,
             Some(MessageSecurityContextV1::DirectV2(context)) => {
                 matches!(header.as_slice(), [0x11, ..] | [0x12, ..])
                     && ((header[0] == 0x11 && header.len() == 114)

@@ -14,6 +14,8 @@ pub mod attachments;
 pub mod auth_contract;
 pub mod connection;
 mod device_identity;
+#[cfg(feature = "test-utils")]
+pub use device_identity::DeviceIdentityV1;
 pub mod direct;
 pub mod direct_history;
 mod direct_v2;
