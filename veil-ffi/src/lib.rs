@@ -5157,33 +5157,18 @@ mod tests {
         mobile_test_install_ready_direct_with_peer(session, lease_token).0
     }
 
-    fn mobile_test_prekey_bundle(
-        peer: IdentityKeyPair,
-    ) -> ([u8; 32], veil_crypto::x3dh::PreKeyBundle) {
-        let identity_key = peer.x25519_public_bytes();
-        let signing_key = peer.ed25519_public_bytes();
-        let mut peer_client = veil_client::api::VeilClient::from_identity(peer);
-        let prekeys = peer_client.generate_prekeys().unwrap();
-        let (one_time_prekey, one_time_prekey_id) = prekeys.otk_publics[0];
-        (
-            identity_key,
-            veil_crypto::x3dh::PreKeyBundle {
-                identity_key,
-                signing_key,
-                signed_prekey: prekeys.spk_public,
-                signed_prekey_signature: prekeys.spk_signature,
-                signed_prekey_id: prekeys.spk_id,
-                one_time_prekey: Some(one_time_prekey),
-                one_time_prekey_id: Some(one_time_prekey_id),
-            },
-        )
-    }
-
     fn mobile_test_prekey_response(peer: IdentityKeyPair) -> ([u8; 32], Vec<u8>) {
         use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 
         let identity_key = peer.x25519_public_bytes();
         let signing_key = peer.ed25519_public_bytes();
+        let stored_device =
+            veil_client::device_identity::DeviceIdentityV1::generate_stored(&peer, [0xD2; 16])
+                .unwrap();
+        let device =
+            veil_client::device_identity::DeviceIdentityV1::from_stored(&peer, stored_device)
+                .unwrap();
+        let binding = device.binding().clone();
         let mut peer_client = veil_client::api::VeilClient::from_identity(peer);
         let prekeys = peer_client.generate_prekeys().unwrap();
         let (one_time_prekey, one_time_prekey_id) = prekeys.otk_publics[0];
@@ -5197,9 +5182,48 @@ mod tests {
             "one_time_prekey_id": one_time_prekey_id,
             "opk_low_warning": false,
             "opk_remaining": 10,
+            "device_id": hex::encode(binding.device_id),
+            "device_binding_version": binding.version,
+            "device_identity_key": BASE64_STANDARD.encode(binding.device_identity_key),
+            "device_signing_key": BASE64_STANDARD.encode(binding.device_signing_key),
+            "device_capabilities": binding.capabilities,
+            "device_binding_status": binding.status,
+            "device_account_signature": BASE64_STANDARD.encode(binding.account_signature),
         }))
         .unwrap();
         (identity_key, response)
+    }
+
+    fn mobile_test_establish_direct_v2(
+        session: &VeilMobileSession,
+        conversation_id: &str,
+        peer: IdentityKeyPair,
+    ) -> [u8; 32] {
+        let (peer_identity_key, response) = mobile_test_prekey_response(peer);
+        let route = session
+            .direct_sync
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .peers
+            .get(conversation_id)
+            .cloned()
+            .expect("authenticated Direct peer route");
+        assert_eq!(route.identity_key, peer_identity_key);
+        let result = veil_client::direct::install_authenticated_direct_prekey_bundle(
+            &mut session.client.lock().unwrap(),
+            &route.user_id,
+            route.identity_key,
+            route.signing_key,
+            &response,
+        )
+        .unwrap();
+        assert!(matches!(
+            result,
+            veil_client::direct::DirectPreKeyInstallResult::Established
+        ));
+        peer_identity_key
     }
 
     fn mobile_test_ready_prekey_fixture(
@@ -7271,13 +7295,7 @@ mod tests {
         });
 
         post_sign_entered.wait();
-        let (peer_identity_key, bundle) = mobile_test_prekey_bundle(peer);
-        session
-            .client
-            .lock()
-            .unwrap()
-            .establish_session(&peer_identity_key, &bundle)
-            .unwrap();
+        let peer_identity_key = mobile_test_establish_direct_v2(&session, &conversation_id, peer);
         release_post_sign.wait();
 
         let error = match signer.join().unwrap() {
@@ -7525,13 +7543,7 @@ mod tests {
         session
             .sign_direct_rest_request(token.clone(), request.request_token.clone())
             .unwrap();
-        let (peer_identity_key, bundle) = mobile_test_prekey_bundle(peer);
-        session
-            .client
-            .lock()
-            .unwrap()
-            .establish_session(&peer_identity_key, &bundle)
-            .unwrap();
+        let peer_identity_key = mobile_test_establish_direct_v2(&session, &conversation_id, peer);
         let before = session
             .client
             .lock()
@@ -7584,13 +7596,7 @@ mod tests {
         let request = session
             .prepare_direct_prekey_request(token.clone(), conversation_id.clone())
             .unwrap();
-        let (peer_identity_key, bundle) = mobile_test_prekey_bundle(peer);
-        session
-            .client
-            .lock()
-            .unwrap()
-            .establish_session(&peer_identity_key, &bundle)
-            .unwrap();
+        let peer_identity_key = mobile_test_establish_direct_v2(&session, &conversation_id, peer);
         let before = session
             .client
             .lock()
@@ -7644,13 +7650,7 @@ mod tests {
         session
             .sign_direct_rest_request(token.clone(), request.request_token.clone())
             .unwrap();
-        let (peer_identity_key, bundle) = mobile_test_prekey_bundle(peer);
-        session
-            .client
-            .lock()
-            .unwrap()
-            .establish_session(&peer_identity_key, &bundle)
-            .unwrap();
+        let peer_identity_key = mobile_test_establish_direct_v2(&session, &conversation_id, peer);
         let before = session
             .client
             .lock()
@@ -7825,13 +7825,7 @@ mod tests {
             MobileDirectSendReadiness::NeedsPreKey
         );
 
-        let (peer_identity_key, bundle) = mobile_test_prekey_bundle(peer);
-        session
-            .client
-            .lock()
-            .unwrap()
-            .establish_session(&peer_identity_key, &bundle)
-            .unwrap();
+        let peer_identity_key = mobile_test_establish_direct_v2(&session, &conversation_id, peer);
         assert_eq!(
             session.direct_send_readiness(token, conversation_id),
             MobileDirectSendReadiness::Ready
@@ -7845,13 +7839,7 @@ mod tests {
     fn mobile_direct_text_send_is_native_atomic_and_projects_only_the_durable_row() {
         let (session, path, token, conversation_id, peer, mut outbound) =
             mobile_test_ready_prekey_fixture(130);
-        let (peer_identity_key, bundle) = mobile_test_prekey_bundle(peer);
-        session
-            .client
-            .lock()
-            .unwrap()
-            .establish_session(&peer_identity_key, &bundle)
-            .unwrap();
+        let peer_identity_key = mobile_test_establish_direct_v2(&session, &conversation_id, peer);
 
         assert_eq!(
             session
@@ -7902,13 +7890,7 @@ mod tests {
     fn mobile_direct_ack_deadline_is_typed_retryable_and_revokes_the_lease() {
         let (session, path, token, conversation_id, peer, mut outbound) =
             mobile_test_ready_prekey_fixture(136);
-        let (peer_identity_key, bundle) = mobile_test_prekey_bundle(peer);
-        session
-            .client
-            .lock()
-            .unwrap()
-            .establish_session(&peer_identity_key, &bundle)
-            .unwrap();
+        let peer_identity_key = mobile_test_establish_direct_v2(&session, &conversation_id, peer);
         assert_eq!(
             session
                 .send_direct_text(
@@ -7969,13 +7951,7 @@ mod tests {
     fn mobile_direct_committed_send_protocol_terminal_is_accepted_without_retry_permission() {
         let (session, path, token, conversation_id, peer, _outbound) =
             mobile_test_ready_prekey_fixture(138);
-        let (peer_identity_key, bundle) = mobile_test_prekey_bundle(peer);
-        session
-            .client
-            .lock()
-            .unwrap()
-            .establish_session(&peer_identity_key, &bundle)
-            .unwrap();
+        let peer_identity_key = mobile_test_establish_direct_v2(&session, &conversation_id, peer);
         session
             .client
             .lock()
@@ -8016,13 +7992,7 @@ mod tests {
     fn mobile_direct_outbox_protocol_terminal_is_never_retryable() {
         let (session, path, token, conversation_id, peer, mut outbound) =
             mobile_test_ready_prekey_fixture(139);
-        let (peer_identity_key, bundle) = mobile_test_prekey_bundle(peer);
-        session
-            .client
-            .lock()
-            .unwrap()
-            .establish_session(&peer_identity_key, &bundle)
-            .unwrap();
+        let peer_identity_key = mobile_test_establish_direct_v2(&session, &conversation_id, peer);
         assert_eq!(
             session
                 .send_direct_text(
@@ -8123,13 +8093,7 @@ mod tests {
     fn mobile_direct_text_transport_loss_keeps_intent_and_revokes_the_lease() {
         let (session, path, token, conversation_id, peer, mut outbound) =
             mobile_test_ready_prekey_fixture(132);
-        let (peer_identity_key, bundle) = mobile_test_prekey_bundle(peer);
-        session
-            .client
-            .lock()
-            .unwrap()
-            .establish_session(&peer_identity_key, &bundle)
-            .unwrap();
+        let peer_identity_key = mobile_test_establish_direct_v2(&session, &conversation_id, peer);
         session
             .client
             .lock()
@@ -8171,13 +8135,7 @@ mod tests {
     fn mobile_direct_new_ready_lease_replays_the_exact_persisted_payload() {
         let (session, path, token, conversation_id, peer, mut first_outbound) =
             mobile_test_ready_prekey_fixture(133);
-        let (peer_identity_key, bundle) = mobile_test_prekey_bundle(peer);
-        session
-            .client
-            .lock()
-            .unwrap()
-            .establish_session(&peer_identity_key, &bundle)
-            .unwrap();
+        let peer_identity_key = mobile_test_establish_direct_v2(&session, &conversation_id, peer);
         assert_eq!(
             session
                 .send_direct_text(token, conversation_id, b"survive reconnect".to_vec(),)
@@ -8285,13 +8243,8 @@ mod tests {
             state.outbox_replay_complete = true;
         }
 
-        let (peer_identity_key, bundle) = mobile_test_prekey_bundle(peer);
-        first_session
-            .client
-            .lock()
-            .unwrap()
-            .establish_session(&peer_identity_key, &bundle)
-            .unwrap();
+        let peer_identity_key =
+            mobile_test_establish_direct_v2(&first_session, &conversation_id, peer);
         let ratchet_before_send = first_session
             .client
             .lock()
@@ -8663,13 +8616,7 @@ mod tests {
     fn mobile_direct_text_storage_uncertainty_revokes_all_mobile_authority() {
         let (session, path, token, conversation_id, peer, _outbound) =
             mobile_test_ready_prekey_fixture(135);
-        let (peer_identity_key, bundle) = mobile_test_prekey_bundle(peer);
-        session
-            .client
-            .lock()
-            .unwrap()
-            .establish_session(&peer_identity_key, &bundle)
-            .unwrap();
+        let peer_identity_key = mobile_test_establish_direct_v2(&session, &conversation_id, peer);
         session
             .client
             .lock()
@@ -8707,13 +8654,7 @@ mod tests {
         let (session, path, token) = mobile_test_session_with_sync(125);
         let (conversation_id, peer) = mobile_test_install_ready_direct_with_peer(&session, &token);
         let _outbound = mobile_test_install_queued_connection(&session);
-        let (peer_identity_key, bundle) = mobile_test_prekey_bundle(peer);
-        session
-            .client
-            .lock()
-            .unwrap()
-            .establish_session(&peer_identity_key, &bundle)
-            .unwrap();
+        let peer_identity_key = mobile_test_establish_direct_v2(&session, &conversation_id, peer);
         assert_eq!(
             session.direct_send_readiness(token.clone(), conversation_id.clone()),
             MobileDirectSendReadiness::Ready
@@ -8888,13 +8829,27 @@ mod tests {
                  END;",
             )
             .unwrap();
-        let (peer_identity_key, bundle) = mobile_test_prekey_bundle(peer);
-        assert!(session
-            .client
+        let (peer_identity_key, response) = mobile_test_prekey_response(peer);
+        let route = session
+            .direct_sync
             .lock()
             .unwrap()
-            .establish_session(&peer_identity_key, &bundle)
-            .is_err());
+            .as_ref()
+            .unwrap()
+            .peers
+            .get(&conversation_id)
+            .cloned()
+            .unwrap();
+        assert!(
+            veil_client::direct::install_authenticated_direct_prekey_bundle(
+                &mut session.client.lock().unwrap(),
+                &route.user_id,
+                route.identity_key,
+                route.signing_key,
+                &response,
+            )
+            .is_err()
+        );
         assert_eq!(
             session
                 .client
