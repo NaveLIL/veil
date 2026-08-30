@@ -158,6 +158,7 @@ export const OnboardingScreen: Component = () => {
       identityStored = true;
 
       appStore.setIdentity(key);
+      await appStore.notifyMessagingStateReset();
       // Authentication and signed prekey publication are one fail-closed
       // operation. Do not present onboarding as complete until both succeed.
       await appStore.connectToServer();

@@ -1395,6 +1395,20 @@ export const appStore = {
   presenceMap,
   friendDirectoryReady,
   autoLockSeconds,
+  notifyMessagingStateReset: async (): Promise<boolean> => {
+    const reset = await invoke<boolean>("take_messaging_state_reset_notice");
+    if (reset) {
+      // State-only consumers do not need an eager UI dependency. Resolve the
+      // visual notification only for an account that actually crossed the
+      // v0.3 messaging-state boundary.
+      const { toast } = await import("@/components/ui/toast");
+      toast.warning(
+        "Secure messaging state refreshed",
+        "Veil cleared pre-v0.3 message history and session keys. Your account, trusted devices and Node settings were preserved.",
+      );
+    }
+    return reset;
+  },
   activeConversation: () => {
     const id = activeConversationId();
     if (!id) return null;
@@ -2177,6 +2191,7 @@ export const appStore = {
       const key = await invoke<string>("get_identity_key");
       if (!activateUiSession(unlockAttemptEpoch)) return false;
       setIdentity(key);
+      await appStore.notifyMessagingStateReset();
       await appStore.refreshPendingNodeAccessPass().catch(() => null);
       const unlockedEpoch = captureUiSessionEpoch();
       setTimeout(async () => {
@@ -2305,6 +2320,7 @@ export const appStore = {
     }
 
     setIdentity(key);
+    await appStore.notifyMessagingStateReset();
     setScreen("chat");
     await appStore.loadConversations();
     await appStore.connectToServer().catch((error) => {

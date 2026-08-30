@@ -29,9 +29,16 @@ users.
 - Kept only two exact, time-bounded mobile `image-size` build-tool audit
   exceptions; their reachability, controls, expiry, and removal gate are
   documented in `docs/reviews/mobile-image-size-audit-exception-2026-08-30.md`.
+- Added the v0.3 persisted messaging-state epoch barrier. An older or
+  unversioned SQLCipher vault atomically drops message plaintext, attachments,
+  ratchets, outboxes, Sender-Key material, inactive MLS prototype state and the
+  derived in-memory search index while preserving account/device identity,
+  trust, transparency, membership continuity, Node settings and conversation
+  metadata. Newer or malformed epochs fail closed without mutation, and the
+  desktop UI explains the one-time history reset after a successful unlock.
 
-This is an intentionally breaking pre-release line. Message/ratchet/Sender-Key
-history cutover and the OpenMLS runtime remain pending and are tracked in
+This is an intentionally breaking pre-release line. Direct v1/Sender-Key v5
+history-path removal and the OpenMLS runtime remain pending and are tracked in
 ADR-0004 and `INTEGRATION_ROADMAP.md`.
 
 ## 0.2.0 Preview — 2026-08-05

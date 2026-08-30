@@ -279,6 +279,9 @@ pub struct IdentityTransparencyPinnedHeadV1 {
 
 const LOCAL_PREKEY_PUBLICATION_BODY_LIMIT: usize = 64 * 1024;
 const LOCAL_PREKEY_PUBLICATION_BATCH_SIZE: usize = 20;
+const MESSAGING_STATE_EPOCH_KEY_V1: &str = "messaging_state_epoch_v1";
+const MESSAGING_STATE_RESET_NOTICE_KEY_V3: &str = "messaging_state_reset_notice_v3";
+const CURRENT_MESSAGING_STATE_EPOCH_V3: u64 = 3;
 pub const DIRECT_MESSAGE_OUTBOX_MAX_PAYLOAD_BYTES_V1: usize = 256 * 1024;
 pub const DIRECT_MESSAGE_OUTBOX_MAX_PENDING_V1: usize = 256;
 pub const DIRECT_MESSAGE_OUTBOX_MAX_LOAD_V1: usize = 256;
@@ -3429,6 +3432,8 @@ impl VeilDb {
             "ALTER TABLE conversations ADD COLUMN crypto_mode TEXT NOT NULL DEFAULT 'sender_key';",
         );
 
+        self.reconcile_messaging_state_epoch_v3()?;
+
         // Legacy incoming rows used status=0 even though only locally-created
         // outgoing rows can be in flight. Normalize them before any UI read so
         // a disconnect can never label received history as DeliveryUnknown.
@@ -3440,6 +3445,167 @@ impl VeilDb {
             .map_err(|e| format!("normalize incoming message status: {e}"))?;
 
         Ok(())
+    }
+
+    /// Enforce the v0.3 Clean Slate boundary for local messaging state.
+    ///
+    /// Account/device identities, trust pins, transparency state, membership
+    /// epochs, Node configuration and conversation metadata deliberately stay
+    /// intact. Message plaintext, ratchets, outboxes, Sender-Key material and
+    /// the inactive MLS prototype are one disposable security epoch and are
+    /// removed atomically when an older or unversioned database is opened.
+    /// A database from a newer Veil version is rejected without mutation.
+    fn reconcile_messaging_state_epoch_v3(&self) -> Result<(), String> {
+        let tx = begin_immediate(&self.conn, "messaging-state epoch reconciliation")?;
+        let encoded_epoch: Option<Vec<u8>> = tx
+            .query_row(
+                "SELECT value FROM client_state WHERE key = ?1",
+                rusqlite::params![MESSAGING_STATE_EPOCH_KEY_V1],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| format!("load messaging-state epoch: {error}"))?;
+
+        let stored_epoch = match encoded_epoch {
+            Some(bytes) => {
+                let encoded: [u8; 8] = bytes.try_into().map_err(|_| {
+                    "persisted messaging-state epoch has an invalid encoding".to_string()
+                })?;
+                Some(u64::from_be_bytes(encoded))
+            }
+            None => None,
+        };
+        if stored_epoch.is_some_and(|epoch| epoch > CURRENT_MESSAGING_STATE_EPOCH_V3) {
+            return Err("persisted messaging state belongs to a newer Veil version".to_string());
+        }
+        if stored_epoch == Some(CURRENT_MESSAGING_STATE_EPOCH_V3) {
+            tx.commit()
+                .map_err(|error| format!("commit messaging-state epoch check: {error}"))?;
+            return Ok(());
+        }
+
+        let disposable_state_present: bool = tx
+            .query_row(
+                "SELECT
+                    EXISTS(SELECT 1 FROM messages LIMIT 1)
+                    OR EXISTS(SELECT 1 FROM message_attachments_v1 LIMIT 1)
+                    OR EXISTS(SELECT 1 FROM message_author_snapshots_v1 LIMIT 1)
+                    OR EXISTS(SELECT 1 FROM reactions LIMIT 1)
+                    OR EXISTS(SELECT 1 FROM remote_message_state LIMIT 1)
+                    OR EXISTS(SELECT 1 FROM ratchet_sessions LIMIT 1)
+                    OR EXISTS(SELECT 1 FROM direct_session_bindings_v2 LIMIT 1)
+                    OR EXISTS(SELECT 1 FROM pending_initial_headers LIMIT 1)
+                    OR EXISTS(SELECT 1 FROM direct_message_outbox_v1 LIMIT 1)
+                    OR EXISTS(SELECT 1 FROM pending_messages LIMIT 1)
+                    OR EXISTS(SELECT 1 FROM sender_keys_local LIMIT 1)
+                    OR EXISTS(SELECT 1 FROM sender_key_incoming_generations LIMIT 1)
+                    OR EXISTS(SELECT 1 FROM sender_key_incoming_routes_v1 LIMIT 1)
+                    OR EXISTS(SELECT 1 FROM sender_key_historical_device_proofs_v1 LIMIT 1)
+                    OR EXISTS(SELECT 1 FROM pending_sender_key_envelopes LIMIT 1)
+                    OR EXISTS(SELECT 1 FROM pending_sender_key_device_envelopes_v1 LIMIT 1)
+                    OR EXISTS(SELECT 1 FROM mls_signer LIMIT 1)
+                    OR EXISTS(SELECT 1 FROM mls_key_packages_local LIMIT 1)
+                    OR EXISTS(SELECT 1 FROM mls_state LIMIT 1)
+                    OR EXISTS(SELECT 1 FROM mls_provider_snapshot LIMIT 1)",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("inspect pre-v0.3 messaging state: {error}"))?;
+
+        if disposable_state_present {
+            // Child/auxiliary rows are explicit even where an FK cascade also
+            // exists. That keeps the cutover auditable if a development DB was
+            // created with foreign_keys disabled or an interim schema.
+            tx.execute_batch(
+                "DELETE FROM reactions;
+                 DELETE FROM message_author_snapshots_v1;
+                 DELETE FROM message_attachments_v1;
+                 DELETE FROM remote_message_state;
+                 DELETE FROM messages;
+                 DELETE FROM direct_message_outbox_v1;
+                 DELETE FROM pending_messages;
+                 DELETE FROM pending_initial_headers;
+                 DELETE FROM direct_session_bindings_v2;
+                 DELETE FROM ratchet_sessions;
+                 DELETE FROM pending_sender_key_envelopes;
+                 DELETE FROM pending_sender_key_device_envelopes_v1;
+                 DELETE FROM sender_key_historical_device_proofs_v1;
+                 DELETE FROM sender_key_incoming_routes_v1;
+                 DELETE FROM sender_key_incoming_generations;
+                 DELETE FROM sender_keys_local;
+                 DELETE FROM mls_key_packages_local;
+                 DELETE FROM mls_state;
+                 DELETE FROM mls_provider_snapshot;
+                 DELETE FROM mls_signer;
+                 UPDATE conversations
+                    SET last_message_at = NULL,
+                        unread_count = 0,
+                        last_read_message_id = NULL;",
+            )
+            .map_err(|error| format!("reset pre-v0.3 messaging state: {error}"))?;
+            tx.execute(
+                "INSERT INTO client_state (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                rusqlite::params![
+                    MESSAGING_STATE_RESET_NOTICE_KEY_V3,
+                    CURRENT_MESSAGING_STATE_EPOCH_V3.to_be_bytes().as_slice(),
+                ],
+            )
+            .map_err(|error| format!("record messaging-state reset notice: {error}"))?;
+        }
+
+        tx.execute(
+            "INSERT INTO client_state (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            rusqlite::params![
+                MESSAGING_STATE_EPOCH_KEY_V1,
+                CURRENT_MESSAGING_STATE_EPOCH_V3.to_be_bytes().as_slice(),
+            ],
+        )
+        .map_err(|error| format!("store messaging-state epoch: {error}"))?;
+        tx.commit()
+            .map_err(|error| format!("commit messaging-state epoch reconciliation: {error}"))
+    }
+
+    /// Return and atomically acknowledge the one-time v0.3 history-reset
+    /// notice. Callers surface this only after the encrypted DB and any
+    /// plaintext search index have both completed their reset.
+    pub fn take_messaging_state_reset_notice_v3(&self) -> Result<bool, String> {
+        let tx = begin_immediate(&self.conn, "messaging-state reset notice")?;
+        let value: Option<Vec<u8>> = tx
+            .query_row(
+                "SELECT value FROM client_state WHERE key = ?1",
+                rusqlite::params![MESSAGING_STATE_RESET_NOTICE_KEY_V3],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| format!("load messaging-state reset notice: {error}"))?;
+        let Some(value) = value else {
+            tx.commit()
+                .map_err(|error| format!("commit absent messaging-state notice: {error}"))?;
+            return Ok(false);
+        };
+        if value.as_slice() != CURRENT_MESSAGING_STATE_EPOCH_V3.to_be_bytes().as_slice() {
+            return Err("persisted messaging-state reset notice is malformed".to_string());
+        }
+        tx.execute(
+            "DELETE FROM client_state WHERE key = ?1",
+            rusqlite::params![MESSAGING_STATE_RESET_NOTICE_KEY_V3],
+        )
+        .map_err(|error| format!("acknowledge messaging-state reset notice: {error}"))?;
+        tx.commit()
+            .map_err(|error| format!("commit messaging-state reset notice: {error}"))?;
+        Ok(true)
+    }
+
+    pub fn messaging_state_reset_notice_pending_v3(&self) -> Result<bool, String> {
+        self.conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM client_state WHERE key = ?1)",
+                rusqlite::params![MESSAGING_STATE_RESET_NOTICE_KEY_V3],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("inspect messaging-state reset notice: {error}"))
     }
 
     fn validate_absence_of_temp_ratchet_schema_on(tx: &Transaction<'_>) -> Result<(), String> {
@@ -19669,5 +19835,146 @@ mod tests {
                 .unwrap(),
             1
         );
+    }
+
+    #[test]
+    fn v03_messaging_epoch_reset_is_atomic_and_preserves_identity_trust() {
+        let db = VeilDb::open_memory(&[0xE1; 32]).unwrap();
+        db.conn
+            .execute(
+                "DELETE FROM client_state WHERE key = ?1",
+                rusqlite::params![MESSAGING_STATE_EPOCH_KEY_V1],
+            )
+            .unwrap();
+        db.conn
+            .execute_batch(
+                "INSERT INTO client_state (key, value) VALUES ('device_id', zeroblob(16));
+                 INSERT INTO trusted_identity_keys (identity_key, signing_key)
+                    VALUES (zeroblob(32), randomblob(32));
+                 INSERT INTO contacts (identity_key, signing_key, username, verified)
+                    VALUES (zeroblob(32), randomblob(32), 'preserved-contact', 1);
+                 INSERT INTO conversations
+                    (id, conv_type, name, last_message_at, unread_count, last_read_message_id)
+                    VALUES ('conversation-v02', 0, 'Preserved conversation', datetime('now'), 3, 'message-v02');
+                 INSERT INTO messages
+                    (id, conversation_id, sender_key, plaintext, is_outgoing, status)
+                    VALUES ('message-v02', 'conversation-v02', randomblob(32), 'legacy plaintext', 0, 2);
+                 INSERT INTO reactions (message_id, user_id, emoji, username)
+                    VALUES ('message-v02', 'legacy-user', 'x', 'legacy');
+                 INSERT INTO remote_message_state
+                    (message_id, conversation_id, sender_key, revision_ms, state)
+                    VALUES ('message-v02', 'conversation-v02', randomblob(32), 1, 0);
+                 INSERT INTO ratchet_sessions
+                    (peer_identity_key, session_data, revision)
+                    VALUES (randomblob(32), x'01', 1);
+                 INSERT INTO pending_initial_headers (peer_identity_key, header_data)
+                    VALUES (randomblob(32), x'01');
+                 INSERT INTO pending_messages (conversation_id, plaintext)
+                    VALUES ('conversation-v02', 'pending plaintext');
+                 INSERT INTO sender_keys_local
+                    (group_id, sender_identity_key, key_data, is_outgoing)
+                    VALUES ('conversation-v02', randomblob(32), x'01', 1);
+                 INSERT INTO mls_signer (leaf, blob) VALUES (x'01', x'02');",
+            )
+            .unwrap();
+
+        db.reconcile_messaging_state_epoch_v3().unwrap();
+
+        for table in [
+            "messages",
+            "reactions",
+            "remote_message_state",
+            "ratchet_sessions",
+            "pending_initial_headers",
+            "pending_messages",
+            "sender_keys_local",
+            "mls_signer",
+        ] {
+            let count: i64 = db
+                .conn
+                .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(count, 0, "{table} survived the v0.3 reset");
+        }
+        let preserved: (i64, i64, i64, Option<String>, i64, Option<String>) = db
+            .conn
+            .query_row(
+                "SELECT
+                    (SELECT count(*) FROM trusted_identity_keys),
+                    (SELECT count(*) FROM contacts),
+                    (SELECT count(*) FROM client_state WHERE key = 'device_id'),
+                    last_message_at, unread_count, last_read_message_id
+                 FROM conversations WHERE id = 'conversation-v02'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(preserved, (1, 1, 1, None, 0, None));
+        assert!(db.messaging_state_reset_notice_pending_v3().unwrap());
+        assert!(db.take_messaging_state_reset_notice_v3().unwrap());
+        assert!(!db.take_messaging_state_reset_notice_v3().unwrap());
+    }
+
+    #[test]
+    fn current_messaging_epoch_never_replays_the_destructive_reset() {
+        let db = VeilDb::open_memory(&[0xE2; 32]).unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO ratchet_sessions
+                    (peer_identity_key, session_data, revision)
+                 VALUES (randomblob(32), x'01', 1)",
+                [],
+            )
+            .unwrap();
+
+        db.reconcile_messaging_state_epoch_v3().unwrap();
+
+        let count: i64 = db
+            .conn
+            .query_row("SELECT count(*) FROM ratchet_sessions", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+        assert!(!db.messaging_state_reset_notice_pending_v3().unwrap());
+    }
+
+    #[test]
+    fn newer_or_malformed_messaging_epoch_fails_closed_without_mutation() {
+        for encoded in [
+            (CURRENT_MESSAGING_STATE_EPOCH_V3 + 1).to_be_bytes().to_vec(),
+            vec![0x03],
+        ] {
+            let db = VeilDb::open_memory(&[0xE3; 32]).unwrap();
+            db.conn
+                .execute(
+                    "UPDATE client_state SET value = ?2 WHERE key = ?1",
+                    rusqlite::params![MESSAGING_STATE_EPOCH_KEY_V1, encoded],
+                )
+                .unwrap();
+            db.conn
+                .execute(
+                    "INSERT INTO ratchet_sessions
+                        (peer_identity_key, session_data, revision)
+                     VALUES (randomblob(32), x'01', 1)",
+                    [],
+                )
+                .unwrap();
+
+            assert!(db.reconcile_messaging_state_epoch_v3().is_err());
+            let count: i64 = db
+                .conn
+                .query_row("SELECT count(*) FROM ratchet_sessions", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(count, 1);
+            assert!(!db.messaging_state_reset_notice_pending_v3().unwrap());
+        }
     }
 }
