@@ -16988,6 +16988,7 @@ mod tests {
             sender_identity_key,
             ciphertext,
             header,
+            security_context,
             reply_to_id,
             ..
         } = &late_two
@@ -17003,7 +17004,7 @@ mod tests {
                 None,
                 None,
                 false,
-                None,
+                security_context.as_ref(),
                 None,
                 header,
                 ciphertext,
@@ -20071,7 +20072,7 @@ mod tests {
                 None,
             )
             .unwrap_err();
-        assert!(rejected.contains("invalid Direct history ratchet header length"));
+        assert!(rejected.contains("invalid ratchet header length: expected 42, got 1"));
         assert!(!fixture.bob.direct_live_storage_uncertain);
         assert!(fixture.bob.db().is_some());
         assert!(fixture.bob.identity.is_some());
