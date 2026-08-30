@@ -13510,9 +13510,9 @@ mod e2ee_rest_tests {
         validated_search_conversation_metadata, validated_search_coverage,
         validated_search_hit_dto, verify_device_directory_account_keys, AppState,
         AuthenticatedSessionScope, ConversationSyncIsolation, CurrentTargetAdmissionEvidence,
-        ParsedMessageCryptoContext, PinnedDirectoryMember, PublishedSearchBinding, RestBinding,
-        RestOrigin, SearchCoverage, SearchRebuildReport, SearchResultContextDto,
-        DEFAULT_AUTO_LOCK_SECONDS, MAX_MEDIA_RANGE_BYTES, SEARCH_MAX_SOURCE_BYTES,
+        PinnedDirectoryMember, PublishedSearchBinding, RestBinding, RestOrigin, SearchCoverage,
+        SearchRebuildReport, SearchResultContextDto, DEFAULT_AUTO_LOCK_SECONDS,
+        MAX_MEDIA_RANGE_BYTES, SEARCH_MAX_SOURCE_BYTES,
     };
     use base64::Engine;
     use ed25519_dalek::SigningKey;
