@@ -44,9 +44,19 @@ users.
   exact profile/era, target device binding, session commitment, and wire-header
   validation. Direct edits now retain and verify the same outer security
   context as new messages instead of falling through a history-only decryptor.
+- Upgraded the isolated MLS foundation to upstream OpenMLS 0.9/RustCrypto 0.6
+  and removed the temporary vendored 0.4 provider fork.
+- Replaced the unversioned, unbounded split MLS signer/provider snapshots with
+  one versioned, leaf-bound, canonical and size-bounded checkpoint. Mutating
+  MLS operations now persist a consecutive compare-and-swap generation before
+  releasing output and restore exact in-memory state on failure.
+- Replaced the inactive split SQLCipher MLS tables with one atomic checkpoint
+  row and removed disconnected desktop/renderer MLS command scaffolding. MLS
+  remains unavailable to users until the remaining credential, external
+  rollback-anchor, durable outbox, interop and physical-device gates close.
 
 This is an intentionally breaking pre-release line. Direct v1/Sender-Key v5
-storage deletion and the OpenMLS runtime remain pending and are tracked in
+storage deletion and the OpenMLS runtime integration remain pending and are tracked in
 ADR-0004 and `INTEGRATION_ROADMAP.md`; production traffic no longer uses those
 legacy profiles.
 

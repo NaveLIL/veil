@@ -142,7 +142,7 @@ pub(crate) fn encode_checkpoint(
     }
 
     let mut entries: Vec<_> = values.iter().collect();
-    entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+    entries.sort_unstable_by_key(|(key, _)| *key);
 
     let mut body_len = signer.len();
     for (key, value) in &entries {

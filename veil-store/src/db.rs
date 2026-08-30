@@ -3378,11 +3378,13 @@ impl VeilDb {
             );
 
             -- ─── Phase 6: OpenMLS support ─────────────────────
-            -- Long-lived signature keypair (TLS-encoded SignatureKeyPair).
-            CREATE TABLE IF NOT EXISTS mls_signer (
+            -- One atomic, generation-checked checkpoint per MLS leaf. The
+            -- encrypted blob contains both the signer and all provider state.
+            CREATE TABLE IF NOT EXISTS mls_checkpoints (
                 leaf       BLOB PRIMARY KEY,
-                blob       BLOB NOT NULL,
-                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                generation INTEGER NOT NULL CHECK(generation >= 0),
+                checkpoint BLOB NOT NULL CHECK(length(checkpoint) BETWEEN 1 AND 67108864),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
 
             -- Locally generated KeyPackages awaiting publication / consumption.
@@ -3403,14 +3405,11 @@ impl VeilDb {
                 updated_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
 
-            -- Opaque byte snapshot of the openmls in-memory storage
-            -- (all groups, secrets and key material owned by this leaf).
-            -- Encrypted at rest by SQLCipher.
-            CREATE TABLE IF NOT EXISTS mls_provider_snapshot (
-                leaf       BLOB PRIMARY KEY,
-                snapshot   BLOB NOT NULL,
-                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );",
+            -- Pre-v0.3 MLS persistence was never activated and split signer
+            -- and provider state across two non-atomic tables. It cannot be
+            -- safely promoted into the v1 checkpoint format.
+            DROP TABLE IF EXISTS mls_provider_snapshot;
+            DROP TABLE IF EXISTS mls_signer;",
             )
             .map_err(|e| format!("migrations: {e}"))?;
 
@@ -3503,10 +3502,9 @@ impl VeilDb {
                     OR EXISTS(SELECT 1 FROM sender_key_historical_device_proofs_v1 LIMIT 1)
                     OR EXISTS(SELECT 1 FROM pending_sender_key_envelopes LIMIT 1)
                     OR EXISTS(SELECT 1 FROM pending_sender_key_device_envelopes_v1 LIMIT 1)
-                    OR EXISTS(SELECT 1 FROM mls_signer LIMIT 1)
                     OR EXISTS(SELECT 1 FROM mls_key_packages_local LIMIT 1)
                     OR EXISTS(SELECT 1 FROM mls_state LIMIT 1)
-                    OR EXISTS(SELECT 1 FROM mls_provider_snapshot LIMIT 1)",
+                    OR EXISTS(SELECT 1 FROM mls_checkpoints LIMIT 1)",
                 [],
                 |row| row.get(0),
             )
@@ -3535,8 +3533,7 @@ impl VeilDb {
                  DELETE FROM sender_keys_local;
                  DELETE FROM mls_key_packages_local;
                  DELETE FROM mls_state;
-                 DELETE FROM mls_provider_snapshot;
-                 DELETE FROM mls_signer;
+                 DELETE FROM mls_checkpoints;
                  UPDATE conversations
                     SET last_message_at = NULL,
                         unread_count = 0,
@@ -4780,61 +4777,76 @@ impl VeilDb {
 
     // ─── CRUD: MLS ────────────────────────────────────────
 
-    pub fn mls_save_signer(&self, leaf: &[u8], blob: &[u8]) -> Result<(), String> {
-        self.conn
-            .execute(
-                "INSERT INTO mls_signer (leaf, blob) VALUES (?1, ?2)
-                 ON CONFLICT(leaf) DO UPDATE SET blob = excluded.blob",
-                rusqlite::params![leaf, blob],
-            )
-            .map(|_| ())
-            .map_err(|e| format!("mls_save_signer: {e}"))
+    /// Atomically create or advance one encrypted MLS checkpoint.
+    ///
+    /// `None` requires that no row exists. `Some(n)` requires that the current
+    /// row has generation `n`; the replacement must be exactly `n + 1`.
+    pub fn mls_save_checkpoint(
+        &self,
+        leaf: &[u8],
+        expected_previous_generation: Option<u64>,
+        generation: u64,
+        checkpoint: &[u8],
+    ) -> Result<(), String> {
+        if checkpoint.is_empty() || checkpoint.len() > 64 * 1024 * 1024 {
+            return Err("mls_save_checkpoint: checkpoint size is invalid".into());
+        }
+        let generation = i64::try_from(generation)
+            .map_err(|_| "mls_save_checkpoint: generation exceeds SQLite range".to_string())?;
+
+        let changed = match expected_previous_generation {
+            None if generation == 0 => self.conn.execute(
+                "INSERT INTO mls_checkpoints (leaf, generation, checkpoint)
+                 VALUES (?1, 0, ?2)
+                 ON CONFLICT(leaf) DO NOTHING",
+                rusqlite::params![leaf, checkpoint],
+            ),
+            Some(previous) => {
+                let previous = i64::try_from(previous).map_err(|_| {
+                    "mls_save_checkpoint: previous generation exceeds SQLite range".to_string()
+                })?;
+                let expected_next = previous.checked_add(1).ok_or_else(|| {
+                    "mls_save_checkpoint: checkpoint generation exhausted".to_string()
+                })?;
+                if generation != expected_next {
+                    return Err("mls_save_checkpoint: generation is not consecutive".into());
+                }
+                self.conn.execute(
+                    "UPDATE mls_checkpoints
+                        SET generation = ?3,
+                            checkpoint = ?4,
+                            updated_at = datetime('now')
+                      WHERE leaf = ?1 AND generation = ?2",
+                    rusqlite::params![leaf, previous, generation, checkpoint],
+                )
+            }
+            None => return Err("mls_save_checkpoint: initial generation must be zero".into()),
+        }
+        .map_err(|error| format!("mls_save_checkpoint: {error}"))?;
+
+        if changed != 1 {
+            return Err("mls_save_checkpoint: compare-and-swap conflict".into());
+        }
+        Ok(())
     }
 
-    pub fn mls_load_signer(&self, leaf: &[u8]) -> Result<Option<Vec<u8>>, String> {
-        self.conn
+    /// Load the latest encrypted MLS checkpoint and its rollback generation.
+    pub fn mls_load_checkpoint(&self, leaf: &[u8]) -> Result<Option<(u64, Vec<u8>)>, String> {
+        let row = self
+            .conn
             .query_row(
-                "SELECT blob FROM mls_signer WHERE leaf = ?1",
+                "SELECT generation, checkpoint FROM mls_checkpoints WHERE leaf = ?1",
                 rusqlite::params![leaf],
-                |row| row.get::<_, Vec<u8>>(0),
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
             )
-            .map(Some)
-            .or_else(|e| match e {
-                rusqlite::Error::QueryReturnedNoRows => Ok(None),
-                other => Err(format!("mls_load_signer: {other}")),
-            })
-    }
-
-    /// Persist an opaque storage snapshot for the given leaf identity.
-    /// Bytes are produced by `MlsClient::snapshot()` and contain raw
-    /// key material — only safe at rest because the SQLCipher database
-    /// is encrypted with the user's identity key.
-    pub fn mls_save_snapshot(&self, leaf: &[u8], snapshot: &[u8]) -> Result<(), String> {
-        self.conn
-            .execute(
-                "INSERT INTO mls_provider_snapshot (leaf, snapshot) VALUES (?1, ?2)
-                 ON CONFLICT(leaf) DO UPDATE SET
-                    snapshot = excluded.snapshot,
-                    updated_at = datetime('now')",
-                rusqlite::params![leaf, snapshot],
-            )
-            .map(|_| ())
-            .map_err(|e| format!("mls_save_snapshot: {e}"))
-    }
-
-    /// Load the most recent snapshot for the given leaf identity, if any.
-    pub fn mls_load_snapshot(&self, leaf: &[u8]) -> Result<Option<Vec<u8>>, String> {
-        self.conn
-            .query_row(
-                "SELECT snapshot FROM mls_provider_snapshot WHERE leaf = ?1",
-                rusqlite::params![leaf],
-                |row| row.get::<_, Vec<u8>>(0),
-            )
-            .map(Some)
-            .or_else(|e| match e {
-                rusqlite::Error::QueryReturnedNoRows => Ok(None),
-                other => Err(format!("mls_load_snapshot: {other}")),
-            })
+            .optional()
+            .map_err(|error| format!("mls_load_checkpoint: {error}"))?;
+        row.map(|(generation, checkpoint)| {
+            u64::try_from(generation)
+                .map(|generation| (generation, checkpoint))
+                .map_err(|_| "mls_load_checkpoint: negative generation".to_string())
+        })
+        .transpose()
     }
 
     pub fn mls_insert_local_kp(&self, id: &str, kp_blob: &[u8]) -> Result<(), String> {
@@ -19874,7 +19886,8 @@ mod tests {
                  INSERT INTO sender_keys_local
                     (group_id, sender_identity_key, key_data, is_outgoing)
                     VALUES ('conversation-v02', randomblob(32), x'01', 1);
-                 INSERT INTO mls_signer (leaf, blob) VALUES (x'01', x'02');",
+                 INSERT INTO mls_checkpoints (leaf, generation, checkpoint)
+                    VALUES (x'01', 0, x'02');",
             )
             .unwrap();
 
@@ -19888,7 +19901,7 @@ mod tests {
             "pending_initial_headers",
             "pending_messages",
             "sender_keys_local",
-            "mls_signer",
+            "mls_checkpoints",
         ] {
             let count: i64 = db
                 .conn
@@ -19984,5 +19997,37 @@ mod tests {
             assert_eq!(count, 1);
             assert!(!db.messaging_state_reset_notice_pending_v3().unwrap());
         }
+    }
+
+    #[test]
+    fn mls_checkpoint_compare_and_swap_is_atomic_and_monotonic() {
+        let db = VeilDb::open_memory(&[0xE4; 32]).unwrap();
+        let leaf = b"mls-leaf";
+
+        db.mls_save_checkpoint(leaf, None, 0, b"checkpoint-0")
+            .expect("initial checkpoint");
+        assert!(db
+            .mls_save_checkpoint(leaf, None, 0, b"duplicate-initial")
+            .is_err());
+        assert!(db
+            .mls_save_checkpoint(leaf, Some(7), 8, b"stale-writer")
+            .is_err());
+        assert!(db
+            .mls_save_checkpoint(leaf, Some(0), 2, b"skipped-generation")
+            .is_err());
+        assert_eq!(
+            db.mls_load_checkpoint(leaf).expect("load"),
+            Some((0, b"checkpoint-0".to_vec()))
+        );
+
+        db.mls_save_checkpoint(leaf, Some(0), 1, b"checkpoint-1")
+            .expect("advance checkpoint");
+        assert_eq!(
+            db.mls_load_checkpoint(leaf).expect("load"),
+            Some((1, b"checkpoint-1".to_vec()))
+        );
+        assert!(db
+            .mls_save_checkpoint(leaf, Some(0), 1, b"rollback")
+            .is_err());
     }
 }

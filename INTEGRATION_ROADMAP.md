@@ -15,8 +15,9 @@
 > удалены. Direct v2 обязателен для отправки, outbox, live/offline receive и
 > edit; группы устанавливаются для traffic только после membership-bound
 > Sender-Key v6. Старые primitive/vector ветки остаются только в test build.
-> Текущий шаг: обновление и hardening изолированного `veil-mls`; живой MLS
-> runtime пока не включается.
+> Изолированный `veil-mls` обновлён и получил первый persistence hardening;
+> живой MLS runtime пока не включается. Следующий шаг — адаптер единого
+> checkpoint к SQLCipher, внешний rollback anchor и атомарный outbox.
 >
 > **Dependency checkpoint 2026-08-30:** patched the actionable desktop/mobile
 > `nanoid` and `js-yaml` advisories with narrow pnpm overrides. Mobile CI keeps
@@ -26,8 +27,8 @@
 > desktop audit, mobile audit, mobile TypeScript, ESLint, and all 233 mobile
 > tests pass locally. The persisted messaging-state version/epoch barrier is
 > now implemented. Product decoding, outgoing Direct and roster installation
-> no longer admit Direct v1/Sender-Key v5; retained storage/schema cleanup and
-> `veil-mls` persistence/rollback hardening remain before MLS promotion.
+> no longer admit Direct v1/Sender-Key v5. Retired Direct/Sender-Key runtime
+> storage cleanup and MLS runtime integration remain before MLS promotion.
 > The first protected-branch run additionally found reachable Go 1.26.5
 > standard-library advisories; every pinned CI/release/container toolchain was
 > advanced to the fixed Go 1.26.6 patch release before merge.
@@ -54,6 +55,21 @@
 > refetches the directory as Sender-Key v6 and only then enables messaging.
 > Frozen Direct v1/Sender-Key v5 vectors remain under `cfg(test)`/`test-utils`
 > to guard downgrade rejection and the active Direct v2 ratchet primitives.
+>
+> **OpenMLS foundation checkpoint 2026-08-31:** изолированный crate обновлён с
+> OpenMLS 0.7.4/RustCrypto 0.4 до поддерживаемых upstream OpenMLS 0.9.0/
+> RustCrypto 0.6.0; временный локальный provider fork удалён. Раздельные signer
+> и provider snapshots заменены единым leaf-bound checkpoint v1: формат имеет
+> версию, canonical ordering, SHA-256 integrity, лимит 64 MiB, ограничения
+> entry/key/value и монотонное поколение. Каждая мутация OpenMLS теперь сначала
+> сохраняет checkpoint через compare-and-swap и только затем отдаёт результат;
+> при protocol/encoding/storage error provider откатывается к точному
+> pre-operation состоянию. SQLCipher schema содержит одну atomic checkpoint
+> row; неподключённые Tauri/renderer MLS-заглушки удалены. Runtime остаётся
+> выключенным до exact account/origin/device credential binding, внешнего
+> rollback anchor, durable checkpoint+outbox transaction и interop/physical
+> gates. Официальный OpenMLS SQLite provider изучен, но не принят: его отдельный
+> bundled SQLite не должен обходить существующий SQLCipher trust boundary.
 >
 > **Checkpoint 2026-08-30:** ADR и open-source policy зафиксированы; desktop
 > PIN 4–5, Android SharedPreferences vault migration и зарегистрированный
@@ -168,7 +184,7 @@ Veil ещё не выпускался, поэтому runtime backward compatibi
 | 5B | Android messaging | automated receive/read, one-shot peer-prekey, idempotent native send/outbox, typed ACK, transient reconnect и true-empty Ready опубликованы; contacts/create-Direct UI и native request scaffolding добавлены, но route/header/friend-request/UniFFI contracts не состыкованы; полная Desktop ↔ Android E2EE/airplane/background/process-death matrix открыта |
 | 5C | Secure QR device linking / multi-device | отдельный blocking gate не начат: second-device enrollment, SAS approval, atomic activation, revoke и hostile-relay matrix обязательны до корректного multi-device |
 | 5S | Direct protocol assurance & hostile Node | production WS v3/REST v2 cutover выполнен, legacy `/ws`/REST v1 fail closed, cross-Node credential-scope P1 и hostile two-Node relay matrix закрыты; Direct v2, transparency/witness/gossip, membership epochs и Sender-Key v6 реализованы и покрыты frozen vectors/CI; release exit открыт до Direct-vs-`libsignal` ADR, independently operated witnesses, physical Android trust/QR matrix и независимого аудита |
-| 6 | OpenMLS | фундамент готов, runtime-ветвление выключено |
+| 6 | OpenMLS | upstream 0.9 + bounded atomic checkpoint foundation готовы; SQLCipher adapter/external anchor/outbox и runtime-ветвление ещё открыты |
 | 7 | LiveKit звонки | не начато |
 | 8 | Полировка, релиз | частично: полный CI и beta artifact matrix зелёные на `92fc1c3`, short-lived debug APK и unsigned desktop artifacts доступны; stable signing/notarization, signed tester APK, physical matrices и public release gate отсутствуют |
 
@@ -2600,10 +2616,10 @@ MLS остаётся выключенным и не используется к�
 
 ## Phase 6 — OpenMLS
 
-Добавить [OpenMLS](https://github.com/openmls/openmls) (RFC 9420) как новый
-явный crypto mode для подходящих DM и небольших приватных групп. Существующие
-DM остаются на Double Ratchet, группы/каналы — на Sender Keys, пока пользователь
-или миграция явно не переключит совместимый разговор.
+Добавить [OpenMLS](https://github.com/openmls/openmls) (RFC 9420) сначала как
+новый crypto mode для Circle и подходящих приватных Space/Room. Direct v2
+остаётся отдельным рабочим протоколом; двухсторонний MLS оценивается только
+после двух стабильных групповых MLS-релизов и отдельного ADR.
 
 Универсальный порог участников пока не фиксируем: прежние документы
 противоречили друг другу (`>50`, `2–500`, «маленькие группы»). Граница MLS
@@ -2618,13 +2634,15 @@ DM остаются на Double Ratchet, группы/каналы — на Send
 Cipher suite: `MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519`. Один, не менять.
 
 Migration plan:
-1. Старые разговоры не меняют crypto mode автоматически.
-2. Новые совместимые DM/маленькие группы могут предложить MLS только если все
-   устройства поддерживают capability и имеют свежие KeyPackages.
-3. Кнопка "Upgrade to MLS" в настройках группы + system message "шифрование обновлено"
-4. Double Ratchet остаётся поддерживаемым. Решение о прекращении его использования
-   для новых DM принимается только после двух стабильных MLS-релизов,
-   multi-device тестов и независимого аудита.
+1. До runtime gate никакой разговор не меняет crypto mode автоматически.
+2. После gate одна детерминированная миграция Circle/Room создаёт MLS group,
+   проверяет все device capabilities/KeyPackages и атомарно переключает режим;
+   downgrade обратно к Sender Keys не допускается.
+3. Пользователь видит одно понятное system message «шифрование обновлено», но
+   не управляет внутренними эпохами, KeyPackages или recovery вручную.
+4. После успешного группового cutover Sender-Key runtime/storage удаляется.
+5. Direct v2 сохраняется. Переход новых DM на two-party MLS — отдельное решение
+   после стабильных релизов, multi-device/physical tests и аудита.
 
 Проблемы которые точно вылезут:
 - Async member adds: Alice добавляет Bob пока Charlie оффлайн. Charlie возвращается и должен обработать commits по порядку. Сервер хранит все commits с last-seen-epoch, bounded 30 дней. После — re-join через Welcome
@@ -2634,18 +2652,32 @@ Migration plan:
 
 ### Что уже сделано (фундамент)
 
-- `veil-mls` crate (openmls 0.7.4): `MlsClient` с операциями create/restore, `generate_key_package`, `create_group`, `add_member`, `process_welcome`, `process_commit`, `encrypt`, `decrypt`, `export_secret`, `epoch`. Cipher suite зафиксирован константой. 2-сторонний round-trip тест проходит.
-- SQLCipher миграция (`veil-store/src/db.rs`): таблицы `mls_signer`, `mls_key_packages_local`, `mls_state` + колонка `conversations.crypto_mode` (через `ALTER ADD COLUMN`, идемпотентно).
+- `veil-mls` использует upstream OpenMLS 0.9.0 + RustCrypto 0.6.0 без
+  временного локального fork. Cipher suite зафиксирован константой; 2/3-party,
+  async catch-up, KeyPackage и restart/epoch round-trip покрыты тестами.
+- Каждая mutating API операция требует `&mut`, сохраняет единый checkpoint до
+  release результата и восстанавливает provider при любой ошибке. Store
+  contract атомарно сравнивает предыдущее поколение; restore принимает внешний
+  minimum generation и отвергает локальный rollback.
+- Checkpoint v1 объединяет signer и provider state, привязан к leaf, canonical,
+  versioned, bounded и corruption/trailing/duplicate-safe. Старый unversioned
+  split format намеренно не мигрируется: активных MLS-пользователей нет.
+- SQLCipher schema (`veil-store/src/db.rs`) содержит `mls_checkpoints` с
+  atomic generation CAS, `mls_key_packages_local`, `mls_state` и
+  `conversations.crypto_mode`. Старые `mls_signer`/`mls_provider_snapshot`
+  удаляются как неактивный pre-v0.3 prototype state.
 - PostgreSQL миграция `008_mls.sql`: колонка `crypto_mode` с CHECK-констрейнтом, таблицы `mls_key_packages`, `mls_welcomes`, `mls_commits` с индексами и наглядным TTL-планом.
 - Серверный пакет `internal/mls`: `Store` (батчевая публикация KP, атомарный consume через `DELETE … FOR UPDATE SKIP LOCKED`, append-only лог commits с `ErrEpochConflict` на 23505) и `Handler` с REST: `POST /v1/mls/keypackages`, `GET …/count`, `GET …/{user}/{device}`, `POST/GET/DELETE /v1/mls/welcomes`, `POST /v1/mls/commits`, `GET /v1/mls/commits/{conv}?after_epoch=N`. Интеграция с подписной middleware (`X-Veil-User/Timestamp/Signature`).
 - Hub реализует `mls.Fanout` (стабы с slog) — клиенты пока подбирают welcomes/commits через REST на reconnect; перевод на отдельный envelope-вариант WS — следующий шаг.
-- Tauri command implementations и renderer wrappers существуют, но не все
-  зарегистрированы в runtime handler; это ещё не пользовательская функция.
+- Неподключённые Tauri command и renderer wrappers удалены: runtime должен
+  появиться только через новый reviewed SQLCipher/checkpoint boundary.
 
 ### Что осталось
 
 - HTTP-клиент в `veil-client` для подписанных REST-запросов к `/v1/mls/*` (сейчас клиент целиком работает поверх WS protobuf).
-- Адаптер `MlsKeyStore` поверх `VeilDb` (сохранение `SignatureKeyPair` в SQLCipher).
+- Адаптер `MlsKeyStore` поверх `VeilDb`, который хранит целый checkpoint и
+  внешний rollback anchor, а checkpoint + network outbox фиксирует одной
+  durable транзакцией до публикации ciphertext/commit/welcome.
 - Ветвление `send_text`/`receive` в `veil-client/src/api.rs` по `crypto_mode` разговора.
 - Зарегистрировать и связать существующие Tauri-команды; добавить отсутствующий
   `mls_upgrade_group`, UI-индикатор «MLS active» и кнопку Upgrade.

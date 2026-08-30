@@ -130,7 +130,7 @@ invariants; they are not a runtime fallback.
 
 OpenMLS runtime activation requires all of the following:
 
-- an reviewed upgrade from the current pinned dependency graph with no ignored
+- a reviewed upgrade from the current pinned dependency graph with no ignored
   applicable security advisory;
 - MLS credentials bound to the exact Veil account identity, device identity,
   binding version, canonical Node origin, and transparency state;
@@ -145,6 +145,18 @@ OpenMLS runtime activation requires all of the following:
   physical-device evidence;
 - no manual security ceremony during ordinary send, receive, reconnect, or
   group membership changes.
+
+Checkpoint 2026-08-31 closes the isolated-library part of the first and third
+items without activating MLS: Veil now uses upstream OpenMLS 0.9/RustCrypto
+0.6, and the wrapper persists a single bounded, versioned, leaf-bound
+checkpoint through a consecutive compare-and-swap generation before returning
+mutation output. The old split snapshot and disconnected desktop facade were
+deleted. This is not the runtime gate: exact account/origin/device credentials,
+the `VeilDb` adapter, an external rollback anchor, atomic checkpoint plus
+network-outbox commits, obsolete-secret deletion evidence and platform/interop
+tests remain mandatory. Upstream's SQLite provider was evaluated but is not a
+drop-in replacement because its separate bundled SQLite connection would sit
+outside Veil's existing SQLCipher boundary.
 
 ## Data cutover
 
