@@ -18100,6 +18100,7 @@ mod tests {
             ciphertext: vec![1],
             header: vec![HEADER_RATCHET],
             edit_timestamp: 1_700_000_000_000_000_000 + message_suffix as u64,
+            security_context: None,
         };
         let healthy = fixture.peers[healthy_peer].next_event("healthy after blocked mutations");
         fixture.enqueue(vec![edit(1), edit(2), healthy]);

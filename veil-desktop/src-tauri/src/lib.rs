@@ -3363,8 +3363,10 @@ fn validate_live_message_security_context(
     match (sender_key_mode, context) {
         (false, Some(MessageSecurityContextV1::DirectV2(_)))
         | (true, Some(MessageSecurityContextV1::SenderKeyV6(_))) => Ok(()),
-        #[cfg(test)]
-        (false, None) | (true, Some(MessageSecurityContextV1::SenderKeyV5(_))) => Ok(()),
+        (false, None) => Err("DM message is missing its Direct v2 context".to_string()),
+        (true, Some(MessageSecurityContextV1::SenderKeyV5(_))) => {
+            Err("group/channel message uses the removed Sender-Key v5 profile".to_string())
+        }
         (false, Some(MessageSecurityContextV1::SenderKeyV5(_)))
         | (false, Some(MessageSecurityContextV1::SenderKeyV6(_))) => {
             Err("DM message carries a Sender-Key security context".to_string())
@@ -15890,7 +15892,10 @@ mod e2ee_rest_tests {
 
     #[test]
     fn live_message_mode_never_accepts_a_missing_or_cross_protocol_context() {
-        use veil_client::api::{MessageSecurityContextV1, SenderKeyMessageSecurityContextV1};
+        use veil_client::api::{
+            MessageSecurityContextV1, SenderKeyMessageSecurityContextV1,
+            SenderKeyMessageSecurityContextV6,
+        };
 
         let sender_key = MessageSecurityContextV1::SenderKeyV5(SenderKeyMessageSecurityContextV1 {
             roster_version: 7,
@@ -15899,8 +15904,19 @@ mod e2ee_rest_tests {
             target_device_id: [0x20; 16],
             sender_binding_version: 9,
         });
-        validate_live_message_security_context(false, None).unwrap();
-        validate_live_message_security_context(true, Some(&sender_key)).unwrap();
+        let sender_key_v6 =
+            MessageSecurityContextV1::SenderKeyV6(SenderKeyMessageSecurityContextV6 {
+                roster_version: 8,
+                roster_commitment: [0xbc; 32],
+                sender_device_id: [0x11; 16],
+                target_device_id: [0x21; 16],
+                sender_binding_version: 10,
+                membership_epoch: 1,
+                membership_epoch_hash: [0xcd; 32],
+            });
+        validate_live_message_security_context(true, Some(&sender_key_v6)).unwrap();
+        assert!(validate_live_message_security_context(false, None).is_err());
+        assert!(validate_live_message_security_context(true, Some(&sender_key)).is_err());
         assert!(validate_live_message_security_context(true, None).is_err());
         assert!(validate_live_message_security_context(false, Some(&sender_key)).is_err());
     }
