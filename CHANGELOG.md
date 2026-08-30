@@ -21,6 +21,8 @@ users.
   `/v3/events` is the only registered WebSocket transport.
 - Patched the actionable desktop/mobile `nanoid` and `js-yaml` dependency
   advisories with narrow version overrides and reproducible lockfile updates.
+- Upgraded the pinned Go toolchain and server build image from 1.26.5 to
+  1.26.6 after `govulncheck` found reachable standard-library advisories.
 - Kept only two exact, time-bounded mobile `image-size` build-tool audit
   exceptions; their reachability, controls, expiry, and removal gate are
   documented in `docs/reviews/mobile-image-size-audit-exception-2026-08-30.md`.

@@ -24,6 +24,9 @@
 > tests pass locally. The next Clean Slate work item is the explicit persisted
 > messaging-state version/epoch barrier, followed by `veil-mls` persistence and
 > rollback hardening before any MLS runtime promotion.
+> The first protected-branch run additionally found reachable Go 1.26.5
+> standard-library advisories; every pinned CI/release/container toolchain was
+> advanced to the fixed Go 1.26.6 patch release before merge.
 >
 > **Checkpoint 2026-08-30:** ADR и open-source policy зафиксированы; desktop
 > PIN 4–5, Android SharedPreferences vault migration и зарегистрированный

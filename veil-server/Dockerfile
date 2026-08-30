@@ -1,6 +1,6 @@
 ARG VEIL_BUILD_COMMIT=development
 
-FROM golang:1.26.5-alpine AS build
+FROM golang:1.26.6-alpine AS build
 ARG VEIL_BUILD_COMMIT
 RUN apk add --no-cache nodejs
 WORKDIR /src
