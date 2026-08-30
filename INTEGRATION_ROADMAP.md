@@ -15,6 +15,16 @@
 > зафиксировать тестами отсутствие downgrade. Следующий шаг: обновление и
 > hardening изолированного `veil-mls`; живой MLS runtime пока не включается.
 >
+> **Dependency checkpoint 2026-08-30:** patched the actionable desktop/mobile
+> `nanoid` and `js-yaml` advisories with narrow pnpm overrides. Mobile CI keeps
+> only the two exact, time-bounded `image-size` build-tool exceptions documented
+> in `docs/reviews/mobile-image-size-audit-exception-2026-08-30.md`; every other
+> low-or-higher pnpm advisory remains blocking. Frozen-lockfile validation,
+> desktop audit, mobile audit, mobile TypeScript, ESLint, and all 233 mobile
+> tests pass locally. The next Clean Slate work item is the explicit persisted
+> messaging-state version/epoch barrier, followed by `veil-mls` persistence and
+> rollback hardening before any MLS runtime promotion.
+>
 > **Checkpoint 2026-08-30:** ADR и open-source policy зафиксированы; desktop
 > PIN 4–5, Android SharedPreferences vault migration и зарегистрированный
 > `/ws` tombstone удалены. Desktop TypeScript boundary проходит локально.

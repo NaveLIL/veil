@@ -4,6 +4,11 @@ packages:
 allowBuilds:
   unrs-resolver: true
 
+auditConfig:
+  ignoreGhsas:
+    - GHSA-w3rx-r6r6-pgpr
+    - GHSA-5p2g-fcmc-qvqq
+
 overrides:
   "shell-quote@>=1.1.0 <=1.8.4": 1.9.0
   "form-data@>=4.0.0 <4.0.6": 4.0.6
@@ -13,8 +18,9 @@ overrides:
   "ws@>=6.0.0 <6.2.4": 6.2.4
   "postcss@>=8.0.0 <8.5.23": 8.5.23
   "tar@>=7.0.0 <7.5.21": 7.5.21
-  "js-yaml@<3.15.0": 3.15.0
-  "js-yaml@>=4.0.0 <4.3.0": 4.3.0
+  "js-yaml@<3.15.1": 3.15.1
+  "js-yaml@>=4.0.0 <4.3.1": 4.3.1
+  "nanoid@<3.3.18": 3.3.18
   "brace-expansion@<1.1.18": 1.1.18
   "brace-expansion@>=2.0.0 <2.1.4": 2.1.4
   "brace-expansion@>=4.0.0 <5.0.9": 5.0.9

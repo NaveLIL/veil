@@ -118,6 +118,11 @@ jobs:
 
       - name: Audit dependencies
         working-directory: veil-mobile
+        # image-size is a Metro build-time parser reached only through the
+        # repository-controlled Expo toolchain. Its upstream repository was
+        # archived and the advisory's claimed 2.0.3 fix is not published.
+        # The workspace auditConfig lists the two exact, time-bounded GHSA
+        # exceptions. Every other advisory remains a hard failure here.
         run: pnpm audit --audit-level=low
 
   third-party-notices:

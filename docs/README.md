@@ -49,6 +49,7 @@ ADR фиксирует принятое решение и причины. Изм
 ## Reviews и completion gates
 
 - [Security hardening audit handoff — 2026-08-05](reviews/security-hardening-audit-handoff-2026-08-05.md)
+- [Mobile image-size audit exception — 2026-08-30](reviews/mobile-image-size-audit-exception-2026-08-30.md)
 - [Security hardening checkpoint — 2026-08-04](reviews/security-hardening-checkpoint-2026-08-04.md)
 - [Beta integration and macOS checkpoint — 2026-08-04](reviews/beta-integration-macos-2026-08-04.md)
 - [Phase 1–4C completion gate](reviews/phase-1-4c-completion-gate.md)

@@ -19,6 +19,11 @@ users.
   current durable no-backup-file format remains write-once and fail-closed.
 - Removed the retired `/ws` route and compatibility response completely;
   `/v3/events` is the only registered WebSocket transport.
+- Patched the actionable desktop/mobile `nanoid` and `js-yaml` dependency
+  advisories with narrow version overrides and reproducible lockfile updates.
+- Kept only two exact, time-bounded mobile `image-size` build-tool audit
+  exceptions; their reachability, controls, expiry, and removal gate are
+  documented in `docs/reviews/mobile-image-size-audit-exception-2026-08-30.md`.
 
 This is an intentionally breaking pre-release line. Message/ratchet/Sender-Key
 history cutover and the OpenMLS runtime remain pending and are tracked in
