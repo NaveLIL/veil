@@ -16519,12 +16519,14 @@ mod tests {
             let (one_time_prekey, one_time_prekey_id) = prekeys.otk_publics[0];
             let sender_device_marker = u8::try_from(0xA0u128 + index).unwrap();
             let sender_device_id = [sender_device_marker; 16];
-            let mut sender = memory_client_with_device(
-                sender_identity,
-                sender_user_uuid,
-                sender_device_id,
-                [sender_device_marker; 32],
-            );
+            let sender_stored_device =
+                DeviceIdentityV1::generate_stored(&sender_identity, sender_device_id).unwrap();
+            let sender_device =
+                DeviceIdentityV1::from_stored(&sender_identity, sender_stored_device).unwrap();
+            let mut sender = VeilClient::from_identity(sender_identity);
+            sender.device_id = sender_device_id;
+            sender.device_identity = Some(sender_device);
+            sender.authenticated_user_id = Some(sender_user_uuid.to_string());
             sender.authenticated_server_origin = Some(DIRECT_LIVE_TEST_ORIGIN.to_string());
             sender
                 .remember_user_identity(
@@ -20069,7 +20071,7 @@ mod tests {
                 None,
             )
             .unwrap_err();
-        assert!(rejected.contains("missing authenticated Direct v2 security context"));
+        assert!(rejected.contains("invalid Direct history ratchet header length"));
         assert!(!fixture.bob.direct_live_storage_uncertain);
         assert!(fixture.bob.db().is_some());
         assert!(fixture.bob.identity.is_some());
