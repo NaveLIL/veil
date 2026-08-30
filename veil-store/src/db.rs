@@ -12142,7 +12142,7 @@ mod tests {
         );
         let mut decoded = Vec::with_capacity(input.len() / 4 * 3);
         let chunk_count = input.len() / 4;
-        for (chunk_index, chunk) in input.chunks_exact(4).enumerate() {
+        for (chunk_index, chunk) in input.as_chunks::<4>().0.iter().enumerate() {
             assert!(
                 chunk[0] != b'=' && chunk[1] != b'=',
                 "Direct-v1 {label} has early Base64 padding"
