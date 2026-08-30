@@ -11,19 +11,18 @@ description = "OpenMLS (RFC 9420) wrapper for Veil — Phase 6 group E2EE."
 
 [dependencies]
 # OpenMLS — single cipher suite: MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519.
-openmls = { version = "0.7", default-features = false }
-openmls_rust_crypto = "0.4"
-openmls_traits = "0.4"
-openmls_basic_credential = "0.4"
-openmls_memory_storage = "0.4"
+openmls = { version = "0.9", default-features = false }
+openmls_rust_crypto = "0.6"
+openmls_traits = "0.6"
+openmls_basic_credential = "0.6"
+openmls_memory_storage = "0.6"
 
-# Encoded payloads on the wire are TLS-serialized blobs; we keep them as
-# opaque Vec<u8> on the boundary, base64 only at REST/JSON layer.
+# Encoded payloads on the wire are TLS-serialized opaque blobs. Text encoding
+# belongs to the transport boundary, not the cryptographic crate.
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-base64 = "0.22"
 hex = "0.4"
 thiserror = "2"
+sha2 = "0.10"
 zeroize = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
