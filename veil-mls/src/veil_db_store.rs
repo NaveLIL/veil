@@ -621,13 +621,14 @@ mod tests {
         let (_, welcome) = alice.add_member(&group, &bob_key_package).unwrap();
 
         let receive_generation = bob.checkpoint_generation() + 1;
+        let expected_epoch = alice.epoch(&group).unwrap();
         anchor.fail_at(receive_generation);
         let error = bob.process_welcome(&welcome).unwrap_err();
         assert!(matches!(error, MlsError::DurableCommitPending(_)));
 
         anchor.allow_writes();
         let restored = MlsClient::restore(bob_identity.clone(), store.clone()).unwrap();
-        assert_eq!(restored.epoch(&group).unwrap(), 0);
+        assert_eq!(restored.epoch(&group).unwrap(), expected_epoch);
         let pending = store
             .load_pending_inbox(bob_identity.as_bytes(), 8)
             .unwrap();
