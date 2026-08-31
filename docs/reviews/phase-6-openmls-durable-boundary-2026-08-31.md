@@ -40,7 +40,8 @@ and may heal only from the generation verified in the database.
   no second SQLite database or plaintext OpenMLS provider was introduced.
 - Added `mls_checkpoints_v1`, `mls_outbox_v1`, and `mls_inbox_v1`. Rows use
   exact leaf/group/digest shapes, deterministic domain-separated IDs, hard
-  payload/count/page limits, consecutive checkpoint CAS, and foreign keys.
+  payload/count/page limits, 64 MiB aggregate pending-byte budgets, consecutive
+  checkpoint CAS, and foreign keys.
 - Commit, Welcome, Ciphertext, and KeyPackage bytes are staged exactly, not
   regenerated. ACK checks the exact scoped digest and erases the payload;
   repeated matching ACK is idempotent.
@@ -63,6 +64,9 @@ and may heal only from the generation verified in the database.
   last. A keychain deletion failure therefore leaves a visible fail-closed
   partial reset that is safe to retry; no reset is executed automatically by
   this checkpoint.
+- The earlier raw checkpoint writer is crate-private. Workspace consumers
+  cannot accidentally select it as a persistence path that bypasses the
+  rollback anchor and durable output contract.
 - Secret-bearing checkpoint snapshots, outbox bytes, inbox plaintext, and
   intermediate provider copies are zeroized on drop where Rust ownership
   permits.

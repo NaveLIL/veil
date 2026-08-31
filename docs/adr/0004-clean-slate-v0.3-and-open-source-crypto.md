@@ -151,10 +151,10 @@ items without activating MLS: Veil now uses upstream OpenMLS 0.9/RustCrypto
 0.6, and the wrapper persists a single bounded, versioned, leaf-bound
 checkpoint through a consecutive compare-and-swap generation before returning
 mutation output. The old split snapshot and disconnected desktop facade were
-deleted. This is not the runtime gate: exact account/origin/device credentials,
+deleted. At that first checkpoint, exact account/origin/device credentials,
 the `VeilDb` adapter, an external rollback anchor, atomic checkpoint plus
-network-outbox commits, obsolete-secret deletion evidence and platform/interop
-tests remain mandatory. Upstream's SQLite provider was evaluated but is not a
+network-output commits, obsolete-secret deletion evidence and platform/interop
+tests were still mandatory. Upstream's SQLite provider was evaluated but is not a
 drop-in replacement because its separate bundled SQLite connection would sit
 outside Veil's existing SQLCipher boundary.
 

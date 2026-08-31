@@ -338,10 +338,12 @@ pub const MLS_CHECKPOINT_MAX_BYTES_V1: usize = 64 * 1024 * 1024;
 pub const MLS_OUTBOX_MAX_PAYLOAD_BYTES_V1: usize = 4 * 1024 * 1024;
 pub const MLS_OUTBOX_MAX_ITEMS_PER_GENERATION_V1: usize = 16;
 pub const MLS_OUTBOX_MAX_PENDING_V1: usize = 1024;
-pub const MLS_OUTBOX_MAX_LOAD_V1: usize = 256;
+pub const MLS_OUTBOX_MAX_PENDING_BYTES_V1: usize = 64 * 1024 * 1024;
+pub const MLS_OUTBOX_MAX_LOAD_V1: usize = 16;
 pub const MLS_INBOX_MAX_PLAINTEXT_BYTES_V1: usize = 4 * 1024 * 1024;
 pub const MLS_INBOX_MAX_PENDING_V1: usize = 1024;
-pub const MLS_INBOX_MAX_LOAD_V1: usize = 256;
+pub const MLS_INBOX_MAX_PENDING_BYTES_V1: usize = 64 * 1024 * 1024;
+pub const MLS_INBOX_MAX_LOAD_V1: usize = 16;
 const MLS_OUTBOX_ID_DOMAIN_V1: &[u8] = b"veil-mls-outbox-v1";
 const MLS_INBOX_ID_DOMAIN_V1: &[u8] = b"veil-mls-inbox-v1";
 const DIRECT_MESSAGE_RATCHET_MAX_BYTES_V1: usize = 1024 * 1024;
@@ -5069,7 +5071,7 @@ impl VeilDb {
     /// Atomically create or advance one encrypted MLS checkpoint without a
     /// network payload. Mutations that produce output must use
     /// `mls_commit_checkpoint_and_outputs_v1` instead.
-    pub fn mls_save_checkpoint(
+    pub(crate) fn mls_save_checkpoint(
         &self,
         leaf: &[u8],
         expected_previous_generation: Option<u64>,
@@ -5143,6 +5145,27 @@ impl VeilDb {
         {
             return Err("MLS outbox pending-row limit reached".into());
         }
+        let pending_bytes: i64 = tx
+            .query_row(
+                "SELECT COALESCE(SUM(length(exact_payload)), 0)
+                   FROM mls_outbox_v1 WHERE leaf = ?1 AND state = 0",
+                rusqlite::params![leaf],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("count MLS outbox byte capacity: {error}"))?;
+        let proposed_bytes = outbox.iter().try_fold(0i64, |total, item| {
+            let size = i64::try_from(item.exact_payload.len())
+                .map_err(|_| "MLS outbox payload size overflow".to_string())?;
+            total
+                .checked_add(size)
+                .ok_or_else(|| "MLS outbox batch byte size overflow".to_string())
+        })?;
+        if pending_bytes
+            .checked_add(proposed_bytes)
+            .is_none_or(|bytes| bytes > MLS_OUTBOX_MAX_PENDING_BYTES_V1 as i64)
+        {
+            return Err("MLS outbox pending-byte limit reached".into());
+        }
         let pending_inbox: i64 = tx
             .query_row(
                 "SELECT COUNT(*) FROM mls_inbox_v1 WHERE leaf = ?1 AND state = 0",
@@ -5157,6 +5180,27 @@ impl VeilDb {
             .is_none_or(|count| count > MLS_INBOX_MAX_PENDING_V1 as i64)
         {
             return Err("MLS inbox pending-row limit reached".into());
+        }
+        let pending_inbox_bytes: i64 = tx
+            .query_row(
+                "SELECT COALESCE(SUM(length(plaintext)), 0)
+                   FROM mls_inbox_v1 WHERE leaf = ?1 AND state = 0",
+                rusqlite::params![leaf],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("count MLS inbox byte capacity: {error}"))?;
+        let proposed_inbox_bytes = inbox.iter().try_fold(0i64, |total, item| {
+            let size = i64::try_from(item.plaintext.len())
+                .map_err(|_| "MLS inbox plaintext size overflow".to_string())?;
+            total
+                .checked_add(size)
+                .ok_or_else(|| "MLS inbox batch byte size overflow".to_string())
+        })?;
+        if pending_inbox_bytes
+            .checked_add(proposed_inbox_bytes)
+            .is_none_or(|bytes| bytes > MLS_INBOX_MAX_PENDING_BYTES_V1 as i64)
+        {
+            return Err("MLS inbox pending-byte limit reached".into());
         }
 
         Self::mls_save_checkpoint_on_v1(

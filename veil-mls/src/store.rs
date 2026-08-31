@@ -435,9 +435,10 @@ pub(crate) fn derive_inbox_id(
 pub enum MlsPersistError {
     /// Nothing from the proposed mutation became durable.
     Rejected(String),
-    /// Checkpoint and outbox committed, but the external rollback anchor could
-    /// not be advanced. The caller must keep the new in-memory state and retry
-    /// through the durable outbox instead of repeating the protocol mutation.
+    /// Checkpoint and durable outputs committed, but the external rollback
+    /// anchor could not be advanced. The caller must keep the new in-memory
+    /// state and recover through the durable outbox/inbox instead of repeating
+    /// the protocol mutation.
     CommittedAnchorPending(String),
 }
 
@@ -450,15 +451,15 @@ impl fmt::Display for MlsPersistError {
     }
 }
 
-/// Atomic storage adapter for one complete MLS client checkpoint and every
-/// exact network payload produced by the same mutation.
+/// Atomic storage adapter for one complete MLS client checkpoint, every exact
+/// network payload, and every inbound result produced by the same mutation.
 ///
 /// Implementations MUST encrypt `checkpoint` at rest and atomically enforce the
 /// compare-and-swap precondition. `None` means that no checkpoint may exist;
 /// `Some(n)` means the stored generation must equal `n`. Returning `Ok(())`
-/// means the whole new checkpoint and outbox batch are durable. A `Rejected`
+/// means the whole new checkpoint and output batch are durable. A `Rejected`
 /// error must never expose partial state. `CommittedAnchorPending` is reserved
-/// for the post-commit OS-anchor gap and still guarantees durable outbox bytes.
+/// for the post-commit OS-anchor gap and still guarantees durable outputs.
 pub trait MlsKeyStore: Send + Sync + 'static {
     fn save_checkpoint(
         &self,
@@ -645,7 +646,7 @@ impl MlsKeyStore for InMemoryStore {
         leaf: &[u8],
         limit: usize,
     ) -> Result<Vec<StoredMlsOutboxItem>, String> {
-        if limit == 0 || limit > 256 {
+        if limit == 0 || limit > 16 {
             return Err("MLS outbox page limit is invalid".into());
         }
         Ok(self
@@ -682,7 +683,7 @@ impl MlsKeyStore for InMemoryStore {
         leaf: &[u8],
         limit: usize,
     ) -> Result<Vec<StoredMlsInboxProjection>, String> {
-        if limit == 0 || limit > 256 {
+        if limit == 0 || limit > 16 {
             return Err("MLS inbox page limit is invalid".into());
         }
         Ok(self

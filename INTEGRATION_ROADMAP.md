@@ -65,19 +65,21 @@
 > entry/key/value и монотонное поколение. Каждая мутация OpenMLS теперь сначала
 > сохраняет checkpoint через compare-and-swap и только затем отдаёт результат;
 > при protocol/encoding/storage error provider откатывается к точному
-> pre-operation состоянию. SQLCipher schema содержит одну atomic checkpoint
-> row; неподключённые Tauri/renderer MLS-заглушки удалены. Runtime остаётся
-> выключенным до exact account/origin/device credential binding, внешнего
-> rollback anchor, durable checkpoint+outbox transaction и interop/physical
-> gates. Официальный OpenMLS SQLite provider изучен, но не принят: его отдельный
+> pre-operation состоянию. На этом первом checkpoint SQLCipher schema содержала
+> одну atomic checkpoint row; неподключённые Tauri/renderer MLS-заглушки удалены.
+> Следующий durable-boundary checkpoint ниже закрыл внешний anchor и outputs.
+> Runtime по-прежнему выключен до exact account/origin/device credential,
+> Delivery Service и interop/physical gates. Официальный OpenMLS SQLite provider
+> изучен, но не принят: его отдельный
 > bundled SQLite не должен обходить существующий SQLCipher trust boundary.
 >
 > **OpenMLS durable-boundary checkpoint 2026-08-31:** `VeilDbMlsStore`
 > реализует production adapter без второй SQLite-базы. Один `BEGIN IMMEDIATE`
 > атомарно фиксирует полный checkpoint и точные commit/welcome/ciphertext/
 > KeyPackage bytes в bounded outbox; receive одновременно фиксирует SQLCipher-
-> only plaintext projection, поэтому уже продвинутый secret tree не теряет
-> сообщение при process death или недоступности keychain. Независимый
+> only typed Welcome/Commit receipts или application plaintext projection,
+> поэтому уже продвинутый secret tree не теряет результат при process death
+> или недоступности keychain. Независимый
 > монотонный generation anchor хранится в OS keychain, rollback
 > `anchor > database` блокируется, а безопасный commit-before-anchor gap
 > автоматически догоняется перед restore. Явный leaf reset удаляет SQLCipher
@@ -2679,7 +2681,7 @@ Migration plan:
   split format намеренно не мигрируется: активных MLS-пользователей нет.
 - SQLCipher schema (`veil-store/src/db.rs`) содержит `mls_checkpoints_v1`,
   `mls_outbox_v1` и `mls_inbox_v1`. Checkpoint CAS, все точные network outputs
-  и receive plaintext projection фиксируются одной транзакцией. Outbox/inbox
+  и typed receive receipt/plaintext projection фиксируются одной транзакцией. Outbox/inbox
   имеют hard size/count/page bounds и exact digest-derived IDs; ACK удаляет
   secret-bearing bytes. Старые `mls_signer`, `mls_provider_snapshot`,
   `mls_checkpoints`, `mls_key_packages_local` и `mls_state` удаляются как
@@ -2689,9 +2691,10 @@ Migration plan:
   of-anchor после commit/keychain crash безопасно heal'ится. Явный leaf reset
   сначала удаляет SQLCipher rows, затем anchor, сохраняя fail-closed retry.
 - Commit/Welcome/Ciphertext/KeyPackage никогда не выходят из mutating API до
-  durable checkpoint+outbox. Receive plaintext дополнительно staging'ится в
-  SQLCipher вместе с продвинутым secret tree и подтверждается только после
-  durable projection в обычную модель сообщений.
+  durable checkpoint+outbox. Receive Welcome/Commit receipts и application
+  plaintext дополнительно staging'ятся в SQLCipher вместе с продвинутым secret
+  tree и подтверждаются только после durable projection в transport/обычную
+  модель сообщений.
 - PostgreSQL миграция `008_mls.sql`: колонка `crypto_mode` с CHECK-констрейнтом, таблицы `mls_key_packages`, `mls_welcomes`, `mls_commits` с индексами и наглядным TTL-планом.
 - Серверный пакет `internal/mls`: `Store` (батчевая публикация KP, атомарный consume через `DELETE … FOR UPDATE SKIP LOCKED`, append-only лог commits с `ErrEpochConflict` на 23505) и `Handler` с REST: `POST /v1/mls/keypackages`, `GET …/count`, `GET …/{user}/{device}`, `POST/GET/DELETE /v1/mls/welcomes`, `POST /v1/mls/commits`, `GET /v1/mls/commits/{conv}?after_epoch=N`. Интеграция с подписной middleware (`X-Veil-User/Timestamp/Signature`).
 - Hub реализует `mls.Fanout` (стабы с slog) — клиенты пока подбирают welcomes/commits через REST на reconnect; перевод на отдельный envelope-вариант WS — следующий шаг.
