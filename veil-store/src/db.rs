@@ -169,6 +169,32 @@ pub struct DirectMessageOutboxRejectResultV1 {
     pub already_rejected: bool,
 }
 
+/// Exact MLS protocol output committed in the same SQLCipher transaction as
+/// the provider checkpoint that produced it. Protocol interpretation remains
+/// owned by `veil-mls`; the store validates only the bounded canonical shape.
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
+pub struct MlsOutboxWriteV1 {
+    pub item_id: [u8; 32],
+    pub item_index: u8,
+    pub kind: u8,
+    pub group_id: Option<[u8; 16]>,
+    pub payload_digest: [u8; 32],
+    pub exact_payload: Vec<u8>,
+}
+
+/// Pending MLS protocol output returned for exact-byte retry.
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
+pub struct PendingMlsOutboxV1 {
+    pub queue_order: u64,
+    pub item_id: [u8; 32],
+    pub generation: u64,
+    pub item_index: u8,
+    pub kind: u8,
+    pub group_id: Option<[u8; 16]>,
+    pub payload_digest: [u8; 32],
+    pub exact_payload: Vec<u8>,
+}
+
 /// Read-only durable state used by the authenticated client to distinguish a
 /// harmless repeated receipt from an unknown or conflicting wire result
 /// before any ACK/Error reconciliation mutates SQLCipher or process memory.
@@ -285,6 +311,12 @@ const CURRENT_MESSAGING_STATE_EPOCH_V3: u64 = 3;
 pub const DIRECT_MESSAGE_OUTBOX_MAX_PAYLOAD_BYTES_V1: usize = 256 * 1024;
 pub const DIRECT_MESSAGE_OUTBOX_MAX_PENDING_V1: usize = 256;
 pub const DIRECT_MESSAGE_OUTBOX_MAX_LOAD_V1: usize = 256;
+pub const MLS_CHECKPOINT_MAX_BYTES_V1: usize = 64 * 1024 * 1024;
+pub const MLS_OUTBOX_MAX_PAYLOAD_BYTES_V1: usize = 4 * 1024 * 1024;
+pub const MLS_OUTBOX_MAX_ITEMS_PER_GENERATION_V1: usize = 16;
+pub const MLS_OUTBOX_MAX_PENDING_V1: usize = 1024;
+pub const MLS_OUTBOX_MAX_LOAD_V1: usize = 256;
+const MLS_OUTBOX_ID_DOMAIN_V1: &[u8] = b"veil-mls-outbox-v1";
 const DIRECT_MESSAGE_RATCHET_MAX_BYTES_V1: usize = 1024 * 1024;
 const DIRECT_SESSION_BINDING_MAX_BYTES_V2: usize = 4096;
 const DIRECT_MESSAGE_RATCHET_MAX_BYTES_SQLITE_V1: i64 = 1024 * 1024;
@@ -298,6 +330,56 @@ const DIRECT_RATCHET_SESSION_MAX_TOTAL_BYTES_SQLITE_V1: i64 = 64 * 1024 * 1024;
 const DIRECT_MESSAGE_PLAINTEXT_MAX_BYTES_V1: usize = 32 * 1024;
 const DIRECT_MESSAGE_REJECTION_REASON_MAX_BYTES_V1: usize = 128;
 const DIRECT_MESSAGE_DIGEST_DOMAIN_V1: &[u8] = b"veil.message.send.v1\x00";
+
+fn mls_outbox_item_id_v1(
+    leaf: &[u8],
+    generation: u64,
+    item_index: u8,
+    kind: u8,
+    group_id: Option<&[u8; 16]>,
+    payload_digest: &[u8; 32],
+) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(MLS_OUTBOX_ID_DOMAIN_V1);
+    digest.update(leaf);
+    digest.update(generation.to_be_bytes());
+    digest.update([item_index, kind]);
+    digest.update(group_id.map_or(&[][..], |value| value.as_slice()));
+    digest.update(payload_digest);
+    digest.finalize().into()
+}
+
+fn validate_single_mls_outbox_item_v1(
+    leaf: &[u8],
+    generation: u64,
+    item: &MlsOutboxWriteV1,
+) -> Result<(), String> {
+    if leaf.len() != 32 {
+        return Err("MLS outbox leaf must be exactly 32 bytes".into());
+    }
+    if !(1..=4).contains(&item.kind) || (item.kind == 1) != item.group_id.is_none() {
+        return Err("MLS outbox kind or group scope is invalid".into());
+    }
+    if item.exact_payload.is_empty() || item.exact_payload.len() > MLS_OUTBOX_MAX_PAYLOAD_BYTES_V1 {
+        return Err("MLS outbox payload size is invalid".into());
+    }
+    let digest: [u8; 32] = Sha256::digest(&item.exact_payload).into();
+    if digest != item.payload_digest {
+        return Err("MLS outbox payload digest mismatch".into());
+    }
+    let expected_id = mls_outbox_item_id_v1(
+        leaf,
+        generation,
+        item.item_index,
+        item.kind,
+        item.group_id.as_ref(),
+        &item.payload_digest,
+    );
+    if item.item_id != expected_id {
+        return Err("MLS outbox item identifier mismatch".into());
+    }
+    Ok(())
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RatchetSessionSchemaShapeV1 {
@@ -3378,38 +3460,63 @@ impl VeilDb {
             );
 
             -- ─── Phase 6: OpenMLS support ─────────────────────
-            -- One atomic, generation-checked checkpoint per MLS leaf. The
-            -- encrypted blob contains both the signer and all provider state.
-            CREATE TABLE IF NOT EXISTS mls_checkpoints (
-                leaf       BLOB PRIMARY KEY,
-                generation INTEGER NOT NULL CHECK(generation >= 0),
-                checkpoint BLOB NOT NULL CHECK(length(checkpoint) BETWEEN 1 AND 67108864),
+            -- One atomic, generation-checked checkpoint per exact 32-byte MLS
+            -- leaf. The encrypted blob contains both signer and provider state.
+            CREATE TABLE IF NOT EXISTS mls_checkpoints_v1 (
+                leaf BLOB NOT NULL PRIMARY KEY
+                    CHECK(typeof(leaf) = 'blob' AND length(leaf) = 32),
+                generation INTEGER NOT NULL
+                    CHECK(generation BETWEEN 0 AND 9223372036854775807),
+                checkpoint BLOB NOT NULL
+                    CHECK(typeof(checkpoint) = 'blob' AND
+                          length(checkpoint) BETWEEN 1 AND 67108864),
                 updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            ) WITHOUT ROWID;
+
+            -- Exact network bytes are committed beside the checkpoint that
+            -- produced them. Pending payloads survive process/transport loss;
+            -- an ACK erases payload bytes but retains the compact digest receipt.
+            CREATE TABLE IF NOT EXISTS mls_outbox_v1 (
+                queue_order INTEGER PRIMARY KEY AUTOINCREMENT,
+                item_id BLOB NOT NULL UNIQUE
+                    CHECK(typeof(item_id) = 'blob' AND length(item_id) = 32),
+                leaf BLOB NOT NULL
+                    CHECK(typeof(leaf) = 'blob' AND length(leaf) = 32)
+                    REFERENCES mls_checkpoints_v1(leaf)
+                    ON UPDATE RESTRICT ON DELETE CASCADE,
+                generation INTEGER NOT NULL
+                    CHECK(generation BETWEEN 0 AND 9223372036854775807),
+                item_index INTEGER NOT NULL CHECK(item_index BETWEEN 0 AND 15),
+                kind INTEGER NOT NULL CHECK(kind BETWEEN 1 AND 4),
+                group_id BLOB
+                    CHECK(group_id IS NULL OR
+                          (typeof(group_id) = 'blob' AND length(group_id) = 16)),
+                payload_digest BLOB NOT NULL
+                    CHECK(typeof(payload_digest) = 'blob' AND length(payload_digest) = 32),
+                exact_payload BLOB,
+                state INTEGER NOT NULL DEFAULT 0 CHECK(state IN (0, 1)),
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                UNIQUE(leaf, generation, item_index),
+                CHECK((kind = 1 AND group_id IS NULL) OR
+                      (kind BETWEEN 2 AND 4 AND group_id IS NOT NULL)),
+                CHECK((state = 0 AND exact_payload IS NOT NULL AND
+                       typeof(exact_payload) = 'blob' AND
+                       length(exact_payload) BETWEEN 1 AND 4194304) OR
+                      (state = 1 AND exact_payload IS NULL))
             );
 
-            -- Locally generated KeyPackages awaiting publication / consumption.
-            -- After server confirms publish we set published=1; after the
-            -- server hands one out to a peer the peer's Welcome arrives and
-            -- the local copy is deleted (private state already inside openmls).
-            CREATE TABLE IF NOT EXISTS mls_key_packages_local (
-                id         TEXT PRIMARY KEY,
-                kp_blob    BLOB NOT NULL,
-                published  INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
+            CREATE INDEX IF NOT EXISTS idx_mls_outbox_v1_pending_leaf
+                ON mls_outbox_v1(leaf, state, queue_order);
 
-            -- Cached current epoch per MLS group, for cheap UI lookups.
-            CREATE TABLE IF NOT EXISTS mls_state (
-                group_id   BLOB PRIMARY KEY,
-                epoch      INTEGER NOT NULL DEFAULT 0,
-                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-
-            -- Pre-v0.3 MLS persistence was never activated and split signer
-            -- and provider state across two non-atomic tables. It cannot be
-            -- safely promoted into the v1 checkpoint format.
+            -- Pre-v0.3 MLS persistence was never activated. Split signer/
+            -- provider tables and the first checkpoint/KP/epoch prototypes
+            -- cannot be promoted into this crash-safe boundary.
             DROP TABLE IF EXISTS mls_provider_snapshot;
-            DROP TABLE IF EXISTS mls_signer;",
+            DROP TABLE IF EXISTS mls_signer;
+            DROP TABLE IF EXISTS mls_key_packages_local;
+            DROP TABLE IF EXISTS mls_state;
+            DROP TABLE IF EXISTS mls_checkpoints;",
             )
             .map_err(|e| format!("migrations: {e}"))?;
 
@@ -3502,9 +3609,8 @@ impl VeilDb {
                     OR EXISTS(SELECT 1 FROM sender_key_historical_device_proofs_v1 LIMIT 1)
                     OR EXISTS(SELECT 1 FROM pending_sender_key_envelopes LIMIT 1)
                     OR EXISTS(SELECT 1 FROM pending_sender_key_device_envelopes_v1 LIMIT 1)
-                    OR EXISTS(SELECT 1 FROM mls_key_packages_local LIMIT 1)
-                    OR EXISTS(SELECT 1 FROM mls_state LIMIT 1)
-                    OR EXISTS(SELECT 1 FROM mls_checkpoints LIMIT 1)",
+                    OR EXISTS(SELECT 1 FROM mls_outbox_v1 LIMIT 1)
+                    OR EXISTS(SELECT 1 FROM mls_checkpoints_v1 LIMIT 1)",
                 [],
                 |row| row.get(0),
             )
@@ -3531,9 +3637,8 @@ impl VeilDb {
                  DELETE FROM sender_key_incoming_routes_v1;
                  DELETE FROM sender_key_incoming_generations;
                  DELETE FROM sender_keys_local;
-                 DELETE FROM mls_key_packages_local;
-                 DELETE FROM mls_state;
-                 DELETE FROM mls_checkpoints;
+                 DELETE FROM mls_outbox_v1;
+                 DELETE FROM mls_checkpoints_v1;
                  UPDATE conversations
                     SET last_message_at = NULL,
                         unread_count = 0,
@@ -4777,26 +4882,57 @@ impl VeilDb {
 
     // ─── CRUD: MLS ────────────────────────────────────────
 
-    /// Atomically create or advance one encrypted MLS checkpoint.
-    ///
-    /// `None` requires that no row exists. `Some(n)` requires that the current
-    /// row has generation `n`; the replacement must be exactly `n + 1`.
-    pub fn mls_save_checkpoint(
-        &self,
+    fn validate_mls_checkpoint_write_v1(
         leaf: &[u8],
         expected_previous_generation: Option<u64>,
         generation: u64,
         checkpoint: &[u8],
     ) -> Result<(), String> {
-        if checkpoint.is_empty() || checkpoint.len() > 64 * 1024 * 1024 {
+        if leaf.len() != 32 {
+            return Err("MLS checkpoint leaf must be exactly 32 bytes".into());
+        }
+        if checkpoint.is_empty() || checkpoint.len() > MLS_CHECKPOINT_MAX_BYTES_V1 {
             return Err("mls_save_checkpoint: checkpoint size is invalid".into());
         }
+        i64::try_from(generation)
+            .map_err(|_| "mls_save_checkpoint: generation exceeds SQLite range".to_string())?;
+        match expected_previous_generation {
+            None if generation == 0 => Ok(()),
+            Some(previous) => {
+                let expected_next = previous.checked_add(1).ok_or_else(|| {
+                    "mls_save_checkpoint: checkpoint generation exhausted".to_string()
+                })?;
+                i64::try_from(previous).map_err(|_| {
+                    "mls_save_checkpoint: previous generation exceeds SQLite range".to_string()
+                })?;
+                if generation != expected_next {
+                    return Err("mls_save_checkpoint: generation is not consecutive".into());
+                }
+                Ok(())
+            }
+            None => Err("mls_save_checkpoint: initial generation must be zero".into()),
+        }
+    }
+
+    fn mls_save_checkpoint_on_v1(
+        conn: &Connection,
+        leaf: &[u8],
+        expected_previous_generation: Option<u64>,
+        generation: u64,
+        checkpoint: &[u8],
+    ) -> Result<(), String> {
+        Self::validate_mls_checkpoint_write_v1(
+            leaf,
+            expected_previous_generation,
+            generation,
+            checkpoint,
+        )?;
         let generation = i64::try_from(generation)
             .map_err(|_| "mls_save_checkpoint: generation exceeds SQLite range".to_string())?;
 
         let changed = match expected_previous_generation {
-            None if generation == 0 => self.conn.execute(
-                "INSERT INTO mls_checkpoints (leaf, generation, checkpoint)
+            None if generation == 0 => conn.execute(
+                "INSERT INTO mls_checkpoints_v1 (leaf, generation, checkpoint)
                  VALUES (?1, 0, ?2)
                  ON CONFLICT(leaf) DO NOTHING",
                 rusqlite::params![leaf, checkpoint],
@@ -4805,14 +4941,8 @@ impl VeilDb {
                 let previous = i64::try_from(previous).map_err(|_| {
                     "mls_save_checkpoint: previous generation exceeds SQLite range".to_string()
                 })?;
-                let expected_next = previous.checked_add(1).ok_or_else(|| {
-                    "mls_save_checkpoint: checkpoint generation exhausted".to_string()
-                })?;
-                if generation != expected_next {
-                    return Err("mls_save_checkpoint: generation is not consecutive".into());
-                }
-                self.conn.execute(
-                    "UPDATE mls_checkpoints
+                conn.execute(
+                    "UPDATE mls_checkpoints_v1
                         SET generation = ?3,
                             checkpoint = ?4,
                             updated_at = datetime('now')
@@ -4830,18 +4960,127 @@ impl VeilDb {
         Ok(())
     }
 
+    /// Atomically create or advance one encrypted MLS checkpoint without a
+    /// network payload. Mutations that produce output must use
+    /// `mls_commit_checkpoint_and_outbox_v1` instead.
+    pub fn mls_save_checkpoint(
+        &self,
+        leaf: &[u8],
+        expected_previous_generation: Option<u64>,
+        generation: u64,
+        checkpoint: &[u8],
+    ) -> Result<(), String> {
+        Self::mls_save_checkpoint_on_v1(
+            &self.conn,
+            leaf,
+            expected_previous_generation,
+            generation,
+            checkpoint,
+        )
+    }
+
+    fn validate_mls_outbox_batch_v1(
+        leaf: &[u8],
+        generation: u64,
+        outbox: &[MlsOutboxWriteV1],
+    ) -> Result<(), String> {
+        if outbox.len() > MLS_OUTBOX_MAX_ITEMS_PER_GENERATION_V1 {
+            return Err("MLS outbox batch has too many items".into());
+        }
+        for (expected_index, item) in outbox.iter().enumerate() {
+            if usize::from(item.item_index) != expected_index {
+                return Err("MLS outbox item indices are not canonical".into());
+            }
+            validate_single_mls_outbox_item_v1(leaf, generation, item)?;
+        }
+        Ok(())
+    }
+
+    /// Commit one checkpoint CAS and every exact protocol output produced by
+    /// that OpenMLS mutation in one durable SQLCipher transaction.
+    pub fn mls_commit_checkpoint_and_outbox_v1(
+        &self,
+        leaf: &[u8],
+        expected_previous_generation: Option<u64>,
+        generation: u64,
+        checkpoint: &[u8],
+        outbox: &[MlsOutboxWriteV1],
+    ) -> Result<(), String> {
+        Self::validate_mls_checkpoint_write_v1(
+            leaf,
+            expected_previous_generation,
+            generation,
+            checkpoint,
+        )?;
+        Self::validate_mls_outbox_batch_v1(leaf, generation, outbox)?;
+
+        let tx = begin_immediate(&self.conn, "MLS checkpoint and outbox transaction")?;
+        let pending: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM mls_outbox_v1 WHERE leaf = ?1 AND state = 0",
+                rusqlite::params![leaf],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("count MLS outbox capacity: {error}"))?;
+        let proposed = i64::try_from(outbox.len())
+            .map_err(|_| "MLS outbox batch size overflow".to_string())?;
+        if pending
+            .checked_add(proposed)
+            .is_none_or(|count| count > MLS_OUTBOX_MAX_PENDING_V1 as i64)
+        {
+            return Err("MLS outbox pending-row limit reached".into());
+        }
+
+        Self::mls_save_checkpoint_on_v1(
+            &tx,
+            leaf,
+            expected_previous_generation,
+            generation,
+            checkpoint,
+        )?;
+        let generation = i64::try_from(generation)
+            .map_err(|_| "MLS outbox generation exceeds SQLite range".to_string())?;
+        for item in outbox {
+            tx.execute(
+                "INSERT INTO mls_outbox_v1
+                    (item_id, leaf, generation, item_index, kind, group_id,
+                     payload_digest, exact_payload)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                rusqlite::params![
+                    item.item_id.as_slice(),
+                    leaf,
+                    generation,
+                    i64::from(item.item_index),
+                    i64::from(item.kind),
+                    item.group_id.as_ref().map(|value| value.as_slice()),
+                    item.payload_digest.as_slice(),
+                    item.exact_payload.as_slice(),
+                ],
+            )
+            .map_err(|error| format!("insert MLS outbox item: {error}"))?;
+        }
+        tx.commit()
+            .map_err(|error| format!("commit MLS checkpoint and outbox: {error}"))
+    }
+
     /// Load the latest encrypted MLS checkpoint and its rollback generation.
     pub fn mls_load_checkpoint(&self, leaf: &[u8]) -> Result<Option<(u64, Vec<u8>)>, String> {
+        if leaf.len() != 32 {
+            return Err("MLS checkpoint leaf must be exactly 32 bytes".into());
+        }
         let row = self
             .conn
             .query_row(
-                "SELECT generation, checkpoint FROM mls_checkpoints WHERE leaf = ?1",
+                "SELECT generation, checkpoint FROM mls_checkpoints_v1 WHERE leaf = ?1",
                 rusqlite::params![leaf],
                 |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
             )
             .optional()
             .map_err(|error| format!("mls_load_checkpoint: {error}"))?;
         row.map(|(generation, checkpoint)| {
+            if checkpoint.is_empty() || checkpoint.len() > MLS_CHECKPOINT_MAX_BYTES_V1 {
+                return Err("mls_load_checkpoint: checkpoint size is invalid".to_string());
+            }
             u64::try_from(generation)
                 .map(|generation| (generation, checkpoint))
                 .map_err(|_| "mls_load_checkpoint: negative generation".to_string())
@@ -4849,61 +5088,142 @@ impl VeilDb {
         .transpose()
     }
 
-    pub fn mls_insert_local_kp(&self, id: &str, kp_blob: &[u8]) -> Result<(), String> {
-        self.conn
-            .execute(
-                "INSERT OR REPLACE INTO mls_key_packages_local (id, kp_blob) VALUES (?1, ?2)",
-                rusqlite::params![id, kp_blob],
+    /// Load a bounded FIFO page of exact MLS network payloads.
+    pub fn mls_load_pending_outbox_v1(
+        &self,
+        leaf: &[u8],
+        limit: usize,
+    ) -> Result<Vec<PendingMlsOutboxV1>, String> {
+        if leaf.len() != 32 {
+            return Err("MLS outbox leaf must be exactly 32 bytes".into());
+        }
+        if limit == 0 || limit > MLS_OUTBOX_MAX_LOAD_V1 {
+            return Err("MLS outbox page limit is invalid".into());
+        }
+        let limit = i64::try_from(limit).map_err(|_| "MLS outbox page limit overflow")?;
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT queue_order, item_id, generation, item_index, kind,
+                        group_id, payload_digest, exact_payload
+                   FROM mls_outbox_v1
+                  WHERE leaf = ?1 AND state = 0
+                  ORDER BY queue_order ASC LIMIT ?2",
             )
-            .map(|_| ())
-            .map_err(|e| format!("mls_insert_local_kp: {e}"))
-    }
-
-    pub fn mls_count_unpublished_kp(&self) -> Result<u32, String> {
-        self.conn
-            .query_row(
-                "SELECT COUNT(*) FROM mls_key_packages_local WHERE published = 0",
-                [],
-                |row| row.get::<_, u32>(0),
-            )
-            .map_err(|e| format!("mls_count_unpublished_kp: {e}"))
-    }
-
-    pub fn mls_mark_published(&self, id: &str) -> Result<(), String> {
-        self.conn
-            .execute(
-                "UPDATE mls_key_packages_local SET published = 1 WHERE id = ?1",
-                rusqlite::params![id],
-            )
-            .map(|_| ())
-            .map_err(|e| format!("mls_mark_published: {e}"))
-    }
-
-    pub fn mls_set_state(&self, group_id: &[u8], epoch: u64) -> Result<(), String> {
-        self.conn
-            .execute(
-                "INSERT INTO mls_state (group_id, epoch) VALUES (?1, ?2)
-                 ON CONFLICT(group_id) DO UPDATE SET
-                    epoch = excluded.epoch,
-                    updated_at = datetime('now')",
-                rusqlite::params![group_id, epoch as i64],
-            )
-            .map(|_| ())
-            .map_err(|e| format!("mls_set_state: {e}"))
-    }
-
-    pub fn mls_get_epoch(&self, group_id: &[u8]) -> Result<Option<u64>, String> {
-        self.conn
-            .query_row(
-                "SELECT epoch FROM mls_state WHERE group_id = ?1",
-                rusqlite::params![group_id],
-                |row| row.get::<_, i64>(0),
-            )
-            .map(|v| Some(v as u64))
-            .or_else(|e| match e {
-                rusqlite::Error::QueryReturnedNoRows => Ok(None),
-                other => Err(format!("mls_get_epoch: {other}")),
+            .map_err(|error| format!("prepare MLS outbox load: {error}"))?;
+        let rows = statement
+            .query_map(rusqlite::params![leaf, limit], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, Option<Vec<u8>>>(5)?,
+                    row.get::<_, Vec<u8>>(6)?,
+                    row.get::<_, Vec<u8>>(7)?,
+                ))
             })
+            .map_err(|error| format!("load MLS outbox: {error}"))?;
+
+        let mut loaded = Vec::new();
+        for row in rows {
+            let (
+                queue_order,
+                item_id,
+                generation,
+                item_index,
+                kind,
+                group_id,
+                payload_digest,
+                exact_payload,
+            ) = row.map_err(|error| format!("decode MLS outbox row: {error}"))?;
+            let queue_order = u64::try_from(queue_order)
+                .map_err(|_| "persisted MLS outbox order is invalid".to_string())?;
+            let generation = u64::try_from(generation)
+                .map_err(|_| "persisted MLS outbox generation is invalid".to_string())?;
+            let item_index = u8::try_from(item_index)
+                .map_err(|_| "persisted MLS outbox index is invalid".to_string())?;
+            let kind = u8::try_from(kind)
+                .map_err(|_| "persisted MLS outbox kind is invalid".to_string())?;
+            let item_id = fixed_bytes::<32>("persisted MLS outbox item id", item_id)?;
+            let payload_digest =
+                fixed_bytes::<32>("persisted MLS outbox payload digest", payload_digest)?;
+            let group_id = group_id
+                .map(|value| fixed_bytes::<16>("persisted MLS outbox group id", value))
+                .transpose()?;
+            let candidate = MlsOutboxWriteV1 {
+                item_id,
+                item_index,
+                kind,
+                group_id,
+                payload_digest,
+                exact_payload,
+            };
+            validate_single_mls_outbox_item_v1(leaf, generation, &candidate)?;
+            loaded.push(PendingMlsOutboxV1 {
+                queue_order,
+                item_id: candidate.item_id,
+                generation,
+                item_index: candidate.item_index,
+                kind: candidate.kind,
+                group_id: candidate.group_id,
+                payload_digest: candidate.payload_digest,
+                exact_payload: candidate.exact_payload,
+            });
+        }
+        Ok(loaded)
+    }
+
+    /// Acknowledge only the exact scoped MLS payload digest. Repeated matching
+    /// ACKs are idempotent; unknown, cross-leaf or conflicting ACKs fail closed.
+    pub fn mls_acknowledge_outbox_v1(
+        &self,
+        leaf: &[u8],
+        item_id: &[u8; 32],
+        payload_digest: &[u8; 32],
+    ) -> Result<(), String> {
+        if leaf.len() != 32 {
+            return Err("MLS outbox leaf must be exactly 32 bytes".into());
+        }
+        let tx = begin_immediate(&self.conn, "MLS outbox acknowledgement")?;
+        let stored = tx
+            .query_row(
+                "SELECT payload_digest, state FROM mls_outbox_v1
+                  WHERE leaf = ?1 AND item_id = ?2",
+                rusqlite::params![leaf, item_id.as_slice()],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()
+            .map_err(|error| format!("load MLS outbox acknowledgement: {error}"))?
+            .ok_or_else(|| "MLS outbox item is unknown".to_string())?;
+        let stored_digest = fixed_bytes::<32>("persisted MLS outbox ACK digest", stored.0)?;
+        if stored_digest != *payload_digest {
+            return Err("MLS outbox acknowledgement digest mismatch".into());
+        }
+        match stored.1 {
+            1 => tx
+                .commit()
+                .map_err(|error| format!("commit repeated MLS outbox ACK: {error}")),
+            0 => {
+                let changed = tx
+                    .execute(
+                        "UPDATE mls_outbox_v1
+                            SET state = 1, exact_payload = NULL,
+                                updated_at = datetime('now')
+                          WHERE leaf = ?1 AND item_id = ?2 AND state = 0
+                            AND payload_digest = ?3",
+                        rusqlite::params![leaf, item_id.as_slice(), payload_digest.as_slice()],
+                    )
+                    .map_err(|error| format!("acknowledge MLS outbox item: {error}"))?;
+                if changed != 1 {
+                    return Err("MLS outbox acknowledgement changed concurrently".into());
+                }
+                tx.commit()
+                    .map_err(|error| format!("commit MLS outbox ACK: {error}"))
+            }
+            _ => Err("persisted MLS outbox state is invalid".into()),
+        }
     }
 
     pub fn set_conversation_crypto_mode(&self, conv_id: &str, mode: &str) -> Result<(), String> {
@@ -19886,8 +20206,8 @@ mod tests {
                  INSERT INTO sender_keys_local
                     (group_id, sender_identity_key, key_data, is_outgoing)
                     VALUES ('conversation-v02', randomblob(32), x'01', 1);
-                 INSERT INTO mls_checkpoints (leaf, generation, checkpoint)
-                    VALUES (x'01', 0, x'02');",
+                 INSERT INTO mls_checkpoints_v1 (leaf, generation, checkpoint)
+                    VALUES (randomblob(32), 0, x'02');",
             )
             .unwrap();
 
@@ -19901,7 +20221,8 @@ mod tests {
             "pending_initial_headers",
             "pending_messages",
             "sender_keys_local",
-            "mls_checkpoints",
+            "mls_outbox_v1",
+            "mls_checkpoints_v1",
         ] {
             let count: i64 = db
                 .conn
@@ -20002,7 +20323,7 @@ mod tests {
     #[test]
     fn mls_checkpoint_compare_and_swap_is_atomic_and_monotonic() {
         let db = VeilDb::open_memory(&[0xE4; 32]).unwrap();
-        let leaf = b"mls-leaf";
+        let leaf = &[0x44; 32];
 
         db.mls_save_checkpoint(leaf, None, 0, b"checkpoint-0")
             .expect("initial checkpoint");
@@ -20029,5 +20350,87 @@ mod tests {
         assert!(db
             .mls_save_checkpoint(leaf, Some(0), 1, b"rollback")
             .is_err());
+    }
+
+    #[test]
+    fn mls_checkpoint_and_exact_outbox_commit_or_roll_back_together() {
+        let db = VeilDb::open_memory(&[0xE5; 32]).unwrap();
+        let leaf = &[0x45; 32];
+        let group_id = [0x46; 16];
+        db.mls_save_checkpoint(leaf, None, 0, b"checkpoint-0")
+            .expect("initial checkpoint");
+
+        let payload = b"exact-mls-ciphertext".to_vec();
+        let payload_digest: [u8; 32] = Sha256::digest(&payload).into();
+        let item_id = mls_outbox_item_id_v1(leaf, 1, 0, 4, Some(&group_id), &payload_digest);
+        let outbox = MlsOutboxWriteV1 {
+            item_id,
+            item_index: 0,
+            kind: 4,
+            group_id: Some(group_id),
+            payload_digest,
+            exact_payload: payload.clone(),
+        };
+        db.mls_commit_checkpoint_and_outbox_v1(
+            leaf,
+            Some(0),
+            1,
+            b"checkpoint-1",
+            std::slice::from_ref(&outbox),
+        )
+        .expect("atomic checkpoint and outbox");
+
+        assert_eq!(
+            db.mls_load_checkpoint(leaf).expect("load checkpoint"),
+            Some((1, b"checkpoint-1".to_vec()))
+        );
+        let pending = db
+            .mls_load_pending_outbox_v1(leaf, 1)
+            .expect("load pending outbox");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].item_id, item_id);
+        assert_eq!(pending[0].exact_payload, payload);
+
+        assert!(db
+            .mls_acknowledge_outbox_v1(leaf, &item_id, &[0xFF; 32])
+            .is_err());
+        assert_eq!(
+            db.mls_load_pending_outbox_v1(leaf, 1)
+                .expect("wrong ACK preserves payload")
+                .len(),
+            1
+        );
+        db.mls_acknowledge_outbox_v1(leaf, &item_id, &payload_digest)
+            .expect("acknowledge exact payload");
+        db.mls_acknowledge_outbox_v1(leaf, &item_id, &payload_digest)
+            .expect("repeated ACK is idempotent");
+        assert!(db
+            .mls_load_pending_outbox_v1(leaf, 1)
+            .expect("outbox drained")
+            .is_empty());
+
+        let faulted = VeilDb::open_memory(&[0xE6; 32]).unwrap();
+        faulted
+            .mls_save_checkpoint(leaf, None, 0, b"fault-checkpoint-0")
+            .unwrap();
+        faulted
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER abort_mls_outbox_insert
+                 BEFORE INSERT ON mls_outbox_v1
+                 BEGIN SELECT RAISE(ABORT, 'injected MLS outbox failure'); END;",
+            )
+            .unwrap();
+        assert!(faulted
+            .mls_commit_checkpoint_and_outbox_v1(leaf, Some(0), 1, b"must-roll-back", &[outbox],)
+            .is_err());
+        assert_eq!(
+            faulted.mls_load_checkpoint(leaf).unwrap(),
+            Some((0, b"fault-checkpoint-0".to_vec()))
+        );
+        assert!(faulted
+            .mls_load_pending_outbox_v1(leaf, 1)
+            .unwrap()
+            .is_empty());
     }
 }

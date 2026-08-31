@@ -24,6 +24,7 @@ hex = "0.4"
 thiserror = "2"
 sha2 = "0.10"
 zeroize = { version = "1", features = ["derive"] }
+veil-store = { path = "../veil-store" }
 
 [dev-dependencies]
 # multi-client roundtrip tests
