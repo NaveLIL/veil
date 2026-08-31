@@ -64,9 +64,9 @@ and may heal only from the generation verified in the database.
   last. A keychain deletion failure therefore leaves a visible fail-closed
   partial reset that is safe to retry; no reset is executed automatically by
   this checkpoint.
-- The earlier raw checkpoint writer is crate-private. Workspace consumers
-  cannot accidentally select it as a persistence path that bypasses the
-  rollback anchor and durable output contract.
+- The earlier raw checkpoint writer exists only under `cfg(test)`. Workspace
+  consumers cannot select it as a persistence path that bypasses the rollback
+  anchor and durable output contract.
 - Secret-bearing checkpoint snapshots, outbox bytes, inbox plaintext, and
   intermediate provider copies are zeroized on drop where Rust ownership
   permits.

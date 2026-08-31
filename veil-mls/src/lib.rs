@@ -559,7 +559,7 @@ impl<S: MlsKeyStore> MlsClient<S> {
     /// pre-commit persistence failure the in-memory provider is restored
     /// exactly. If SQLCipher committed but the OS anchor update failed, the
     /// provider remains advanced and the caller receives
-    /// `DurableCommitPending`; replay uses the already-durable outbox.
+    /// `DurableCommitPending`; recovery uses the already-durable outbox/inbox.
     fn transact<R>(
         &mut self,
         operation: impl FnOnce(
@@ -601,7 +601,7 @@ impl<S: MlsKeyStore> MlsClient<S> {
             Err(MlsPersistError::Rejected(error)) => {
                 self.restore_provider_values(previous_values)?;
                 Err(MlsError::Storage(format!(
-                    "persist MLS checkpoint and outbox: {error}"
+                    "persist MLS checkpoint and outputs: {error}"
                 )))
             }
             Err(MlsPersistError::CommittedAnchorPending(error)) => {

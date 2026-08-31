@@ -5068,9 +5068,9 @@ impl VeilDb {
         Ok(())
     }
 
-    /// Atomically create or advance one encrypted MLS checkpoint without a
-    /// network payload. Mutations that produce output must use
-    /// `mls_commit_checkpoint_and_outputs_v1` instead.
+    /// Test-only primitive for exercising checkpoint CAS independently from
+    /// the production adapter and durable outputs.
+    #[cfg(test)]
     pub(crate) fn mls_save_checkpoint(
         &self,
         leaf: &[u8],
