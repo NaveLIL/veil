@@ -29,6 +29,7 @@ use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::OpenMlsRustCrypto;
 use openmls_traits::OpenMlsProvider;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
@@ -37,8 +38,9 @@ pub mod veil_db_store;
 
 use store::{decode_checkpoint, encode_checkpoint};
 pub use store::{
-    CheckpointBlob, InMemoryStore, MlsKeyStore, MlsOutboxId, MlsOutboxKind, MlsOutboxPayload,
-    MlsPersistError, StoredMlsOutboxItem,
+    CheckpointBlob, InMemoryStore, MlsInboxId, MlsInboxProjection, MlsKeyStore, MlsOutboxId,
+    MlsOutboxKind, MlsOutboxPayload, MlsPersistError, StoredMlsInboxProjection,
+    StoredMlsOutboxItem,
 };
 pub use veil_db_store::{MlsRollbackAnchor, OsKeychainMlsRollbackAnchor, VeilDbMlsStore};
 
@@ -196,7 +198,7 @@ impl<S: MlsKeyStore> MlsClient<S> {
         let checkpoint = me.checkpoint(0)?;
         match me
             .store
-            .save_checkpoint(&me.leaf.0, None, checkpoint, Vec::new())
+            .save_checkpoint(&me.leaf.0, None, checkpoint, Vec::new(), Vec::new())
         {
             Ok(()) => {}
             Err(MlsPersistError::Rejected(error)) => {
@@ -270,7 +272,7 @@ impl<S: MlsKeyStore> MlsClient<S> {
             ensure_max_len("MLS KeyPackage", serialized.len(), MAX_KEY_PACKAGE_BYTES)?;
             let outbox = MlsOutboxPayload::new(MlsOutboxKind::KeyPackage, None, serialized.clone())
                 .map_err(MlsError::Storage)?;
-            Ok((KeyPackageBlob(serialized), vec![outbox]))
+            Ok((KeyPackageBlob(serialized), vec![outbox], Vec::new()))
         })
     }
 
@@ -297,7 +299,7 @@ impl<S: MlsKeyStore> MlsClient<S> {
                 credential_with_key,
             )
             .map_err(|e| MlsError::Protocol(format!("create group: {e:?}")))?;
-            Ok(((), Vec::new()))
+            Ok(((), Vec::new(), Vec::new()))
         })
     }
 
@@ -349,6 +351,7 @@ impl<S: MlsKeyStore> MlsClient<S> {
             Ok((
                 (CommitBlob(commit_bytes), WelcomeBlob(welcome_bytes)),
                 outbox,
+                Vec::new(),
             ))
         })
     }
@@ -374,6 +377,7 @@ impl<S: MlsKeyStore> MlsClient<S> {
                 .map_err(|e| MlsError::Protocol(format!("install welcome: {e:?}")))?;
             Ok((
                 MlsGroupId::from_uuid_bytes(group.group_id().as_slice())?,
+                Vec::new(),
                 Vec::new(),
             ))
         })
@@ -402,7 +406,7 @@ impl<S: MlsKeyStore> MlsClient<S> {
                     "handshake message is not an MLS Commit".into(),
                 )),
             }?;
-            Ok((result, Vec::new()))
+            Ok((result, Vec::new(), Vec::new()))
         })
     }
 
@@ -423,7 +427,7 @@ impl<S: MlsKeyStore> MlsClient<S> {
             let outbox =
                 MlsOutboxPayload::new(MlsOutboxKind::Ciphertext, Some(group_scope), bytes.clone())
                     .map_err(MlsError::Storage)?;
-            Ok((MlsCiphertext(bytes), vec![outbox]))
+            Ok((MlsCiphertext(bytes), vec![outbox], Vec::new()))
         })
     }
 
@@ -434,6 +438,11 @@ impl<S: MlsKeyStore> MlsClient<S> {
         ciphertext: &MlsCiphertext,
     ) -> Result<Vec<u8>> {
         ensure_max_len("MLS ciphertext", ciphertext.0.len(), MAX_MLS_MESSAGE_BYTES)?;
+        let group_scope: [u8; MLS_GROUP_ID_BYTES] =
+            group_id.0.as_slice().try_into().map_err(|_| {
+                MlsError::Invalid("MLS group id must be exactly 16 UUID bytes".into())
+            })?;
+        let source_digest: [u8; 32] = Sha256::digest(&ciphertext.0).into();
         self.transact(|provider, _signer| {
             let mut group = Self::load_group_from(provider, group_id)?;
             let msg = MlsMessageIn::tls_deserialize_exact_bytes(ciphertext.0.as_slice())
@@ -450,7 +459,10 @@ impl<S: MlsKeyStore> MlsClient<S> {
                 ProcessedMessageContent::ApplicationMessage(app) => {
                     let plaintext = app.into_bytes();
                     ensure_max_len("MLS plaintext", plaintext.len(), MAX_MLS_MESSAGE_BYTES)?;
-                    Ok((plaintext, Vec::new()))
+                    let inbox =
+                        MlsInboxProjection::new(group_scope, source_digest, plaintext.clone())
+                            .map_err(MlsError::Storage)?;
+                    Ok((plaintext, Vec::new(), vec![inbox]))
                 }
                 _ => Err(MlsError::Invalid("not an application message".into())),
             }
@@ -528,10 +540,10 @@ impl<S: MlsKeyStore> MlsClient<S> {
         operation: impl FnOnce(
             &OpenMlsRustCrypto,
             &SignatureKeyPair,
-        ) -> Result<(R, Vec<MlsOutboxPayload>)>,
+        ) -> Result<(R, Vec<MlsOutboxPayload>, Vec<MlsInboxProjection>)>,
     ) -> Result<R> {
         let previous_values = self.provider_values()?;
-        let (output, outbox) = match operation(&self.provider, &self.signer) {
+        let (output, outbox, inbox) = match operation(&self.provider, &self.signer) {
             Ok(output) => output,
             Err(error) => {
                 self.restore_provider_values(previous_values)?;
@@ -550,10 +562,13 @@ impl<S: MlsKeyStore> MlsClient<S> {
                 return Err(error);
             }
         };
-        match self
-            .store
-            .save_checkpoint(&self.leaf.0, Some(self.generation), checkpoint, outbox)
-        {
+        match self.store.save_checkpoint(
+            &self.leaf.0,
+            Some(self.generation),
+            checkpoint,
+            outbox,
+            inbox,
+        ) {
             Ok(()) => {
                 self.generation = next_generation;
                 Ok(output)
@@ -598,14 +613,20 @@ mod tests {
             expected_previous_generation: Option<u64>,
             checkpoint: CheckpointBlob,
             outbox: Vec<MlsOutboxPayload>,
+            inbox: Vec<MlsInboxProjection>,
         ) -> std::result::Result<(), MlsPersistError> {
             if self.reject_writes.load(Ordering::SeqCst) {
                 return Err(MlsPersistError::Rejected(
                     "injected persistence failure".into(),
                 ));
             }
-            self.inner
-                .save_checkpoint(leaf, expected_previous_generation, checkpoint, outbox)
+            self.inner.save_checkpoint(
+                leaf,
+                expected_previous_generation,
+                checkpoint,
+                outbox,
+                inbox,
+            )
         }
 
         fn load_checkpoint(
@@ -630,6 +651,22 @@ mod tests {
             payload_digest: &[u8; 32],
         ) -> std::result::Result<(), String> {
             self.inner.acknowledge_outbox(leaf, id, payload_digest)
+        }
+
+        fn load_pending_inbox(
+            &self,
+            leaf: &[u8],
+            limit: usize,
+        ) -> std::result::Result<Vec<StoredMlsInboxProjection>, String> {
+            self.inner.load_pending_inbox(leaf, limit)
+        }
+
+        fn acknowledge_inbox(
+            &self,
+            leaf: &[u8],
+            id: MlsInboxId,
+        ) -> std::result::Result<(), String> {
+            self.inner.acknowledge_inbox(leaf, id)
         }
     }
 

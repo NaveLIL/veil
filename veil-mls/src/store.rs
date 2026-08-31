@@ -23,8 +23,11 @@ pub const MAX_CHECKPOINT_VALUE_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_CHECKPOINT_SIGNER_BYTES: usize = 64 * 1024;
 pub const MAX_OUTBOX_ITEMS_PER_GENERATION: usize = 16;
 pub const MAX_OUTBOX_PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_INBOX_PROJECTIONS_PER_GENERATION: usize = 1;
+pub const MAX_INBOX_PLAINTEXT_BYTES: usize = 4 * 1024 * 1024;
 
 const OUTBOX_ID_DOMAIN: &[u8] = b"veil-mls-outbox-v1";
+const INBOX_ID_DOMAIN: &[u8] = b"veil-mls-inbox-v1";
 
 /// Opaque, secret-bearing checkpoint stored in an encrypted persistence layer.
 ///
@@ -122,6 +125,120 @@ impl MlsOutboxPayload {
 
     pub fn as_bytes(&self) -> &[u8] {
         &self.bytes
+    }
+}
+
+/// Decrypted application payload staged in SQLCipher beside the receive-state
+/// checkpoint. It is never returned by the network outbox API.
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
+pub struct MlsInboxProjection {
+    group_id: [u8; 16],
+    source_digest: [u8; 32],
+    plaintext: Vec<u8>,
+}
+
+impl MlsInboxProjection {
+    pub fn new(
+        group_id: [u8; 16],
+        source_digest: [u8; 32],
+        plaintext: Vec<u8>,
+    ) -> Result<Self, String> {
+        if plaintext.len() > MAX_INBOX_PLAINTEXT_BYTES {
+            return Err("MLS inbox plaintext exceeds the limit".into());
+        }
+        Ok(Self {
+            group_id,
+            source_digest,
+            plaintext,
+        })
+    }
+
+    pub fn group_id(&self) -> &[u8; 16] {
+        &self.group_id
+    }
+
+    pub fn source_digest(&self) -> &[u8; 32] {
+        &self.source_digest
+    }
+
+    pub fn plaintext(&self) -> &[u8] {
+        &self.plaintext
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MlsInboxId([u8; 32]);
+
+impl MlsInboxId {
+    pub fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for MlsInboxId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("MlsInboxId(")?;
+        formatter.write_str(&hex::encode(self.0))?;
+        formatter.write_str(")")
+    }
+}
+
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
+pub struct StoredMlsInboxProjection {
+    #[zeroize(skip)]
+    id: MlsInboxId,
+    generation: u64,
+    group_id: [u8; 16],
+    source_digest: [u8; 32],
+    plaintext: Vec<u8>,
+}
+
+impl StoredMlsInboxProjection {
+    pub fn from_parts(
+        leaf: &[u8],
+        id: MlsInboxId,
+        generation: u64,
+        group_id: [u8; 16],
+        source_digest: [u8; 32],
+        plaintext: Vec<u8>,
+    ) -> Result<Self, String> {
+        if leaf.len() != 32 || plaintext.len() > MAX_INBOX_PLAINTEXT_BYTES {
+            return Err("MLS inbox projection shape is invalid".into());
+        }
+        if id != derive_inbox_id(leaf, generation, &group_id, &source_digest) {
+            return Err("MLS inbox identifier mismatch".into());
+        }
+        Ok(Self {
+            id,
+            generation,
+            group_id,
+            source_digest,
+            plaintext,
+        })
+    }
+
+    pub fn id(&self) -> MlsInboxId {
+        self.id
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub fn group_id(&self) -> &[u8; 16] {
+        &self.group_id
+    }
+
+    pub fn source_digest(&self) -> &[u8; 32] {
+        &self.source_digest
+    }
+
+    pub fn plaintext(&self) -> &[u8] {
+        &self.plaintext
     }
 }
 
@@ -249,6 +366,21 @@ pub(crate) fn derive_outbox_id(
     MlsOutboxId(digest.finalize().into())
 }
 
+pub(crate) fn derive_inbox_id(
+    leaf: &[u8],
+    generation: u64,
+    group_id: &[u8; 16],
+    source_digest: &[u8; 32],
+) -> MlsInboxId {
+    let mut digest = Sha256::new();
+    digest.update(INBOX_ID_DOMAIN);
+    digest.update(leaf);
+    digest.update(generation.to_be_bytes());
+    digest.update(group_id);
+    digest.update(source_digest);
+    MlsInboxId(digest.finalize().into())
+}
+
 /// Failure from the durable checkpoint boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MlsPersistError {
@@ -285,6 +417,7 @@ pub trait MlsKeyStore: Send + Sync + 'static {
         expected_previous_generation: Option<u64>,
         checkpoint: CheckpointBlob,
         outbox: Vec<MlsOutboxPayload>,
+        inbox: Vec<MlsInboxProjection>,
     ) -> Result<(), MlsPersistError>;
 
     fn load_checkpoint(&self, leaf: &[u8]) -> Result<Option<CheckpointBlob>, String>;
@@ -301,6 +434,14 @@ pub trait MlsKeyStore: Send + Sync + 'static {
         id: MlsOutboxId,
         payload_digest: &[u8; 32],
     ) -> Result<(), String>;
+
+    fn load_pending_inbox(
+        &self,
+        leaf: &[u8],
+        limit: usize,
+    ) -> Result<Vec<StoredMlsInboxProjection>, String>;
+
+    fn acknowledge_inbox(&self, leaf: &[u8], id: MlsInboxId) -> Result<(), String>;
 }
 
 /// In-memory implementation for tests and local-only flows.
@@ -314,6 +455,7 @@ struct InMemoryState {
     checkpoints: HashMap<Vec<u8>, CheckpointBlob>,
     anchors: HashMap<Vec<u8>, u64>,
     outbox: Vec<(Vec<u8>, StoredMlsOutboxItem)>,
+    inbox: Vec<(Vec<u8>, StoredMlsInboxProjection)>,
 }
 
 impl InMemoryStore {
@@ -331,6 +473,7 @@ impl MlsKeyStore for InMemoryStore {
         expected_previous_generation: Option<u64>,
         checkpoint: CheckpointBlob,
         outbox: Vec<MlsOutboxPayload>,
+        inbox: Vec<MlsInboxProjection>,
     ) -> Result<(), MlsPersistError> {
         if leaf.len() != 32 {
             return Err(MlsPersistError::Rejected(
@@ -340,6 +483,11 @@ impl MlsKeyStore for InMemoryStore {
         if outbox.len() > MAX_OUTBOX_ITEMS_PER_GENERATION {
             return Err(MlsPersistError::Rejected(
                 "MLS outbox batch has too many items".into(),
+            ));
+        }
+        if inbox.len() > MAX_INBOX_PROJECTIONS_PER_GENERATION {
+            return Err(MlsPersistError::Rejected(
+                "MLS inbox batch has too many projections".into(),
             ));
         }
         let expected_next = match expected_previous_generation {
@@ -400,9 +548,29 @@ impl MlsKeyStore for InMemoryStore {
             .map_err(MlsPersistError::Rejected)?;
             stored.push((leaf.to_vec(), item));
         }
+        let mut stored_inbox = Vec::with_capacity(inbox.len());
+        for projection in inbox {
+            let id = derive_inbox_id(
+                leaf,
+                expected_next,
+                projection.group_id(),
+                projection.source_digest(),
+            );
+            let item = StoredMlsInboxProjection::from_parts(
+                leaf,
+                id,
+                expected_next,
+                *projection.group_id(),
+                *projection.source_digest(),
+                projection.plaintext().to_vec(),
+            )
+            .map_err(MlsPersistError::Rejected)?;
+            stored_inbox.push((leaf.to_vec(), item));
+        }
 
         state.checkpoints.insert(leaf.to_vec(), checkpoint);
         state.outbox.extend(stored);
+        state.inbox.extend(stored_inbox);
         state.anchors.insert(leaf.to_vec(), expected_next);
         Ok(())
     }
@@ -455,6 +623,35 @@ impl MlsKeyStore for InMemoryStore {
             return Err("MLS outbox acknowledgement digest mismatch".into());
         }
         state.outbox.remove(index);
+        Ok(())
+    }
+
+    fn load_pending_inbox(
+        &self,
+        leaf: &[u8],
+        limit: usize,
+    ) -> Result<Vec<StoredMlsInboxProjection>, String> {
+        if limit == 0 || limit > 256 {
+            return Err("MLS inbox page limit is invalid".into());
+        }
+        Ok(self
+            .lock()?
+            .inbox
+            .iter()
+            .filter(|(stored_leaf, _)| stored_leaf.as_slice() == leaf)
+            .take(limit)
+            .map(|(_, item)| item.clone())
+            .collect())
+    }
+
+    fn acknowledge_inbox(&self, leaf: &[u8], id: MlsInboxId) -> Result<(), String> {
+        let mut state = self.lock()?;
+        let index = state
+            .inbox
+            .iter()
+            .position(|(stored_leaf, item)| stored_leaf.as_slice() == leaf && item.id() == id)
+            .ok_or_else(|| "MLS inbox projection is unknown".to_string())?;
+        state.inbox.remove(index);
         Ok(())
     }
 }
@@ -751,21 +948,21 @@ mod tests {
         let store = InMemoryStore::default();
         let checkpoint = sample_checkpoint();
         assert!(store
-            .save_checkpoint(LEAF, Some(6), checkpoint.clone(), Vec::new())
+            .save_checkpoint(LEAF, Some(6), checkpoint.clone(), Vec::new(), Vec::new())
             .is_err());
         assert!(store
-            .save_checkpoint(LEAF, None, checkpoint.clone(), Vec::new())
+            .save_checkpoint(LEAF, None, checkpoint.clone(), Vec::new(), Vec::new())
             .is_err());
 
         let initial = encode_checkpoint(LEAF, 0, b"signer", &HashMap::new()).unwrap();
         store
-            .save_checkpoint(LEAF, None, initial, Vec::new())
+            .save_checkpoint(LEAF, None, initial, Vec::new(), Vec::new())
             .expect("initial save");
         assert!(store
-            .save_checkpoint(LEAF, None, checkpoint.clone(), Vec::new())
+            .save_checkpoint(LEAF, None, checkpoint.clone(), Vec::new(), Vec::new())
             .is_err());
         assert!(store
-            .save_checkpoint(LEAF, Some(0), checkpoint, Vec::new())
+            .save_checkpoint(LEAF, Some(0), checkpoint, Vec::new(), Vec::new())
             .is_err());
     }
 }

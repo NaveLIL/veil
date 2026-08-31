@@ -1,24 +1,28 @@
 //! Production SQLCipher + OS-keychain persistence adapter for OpenMLS.
 //!
-//! SQLCipher commits the complete checkpoint and exact network outbox in one
-//! transaction. A monotonic generation is then advanced in OS secure storage.
+//! SQLCipher commits the complete checkpoint, exact network outbox, and any
+//! decrypted inbox projection in one transaction. A monotonic generation is
+//! then advanced in OS secure storage.
 //! The only permitted split is `database generation > anchor generation`: it
 //! means SQLCipher committed before an OS-keychain failure or process death and
 //! is healed before restore. `anchor > database` is a rollback and fails closed.
 
 use crate::store::{
-    decode_checkpoint, derive_outbox_id, CheckpointBlob, MlsKeyStore, MlsOutboxId, MlsOutboxKind,
-    MlsOutboxPayload, MlsPersistError, StoredMlsOutboxItem, MAX_OUTBOX_ITEMS_PER_GENERATION,
+    decode_checkpoint, derive_inbox_id, derive_outbox_id, CheckpointBlob, MlsInboxId,
+    MlsInboxProjection, MlsKeyStore, MlsOutboxId, MlsOutboxKind, MlsOutboxPayload, MlsPersistError,
+    StoredMlsInboxProjection, StoredMlsOutboxItem, MAX_INBOX_PROJECTIONS_PER_GENERATION,
+    MAX_OUTBOX_ITEMS_PER_GENERATION,
 };
 use sha2::{Digest, Sha256};
 use std::sync::{Arc, Mutex, MutexGuard};
-use veil_store::db::{MlsOutboxWriteV1, VeilDb};
+use veil_store::db::{MlsInboxWriteV1, MlsOutboxWriteV1, VeilDb};
 
 /// Independent monotonic generation authority. Production uses the OS
 /// keychain; tests can supply a deterministic in-memory implementation.
 pub trait MlsRollbackAnchor: Clone + Send + Sync + 'static {
     fn load_generation(&self, leaf: &[u8]) -> Result<Option<u64>, String>;
     fn advance_generation(&self, leaf: &[u8], generation: u64) -> Result<(), String>;
+    fn delete_generation(&self, leaf: &[u8]) -> Result<(), String>;
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -31,6 +35,10 @@ impl MlsRollbackAnchor for OsKeychainMlsRollbackAnchor {
 
     fn advance_generation(&self, leaf: &[u8], generation: u64) -> Result<(), String> {
         veil_store::keychain::store_mls_rollback_anchor_v1(leaf, generation)
+    }
+
+    fn delete_generation(&self, leaf: &[u8]) -> Result<(), String> {
+        veil_store::keychain::delete_mls_rollback_anchor_v1(leaf)
     }
 }
 
@@ -55,6 +63,14 @@ impl<A: MlsRollbackAnchor> VeilDbMlsStore<A> {
 
     pub fn shared_db(&self) -> Arc<Mutex<VeilDb>> {
         Arc::clone(&self.db)
+    }
+
+    /// Explicitly reset one MLS leaf so it may safely start again at
+    /// generation zero. SQLCipher is cleared first; a keychain failure then
+    /// leaves a fail-closed anchor that makes the partial reset retryable.
+    pub fn delete_leaf_state(&self, leaf: &[u8]) -> Result<(), String> {
+        self.lock_db()?.mls_delete_leaf_state_v1(leaf)?;
+        self.anchor.delete_generation(leaf)
     }
 
     fn lock_db(&self) -> Result<MutexGuard<'_, VeilDb>, String> {
@@ -98,6 +114,33 @@ impl<A: MlsRollbackAnchor> VeilDbMlsStore<A> {
             .collect()
     }
 
+    fn prepare_inbox(
+        leaf: &[u8],
+        generation: u64,
+        inbox: &[MlsInboxProjection],
+    ) -> Result<Vec<MlsInboxWriteV1>, String> {
+        if inbox.len() > MAX_INBOX_PROJECTIONS_PER_GENERATION {
+            return Err("MLS inbox batch has too many projections".into());
+        }
+        inbox
+            .iter()
+            .map(|projection| {
+                let id = derive_inbox_id(
+                    leaf,
+                    generation,
+                    projection.group_id(),
+                    projection.source_digest(),
+                );
+                Ok(MlsInboxWriteV1 {
+                    item_id: *id.as_bytes(),
+                    group_id: *projection.group_id(),
+                    source_digest: *projection.source_digest(),
+                    plaintext: projection.plaintext().to_vec(),
+                })
+            })
+            .collect()
+    }
+
     fn require_or_heal_anchor(&self, leaf: &[u8], database_generation: u64) -> Result<(), String> {
         match self.anchor.load_generation(leaf)? {
             None => Err("MLS rollback anchor is missing for an existing checkpoint".into()),
@@ -120,6 +163,7 @@ impl<A: MlsRollbackAnchor> MlsKeyStore for VeilDbMlsStore<A> {
         expected_previous_generation: Option<u64>,
         checkpoint: CheckpointBlob,
         outbox: Vec<MlsOutboxPayload>,
+        inbox: Vec<MlsInboxProjection>,
     ) -> Result<(), MlsPersistError> {
         if leaf.len() != 32 {
             return Err(MlsPersistError::Rejected(
@@ -130,24 +174,39 @@ impl<A: MlsRollbackAnchor> MlsKeyStore for VeilDbMlsStore<A> {
         let generation = checkpoint.generation();
         let prepared =
             Self::prepare_outbox(leaf, generation, &outbox).map_err(MlsPersistError::Rejected)?;
+        let prepared_inbox =
+            Self::prepare_inbox(leaf, generation, &inbox).map_err(MlsPersistError::Rejected)?;
 
         match expected_previous_generation {
-            None => match self
-                .anchor
-                .load_generation(leaf)
-                .map_err(MlsPersistError::Rejected)?
-            {
-                None => self
-                    .anchor
-                    .advance_generation(leaf, 0)
-                    .map_err(MlsPersistError::Rejected)?,
-                Some(0) => {}
-                Some(_) => {
+            None => {
+                if self
+                    .lock_db()
+                    .map_err(MlsPersistError::Rejected)?
+                    .mls_load_checkpoint(leaf)
+                    .map_err(MlsPersistError::Rejected)?
+                    .is_some()
+                {
                     return Err(MlsPersistError::Rejected(
-                        "MLS rollback anchor conflicts with initial checkpoint".into(),
-                    ))
+                        "MLS checkpoint already exists for initial generation".into(),
+                    ));
                 }
-            },
+                match self
+                    .anchor
+                    .load_generation(leaf)
+                    .map_err(MlsPersistError::Rejected)?
+                {
+                    None => self
+                        .anchor
+                        .advance_generation(leaf, 0)
+                        .map_err(MlsPersistError::Rejected)?,
+                    Some(0) => {}
+                    Some(_) => {
+                        return Err(MlsPersistError::Rejected(
+                            "MLS rollback anchor conflicts with initial checkpoint".into(),
+                        ))
+                    }
+                }
+            }
             Some(previous) => match self
                 .anchor
                 .load_generation(leaf)
@@ -163,22 +222,36 @@ impl<A: MlsRollbackAnchor> MlsKeyStore for VeilDbMlsStore<A> {
                         "MLS checkpoint is older than the external rollback anchor".into(),
                     ))
                 }
-                Some(anchor) if anchor < previous => self
-                    .anchor
-                    .advance_generation(leaf, previous)
-                    .map_err(MlsPersistError::Rejected)?,
+                Some(anchor) if anchor < previous => {
+                    let database_generation = self
+                        .lock_db()
+                        .map_err(MlsPersistError::Rejected)?
+                        .mls_load_checkpoint(leaf)
+                        .map_err(MlsPersistError::Rejected)?
+                        .map(|(generation, _)| generation);
+                    if database_generation != Some(previous) {
+                        return Err(MlsPersistError::Rejected(
+                            "MLS rollback anchor cannot heal from an unverified client generation"
+                                .into(),
+                        ));
+                    }
+                    self.anchor
+                        .advance_generation(leaf, previous)
+                        .map_err(MlsPersistError::Rejected)?;
+                }
                 Some(_) => {}
             },
         }
 
         self.lock_db()
             .map_err(MlsPersistError::Rejected)?
-            .mls_commit_checkpoint_and_outbox_v1(
+            .mls_commit_checkpoint_and_outputs_v1(
                 leaf,
                 expected_previous_generation,
                 generation,
                 checkpoint.as_bytes(),
                 &prepared,
+                &prepared_inbox,
             )
             .map_err(MlsPersistError::Rejected)?;
 
@@ -187,7 +260,7 @@ impl<A: MlsRollbackAnchor> MlsKeyStore for VeilDbMlsStore<A> {
                 .advance_generation(leaf, generation)
                 .map_err(|error| {
                     MlsPersistError::CommittedAnchorPending(format!(
-                        "SQLCipher generation {generation} and its outbox are durable; {error}"
+                        "SQLCipher generation {generation} and its durable outputs are committed; {error}"
                     ))
                 })?;
         }
@@ -221,7 +294,8 @@ impl<A: MlsRollbackAnchor> MlsKeyStore for VeilDbMlsStore<A> {
         self.lock_db()?
             .mls_load_pending_outbox_v1(leaf, limit)?
             .into_iter()
-            .map(|item| {
+            .map(|mut item| {
+                let exact_payload = std::mem::take(&mut item.exact_payload);
                 StoredMlsOutboxItem::from_parts(
                     leaf,
                     MlsOutboxId::from_bytes(item.item_id),
@@ -230,7 +304,7 @@ impl<A: MlsRollbackAnchor> MlsKeyStore for VeilDbMlsStore<A> {
                     MlsOutboxKind::from_u8(item.kind)?,
                     item.group_id,
                     item.payload_digest,
-                    item.exact_payload,
+                    exact_payload,
                 )
             })
             .collect()
@@ -247,14 +321,45 @@ impl<A: MlsRollbackAnchor> MlsKeyStore for VeilDbMlsStore<A> {
         self.lock_db()?
             .mls_acknowledge_outbox_v1(leaf, id.as_bytes(), payload_digest)
     }
+
+    fn load_pending_inbox(
+        &self,
+        leaf: &[u8],
+        limit: usize,
+    ) -> Result<Vec<StoredMlsInboxProjection>, String> {
+        self.load_checkpoint(leaf)?
+            .ok_or_else(|| "MLS checkpoint not found for inbox load".to_string())?;
+        self.lock_db()?
+            .mls_load_pending_inbox_v1(leaf, limit)?
+            .into_iter()
+            .map(|mut item| {
+                let plaintext = std::mem::take(&mut item.plaintext);
+                StoredMlsInboxProjection::from_parts(
+                    leaf,
+                    MlsInboxId::from_bytes(item.item_id),
+                    item.generation,
+                    item.group_id,
+                    item.source_digest,
+                    plaintext,
+                )
+            })
+            .collect()
+    }
+
+    fn acknowledge_inbox(&self, leaf: &[u8], id: MlsInboxId) -> Result<(), String> {
+        self.load_checkpoint(leaf)?
+            .ok_or_else(|| "MLS checkpoint not found for inbox acknowledgement".to_string())?;
+        self.lock_db()?
+            .mls_acknowledge_inbox_v1(leaf, id.as_bytes())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{LeafIdentity, MlsClient, MlsError, MlsGroupId};
+    use crate::{InMemoryStore, LeafIdentity, MlsClient, MlsError, MlsGroupId};
     use std::collections::HashMap;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     const NO_FAILURE: u64 = u64::MAX;
 
@@ -262,6 +367,7 @@ mod tests {
     struct MemoryAnchor {
         generations: Arc<Mutex<HashMap<Vec<u8>, u64>>>,
         fail_generation: Arc<AtomicU64>,
+        fail_delete: Arc<AtomicBool>,
     }
 
     impl MemoryAnchor {
@@ -278,6 +384,10 @@ mod tests {
                 .lock()
                 .unwrap()
                 .insert(leaf.to_vec(), generation);
+        }
+
+        fn fail_deletes(&self, fail: bool) {
+            self.fail_delete.store(fail, Ordering::SeqCst);
         }
     }
 
@@ -298,6 +408,14 @@ mod tests {
                 return Err("rollback-anchor decrease rejected".into());
             }
             anchors.insert(leaf.to_vec(), generation);
+            Ok(())
+        }
+
+        fn delete_generation(&self, leaf: &[u8]) -> Result<(), String> {
+            if self.fail_delete.load(Ordering::SeqCst) {
+                return Err("injected OS-anchor deletion failure".into());
+            }
+            self.generations.lock().unwrap().remove(leaf);
             Ok(())
         }
     }
@@ -378,5 +496,118 @@ mod tests {
         assert!(rollback
             .to_string()
             .contains("older than the external rollback anchor"));
+    }
+
+    #[test]
+    fn unverified_client_generation_cannot_poison_the_external_anchor() {
+        let anchor = MemoryAnchor::default();
+        anchor.allow_writes();
+        let store = VeilDbMlsStore::new(
+            Arc::new(Mutex::new(VeilDb::open_memory(&[0x95; 32]).unwrap())),
+            anchor.clone(),
+        );
+        let identity = leaf(b"stale-client-anchor-poisoning");
+        MlsClient::create(identity.clone(), store.clone()).unwrap();
+
+        let source = InMemoryStore::default();
+        let mut source_client = MlsClient::create(identity.clone(), source.clone()).unwrap();
+        for _ in 0..10 {
+            source_client.generate_key_package().unwrap();
+        }
+        let forged_future = source
+            .load_checkpoint(identity.as_bytes())
+            .unwrap()
+            .unwrap();
+        assert_eq!(forged_future.generation(), 10);
+
+        let error = store
+            .save_checkpoint(
+                identity.as_bytes(),
+                Some(9),
+                forged_future,
+                Vec::new(),
+                Vec::new(),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("unverified client generation"));
+        assert_eq!(
+            anchor.load_generation(identity.as_bytes()).unwrap(),
+            Some(0)
+        );
+        assert_eq!(
+            store
+                .load_checkpoint(identity.as_bytes())
+                .unwrap()
+                .unwrap()
+                .generation(),
+            0
+        );
+    }
+
+    #[test]
+    fn decrypt_anchor_gap_keeps_plaintext_in_sqlcipher_inbox() {
+        let anchor = MemoryAnchor::default();
+        anchor.allow_writes();
+        let store = VeilDbMlsStore::new(
+            Arc::new(Mutex::new(VeilDb::open_memory(&[0x93; 32]).unwrap())),
+            anchor.clone(),
+        );
+        let bob_identity = leaf(b"inbox-anchor-gap-bob");
+        let mut bob = MlsClient::create(bob_identity.clone(), store.clone()).unwrap();
+        let mut alice =
+            MlsClient::create(leaf(b"inbox-anchor-gap-alice"), InMemoryStore::default()).unwrap();
+        let group = group(b"inbox-anchor-gap-group");
+        let bob_key_package = bob.generate_key_package().unwrap();
+        alice.create_group(&group).unwrap();
+        let (_, welcome) = alice.add_member(&group, &bob_key_package).unwrap();
+        bob.process_welcome(&welcome).unwrap();
+        let ciphertext = alice
+            .encrypt(&group, b"recoverable staged plaintext")
+            .unwrap();
+
+        let receive_generation = bob.checkpoint_generation() + 1;
+        anchor.fail_at(receive_generation);
+        let error = bob.decrypt(&group, &ciphertext).unwrap_err();
+        assert!(matches!(error, MlsError::DurableCommitPending(_)));
+        assert_eq!(bob.checkpoint_generation(), receive_generation);
+
+        anchor.allow_writes();
+        let restored = MlsClient::restore(bob_identity.clone(), store.clone()).unwrap();
+        assert_eq!(restored.checkpoint_generation(), receive_generation);
+        let pending = store
+            .load_pending_inbox(bob_identity.as_bytes(), 8)
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].plaintext(), b"recoverable staged plaintext");
+        store
+            .acknowledge_inbox(bob_identity.as_bytes(), pending[0].id())
+            .unwrap();
+        assert!(store
+            .load_pending_inbox(bob_identity.as_bytes(), 8)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn explicit_leaf_reset_is_fail_closed_retryable_and_reusable() {
+        let anchor = MemoryAnchor::default();
+        anchor.allow_writes();
+        let store = VeilDbMlsStore::new(
+            Arc::new(Mutex::new(VeilDb::open_memory(&[0x94; 32]).unwrap())),
+            anchor.clone(),
+        );
+        let identity = leaf(b"explicit-leaf-reset");
+        let mut client = MlsClient::create(identity.clone(), store.clone()).unwrap();
+        client.generate_key_package().unwrap();
+
+        anchor.fail_deletes(true);
+        let error = store.delete_leaf_state(identity.as_bytes()).unwrap_err();
+        assert!(error.contains("deletion failure"));
+        assert!(MlsClient::restore(identity.clone(), store.clone()).is_err());
+
+        anchor.fail_deletes(false);
+        store.delete_leaf_state(identity.as_bytes()).unwrap();
+        let recreated = MlsClient::create(identity, store).unwrap();
+        assert_eq!(recreated.checkpoint_generation(), 0);
     }
 }

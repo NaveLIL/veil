@@ -145,6 +145,19 @@ pub fn store_mls_rollback_anchor_v1(leaf: &[u8], generation: u64) -> Result<(), 
     result
 }
 
+/// Delete the external MLS rollback anchor as the final step of an explicit
+/// leaf-state reset. Absence is idempotent; every other keychain failure is
+/// surfaced so callers cannot mistake a partial reset for success.
+pub fn delete_mls_rollback_anchor_v1(leaf: &[u8]) -> Result<(), String> {
+    let account = mls_rollback_anchor_account_v1(leaf)?;
+    let entry = Entry::new(MLS_ROLLBACK_SERVICE_NAME, &account)
+        .map_err(|error| format!("MLS rollback-anchor keychain entry: {error}"))?;
+    match entry.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(error) => Err(format!("delete MLS rollback anchor: {error}")),
+    }
+}
+
 fn validate_transparency_anchor_v1(
     anchor: &IdentityTransparencyPinnedHeadV1,
 ) -> Result<(), String> {

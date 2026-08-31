@@ -195,6 +195,26 @@ pub struct PendingMlsOutboxV1 {
     pub exact_payload: Vec<u8>,
 }
 
+/// Decrypted MLS application payload staged atomically with its receive-state
+/// checkpoint. This SQLCipher-only projection is never a network outbox item.
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
+pub struct MlsInboxWriteV1 {
+    pub item_id: [u8; 32],
+    pub group_id: [u8; 16],
+    pub source_digest: [u8; 32],
+    pub plaintext: Vec<u8>,
+}
+
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
+pub struct PendingMlsInboxV1 {
+    pub queue_order: u64,
+    pub item_id: [u8; 32],
+    pub generation: u64,
+    pub group_id: [u8; 16],
+    pub source_digest: [u8; 32],
+    pub plaintext: Vec<u8>,
+}
+
 /// Read-only durable state used by the authenticated client to distinguish a
 /// harmless repeated receipt from an unknown or conflicting wire result
 /// before any ACK/Error reconciliation mutates SQLCipher or process memory.
@@ -316,7 +336,11 @@ pub const MLS_OUTBOX_MAX_PAYLOAD_BYTES_V1: usize = 4 * 1024 * 1024;
 pub const MLS_OUTBOX_MAX_ITEMS_PER_GENERATION_V1: usize = 16;
 pub const MLS_OUTBOX_MAX_PENDING_V1: usize = 1024;
 pub const MLS_OUTBOX_MAX_LOAD_V1: usize = 256;
+pub const MLS_INBOX_MAX_PLAINTEXT_BYTES_V1: usize = 4 * 1024 * 1024;
+pub const MLS_INBOX_MAX_PENDING_V1: usize = 1024;
+pub const MLS_INBOX_MAX_LOAD_V1: usize = 256;
 const MLS_OUTBOX_ID_DOMAIN_V1: &[u8] = b"veil-mls-outbox-v1";
+const MLS_INBOX_ID_DOMAIN_V1: &[u8] = b"veil-mls-inbox-v1";
 const DIRECT_MESSAGE_RATCHET_MAX_BYTES_V1: usize = 1024 * 1024;
 const DIRECT_SESSION_BINDING_MAX_BYTES_V2: usize = 4096;
 const DIRECT_MESSAGE_RATCHET_MAX_BYTES_SQLITE_V1: i64 = 1024 * 1024;
@@ -377,6 +401,35 @@ fn validate_single_mls_outbox_item_v1(
     );
     if item.item_id != expected_id {
         return Err("MLS outbox item identifier mismatch".into());
+    }
+    Ok(())
+}
+
+fn mls_inbox_item_id_v1(
+    leaf: &[u8],
+    generation: u64,
+    group_id: &[u8; 16],
+    source_digest: &[u8; 32],
+) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(MLS_INBOX_ID_DOMAIN_V1);
+    digest.update(leaf);
+    digest.update(generation.to_be_bytes());
+    digest.update(group_id);
+    digest.update(source_digest);
+    digest.finalize().into()
+}
+
+fn validate_single_mls_inbox_item_v1(
+    leaf: &[u8],
+    generation: u64,
+    item: &MlsInboxWriteV1,
+) -> Result<(), String> {
+    if leaf.len() != 32 || item.plaintext.len() > MLS_INBOX_MAX_PLAINTEXT_BYTES_V1 {
+        return Err("MLS inbox projection shape is invalid".into());
+    }
+    if item.item_id != mls_inbox_item_id_v1(leaf, generation, &item.group_id, &item.source_digest) {
+        return Err("MLS inbox item identifier mismatch".into());
     }
     Ok(())
 }
@@ -3509,6 +3562,38 @@ impl VeilDb {
             CREATE INDEX IF NOT EXISTS idx_mls_outbox_v1_pending_leaf
                 ON mls_outbox_v1(leaf, state, queue_order);
 
+            -- Decrypted application bytes are staged inside SQLCipher in the
+            -- same transaction as the advanced receive secret tree. This
+            -- prevents a keychain failure/process death from losing plaintext
+            -- that cannot safely be decrypted a second time.
+            CREATE TABLE IF NOT EXISTS mls_inbox_v1 (
+                queue_order INTEGER PRIMARY KEY AUTOINCREMENT,
+                item_id BLOB NOT NULL UNIQUE
+                    CHECK(typeof(item_id) = 'blob' AND length(item_id) = 32),
+                leaf BLOB NOT NULL
+                    CHECK(typeof(leaf) = 'blob' AND length(leaf) = 32)
+                    REFERENCES mls_checkpoints_v1(leaf)
+                    ON UPDATE RESTRICT ON DELETE CASCADE,
+                generation INTEGER NOT NULL
+                    CHECK(generation BETWEEN 0 AND 9223372036854775807),
+                group_id BLOB NOT NULL
+                    CHECK(typeof(group_id) = 'blob' AND length(group_id) = 16),
+                source_digest BLOB NOT NULL
+                    CHECK(typeof(source_digest) = 'blob' AND length(source_digest) = 32),
+                plaintext BLOB,
+                state INTEGER NOT NULL DEFAULT 0 CHECK(state IN (0, 1)),
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                UNIQUE(leaf, generation),
+                UNIQUE(leaf, group_id, source_digest),
+                CHECK((state = 0 AND plaintext IS NOT NULL AND
+                       typeof(plaintext) = 'blob' AND length(plaintext) <= 4194304) OR
+                      (state = 1 AND plaintext IS NULL))
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_mls_inbox_v1_pending_leaf
+                ON mls_inbox_v1(leaf, state, queue_order);
+
             -- Pre-v0.3 MLS persistence was never activated. Split signer/
             -- provider tables and the first checkpoint/KP/epoch prototypes
             -- cannot be promoted into this crash-safe boundary.
@@ -3609,6 +3694,7 @@ impl VeilDb {
                     OR EXISTS(SELECT 1 FROM sender_key_historical_device_proofs_v1 LIMIT 1)
                     OR EXISTS(SELECT 1 FROM pending_sender_key_envelopes LIMIT 1)
                     OR EXISTS(SELECT 1 FROM pending_sender_key_device_envelopes_v1 LIMIT 1)
+                    OR EXISTS(SELECT 1 FROM mls_inbox_v1 LIMIT 1)
                     OR EXISTS(SELECT 1 FROM mls_outbox_v1 LIMIT 1)
                     OR EXISTS(SELECT 1 FROM mls_checkpoints_v1 LIMIT 1)",
                 [],
@@ -3637,6 +3723,7 @@ impl VeilDb {
                  DELETE FROM sender_key_incoming_routes_v1;
                  DELETE FROM sender_key_incoming_generations;
                  DELETE FROM sender_keys_local;
+                 DELETE FROM mls_inbox_v1;
                  DELETE FROM mls_outbox_v1;
                  DELETE FROM mls_checkpoints_v1;
                  UPDATE conversations
@@ -4962,7 +5049,7 @@ impl VeilDb {
 
     /// Atomically create or advance one encrypted MLS checkpoint without a
     /// network payload. Mutations that produce output must use
-    /// `mls_commit_checkpoint_and_outbox_v1` instead.
+    /// `mls_commit_checkpoint_and_outputs_v1` instead.
     pub fn mls_save_checkpoint(
         &self,
         leaf: &[u8],
@@ -4998,13 +5085,14 @@ impl VeilDb {
 
     /// Commit one checkpoint CAS and every exact protocol output produced by
     /// that OpenMLS mutation in one durable SQLCipher transaction.
-    pub fn mls_commit_checkpoint_and_outbox_v1(
+    pub fn mls_commit_checkpoint_and_outputs_v1(
         &self,
         leaf: &[u8],
         expected_previous_generation: Option<u64>,
         generation: u64,
         checkpoint: &[u8],
         outbox: &[MlsOutboxWriteV1],
+        inbox: &[MlsInboxWriteV1],
     ) -> Result<(), String> {
         Self::validate_mls_checkpoint_write_v1(
             leaf,
@@ -5013,8 +5101,14 @@ impl VeilDb {
             checkpoint,
         )?;
         Self::validate_mls_outbox_batch_v1(leaf, generation, outbox)?;
+        if inbox.len() > 1 {
+            return Err("MLS inbox batch has too many projections".into());
+        }
+        for item in inbox {
+            validate_single_mls_inbox_item_v1(leaf, generation, item)?;
+        }
 
-        let tx = begin_immediate(&self.conn, "MLS checkpoint and outbox transaction")?;
+        let tx = begin_immediate(&self.conn, "MLS checkpoint and outputs transaction")?;
         let pending: i64 = tx
             .query_row(
                 "SELECT COUNT(*) FROM mls_outbox_v1 WHERE leaf = ?1 AND state = 0",
@@ -5029,6 +5123,21 @@ impl VeilDb {
             .is_none_or(|count| count > MLS_OUTBOX_MAX_PENDING_V1 as i64)
         {
             return Err("MLS outbox pending-row limit reached".into());
+        }
+        let pending_inbox: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM mls_inbox_v1 WHERE leaf = ?1 AND state = 0",
+                rusqlite::params![leaf],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("count MLS inbox capacity: {error}"))?;
+        let proposed_inbox =
+            i64::try_from(inbox.len()).map_err(|_| "MLS inbox batch size overflow".to_string())?;
+        if pending_inbox
+            .checked_add(proposed_inbox)
+            .is_none_or(|count| count > MLS_INBOX_MAX_PENDING_V1 as i64)
+        {
+            return Err("MLS inbox pending-row limit reached".into());
         }
 
         Self::mls_save_checkpoint_on_v1(
@@ -5059,8 +5168,24 @@ impl VeilDb {
             )
             .map_err(|error| format!("insert MLS outbox item: {error}"))?;
         }
+        for item in inbox {
+            tx.execute(
+                "INSERT INTO mls_inbox_v1
+                    (item_id, leaf, generation, group_id, source_digest, plaintext)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![
+                    item.item_id.as_slice(),
+                    leaf,
+                    generation,
+                    item.group_id.as_slice(),
+                    item.source_digest.as_slice(),
+                    item.plaintext.as_slice(),
+                ],
+            )
+            .map_err(|error| format!("insert MLS inbox projection: {error}"))?;
+        }
         tx.commit()
-            .map_err(|error| format!("commit MLS checkpoint and outbox: {error}"))
+            .map_err(|error| format!("commit MLS checkpoint and outputs: {error}"))
     }
 
     /// Load the latest encrypted MLS checkpoint and its rollback generation.
@@ -5152,7 +5277,7 @@ impl VeilDb {
             let group_id = group_id
                 .map(|value| fixed_bytes::<16>("persisted MLS outbox group id", value))
                 .transpose()?;
-            let candidate = MlsOutboxWriteV1 {
+            let mut candidate = MlsOutboxWriteV1 {
                 item_id,
                 item_index,
                 kind,
@@ -5169,7 +5294,7 @@ impl VeilDb {
                 kind: candidate.kind,
                 group_id: candidate.group_id,
                 payload_digest: candidate.payload_digest,
-                exact_payload: candidate.exact_payload,
+                exact_payload: std::mem::take(&mut candidate.exact_payload),
             });
         }
         Ok(loaded)
@@ -5223,6 +5348,112 @@ impl VeilDb {
                     .map_err(|error| format!("commit MLS outbox ACK: {error}"))
             }
             _ => Err("persisted MLS outbox state is invalid".into()),
+        }
+    }
+
+    /// Load decrypted application payloads that were committed with receive
+    /// state but not yet projected into the normal message model.
+    pub fn mls_load_pending_inbox_v1(
+        &self,
+        leaf: &[u8],
+        limit: usize,
+    ) -> Result<Vec<PendingMlsInboxV1>, String> {
+        if leaf.len() != 32 {
+            return Err("MLS inbox leaf must be exactly 32 bytes".into());
+        }
+        if limit == 0 || limit > MLS_INBOX_MAX_LOAD_V1 {
+            return Err("MLS inbox page limit is invalid".into());
+        }
+        let limit = i64::try_from(limit).map_err(|_| "MLS inbox page limit overflow")?;
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT queue_order, item_id, generation, group_id,
+                        source_digest, plaintext
+                   FROM mls_inbox_v1
+                  WHERE leaf = ?1 AND state = 0
+                  ORDER BY queue_order ASC LIMIT ?2",
+            )
+            .map_err(|error| format!("prepare MLS inbox load: {error}"))?;
+        let rows = statement
+            .query_map(rusqlite::params![leaf, limit], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, Vec<u8>>(4)?,
+                    row.get::<_, Vec<u8>>(5)?,
+                ))
+            })
+            .map_err(|error| format!("load MLS inbox: {error}"))?;
+        let mut loaded = Vec::new();
+        for row in rows {
+            let (queue_order, item_id, generation, group_id, source_digest, plaintext) =
+                row.map_err(|error| format!("decode MLS inbox row: {error}"))?;
+            let queue_order = u64::try_from(queue_order)
+                .map_err(|_| "persisted MLS inbox order is invalid".to_string())?;
+            let generation = u64::try_from(generation)
+                .map_err(|_| "persisted MLS inbox generation is invalid".to_string())?;
+            let mut candidate = MlsInboxWriteV1 {
+                item_id: fixed_bytes::<32>("persisted MLS inbox item id", item_id)?,
+                group_id: fixed_bytes::<16>("persisted MLS inbox group id", group_id)?,
+                source_digest: fixed_bytes::<32>(
+                    "persisted MLS inbox source digest",
+                    source_digest,
+                )?,
+                plaintext,
+            };
+            validate_single_mls_inbox_item_v1(leaf, generation, &candidate)?;
+            loaded.push(PendingMlsInboxV1 {
+                queue_order,
+                item_id: candidate.item_id,
+                generation,
+                group_id: candidate.group_id,
+                source_digest: candidate.source_digest,
+                plaintext: std::mem::take(&mut candidate.plaintext),
+            });
+        }
+        Ok(loaded)
+    }
+
+    /// Erase one exact staged plaintext only after its normal message
+    /// projection is durable. Matching repeated ACKs are idempotent.
+    pub fn mls_acknowledge_inbox_v1(&self, leaf: &[u8], item_id: &[u8; 32]) -> Result<(), String> {
+        if leaf.len() != 32 {
+            return Err("MLS inbox leaf must be exactly 32 bytes".into());
+        }
+        let tx = begin_immediate(&self.conn, "MLS inbox acknowledgement")?;
+        let state = tx
+            .query_row(
+                "SELECT state FROM mls_inbox_v1 WHERE leaf = ?1 AND item_id = ?2",
+                rusqlite::params![leaf, item_id.as_slice()],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|error| format!("load MLS inbox acknowledgement: {error}"))?
+            .ok_or_else(|| "MLS inbox projection is unknown".to_string())?;
+        match state {
+            1 => tx
+                .commit()
+                .map_err(|error| format!("commit repeated MLS inbox ACK: {error}")),
+            0 => {
+                let changed = tx
+                    .execute(
+                        "UPDATE mls_inbox_v1
+                            SET state = 1, plaintext = NULL,
+                                updated_at = datetime('now')
+                          WHERE leaf = ?1 AND item_id = ?2 AND state = 0",
+                        rusqlite::params![leaf, item_id.as_slice()],
+                    )
+                    .map_err(|error| format!("acknowledge MLS inbox projection: {error}"))?;
+                if changed != 1 {
+                    return Err("MLS inbox acknowledgement changed concurrently".into());
+                }
+                tx.commit()
+                    .map_err(|error| format!("commit MLS inbox ACK: {error}"))
+            }
+            _ => Err("persisted MLS inbox state is invalid".into()),
         }
     }
 
@@ -5803,6 +6034,33 @@ impl VeilDb {
                 },
             )
             .transpose()
+    }
+
+    /// Delete every SQLCipher row for one MLS leaf. The external rollback
+    /// anchor is intentionally outside this layer and must be deleted only
+    /// after this transaction commits.
+    pub fn mls_delete_leaf_state_v1(&self, leaf: &[u8]) -> Result<(), String> {
+        if leaf.len() != 32 {
+            return Err("MLS leaf reset requires exactly 32 bytes".into());
+        }
+        let tx = begin_immediate(&self.conn, "MLS leaf-state reset")?;
+        tx.execute(
+            "DELETE FROM mls_inbox_v1 WHERE leaf = ?1",
+            rusqlite::params![leaf],
+        )
+        .map_err(|error| format!("delete MLS inbox during reset: {error}"))?;
+        tx.execute(
+            "DELETE FROM mls_outbox_v1 WHERE leaf = ?1",
+            rusqlite::params![leaf],
+        )
+        .map_err(|error| format!("delete MLS outbox during reset: {error}"))?;
+        tx.execute(
+            "DELETE FROM mls_checkpoints_v1 WHERE leaf = ?1",
+            rusqlite::params![leaf],
+        )
+        .map_err(|error| format!("delete MLS checkpoint during reset: {error}"))?;
+        tx.commit()
+            .map_err(|error| format!("commit MLS leaf-state reset: {error}"))
     }
 
     /// Load a cached profile only when the currently unlocked account is
@@ -20221,6 +20479,7 @@ mod tests {
             "pending_initial_headers",
             "pending_messages",
             "sender_keys_local",
+            "mls_inbox_v1",
             "mls_outbox_v1",
             "mls_checkpoints_v1",
         ] {
@@ -20371,12 +20630,13 @@ mod tests {
             payload_digest,
             exact_payload: payload.clone(),
         };
-        db.mls_commit_checkpoint_and_outbox_v1(
+        db.mls_commit_checkpoint_and_outputs_v1(
             leaf,
             Some(0),
             1,
             b"checkpoint-1",
             std::slice::from_ref(&outbox),
+            &[],
         )
         .expect("atomic checkpoint and outbox");
 
@@ -20409,6 +20669,38 @@ mod tests {
             .expect("outbox drained")
             .is_empty());
 
+        let source_digest: [u8; 32] = Sha256::digest(b"source ciphertext").into();
+        let inbox_id = mls_inbox_item_id_v1(leaf, 2, &group_id, &source_digest);
+        let inbox = MlsInboxWriteV1 {
+            item_id: inbox_id,
+            group_id,
+            source_digest,
+            plaintext: b"decrypted inside SQLCipher".to_vec(),
+        };
+        db.mls_commit_checkpoint_and_outputs_v1(
+            leaf,
+            Some(1),
+            2,
+            b"checkpoint-2",
+            &[],
+            std::slice::from_ref(&inbox),
+        )
+        .expect("atomic receive checkpoint and inbox");
+        let pending_inbox = db
+            .mls_load_pending_inbox_v1(leaf, 1)
+            .expect("load staged plaintext");
+        assert_eq!(pending_inbox.len(), 1);
+        assert_eq!(pending_inbox[0].item_id, inbox_id);
+        assert_eq!(pending_inbox[0].plaintext, inbox.plaintext);
+        db.mls_acknowledge_inbox_v1(leaf, &inbox_id)
+            .expect("acknowledge inbox projection");
+        db.mls_acknowledge_inbox_v1(leaf, &inbox_id)
+            .expect("repeated inbox ACK is idempotent");
+        assert!(db
+            .mls_load_pending_inbox_v1(leaf, 1)
+            .expect("inbox drained")
+            .is_empty());
+
         let faulted = VeilDb::open_memory(&[0xE6; 32]).unwrap();
         faulted
             .mls_save_checkpoint(leaf, None, 0, b"fault-checkpoint-0")
@@ -20422,7 +20714,14 @@ mod tests {
             )
             .unwrap();
         assert!(faulted
-            .mls_commit_checkpoint_and_outbox_v1(leaf, Some(0), 1, b"must-roll-back", &[outbox],)
+            .mls_commit_checkpoint_and_outputs_v1(
+                leaf,
+                Some(0),
+                1,
+                b"must-roll-back",
+                &[outbox],
+                &[],
+            )
             .is_err());
         assert_eq!(
             faulted.mls_load_checkpoint(leaf).unwrap(),
@@ -20430,6 +20729,44 @@ mod tests {
         );
         assert!(faulted
             .mls_load_pending_outbox_v1(leaf, 1)
+            .unwrap()
+            .is_empty());
+
+        let inbox_faulted = VeilDb::open_memory(&[0xE7; 32]).unwrap();
+        inbox_faulted
+            .mls_save_checkpoint(leaf, None, 0, b"inbox-fault-checkpoint-0")
+            .unwrap();
+        inbox_faulted
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER abort_mls_inbox_insert
+                 BEFORE INSERT ON mls_inbox_v1
+                 BEGIN SELECT RAISE(ABORT, 'injected MLS inbox failure'); END;",
+            )
+            .unwrap();
+        let fault_source: [u8; 32] = Sha256::digest(b"fault source").into();
+        let fault_inbox = MlsInboxWriteV1 {
+            item_id: mls_inbox_item_id_v1(leaf, 1, &group_id, &fault_source),
+            group_id,
+            source_digest: fault_source,
+            plaintext: b"must roll back with checkpoint".to_vec(),
+        };
+        assert!(inbox_faulted
+            .mls_commit_checkpoint_and_outputs_v1(
+                leaf,
+                Some(0),
+                1,
+                b"must-roll-back-inbox",
+                &[],
+                &[fault_inbox],
+            )
+            .is_err());
+        assert_eq!(
+            inbox_faulted.mls_load_checkpoint(leaf).unwrap(),
+            Some((0, b"inbox-fault-checkpoint-0".to_vec()))
+        );
+        assert!(inbox_faulted
+            .mls_load_pending_inbox_v1(leaf, 1)
             .unwrap()
             .is_empty());
     }
