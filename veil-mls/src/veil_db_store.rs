@@ -473,7 +473,8 @@ mod tests {
         assert_eq!(client.checkpoint_generation(), 2);
         let pending = store
             .load_pending_outbox(identity.as_bytes(), 8)
-            .unwrap_err();
+            .err()
+            .expect("anchor gap must block outbox load");
         assert!(pending.contains("heal MLS rollback anchor"));
 
         anchor.allow_writes();

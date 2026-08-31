@@ -162,7 +162,7 @@ struct ProviderSnapshot(std::collections::HashMap<Vec<u8>, Vec<u8>>);
 
 impl Drop for ProviderSnapshot {
     fn drop(&mut self) {
-        for (key, value) in &mut self.0 {
+        for (mut key, mut value) in self.0.drain() {
             key.zeroize();
             value.zeroize();
         }

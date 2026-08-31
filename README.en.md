@@ -129,7 +129,7 @@ databases, or unsanitized logs in a public Issue.
 |---|---|
 | **veil-crypto**, **veil-store**, **veil-client** | Native crypto, encrypted storage, and protocol engine |
 | **veil-search**, **veil-uploads** | In-memory search and encrypted transfer primitives |
-| **veil-ffi**, **veil-mls** | Mobile native boundary and OpenMLS 0.9 foundation with bounded atomic checkpoints; MLS runtime remains disabled |
+| **veil-ffi**, **veil-mls** | Mobile boundary and OpenMLS 0.9 with atomic SQLCipher checkpoint/outbox/inbox plus OS rollback anchor; runtime remains disabled |
 | **veil-desktop** | Tauri/SolidJS desktop application |
 | **veil-mobile** | Closed Android Direct Preview using React Native, Kotlin, and Rust/UniFFI |
 | **veil-server** | Go Veil Node gateway and hosted web surfaces |

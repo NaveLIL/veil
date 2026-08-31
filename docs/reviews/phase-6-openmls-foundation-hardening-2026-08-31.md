@@ -17,9 +17,10 @@ tree or epoch durable.
 
 The new invariant is: one leaf has one complete checkpoint, generations advance
 exactly by one through atomic compare-and-swap, restore rejects state older than
-the caller's external anchor, and a mutating API releases output only after its
-new checkpoint is durable. Any protocol, encoding, or persistence failure
-restores the exact pre-operation provider state.
+the store-owned external anchor, and a mutating API releases output only after
+its new checkpoint and exact durable output are committed. Any protocol,
+encoding, or pre-commit persistence failure restores the exact pre-operation
+provider state.
 
 ## Implemented
 
@@ -39,9 +40,10 @@ restores the exact pre-operation provider state.
 - Added an atomic `MlsKeyStore` checkpoint contract and in-memory CAS
   implementation. Restore requires a minimum external generation.
 - Replaced inactive SQLCipher `mls_signer` plus `mls_provider_snapshot` tables
-  with `mls_checkpoints(leaf, generation, checkpoint)` and a one-statement CAS
-  boundary. Old prototype rows are intentionally discarded: MLS was never an
-  enabled user feature and the formats cannot be safely combined.
+  with the versioned `mls_checkpoints_v1` boundary. The follow-up durable-
+  boundary checkpoint adds atomic `mls_outbox_v1`/`mls_inbox_v1` and the OS
+  rollback anchor. Old prototype rows are intentionally discarded: MLS was
+  never an enabled user feature and the formats cannot be safely combined.
 - Deleted unregistered Tauri commands and unused renderer wrappers that still
   modeled the old split persistence flow.
 
@@ -74,14 +76,17 @@ The final CI run and exact result are recorded in the pull request before merge.
 The local Windows host can run formatting, metadata and diff checks but lacks
 the MSVC linker/Windows SDK, so compiled Rust evidence comes from GitHub CI.
 
+## Superseded local-boundary items
+
+The `VeilDb` adapter, external rollback anchor, atomic network outbox, and
+receive recovery projection were completed later on 2026-08-31 and are
+documented in
+[`phase-6-openmls-durable-boundary-2026-08-31.md`](phase-6-openmls-durable-boundary-2026-08-31.md).
+
 ## Still blocking MLS runtime
 
 - Derive credentials from exact canonical Node origin, account, device,
   binding version and accepted transparency state.
-- Implement `MlsKeyStore` over `VeilDb` and keep the external monotonic anchor
-  outside the replaceable SQLCipher file.
-- Commit checkpoint plus ciphertext/commit/welcome outbox atomically so a crash
-  after state advance cannot lose unpublished protocol output.
 - Bound and authenticate KeyPackage lifecycle and Delivery Service operations.
 - Prove obsolete-secret deletion, concurrent-commit handling, replay/reorder,
   removal, offline catch-up/rejoin and process/power-loss recovery.

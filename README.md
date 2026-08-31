@@ -128,7 +128,7 @@ integration blockers и локальной macOS x86_64 сборкой опуб�
 | `veil-server` | Go | gateway, auth, messages, Spaces/ACL, push, uploads и invitation portal |
 | `veil-desktop` | Rust + SolidJS | Tauri v2 desktop client и Island UI |
 | `veil-mobile` | TypeScript + Kotlin + Rust | закрытый Android Direct Preview; tester signing и physical exit matrix открыты |
-| `veil-mls` | Rust | OpenMLS 0.9 foundation с bounded atomic checkpoints; runtime выключен до integration gates |
+| `veil-mls` | Rust | OpenMLS 0.9, SQLCipher checkpoint/outbox/inbox и OS rollback anchor; runtime выключен до integration gates |
 | `veil-share-viewer` | Rust/WASM | экспериментальный viewer prototype; production Secure Share ещё не подключён |
 
 ## Security model и известные границы

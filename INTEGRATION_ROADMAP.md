@@ -15,9 +15,10 @@
 > удалены. Direct v2 обязателен для отправки, outbox, live/offline receive и
 > edit; группы устанавливаются для traffic только после membership-bound
 > Sender-Key v6. Старые primitive/vector ветки остаются только в test build.
-> Изолированный `veil-mls` обновлён и получил первый persistence hardening;
-> живой MLS runtime пока не включается. Следующий шаг — адаптер единого
-> checkpoint к SQLCipher, внешний rollback anchor и атомарный outbox.
+> Изолированный `veil-mls` обновлён, а его durable boundary теперь подключён к
+> существующему SQLCipher и системному keychain. Живой MLS runtime пока не
+> включается. Следующий шаг — exact account/origin/device credential binding,
+> затем подписанный Delivery Service/KeyPackage lifecycle и runtime orchestration.
 >
 > **Dependency checkpoint 2026-08-30:** patched the actionable desktop/mobile
 > `nanoid` and `js-yaml` advisories with narrow pnpm overrides. Mobile CI keeps
@@ -70,6 +71,19 @@
 > rollback anchor, durable checkpoint+outbox transaction и interop/physical
 > gates. Официальный OpenMLS SQLite provider изучен, но не принят: его отдельный
 > bundled SQLite не должен обходить существующий SQLCipher trust boundary.
+>
+> **OpenMLS durable-boundary checkpoint 2026-08-31:** `VeilDbMlsStore`
+> реализует production adapter без второй SQLite-базы. Один `BEGIN IMMEDIATE`
+> атомарно фиксирует полный checkpoint и точные commit/welcome/ciphertext/
+> KeyPackage bytes в bounded outbox; receive одновременно фиксирует SQLCipher-
+> only plaintext projection, поэтому уже продвинутый secret tree не теряет
+> сообщение при process death или недоступности keychain. Независимый
+> монотонный generation anchor хранится в OS keychain, rollback
+> `anchor > database` блокируется, а безопасный commit-before-anchor gap
+> автоматически догоняется перед restore. Явный leaf reset удаляет SQLCipher
+> state первым и keychain anchor последним, поэтому частичный reset остаётся
+> fail-closed и retryable. MLS всё ещё не является пользовательским режимом:
+> credential/Delivery Service/runtime/interop/physical gates открыты.
 >
 > **Checkpoint 2026-08-30:** ADR и open-source policy зафиксированы; desktop
 > PIN 4–5, Android SharedPreferences vault migration и зарегистрированный
@@ -184,7 +198,7 @@ Veil ещё не выпускался, поэтому runtime backward compatibi
 | 5B | Android messaging | automated receive/read, one-shot peer-prekey, idempotent native send/outbox, typed ACK, transient reconnect и true-empty Ready опубликованы; contacts/create-Direct UI и native request scaffolding добавлены, но route/header/friend-request/UniFFI contracts не состыкованы; полная Desktop ↔ Android E2EE/airplane/background/process-death matrix открыта |
 | 5C | Secure QR device linking / multi-device | отдельный blocking gate не начат: second-device enrollment, SAS approval, atomic activation, revoke и hostile-relay matrix обязательны до корректного multi-device |
 | 5S | Direct protocol assurance & hostile Node | production WS v3/REST v2 cutover выполнен, legacy `/ws`/REST v1 fail closed, cross-Node credential-scope P1 и hostile two-Node relay matrix закрыты; Direct v2, transparency/witness/gossip, membership epochs и Sender-Key v6 реализованы и покрыты frozen vectors/CI; release exit открыт до Direct-vs-`libsignal` ADR, independently operated witnesses, physical Android trust/QR matrix и независимого аудита |
-| 6 | OpenMLS | upstream 0.9 + bounded atomic checkpoint foundation готовы; SQLCipher adapter/external anchor/outbox и runtime-ветвление ещё открыты |
+| 6 | OpenMLS | upstream 0.9, единый bounded checkpoint, SQLCipher adapter, OS rollback anchor и атомарные outbox/inbox готовы; credential/Delivery Service/runtime/interop gates открыты |
 | 7 | LiveKit звонки | не начато |
 | 8 | Полировка, релиз | частично: полный CI и beta artifact matrix зелёные на `92fc1c3`, short-lived debug APK и unsigned desktop artifacts доступны; stable signing/notarization, signed tester APK, physical matrices и public release gate отсутствуют |
 
@@ -2657,15 +2671,27 @@ Migration plan:
   async catch-up, KeyPackage и restart/epoch round-trip покрыты тестами.
 - Каждая mutating API операция требует `&mut`, сохраняет единый checkpoint до
   release результата и восстанавливает provider при любой ошибке. Store
-  contract атомарно сравнивает предыдущее поколение; restore принимает внешний
-  minimum generation и отвергает локальный rollback.
+  contract атомарно сравнивает предыдущее поколение; restore сверяется с
+  независимым store-owned rollback anchor и не принимает caller-controlled
+  minimum generation.
 - Checkpoint v1 объединяет signer и provider state, привязан к leaf, canonical,
   versioned, bounded и corruption/trailing/duplicate-safe. Старый unversioned
   split format намеренно не мигрируется: активных MLS-пользователей нет.
-- SQLCipher schema (`veil-store/src/db.rs`) содержит `mls_checkpoints` с
-  atomic generation CAS, `mls_key_packages_local`, `mls_state` и
-  `conversations.crypto_mode`. Старые `mls_signer`/`mls_provider_snapshot`
-  удаляются как неактивный pre-v0.3 prototype state.
+- SQLCipher schema (`veil-store/src/db.rs`) содержит `mls_checkpoints_v1`,
+  `mls_outbox_v1` и `mls_inbox_v1`. Checkpoint CAS, все точные network outputs
+  и receive plaintext projection фиксируются одной транзакцией. Outbox/inbox
+  имеют hard size/count/page bounds и exact digest-derived IDs; ACK удаляет
+  secret-bearing bytes. Старые `mls_signer`, `mls_provider_snapshot`,
+  `mls_checkpoints`, `mls_key_packages_local` и `mls_state` удаляются как
+  неактивный pre-v0.3 prototype state.
+- `VeilDbMlsStore` использует существующий SQLCipher authority и внешний OS
+  keychain generation anchor. DB-behind-anchor считается rollback; DB-ahead-
+  of-anchor после commit/keychain crash безопасно heal'ится. Явный leaf reset
+  сначала удаляет SQLCipher rows, затем anchor, сохраняя fail-closed retry.
+- Commit/Welcome/Ciphertext/KeyPackage никогда не выходят из mutating API до
+  durable checkpoint+outbox. Receive plaintext дополнительно staging'ится в
+  SQLCipher вместе с продвинутым secret tree и подтверждается только после
+  durable projection в обычную модель сообщений.
 - PostgreSQL миграция `008_mls.sql`: колонка `crypto_mode` с CHECK-констрейнтом, таблицы `mls_key_packages`, `mls_welcomes`, `mls_commits` с индексами и наглядным TTL-планом.
 - Серверный пакет `internal/mls`: `Store` (батчевая публикация KP, атомарный consume через `DELETE … FOR UPDATE SKIP LOCKED`, append-only лог commits с `ErrEpochConflict` на 23505) и `Handler` с REST: `POST /v1/mls/keypackages`, `GET …/count`, `GET …/{user}/{device}`, `POST/GET/DELETE /v1/mls/welcomes`, `POST /v1/mls/commits`, `GET /v1/mls/commits/{conv}?after_epoch=N`. Интеграция с подписной middleware (`X-Veil-User/Timestamp/Signature`).
 - Hub реализует `mls.Fanout` (стабы с slog) — клиенты пока подбирают welcomes/commits через REST на reconnect; перевод на отдельный envelope-вариант WS — следующий шаг.
@@ -2674,17 +2700,20 @@ Migration plan:
 
 ### Что осталось
 
+- Exact MLS credential: canonical Node origin, account UUID/identity key,
+  device binding/version и принятый transparency state; capability negotiation
+  должна быть per-device и защищённой от cross-origin/cross-account подмены.
 - HTTP-клиент в `veil-client` для подписанных REST-запросов к `/v1/mls/*` (сейчас клиент целиком работает поверх WS protobuf).
-- Адаптер `MlsKeyStore` поверх `VeilDb`, который хранит целый checkpoint и
-  внешний rollback anchor, а checkpoint + network outbox фиксирует одной
-  durable транзакцией до публикации ciphertext/commit/welcome.
 - Ветвление `send_text`/`receive` в `veil-client/src/api.rs` по `crypto_mode` разговора.
-- Зарегистрировать и связать существующие Tauri-команды; добавить отсутствующий
-  `mls_upgrade_group`, UI-индикатор «MLS active» и кнопку Upgrade.
+- Подключить новую reviewed Tauri/UniFFI runtime surface; старые неподключённые
+  команды удалены и не должны возвращаться как compatibility layer. Добавить
+  детерминированный group upgrade и правдивый UI-индикатор только после gates.
 - Полноценный WS-канал `mls.welcome`/`mls.commit` (новый вариант `pb.Envelope`) вместо текущего log-стаба.
 - Интеграционные тесты: catch-up Charlie оффлайн, авто-пополнение KP при count < 10, упорядоченное применение commits на трёх устройствах.
-- До всего перечисленного: формализовать per-device identity и capability
-  negotiation. Без этого MLS для Android/desktop multi-device не включается.
+- Adversarial/reliability matrix: concurrent commits, replay/reorder, removal,
+  stale device, exhausted KeyPackages, offline catch-up/rejoin, outbox/inbox
+  projection, process/power loss, obsolete-secret deletion, parser/fuzz,
+  hostile Node и desktop/Android physical interop.
 
 ---
 

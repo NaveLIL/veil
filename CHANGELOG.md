@@ -51,14 +51,18 @@ users.
   MLS operations now persist a consecutive compare-and-swap generation before
   releasing output and restore exact in-memory state on failure.
 - Replaced the inactive split SQLCipher MLS tables with one atomic checkpoint
-  row and removed disconnected desktop/renderer MLS command scaffolding. MLS
-  remains unavailable to users until the remaining credential, external
-  rollback-anchor, durable outbox, interop and physical-device gates close.
+  row and removed disconnected desktop/renderer MLS command scaffolding.
+- Added the production `VeilDb` MLS persistence adapter: SQLCipher atomically
+  commits each checkpoint with exact bounded network outbox bytes and decrypted
+  receive projection; an OS-keychain generation anchor detects database
+  rollback and safely heals only the commit-before-anchor crash gap. Explicit
+  leaf reset is fail-closed and retryable. MLS remains unavailable to users
+  until credential, Delivery Service, runtime, interop and physical gates close.
 
 This is an intentionally breaking pre-release line. Direct v1/Sender-Key v5
-storage deletion and the OpenMLS runtime integration remain pending and are tracked in
-ADR-0004 and `INTEGRATION_ROADMAP.md`; production traffic no longer uses those
-legacy profiles.
+storage deletion and the OpenMLS runtime integration remain pending and are
+tracked in ADR-0004 and `INTEGRATION_ROADMAP.md`; production traffic no longer
+uses those legacy profiles.
 
 ## 0.2.0 Preview — 2026-08-05
 

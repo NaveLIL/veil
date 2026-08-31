@@ -581,7 +581,7 @@ impl MlsKeyStore for InMemoryStore {
         match (checkpoint.as_ref(), state.anchors.get(leaf)) {
             (None, None) => Ok(None),
             (Some(checkpoint), Some(anchor)) if checkpoint.generation() == *anchor => {
-                Ok(checkpoint.cloned())
+                Ok(Some(checkpoint.clone()))
             }
             (Some(_), None) => Err("MLS rollback anchor is missing".into()),
             (None, Some(_)) => Err("MLS rollback anchor exists without a checkpoint".into()),
