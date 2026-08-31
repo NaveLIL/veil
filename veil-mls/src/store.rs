@@ -7,6 +7,7 @@
 
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
@@ -20,6 +21,13 @@ pub const MAX_CHECKPOINT_ENTRIES: usize = 100_000;
 pub const MAX_CHECKPOINT_KEY_BYTES: usize = 64 * 1024;
 pub const MAX_CHECKPOINT_VALUE_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_CHECKPOINT_SIGNER_BYTES: usize = 64 * 1024;
+pub const MAX_OUTBOX_ITEMS_PER_GENERATION: usize = 16;
+pub const MAX_OUTBOX_PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_INBOX_PROJECTIONS_PER_GENERATION: usize = 1;
+pub const MAX_INBOX_PLAINTEXT_BYTES: usize = 4 * 1024 * 1024;
+
+const OUTBOX_ID_DOMAIN: &[u8] = b"veil-mls-outbox-v1";
+const INBOX_ID_DOMAIN: &[u8] = b"veil-mls-inbox-v1";
 
 /// Opaque, secret-bearing checkpoint stored in an encrypted persistence layer.
 ///
@@ -49,32 +57,464 @@ impl CheckpointBlob {
     }
 }
 
-/// Atomic storage adapter for one complete MLS client checkpoint.
+/// Network payload kind persisted with the exact MLS state that produced it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum MlsOutboxKind {
+    KeyPackage = 1,
+    Welcome = 2,
+    Commit = 3,
+    Ciphertext = 4,
+}
+
+impl MlsOutboxKind {
+    pub fn from_u8(value: u8) -> Result<Self, String> {
+        match value {
+            1 => Ok(Self::KeyPackage),
+            2 => Ok(Self::Welcome),
+            3 => Ok(Self::Commit),
+            4 => Ok(Self::Ciphertext),
+            _ => Err("MLS outbox kind is invalid".into()),
+        }
+    }
+
+    pub fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    fn requires_group(self) -> bool {
+        !matches!(self, Self::KeyPackage)
+    }
+}
+
+/// One exact payload that must be durable before it can be published.
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
+pub struct MlsOutboxPayload {
+    #[zeroize(skip)]
+    kind: MlsOutboxKind,
+    group_id: Option<[u8; 16]>,
+    bytes: Vec<u8>,
+}
+
+impl MlsOutboxPayload {
+    pub fn new(
+        kind: MlsOutboxKind,
+        group_id: Option<[u8; 16]>,
+        bytes: Vec<u8>,
+    ) -> Result<Self, String> {
+        if bytes.is_empty() || bytes.len() > MAX_OUTBOX_PAYLOAD_BYTES {
+            return Err("MLS outbox payload size is invalid".into());
+        }
+        if kind.requires_group() != group_id.is_some() {
+            return Err("MLS outbox payload group scope is invalid".into());
+        }
+        Ok(Self {
+            kind,
+            group_id,
+            bytes,
+        })
+    }
+
+    pub fn kind(&self) -> MlsOutboxKind {
+        self.kind
+    }
+
+    pub fn group_id(&self) -> Option<&[u8; 16]> {
+        self.group_id.as_ref()
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+/// Result kind staged beside a receive-state checkpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum MlsInboxKind {
+    Welcome = 1,
+    Commit = 2,
+    Application = 3,
+}
+
+impl MlsInboxKind {
+    pub fn from_u8(value: u8) -> Result<Self, String> {
+        match value {
+            1 => Ok(Self::Welcome),
+            2 => Ok(Self::Commit),
+            3 => Ok(Self::Application),
+            _ => Err("MLS inbox kind is invalid".into()),
+        }
+    }
+
+    pub fn as_u8(self) -> u8 {
+        self as u8
+    }
+}
+
+/// Inbound control receipt or decrypted application payload staged in
+/// SQLCipher beside the receive-state checkpoint. It is never returned by the
+/// network outbox API.
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
+pub struct MlsInboxProjection {
+    #[zeroize(skip)]
+    kind: MlsInboxKind,
+    group_id: [u8; 16],
+    source_digest: [u8; 32],
+    plaintext: Vec<u8>,
+}
+
+impl MlsInboxProjection {
+    pub fn new(
+        kind: MlsInboxKind,
+        group_id: [u8; 16],
+        source_digest: [u8; 32],
+        plaintext: Vec<u8>,
+    ) -> Result<Self, String> {
+        if plaintext.len() > MAX_INBOX_PLAINTEXT_BYTES {
+            return Err("MLS inbox plaintext exceeds the limit".into());
+        }
+        if kind != MlsInboxKind::Application && !plaintext.is_empty() {
+            return Err("MLS control receipt must not contain plaintext".into());
+        }
+        Ok(Self {
+            kind,
+            group_id,
+            source_digest,
+            plaintext,
+        })
+    }
+
+    pub fn kind(&self) -> MlsInboxKind {
+        self.kind
+    }
+
+    pub fn group_id(&self) -> &[u8; 16] {
+        &self.group_id
+    }
+
+    pub fn source_digest(&self) -> &[u8; 32] {
+        &self.source_digest
+    }
+
+    pub fn plaintext(&self) -> &[u8] {
+        &self.plaintext
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MlsInboxId([u8; 32]);
+
+impl MlsInboxId {
+    pub fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for MlsInboxId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("MlsInboxId(")?;
+        formatter.write_str(&hex::encode(self.0))?;
+        formatter.write_str(")")
+    }
+}
+
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
+pub struct StoredMlsInboxProjection {
+    #[zeroize(skip)]
+    id: MlsInboxId,
+    generation: u64,
+    #[zeroize(skip)]
+    kind: MlsInboxKind,
+    group_id: [u8; 16],
+    source_digest: [u8; 32],
+    plaintext: Vec<u8>,
+}
+
+impl StoredMlsInboxProjection {
+    pub fn from_parts(
+        leaf: &[u8],
+        id: MlsInboxId,
+        generation: u64,
+        kind: MlsInboxKind,
+        group_id: [u8; 16],
+        source_digest: [u8; 32],
+        plaintext: Vec<u8>,
+    ) -> Result<Self, String> {
+        if leaf.len() != 32
+            || plaintext.len() > MAX_INBOX_PLAINTEXT_BYTES
+            || (kind != MlsInboxKind::Application && !plaintext.is_empty())
+        {
+            return Err("MLS inbox projection shape is invalid".into());
+        }
+        if id != derive_inbox_id(leaf, generation, kind, &group_id, &source_digest) {
+            return Err("MLS inbox identifier mismatch".into());
+        }
+        Ok(Self {
+            id,
+            generation,
+            kind,
+            group_id,
+            source_digest,
+            plaintext,
+        })
+    }
+
+    pub fn kind(&self) -> MlsInboxKind {
+        self.kind
+    }
+
+    pub fn id(&self) -> MlsInboxId {
+        self.id
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub fn group_id(&self) -> &[u8; 16] {
+        &self.group_id
+    }
+
+    pub fn source_digest(&self) -> &[u8; 32] {
+        &self.source_digest
+    }
+
+    pub fn plaintext(&self) -> &[u8] {
+        &self.plaintext
+    }
+}
+
+/// Stable identifier for one exact outbox payload.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MlsOutboxId([u8; 32]);
+
+impl MlsOutboxId {
+    pub fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for MlsOutboxId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("MlsOutboxId(")?;
+        formatter.write_str(&hex::encode(self.0))?;
+        formatter.write_str(")")
+    }
+}
+
+/// Durable payload loaded for retry after a crash or transport failure.
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
+pub struct StoredMlsOutboxItem {
+    #[zeroize(skip)]
+    id: MlsOutboxId,
+    generation: u64,
+    item_index: u8,
+    #[zeroize(skip)]
+    kind: MlsOutboxKind,
+    group_id: Option<[u8; 16]>,
+    payload_digest: [u8; 32],
+    bytes: Vec<u8>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct MlsOutboxMetadata {
+    pub id: MlsOutboxId,
+    pub generation: u64,
+    pub item_index: u8,
+    pub kind: MlsOutboxKind,
+    pub group_id: Option<[u8; 16]>,
+    pub payload_digest: [u8; 32],
+}
+
+impl StoredMlsOutboxItem {
+    pub(crate) fn from_parts(
+        leaf: &[u8],
+        metadata: MlsOutboxMetadata,
+        bytes: Vec<u8>,
+    ) -> Result<Self, String> {
+        MlsOutboxPayload::new(metadata.kind, metadata.group_id, bytes.clone())?;
+        if Sha256::digest(&bytes).as_slice() != metadata.payload_digest {
+            return Err("MLS outbox payload digest mismatch".into());
+        }
+        if leaf.len() != 32 {
+            return Err("MLS outbox leaf must be exactly 32 bytes".into());
+        }
+        if metadata.id
+            != derive_outbox_id(
+                leaf,
+                metadata.generation,
+                metadata.item_index,
+                metadata.kind,
+                metadata.group_id.as_ref(),
+                &metadata.payload_digest,
+            )
+        {
+            return Err("MLS outbox identifier mismatch".into());
+        }
+        Ok(Self {
+            id: metadata.id,
+            generation: metadata.generation,
+            item_index: metadata.item_index,
+            kind: metadata.kind,
+            group_id: metadata.group_id,
+            payload_digest: metadata.payload_digest,
+            bytes,
+        })
+    }
+
+    pub fn id(&self) -> MlsOutboxId {
+        self.id
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub fn item_index(&self) -> u8 {
+        self.item_index
+    }
+
+    pub fn kind(&self) -> MlsOutboxKind {
+        self.kind
+    }
+
+    pub fn group_id(&self) -> Option<&[u8; 16]> {
+        self.group_id.as_ref()
+    }
+
+    pub fn payload_digest(&self) -> &[u8; 32] {
+        &self.payload_digest
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+pub(crate) fn derive_outbox_id(
+    leaf: &[u8],
+    generation: u64,
+    item_index: u8,
+    kind: MlsOutboxKind,
+    group_id: Option<&[u8; 16]>,
+    payload_digest: &[u8; 32],
+) -> MlsOutboxId {
+    let mut digest = Sha256::new();
+    digest.update(OUTBOX_ID_DOMAIN);
+    digest.update(leaf);
+    digest.update(generation.to_be_bytes());
+    digest.update([item_index, kind.as_u8()]);
+    digest.update(group_id.map_or(&[][..], |value| value.as_slice()));
+    digest.update(payload_digest);
+    MlsOutboxId(digest.finalize().into())
+}
+
+pub(crate) fn derive_inbox_id(
+    leaf: &[u8],
+    generation: u64,
+    kind: MlsInboxKind,
+    group_id: &[u8; 16],
+    source_digest: &[u8; 32],
+) -> MlsInboxId {
+    let mut digest = Sha256::new();
+    digest.update(INBOX_ID_DOMAIN);
+    digest.update(leaf);
+    digest.update(generation.to_be_bytes());
+    digest.update([kind.as_u8()]);
+    digest.update(group_id);
+    digest.update(source_digest);
+    MlsInboxId(digest.finalize().into())
+}
+
+/// Failure from the durable checkpoint boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MlsPersistError {
+    /// Nothing from the proposed mutation became durable.
+    Rejected(String),
+    /// Checkpoint and durable outputs committed, but the external rollback
+    /// anchor could not be advanced. The caller must keep the new in-memory
+    /// state and recover through the durable outbox/inbox instead of repeating
+    /// the protocol mutation.
+    CommittedAnchorPending(String),
+}
+
+impl fmt::Display for MlsPersistError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Rejected(message) => formatter.write_str(message),
+            Self::CommittedAnchorPending(message) => formatter.write_str(message),
+        }
+    }
+}
+
+/// Atomic storage adapter for one complete MLS client checkpoint, every exact
+/// network payload, and every inbound result produced by the same mutation.
 ///
 /// Implementations MUST encrypt `checkpoint` at rest and atomically enforce the
 /// compare-and-swap precondition. `None` means that no checkpoint may exist;
 /// `Some(n)` means the stored generation must equal `n`. Returning `Ok(())`
-/// means the whole new checkpoint is durable. Returning `Err` must never expose
-/// a partial checkpoint.
+/// means the whole new checkpoint and output batch are durable. A `Rejected`
+/// error must never expose partial state. `CommittedAnchorPending` is reserved
+/// for the post-commit OS-anchor gap and still guarantees durable outputs.
 pub trait MlsKeyStore: Send + Sync + 'static {
     fn save_checkpoint(
         &self,
         leaf: &[u8],
         expected_previous_generation: Option<u64>,
         checkpoint: CheckpointBlob,
-    ) -> Result<(), String>;
+        outbox: Vec<MlsOutboxPayload>,
+        inbox: Vec<MlsInboxProjection>,
+    ) -> Result<(), MlsPersistError>;
 
     fn load_checkpoint(&self, leaf: &[u8]) -> Result<Option<CheckpointBlob>, String>;
+
+    fn load_pending_outbox(
+        &self,
+        leaf: &[u8],
+        limit: usize,
+    ) -> Result<Vec<StoredMlsOutboxItem>, String>;
+
+    fn acknowledge_outbox(
+        &self,
+        leaf: &[u8],
+        id: MlsOutboxId,
+        payload_digest: &[u8; 32],
+    ) -> Result<(), String>;
+
+    fn load_pending_inbox(
+        &self,
+        leaf: &[u8],
+        limit: usize,
+    ) -> Result<Vec<StoredMlsInboxProjection>, String>;
+
+    fn acknowledge_inbox(&self, leaf: &[u8], id: MlsInboxId) -> Result<(), String>;
 }
 
 /// In-memory implementation for tests and local-only flows.
 #[derive(Clone, Default)]
 pub struct InMemoryStore {
-    inner: Arc<Mutex<HashMap<Vec<u8>, CheckpointBlob>>>,
+    inner: Arc<Mutex<InMemoryState>>,
+}
+
+#[derive(Default)]
+struct InMemoryState {
+    checkpoints: HashMap<Vec<u8>, CheckpointBlob>,
+    anchors: HashMap<Vec<u8>, u64>,
+    outbox: Vec<(Vec<u8>, StoredMlsOutboxItem)>,
+    inbox: Vec<(Vec<u8>, StoredMlsInboxProjection)>,
 }
 
 impl InMemoryStore {
-    fn lock(&self) -> Result<MutexGuard<'_, HashMap<Vec<u8>, CheckpointBlob>>, String> {
+    fn lock(&self) -> Result<MutexGuard<'_, InMemoryState>, String> {
         self.inner
             .lock()
             .map_err(|_| "InMemoryStore mutex poisoned".to_string())
@@ -87,28 +527,191 @@ impl MlsKeyStore for InMemoryStore {
         leaf: &[u8],
         expected_previous_generation: Option<u64>,
         checkpoint: CheckpointBlob,
-    ) -> Result<(), String> {
+        outbox: Vec<MlsOutboxPayload>,
+        inbox: Vec<MlsInboxProjection>,
+    ) -> Result<(), MlsPersistError> {
+        if leaf.len() != 32 {
+            return Err(MlsPersistError::Rejected(
+                "MLS leaf must be exactly 32 bytes".into(),
+            ));
+        }
+        if outbox.len() > MAX_OUTBOX_ITEMS_PER_GENERATION {
+            return Err(MlsPersistError::Rejected(
+                "MLS outbox batch has too many items".into(),
+            ));
+        }
+        if inbox.len() > MAX_INBOX_PROJECTIONS_PER_GENERATION {
+            return Err(MlsPersistError::Rejected(
+                "MLS inbox batch has too many projections".into(),
+            ));
+        }
         let expected_next = match expected_previous_generation {
-            Some(previous) => previous
-                .checked_add(1)
-                .ok_or_else(|| "MLS checkpoint generation exhausted".to_string())?,
+            Some(previous) => previous.checked_add(1).ok_or_else(|| {
+                MlsPersistError::Rejected("MLS checkpoint generation exhausted".into())
+            })?,
             None => 0,
         };
         if checkpoint.generation() != expected_next {
-            return Err("MLS checkpoint generation is not consecutive".into());
+            return Err(MlsPersistError::Rejected(
+                "MLS checkpoint generation is not consecutive".into(),
+            ));
         }
 
-        let mut checkpoints = self.lock()?;
-        let actual_previous = checkpoints.get(leaf).map(CheckpointBlob::generation);
+        let mut state = self.lock().map_err(MlsPersistError::Rejected)?;
+        let actual_previous = state.checkpoints.get(leaf).map(CheckpointBlob::generation);
         if actual_previous != expected_previous_generation {
-            return Err("MLS checkpoint compare-and-swap conflict".into());
+            return Err(MlsPersistError::Rejected(
+                "MLS checkpoint compare-and-swap conflict".into(),
+            ));
         }
-        checkpoints.insert(leaf.to_vec(), checkpoint);
+        let anchor = state.anchors.get(leaf).copied();
+        if expected_previous_generation.is_none() {
+            if anchor.is_some_and(|generation| generation != 0) {
+                return Err(MlsPersistError::Rejected(
+                    "MLS rollback anchor conflicts with initial checkpoint".into(),
+                ));
+            }
+        } else if anchor != expected_previous_generation {
+            return Err(MlsPersistError::Rejected(
+                "MLS rollback anchor does not match the previous checkpoint".into(),
+            ));
+        }
+
+        let mut stored = Vec::with_capacity(outbox.len());
+        for (index, payload) in outbox.into_iter().enumerate() {
+            let item_index = u8::try_from(index)
+                .map_err(|_| MlsPersistError::Rejected("MLS outbox item index overflow".into()))?;
+            let payload_digest: [u8; 32] = Sha256::digest(payload.as_bytes()).into();
+            let id = derive_outbox_id(
+                leaf,
+                expected_next,
+                item_index,
+                payload.kind(),
+                payload.group_id(),
+                &payload_digest,
+            );
+            let item = StoredMlsOutboxItem::from_parts(
+                leaf,
+                MlsOutboxMetadata {
+                    id,
+                    generation: expected_next,
+                    item_index,
+                    kind: payload.kind(),
+                    group_id: payload.group_id().copied(),
+                    payload_digest,
+                },
+                payload.as_bytes().to_vec(),
+            )
+            .map_err(MlsPersistError::Rejected)?;
+            stored.push((leaf.to_vec(), item));
+        }
+        let mut stored_inbox = Vec::with_capacity(inbox.len());
+        for projection in inbox {
+            let id = derive_inbox_id(
+                leaf,
+                expected_next,
+                projection.kind(),
+                projection.group_id(),
+                projection.source_digest(),
+            );
+            let item = StoredMlsInboxProjection::from_parts(
+                leaf,
+                id,
+                expected_next,
+                projection.kind(),
+                *projection.group_id(),
+                *projection.source_digest(),
+                projection.plaintext().to_vec(),
+            )
+            .map_err(MlsPersistError::Rejected)?;
+            stored_inbox.push((leaf.to_vec(), item));
+        }
+
+        state.checkpoints.insert(leaf.to_vec(), checkpoint);
+        state.outbox.extend(stored);
+        state.inbox.extend(stored_inbox);
+        state.anchors.insert(leaf.to_vec(), expected_next);
         Ok(())
     }
 
     fn load_checkpoint(&self, leaf: &[u8]) -> Result<Option<CheckpointBlob>, String> {
-        Ok(self.lock()?.get(leaf).cloned())
+        let state = self.lock()?;
+        let checkpoint = state.checkpoints.get(leaf).cloned();
+        match (checkpoint.as_ref(), state.anchors.get(leaf)) {
+            (None, None) => Ok(None),
+            (Some(checkpoint), Some(anchor)) if checkpoint.generation() == *anchor => {
+                Ok(Some(checkpoint.clone()))
+            }
+            (Some(_), None) => Err("MLS rollback anchor is missing".into()),
+            (None, Some(_)) => Err("MLS rollback anchor exists without a checkpoint".into()),
+            (Some(_), Some(_)) => Err("MLS checkpoint conflicts with rollback anchor".into()),
+        }
+    }
+
+    fn load_pending_outbox(
+        &self,
+        leaf: &[u8],
+        limit: usize,
+    ) -> Result<Vec<StoredMlsOutboxItem>, String> {
+        if limit == 0 || limit > 16 {
+            return Err("MLS outbox page limit is invalid".into());
+        }
+        Ok(self
+            .lock()?
+            .outbox
+            .iter()
+            .filter(|(stored_leaf, _)| stored_leaf.as_slice() == leaf)
+            .take(limit)
+            .map(|(_, item)| item.clone())
+            .collect())
+    }
+
+    fn acknowledge_outbox(
+        &self,
+        leaf: &[u8],
+        id: MlsOutboxId,
+        payload_digest: &[u8; 32],
+    ) -> Result<(), String> {
+        let mut state = self.lock()?;
+        let index = state
+            .outbox
+            .iter()
+            .position(|(stored_leaf, item)| stored_leaf.as_slice() == leaf && item.id() == id)
+            .ok_or_else(|| "MLS outbox item is unknown".to_string())?;
+        if state.outbox[index].1.payload_digest() != payload_digest {
+            return Err("MLS outbox acknowledgement digest mismatch".into());
+        }
+        state.outbox.remove(index);
+        Ok(())
+    }
+
+    fn load_pending_inbox(
+        &self,
+        leaf: &[u8],
+        limit: usize,
+    ) -> Result<Vec<StoredMlsInboxProjection>, String> {
+        if limit == 0 || limit > 16 {
+            return Err("MLS inbox page limit is invalid".into());
+        }
+        Ok(self
+            .lock()?
+            .inbox
+            .iter()
+            .filter(|(stored_leaf, _)| stored_leaf.as_slice() == leaf)
+            .take(limit)
+            .map(|(_, item)| item.clone())
+            .collect())
+    }
+
+    fn acknowledge_inbox(&self, leaf: &[u8], id: MlsInboxId) -> Result<(), String> {
+        let mut state = self.lock()?;
+        let index = state
+            .inbox
+            .iter()
+            .position(|(stored_leaf, item)| stored_leaf.as_slice() == leaf && item.id() == id)
+            .ok_or_else(|| "MLS inbox projection is unknown".to_string())?;
+        state.inbox.remove(index);
+        Ok(())
     }
 }
 
@@ -326,12 +929,14 @@ fn read_u64(cursor: &mut &[u8]) -> Result<u64, String> {
 mod tests {
     use super::*;
 
+    const LEAF: &[u8; 32] = &[0xA1; 32];
+
     fn sample_checkpoint() -> CheckpointBlob {
         let values = HashMap::from([
             (b"bravo".to_vec(), b"two".to_vec()),
             (b"alpha".to_vec(), b"one".to_vec()),
         ]);
-        encode_checkpoint(b"leaf-a", 7, b"signer", &values).expect("encode")
+        encode_checkpoint(LEAF, 7, b"signer", &values).expect("encode")
     }
 
     #[test]
@@ -340,16 +945,16 @@ mod tests {
         let second = sample_checkpoint();
         assert_eq!(first.as_bytes(), second.as_bytes());
 
-        let decoded = decode_checkpoint(b"leaf-a", &first).expect("decode");
+        let decoded = decode_checkpoint(LEAF, &first).expect("decode");
         assert_eq!(decoded.generation, 7);
         assert_eq!(decoded.signer, b"signer");
         assert_eq!(decoded.entries[0].0, b"alpha");
         assert_eq!(decoded.entries[1].0, b"bravo");
 
-        assert!(decode_checkpoint(b"leaf-b", &first).is_err());
+        assert!(decode_checkpoint(&[0xB2; 32], &first).is_err());
         let wrong_generation =
             CheckpointBlob::from_parts(8, first.as_bytes().to_vec()).expect("blob");
-        assert!(decode_checkpoint(b"leaf-a", &wrong_generation).is_err());
+        assert!(decode_checkpoint(LEAF, &wrong_generation).is_err());
     }
 
     #[test]
@@ -402,21 +1007,21 @@ mod tests {
         let store = InMemoryStore::default();
         let checkpoint = sample_checkpoint();
         assert!(store
-            .save_checkpoint(b"leaf-a", Some(6), checkpoint.clone())
+            .save_checkpoint(LEAF, Some(6), checkpoint.clone(), Vec::new(), Vec::new())
             .is_err());
         assert!(store
-            .save_checkpoint(b"leaf-a", None, checkpoint.clone())
+            .save_checkpoint(LEAF, None, checkpoint.clone(), Vec::new(), Vec::new())
             .is_err());
 
-        let initial = encode_checkpoint(b"leaf-a", 0, b"signer", &HashMap::new()).unwrap();
+        let initial = encode_checkpoint(LEAF, 0, b"signer", &HashMap::new()).unwrap();
         store
-            .save_checkpoint(b"leaf-a", None, initial)
+            .save_checkpoint(LEAF, None, initial, Vec::new(), Vec::new())
             .expect("initial save");
         assert!(store
-            .save_checkpoint(b"leaf-a", None, checkpoint.clone())
+            .save_checkpoint(LEAF, None, checkpoint.clone(), Vec::new(), Vec::new())
             .is_err());
         assert!(store
-            .save_checkpoint(b"leaf-a", Some(0), checkpoint)
+            .save_checkpoint(LEAF, Some(0), checkpoint, Vec::new(), Vec::new())
             .is_err());
     }
 }

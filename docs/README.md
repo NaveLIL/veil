@@ -61,6 +61,8 @@ ADR фиксирует принятое решение и причины. Изм
 - [Phase 4E completion gate](reviews/phase-4e-completion-gate.md)
 - [Phase 4E Veil Link schema/security review](reviews/phase-4e-veil-link-schema-security-review.md)
 - [Phase 4P device push client review](reviews/phase-4p-device-push-client-review.md)
+- [Phase 6 OpenMLS foundation hardening](reviews/phase-6-openmls-foundation-hardening-2026-08-31.md)
+- [Phase 6 OpenMLS durable boundary](reviews/phase-6-openmls-durable-boundary-2026-08-31.md)
 - [Android runtime terminal failure review](reviews/android-runtime-terminal-failure-review.md)
 - [Android identity setup reconciliation review](reviews/android-identity-setup-reconciliation-review.md)
 - [Android Direct public-failure action contract](reviews/android-direct-public-failure-action-contract.md)

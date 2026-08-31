@@ -1,12 +1,23 @@
 use keyring::Entry;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::sync::Mutex;
 use zeroize::Zeroize;
 
 use crate::db::IdentityTransparencyPinnedHeadV1;
 
 const SERVICE_NAME: &str = "veil-messenger";
 const TRANSPARENCY_SERVICE_NAME: &str = "veil-messenger-transparency-v1";
+const MLS_ROLLBACK_SERVICE_NAME: &str = "veil-messenger-mls-rollback-v1";
+static MLS_ROLLBACK_ANCHOR_WRITE_LOCK: Mutex<()> = Mutex::new(());
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MlsRollbackAnchorWireV1 {
+    version: u8,
+    leaf_hash: String,
+    generation: String,
+}
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -57,6 +68,102 @@ fn parse_exact_hex_v1<const N: usize>(label: &str, encoded: &str) -> Result<[u8;
     decoded
         .try_into()
         .map_err(|_| format!("{label} has an invalid length"))
+}
+
+fn mls_rollback_anchor_account_v1(leaf: &[u8]) -> Result<String, String> {
+    if leaf.len() != 32 {
+        return Err("MLS rollback-anchor leaf must be exactly 32 bytes".to_string());
+    }
+    Ok(format!("leaf-{}", hex::encode(Sha256::digest(leaf))))
+}
+
+fn encode_mls_rollback_anchor_v1(leaf: &[u8], generation: u64) -> Result<String, String> {
+    mls_rollback_anchor_account_v1(leaf)?;
+    if generation > i64::MAX as u64 {
+        return Err("MLS rollback-anchor generation exceeds SQLite range".to_string());
+    }
+    serde_json::to_string(&MlsRollbackAnchorWireV1 {
+        version: 1,
+        leaf_hash: hex::encode(Sha256::digest(leaf)),
+        generation: generation.to_string(),
+    })
+    .map_err(|error| format!("encode MLS rollback anchor: {error}"))
+}
+
+fn decode_mls_rollback_anchor_v1(leaf: &[u8], encoded: &str) -> Result<u64, String> {
+    mls_rollback_anchor_account_v1(leaf)?;
+    let wire: MlsRollbackAnchorWireV1 = serde_json::from_str(encoded)
+        .map_err(|error| format!("decode MLS rollback anchor: {error}"))?;
+    if wire.version != 1
+        || wire.leaf_hash != hex::encode(Sha256::digest(leaf))
+        || wire.leaf_hash.len() != 64
+    {
+        return Err("MLS rollback-anchor scope is invalid".to_string());
+    }
+    let generation = parse_exact_decimal_v1("MLS rollback-anchor generation", &wire.generation)?;
+    if generation > i64::MAX as u64 {
+        return Err("MLS rollback-anchor generation exceeds SQLite range".to_string());
+    }
+    Ok(generation)
+}
+
+/// Load one monotonic MLS generation kept outside the replaceable SQLCipher
+/// database. Only a genuinely absent credential maps to `None`; keychain
+/// availability and malformed values fail closed.
+pub fn get_mls_rollback_anchor_v1(leaf: &[u8]) -> Result<Option<u64>, String> {
+    let account = mls_rollback_anchor_account_v1(leaf)?;
+    let entry = Entry::new(MLS_ROLLBACK_SERVICE_NAME, &account)
+        .map_err(|error| format!("MLS rollback-anchor keychain entry: {error}"))?;
+    match entry.get_password() {
+        Ok(mut encoded) => {
+            let decoded = decode_mls_rollback_anchor_v1(leaf, &encoded);
+            encoded.zeroize();
+            decoded.map(Some)
+        }
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(error) => Err(format!("MLS rollback-anchor keychain access: {error}")),
+    }
+}
+
+/// Create or monotonically advance the external MLS generation anchor.
+/// Decrease attempts never overwrite stronger evidence.
+pub fn store_mls_rollback_anchor_v1(leaf: &[u8], generation: u64) -> Result<(), String> {
+    let _write_guard = MLS_ROLLBACK_ANCHOR_WRITE_LOCK
+        .lock()
+        .map_err(|_| "MLS rollback-anchor write lock poisoned".to_string())?;
+    if let Some(existing) = get_mls_rollback_anchor_v1(leaf)? {
+        if generation < existing {
+            return Err("MLS rollback-anchor decrease rejected".to_string());
+        }
+        if generation == existing {
+            return Ok(());
+        }
+    }
+    let account = mls_rollback_anchor_account_v1(leaf)?;
+    let entry = Entry::new(MLS_ROLLBACK_SERVICE_NAME, &account)
+        .map_err(|error| format!("MLS rollback-anchor keychain entry: {error}"))?;
+    let mut encoded = encode_mls_rollback_anchor_v1(leaf, generation)?;
+    let result = entry
+        .set_password(&encoded)
+        .map_err(|error| format!("store MLS rollback anchor: {error}"));
+    encoded.zeroize();
+    result
+}
+
+/// Delete the external MLS rollback anchor as the final step of an explicit
+/// leaf-state reset. Absence is idempotent; every other keychain failure is
+/// surfaced so callers cannot mistake a partial reset for success.
+pub fn delete_mls_rollback_anchor_v1(leaf: &[u8]) -> Result<(), String> {
+    let _write_guard = MLS_ROLLBACK_ANCHOR_WRITE_LOCK
+        .lock()
+        .map_err(|_| "MLS rollback-anchor write lock poisoned".to_string())?;
+    let account = mls_rollback_anchor_account_v1(leaf)?;
+    let entry = Entry::new(MLS_ROLLBACK_SERVICE_NAME, &account)
+        .map_err(|error| format!("MLS rollback-anchor keychain entry: {error}"))?;
+    match entry.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(error) => Err(format!("delete MLS rollback anchor: {error}")),
+    }
 }
 
 fn validate_transparency_anchor_v1(
@@ -333,5 +440,23 @@ mod tests {
         let mut forged = anchor;
         forged.root_hash[0] ^= 1;
         assert!(validate_transparency_anchor_v1(&forged).is_err());
+    }
+
+    #[test]
+    fn mls_rollback_anchor_codec_is_canonical_and_leaf_bound() {
+        let leaf = [0x81; 32];
+        let encoded = encode_mls_rollback_anchor_v1(&leaf, 17).unwrap();
+        assert_eq!(decode_mls_rollback_anchor_v1(&leaf, &encoded).unwrap(), 17);
+        assert!(decode_mls_rollback_anchor_v1(&[0x82; 32], &encoded).is_err());
+
+        let mut unknown: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        unknown["unexpected"] = serde_json::json!(true);
+        assert!(decode_mls_rollback_anchor_v1(&leaf, &unknown.to_string()).is_err());
+
+        let mut noncanonical: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        noncanonical["generation"] = serde_json::json!("017");
+        assert!(decode_mls_rollback_anchor_v1(&leaf, &noncanonical.to_string()).is_err());
+        assert!(encode_mls_rollback_anchor_v1(&leaf[..31], 0).is_err());
+        assert!(encode_mls_rollback_anchor_v1(&leaf, i64::MAX as u64 + 1).is_err());
     }
 }

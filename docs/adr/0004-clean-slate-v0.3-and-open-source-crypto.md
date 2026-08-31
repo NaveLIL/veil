@@ -151,12 +151,29 @@ items without activating MLS: Veil now uses upstream OpenMLS 0.9/RustCrypto
 0.6, and the wrapper persists a single bounded, versioned, leaf-bound
 checkpoint through a consecutive compare-and-swap generation before returning
 mutation output. The old split snapshot and disconnected desktop facade were
-deleted. This is not the runtime gate: exact account/origin/device credentials,
+deleted. At that first checkpoint, exact account/origin/device credentials,
 the `VeilDb` adapter, an external rollback anchor, atomic checkpoint plus
-network-outbox commits, obsolete-secret deletion evidence and platform/interop
-tests remain mandatory. Upstream's SQLite provider was evaluated but is not a
+network-output commits, obsolete-secret deletion evidence and platform/interop
+tests were still mandatory. Upstream's SQLite provider was evaluated but is not a
 drop-in replacement because its separate bundled SQLite connection would sit
 outside Veil's existing SQLCipher boundary.
+
+A second checkpoint on 2026-08-31 closes the local durable-boundary portion of
+the third and fourth items without activating MLS. `VeilDbMlsStore` commits the
+complete checkpoint, exact bounded network outputs, and any decrypted receive
+projection in one SQLCipher transaction. An external OS-keychain generation
+anchor is owned by the store rather than supplied by a caller: an anchor ahead
+of the database is rejected as rollback, while the only healable split is a
+database generation already committed before its matching anchor update. A
+stale client cannot advance the anchor from an unverified generation. Explicit
+leaf reset deletes SQLCipher rows first and the anchor last, making partial
+failure fail closed and retryable.
+
+This still does not close credential binding, KeyPackage/Delivery Service,
+obsolete-secret deletion evidence, runtime orchestration, hostile-Node,
+interop, fuzz, or physical-device gates. The SQLCipher inbox is a crash-recovery
+projection, not a second message history: callers acknowledge and erase it only
+after the normal message projection is durable.
 
 ## Data cutover
 

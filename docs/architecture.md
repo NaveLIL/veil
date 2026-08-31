@@ -45,7 +45,7 @@ origin-hosted invitation preview и будущим узким Secure Share Viewe
 | **veil-search** | Локальный process-memory Tantivy index |
 | **veil-uploads** | Resumable encrypted upload/download primitives |
 | **veil-ffi** | UniFFI boundary для native mobile integration |
-| **veil-mls** | OpenMLS 0.9 foundation с bounded atomic checkpoints; runtime пока выключен |
+| **veil-mls** | OpenMLS 0.9 с atomic SQLCipher checkpoint/outbox/inbox и OS rollback anchor; runtime пока выключен |
 | **veil-desktop** | SolidJS UI и Tauri/Rust application boundary |
 | **veil-mobile** | React Native shell + Kotlin/Rust Direct runtime; закрытый Android Preview |
 | **veil-server** | Go gateway, auth, messaging, Spaces/ACL, push, uploads и Veil Link |
@@ -93,6 +93,13 @@ physical-device и независимый audit evidence остаются blocki
 Долговременные данные клиента находятся в SQLCipher. Поисковый индекс
 перестраивается из exact-origin хранилища и существует только в памяти
 процесса; lock, account switch и origin switch должны очищать его.
+
+Изолированный MLS foundation использует тот же SQLCipher authority: полный
+OpenMLS checkpoint, точные неподтверждённые network outputs и recoverable
+receive projection фиксируются одной транзакцией. Отдельный монотонный anchor
+в OS keychain обнаруживает откат заменяемого файла базы. При штатной работе и
+аварийном восстановлении это не добавляет пользователю ручных действий; MLS
+runtime остаётся выключенным до identity, transport и platform gates.
 
 ### Attachments и push
 
