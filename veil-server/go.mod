@@ -17,10 +17,10 @@ require (
 	github.com/testcontainers/testcontainers-go v0.43.0
 	github.com/testcontainers/testcontainers-go/modules/postgres v0.43.0
 	github.com/tus/tusd/v2 v2.10.0
-	golang.org/x/crypto v0.54.0
+	golang.org/x/crypto v0.55.0
 	golang.org/x/exp v0.0.0-20250106191152-7588d65b2ba8
-	golang.org/x/net v0.56.0
-	golang.org/x/text v0.40.0
+	golang.org/x/net v0.58.0
+	golang.org/x/text v0.41.0
 	google.golang.org/protobuf v1.36.11
 )
 
