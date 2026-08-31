@@ -1,6 +1,7 @@
 use keyring::Entry;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::sync::Mutex;
 use zeroize::Zeroize;
 
 use crate::db::IdentityTransparencyPinnedHeadV1;
@@ -8,6 +9,7 @@ use crate::db::IdentityTransparencyPinnedHeadV1;
 const SERVICE_NAME: &str = "veil-messenger";
 const TRANSPARENCY_SERVICE_NAME: &str = "veil-messenger-transparency-v1";
 const MLS_ROLLBACK_SERVICE_NAME: &str = "veil-messenger-mls-rollback-v1";
+static MLS_ROLLBACK_ANCHOR_WRITE_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -126,6 +128,9 @@ pub fn get_mls_rollback_anchor_v1(leaf: &[u8]) -> Result<Option<u64>, String> {
 /// Create or monotonically advance the external MLS generation anchor.
 /// Decrease attempts never overwrite stronger evidence.
 pub fn store_mls_rollback_anchor_v1(leaf: &[u8], generation: u64) -> Result<(), String> {
+    let _write_guard = MLS_ROLLBACK_ANCHOR_WRITE_LOCK
+        .lock()
+        .map_err(|_| "MLS rollback-anchor write lock poisoned".to_string())?;
     if let Some(existing) = get_mls_rollback_anchor_v1(leaf)? {
         if generation < existing {
             return Err("MLS rollback-anchor decrease rejected".to_string());
@@ -149,6 +154,9 @@ pub fn store_mls_rollback_anchor_v1(leaf: &[u8], generation: u64) -> Result<(), 
 /// leaf-state reset. Absence is idempotent; every other keychain failure is
 /// surfaced so callers cannot mistake a partial reset for success.
 pub fn delete_mls_rollback_anchor_v1(leaf: &[u8]) -> Result<(), String> {
+    let _write_guard = MLS_ROLLBACK_ANCHOR_WRITE_LOCK
+        .lock()
+        .map_err(|_| "MLS rollback-anchor write lock poisoned".to_string())?;
     let account = mls_rollback_anchor_account_v1(leaf)?;
     let entry = Entry::new(MLS_ROLLBACK_SERVICE_NAME, &account)
         .map_err(|error| format!("MLS rollback-anchor keychain entry: {error}"))?;

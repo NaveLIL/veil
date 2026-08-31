@@ -44,15 +44,18 @@ and may heal only from the generation verified in the database.
 - Commit, Welcome, Ciphertext, and KeyPackage bytes are staged exactly, not
   regenerated. ACK checks the exact scoped digest and erases the payload;
   repeated matching ACK is idempotent.
-- Decrypted application bytes are staged inside SQLCipher in the same
-  transaction as receive state. They are not network output or a second public
-  history. The caller ACKs and erases them only after normal message projection
-  is durable.
+- Typed Welcome/Commit receipts and decrypted application bytes are staged
+  inside SQLCipher in the same transaction as receive state. They are not
+  network output or a second public history. The caller ACKs a control receipt
+  after transport projection, or erases application plaintext only after its
+  normal message projection is durable.
 - The store owns its rollback comparison. The previous caller-controlled
   minimum-generation argument was removed.
 - Added a canonical leaf-bound OS-keychain generation record. Missing,
   malformed, unavailable, cross-leaf, decreasing, and database-behind-anchor
-  states fail closed.
+  states fail closed. Monotonic writes/deletion are serialized process-wide;
+  a multi-process runtime remains outside the enabled product boundary and is
+  part of the concurrency gate.
 - A stale client may not advance the anchor from an unverified generation.
   The adapter heals a lagging anchor only after SQLCipher proves the matching
   generation already exists.
@@ -85,6 +88,7 @@ Automated tests cover:
 - exact output recovery and bounded, digest-bound idempotent ACK;
 - process-gap behavior where SQLCipher commits and the anchor update fails;
 - receive-gap recovery of plaintext without decrypting the ciphertext twice;
+- typed Welcome/Commit receipt recovery without applying control input twice;
 - database rollback detection when the keychain anchor is newer;
 - rejection of a stale/unverified client generation without poisoning the
   anchor;

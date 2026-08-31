@@ -195,11 +195,13 @@ pub struct PendingMlsOutboxV1 {
     pub exact_payload: Vec<u8>,
 }
 
-/// Decrypted MLS application payload staged atomically with its receive-state
-/// checkpoint. This SQLCipher-only projection is never a network outbox item.
+/// Typed inbound MLS receipt, optionally carrying decrypted application bytes,
+/// staged atomically with its receive-state checkpoint. This SQLCipher-only
+/// projection is never a network outbox item.
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct MlsInboxWriteV1 {
     pub item_id: [u8; 32],
+    pub kind: u8,
     pub group_id: [u8; 16],
     pub source_digest: [u8; 32],
     pub plaintext: Vec<u8>,
@@ -210,6 +212,7 @@ pub struct PendingMlsInboxV1 {
     pub queue_order: u64,
     pub item_id: [u8; 32],
     pub generation: u64,
+    pub kind: u8,
     pub group_id: [u8; 16],
     pub source_digest: [u8; 32],
     pub plaintext: Vec<u8>,
@@ -408,6 +411,7 @@ fn validate_single_mls_outbox_item_v1(
 fn mls_inbox_item_id_v1(
     leaf: &[u8],
     generation: u64,
+    kind: u8,
     group_id: &[u8; 16],
     source_digest: &[u8; 32],
 ) -> [u8; 32] {
@@ -415,6 +419,7 @@ fn mls_inbox_item_id_v1(
     digest.update(MLS_INBOX_ID_DOMAIN_V1);
     digest.update(leaf);
     digest.update(generation.to_be_bytes());
+    digest.update([kind]);
     digest.update(group_id);
     digest.update(source_digest);
     digest.finalize().into()
@@ -425,10 +430,22 @@ fn validate_single_mls_inbox_item_v1(
     generation: u64,
     item: &MlsInboxWriteV1,
 ) -> Result<(), String> {
-    if leaf.len() != 32 || item.plaintext.len() > MLS_INBOX_MAX_PLAINTEXT_BYTES_V1 {
+    if leaf.len() != 32
+        || !(1..=3).contains(&item.kind)
+        || item.plaintext.len() > MLS_INBOX_MAX_PLAINTEXT_BYTES_V1
+        || (item.kind != 3 && !item.plaintext.is_empty())
+    {
         return Err("MLS inbox projection shape is invalid".into());
     }
-    if item.item_id != mls_inbox_item_id_v1(leaf, generation, &item.group_id, &item.source_digest) {
+    if item.item_id
+        != mls_inbox_item_id_v1(
+            leaf,
+            generation,
+            item.kind,
+            &item.group_id,
+            &item.source_digest,
+        )
+    {
         return Err("MLS inbox item identifier mismatch".into());
     }
     Ok(())
@@ -3562,10 +3579,10 @@ impl VeilDb {
             CREATE INDEX IF NOT EXISTS idx_mls_outbox_v1_pending_leaf
                 ON mls_outbox_v1(leaf, state, queue_order);
 
-            -- Decrypted application bytes are staged inside SQLCipher in the
-            -- same transaction as the advanced receive secret tree. This
-            -- prevents a keychain failure/process death from losing plaintext
-            -- that cannot safely be decrypted a second time.
+            -- Typed inbound receipts and decrypted application bytes are
+            -- staged inside SQLCipher in the same transaction as the advanced
+            -- receive secret tree. This prevents a keychain failure/process
+            -- death from losing results that cannot safely be applied twice.
             CREATE TABLE IF NOT EXISTS mls_inbox_v1 (
                 queue_order INTEGER PRIMARY KEY AUTOINCREMENT,
                 item_id BLOB NOT NULL UNIQUE
@@ -3576,6 +3593,7 @@ impl VeilDb {
                     ON UPDATE RESTRICT ON DELETE CASCADE,
                 generation INTEGER NOT NULL
                     CHECK(generation BETWEEN 0 AND 9223372036854775807),
+                kind INTEGER NOT NULL CHECK(kind BETWEEN 1 AND 3),
                 group_id BLOB NOT NULL
                     CHECK(typeof(group_id) = 'blob' AND length(group_id) = 16),
                 source_digest BLOB NOT NULL
@@ -3586,6 +3604,7 @@ impl VeilDb {
                 updated_at TEXT NOT NULL DEFAULT (datetime('now')),
                 UNIQUE(leaf, generation),
                 UNIQUE(leaf, group_id, source_digest),
+                CHECK(kind = 3 OR length(plaintext) = 0 OR plaintext IS NULL),
                 CHECK((state = 0 AND plaintext IS NOT NULL AND
                        typeof(plaintext) = 'blob' AND length(plaintext) <= 4194304) OR
                       (state = 1 AND plaintext IS NULL))
@@ -5171,12 +5190,13 @@ impl VeilDb {
         for item in inbox {
             tx.execute(
                 "INSERT INTO mls_inbox_v1
-                    (item_id, leaf, generation, group_id, source_digest, plaintext)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    (item_id, leaf, generation, kind, group_id, source_digest, plaintext)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 rusqlite::params![
                     item.item_id.as_slice(),
                     leaf,
                     generation,
+                    i64::from(item.kind),
                     item.group_id.as_slice(),
                     item.source_digest.as_slice(),
                     item.plaintext.as_slice(),
@@ -5351,8 +5371,8 @@ impl VeilDb {
         }
     }
 
-    /// Load decrypted application payloads that were committed with receive
-    /// state but not yet projected into the normal message model.
+    /// Load inbound control receipts or decrypted application payloads that
+    /// were committed with receive state but not yet projected/acknowledged.
     pub fn mls_load_pending_inbox_v1(
         &self,
         leaf: &[u8],
@@ -5368,7 +5388,7 @@ impl VeilDb {
         let mut statement = self
             .conn
             .prepare(
-                "SELECT queue_order, item_id, generation, group_id,
+                "SELECT queue_order, item_id, generation, kind, group_id,
                         source_digest, plaintext
                    FROM mls_inbox_v1
                   WHERE leaf = ?1 AND state = 0
@@ -5381,22 +5401,26 @@ impl VeilDb {
                     row.get::<_, i64>(0)?,
                     row.get::<_, Vec<u8>>(1)?,
                     row.get::<_, i64>(2)?,
-                    row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, i64>(3)?,
                     row.get::<_, Vec<u8>>(4)?,
                     row.get::<_, Vec<u8>>(5)?,
+                    row.get::<_, Vec<u8>>(6)?,
                 ))
             })
             .map_err(|error| format!("load MLS inbox: {error}"))?;
         let mut loaded = Vec::new();
         for row in rows {
-            let (queue_order, item_id, generation, group_id, source_digest, plaintext) =
+            let (queue_order, item_id, generation, kind, group_id, source_digest, plaintext) =
                 row.map_err(|error| format!("decode MLS inbox row: {error}"))?;
             let queue_order = u64::try_from(queue_order)
                 .map_err(|_| "persisted MLS inbox order is invalid".to_string())?;
             let generation = u64::try_from(generation)
                 .map_err(|_| "persisted MLS inbox generation is invalid".to_string())?;
+            let kind = u8::try_from(kind)
+                .map_err(|_| "persisted MLS inbox kind is invalid".to_string())?;
             let mut candidate = MlsInboxWriteV1 {
                 item_id: fixed_bytes::<32>("persisted MLS inbox item id", item_id)?,
+                kind,
                 group_id: fixed_bytes::<16>("persisted MLS inbox group id", group_id)?,
                 source_digest: fixed_bytes::<32>(
                     "persisted MLS inbox source digest",
@@ -5409,6 +5433,7 @@ impl VeilDb {
                 queue_order,
                 item_id: candidate.item_id,
                 generation,
+                kind: candidate.kind,
                 group_id: candidate.group_id,
                 source_digest: candidate.source_digest,
                 plaintext: std::mem::take(&mut candidate.plaintext),
@@ -5417,8 +5442,8 @@ impl VeilDb {
         Ok(loaded)
     }
 
-    /// Erase one exact staged plaintext only after its normal message
-    /// projection is durable. Matching repeated ACKs are idempotent.
+    /// Acknowledge one exact inbound result and erase any staged plaintext only
+    /// after its normal projection is durable. Repeated ACKs are idempotent.
     pub fn mls_acknowledge_inbox_v1(&self, leaf: &[u8], item_id: &[u8; 32]) -> Result<(), String> {
         if leaf.len() != 32 {
             return Err("MLS inbox leaf must be exactly 32 bytes".into());
@@ -20670,9 +20695,10 @@ mod tests {
             .is_empty());
 
         let source_digest: [u8; 32] = Sha256::digest(b"source ciphertext").into();
-        let inbox_id = mls_inbox_item_id_v1(leaf, 2, &group_id, &source_digest);
+        let inbox_id = mls_inbox_item_id_v1(leaf, 2, 3, &group_id, &source_digest);
         let inbox = MlsInboxWriteV1 {
             item_id: inbox_id,
+            kind: 3,
             group_id,
             source_digest,
             plaintext: b"decrypted inside SQLCipher".to_vec(),
@@ -20746,7 +20772,8 @@ mod tests {
             .unwrap();
         let fault_source: [u8; 32] = Sha256::digest(b"fault source").into();
         let fault_inbox = MlsInboxWriteV1 {
-            item_id: mls_inbox_item_id_v1(leaf, 1, &group_id, &fault_source),
+            item_id: mls_inbox_item_id_v1(leaf, 1, 3, &group_id, &fault_source),
+            kind: 3,
             group_id,
             source_digest: fault_source,
             plaintext: b"must roll back with checkpoint".to_vec(),

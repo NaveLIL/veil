@@ -38,8 +38,8 @@ pub mod veil_db_store;
 
 use store::{decode_checkpoint, encode_checkpoint};
 pub use store::{
-    CheckpointBlob, InMemoryStore, MlsInboxId, MlsInboxProjection, MlsKeyStore, MlsOutboxId,
-    MlsOutboxKind, MlsOutboxPayload, MlsPersistError, StoredMlsInboxProjection,
+    CheckpointBlob, InMemoryStore, MlsInboxId, MlsInboxKind, MlsInboxProjection, MlsKeyStore,
+    MlsOutboxId, MlsOutboxKind, MlsOutboxPayload, MlsPersistError, StoredMlsInboxProjection,
     StoredMlsOutboxItem,
 };
 pub use veil_db_store::{MlsRollbackAnchor, OsKeychainMlsRollbackAnchor, VeilDbMlsStore};
@@ -359,6 +359,7 @@ impl<S: MlsKeyStore> MlsClient<S> {
     /// Process an incoming Welcome and join the group it carries.
     pub fn process_welcome(&mut self, welcome: &WelcomeBlob) -> Result<MlsGroupId> {
         ensure_max_len("MLS Welcome", welcome.0.len(), MAX_MLS_MESSAGE_BYTES)?;
+        let source_digest: [u8; 32] = Sha256::digest(&welcome.0).into();
         self.transact(|provider, _signer| {
             let msg =
                 MlsMessageIn::tls_deserialize_exact_bytes(welcome.0.as_slice()).map_err(tls_err)?;
@@ -375,17 +376,30 @@ impl<S: MlsKeyStore> MlsClient<S> {
             let group = staged
                 .into_group(provider)
                 .map_err(|e| MlsError::Protocol(format!("install welcome: {e:?}")))?;
-            Ok((
-                MlsGroupId::from_uuid_bytes(group.group_id().as_slice())?,
+            let group_id = MlsGroupId::from_uuid_bytes(group.group_id().as_slice())?;
+            let group_scope: [u8; MLS_GROUP_ID_BYTES] =
+                group_id.0.as_slice().try_into().map_err(|_| {
+                    MlsError::Invalid("MLS group id must be exactly 16 UUID bytes".into())
+                })?;
+            let receipt = MlsInboxProjection::new(
+                MlsInboxKind::Welcome,
+                group_scope,
+                source_digest,
                 Vec::new(),
-                Vec::new(),
-            ))
+            )
+            .map_err(MlsError::Storage)?;
+            Ok((group_id, Vec::new(), vec![receipt]))
         })
     }
 
     /// Process an incoming Commit. Advances the group epoch.
     pub fn process_commit(&mut self, group_id: &MlsGroupId, commit: &CommitBlob) -> Result<()> {
         ensure_max_len("MLS Commit", commit.0.len(), MAX_MLS_MESSAGE_BYTES)?;
+        let group_scope: [u8; MLS_GROUP_ID_BYTES] =
+            group_id.0.as_slice().try_into().map_err(|_| {
+                MlsError::Invalid("MLS group id must be exactly 16 UUID bytes".into())
+            })?;
+        let source_digest: [u8; 32] = Sha256::digest(&commit.0).into();
         self.transact(|provider, _signer| {
             let mut group = Self::load_group_from(provider, group_id)?;
             let msg =
@@ -406,7 +420,14 @@ impl<S: MlsKeyStore> MlsClient<S> {
                     "handshake message is not an MLS Commit".into(),
                 )),
             }?;
-            Ok((result, Vec::new(), Vec::new()))
+            let receipt = MlsInboxProjection::new(
+                MlsInboxKind::Commit,
+                group_scope,
+                source_digest,
+                Vec::new(),
+            )
+            .map_err(MlsError::Storage)?;
+            Ok((result, Vec::new(), vec![receipt]))
         })
     }
 
@@ -459,9 +480,13 @@ impl<S: MlsKeyStore> MlsClient<S> {
                 ProcessedMessageContent::ApplicationMessage(app) => {
                     let plaintext = app.into_bytes();
                     ensure_max_len("MLS plaintext", plaintext.len(), MAX_MLS_MESSAGE_BYTES)?;
-                    let inbox =
-                        MlsInboxProjection::new(group_scope, source_digest, plaintext.clone())
-                            .map_err(MlsError::Storage)?;
+                    let inbox = MlsInboxProjection::new(
+                        MlsInboxKind::Application,
+                        group_scope,
+                        source_digest,
+                        plaintext.clone(),
+                    )
+                    .map_err(MlsError::Storage)?;
                     Ok((plaintext, Vec::new(), vec![inbox]))
                 }
                 _ => Err(MlsError::Invalid("not an application message".into())),

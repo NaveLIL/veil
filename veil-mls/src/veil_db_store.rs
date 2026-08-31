@@ -8,7 +8,7 @@
 //! is healed before restore. `anchor > database` is a rollback and fails closed.
 
 use crate::store::{
-    decode_checkpoint, derive_inbox_id, derive_outbox_id, CheckpointBlob, MlsInboxId,
+    decode_checkpoint, derive_inbox_id, derive_outbox_id, CheckpointBlob, MlsInboxId, MlsInboxKind,
     MlsInboxProjection, MlsKeyStore, MlsOutboxId, MlsOutboxKind, MlsOutboxPayload, MlsPersistError,
     StoredMlsInboxProjection, StoredMlsOutboxItem, MAX_INBOX_PROJECTIONS_PER_GENERATION,
     MAX_OUTBOX_ITEMS_PER_GENERATION,
@@ -128,11 +128,13 @@ impl<A: MlsRollbackAnchor> VeilDbMlsStore<A> {
                 let id = derive_inbox_id(
                     leaf,
                     generation,
+                    projection.kind(),
                     projection.group_id(),
                     projection.source_digest(),
                 );
                 Ok(MlsInboxWriteV1 {
                     item_id: *id.as_bytes(),
+                    kind: projection.kind().as_u8(),
                     group_id: *projection.group_id(),
                     source_digest: *projection.source_digest(),
                     plaintext: projection.plaintext().to_vec(),
@@ -338,6 +340,7 @@ impl<A: MlsRollbackAnchor> MlsKeyStore for VeilDbMlsStore<A> {
                     leaf,
                     MlsInboxId::from_bytes(item.item_id),
                     item.generation,
+                    MlsInboxKind::from_u8(item.kind)?,
                     item.group_id,
                     item.source_digest,
                     plaintext,
@@ -562,6 +565,14 @@ mod tests {
         alice.create_group(&group).unwrap();
         let (_, welcome) = alice.add_member(&group, &bob_key_package).unwrap();
         bob.process_welcome(&welcome).unwrap();
+        let welcome_receipt = store
+            .load_pending_inbox(bob_identity.as_bytes(), 8)
+            .unwrap();
+        assert_eq!(welcome_receipt.len(), 1);
+        assert_eq!(welcome_receipt[0].kind(), MlsInboxKind::Welcome);
+        store
+            .acknowledge_inbox(bob_identity.as_bytes(), welcome_receipt[0].id())
+            .unwrap();
         let ciphertext = alice
             .encrypt(&group, b"recoverable staged plaintext")
             .unwrap();
@@ -580,6 +591,7 @@ mod tests {
             .unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].plaintext(), b"recoverable staged plaintext");
+        assert_eq!(pending[0].kind(), MlsInboxKind::Application);
         store
             .acknowledge_inbox(bob_identity.as_bytes(), pending[0].id())
             .unwrap();
@@ -587,6 +599,40 @@ mod tests {
             .load_pending_inbox(bob_identity.as_bytes(), 8)
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn welcome_anchor_gap_keeps_a_typed_inbound_receipt() {
+        let anchor = MemoryAnchor::default();
+        anchor.allow_writes();
+        let store = VeilDbMlsStore::new(
+            Arc::new(Mutex::new(VeilDb::open_memory(&[0x96; 32]).unwrap())),
+            anchor.clone(),
+        );
+        let bob_identity = leaf(b"welcome-anchor-gap-bob");
+        let mut bob = MlsClient::create(bob_identity.clone(), store.clone()).unwrap();
+        let mut alice =
+            MlsClient::create(leaf(b"welcome-anchor-gap-alice"), InMemoryStore::default()).unwrap();
+        let group = group(b"welcome-anchor-gap-group");
+        let bob_key_package = bob.generate_key_package().unwrap();
+        alice.create_group(&group).unwrap();
+        let (_, welcome) = alice.add_member(&group, &bob_key_package).unwrap();
+
+        let receive_generation = bob.checkpoint_generation() + 1;
+        anchor.fail_at(receive_generation);
+        let error = bob.process_welcome(&welcome).unwrap_err();
+        assert!(matches!(error, MlsError::DurableCommitPending(_)));
+
+        anchor.allow_writes();
+        let restored = MlsClient::restore(bob_identity.clone(), store.clone()).unwrap();
+        assert_eq!(restored.epoch(&group).unwrap(), 0);
+        let pending = store
+            .load_pending_inbox(bob_identity.as_bytes(), 8)
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].kind(), MlsInboxKind::Welcome);
+        assert_eq!(pending[0].group_id(), group.as_bytes());
+        assert!(pending[0].plaintext().is_empty());
     }
 
     #[test]

@@ -128,10 +128,37 @@ impl MlsOutboxPayload {
     }
 }
 
-/// Decrypted application payload staged in SQLCipher beside the receive-state
-/// checkpoint. It is never returned by the network outbox API.
+/// Result kind staged beside a receive-state checkpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum MlsInboxKind {
+    Welcome = 1,
+    Commit = 2,
+    Application = 3,
+}
+
+impl MlsInboxKind {
+    pub fn from_u8(value: u8) -> Result<Self, String> {
+        match value {
+            1 => Ok(Self::Welcome),
+            2 => Ok(Self::Commit),
+            3 => Ok(Self::Application),
+            _ => Err("MLS inbox kind is invalid".into()),
+        }
+    }
+
+    pub fn as_u8(self) -> u8 {
+        self as u8
+    }
+}
+
+/// Inbound control receipt or decrypted application payload staged in
+/// SQLCipher beside the receive-state checkpoint. It is never returned by the
+/// network outbox API.
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct MlsInboxProjection {
+    #[zeroize(skip)]
+    kind: MlsInboxKind,
     group_id: [u8; 16],
     source_digest: [u8; 32],
     plaintext: Vec<u8>,
@@ -139,6 +166,7 @@ pub struct MlsInboxProjection {
 
 impl MlsInboxProjection {
     pub fn new(
+        kind: MlsInboxKind,
         group_id: [u8; 16],
         source_digest: [u8; 32],
         plaintext: Vec<u8>,
@@ -146,11 +174,19 @@ impl MlsInboxProjection {
         if plaintext.len() > MAX_INBOX_PLAINTEXT_BYTES {
             return Err("MLS inbox plaintext exceeds the limit".into());
         }
+        if kind != MlsInboxKind::Application && !plaintext.is_empty() {
+            return Err("MLS control receipt must not contain plaintext".into());
+        }
         Ok(Self {
+            kind,
             group_id,
             source_digest,
             plaintext,
         })
+    }
+
+    pub fn kind(&self) -> MlsInboxKind {
+        self.kind
     }
 
     pub fn group_id(&self) -> &[u8; 16] {
@@ -192,6 +228,8 @@ pub struct StoredMlsInboxProjection {
     #[zeroize(skip)]
     id: MlsInboxId,
     generation: u64,
+    #[zeroize(skip)]
+    kind: MlsInboxKind,
     group_id: [u8; 16],
     source_digest: [u8; 32],
     plaintext: Vec<u8>,
@@ -202,23 +240,32 @@ impl StoredMlsInboxProjection {
         leaf: &[u8],
         id: MlsInboxId,
         generation: u64,
+        kind: MlsInboxKind,
         group_id: [u8; 16],
         source_digest: [u8; 32],
         plaintext: Vec<u8>,
     ) -> Result<Self, String> {
-        if leaf.len() != 32 || plaintext.len() > MAX_INBOX_PLAINTEXT_BYTES {
+        if leaf.len() != 32
+            || plaintext.len() > MAX_INBOX_PLAINTEXT_BYTES
+            || (kind != MlsInboxKind::Application && !plaintext.is_empty())
+        {
             return Err("MLS inbox projection shape is invalid".into());
         }
-        if id != derive_inbox_id(leaf, generation, &group_id, &source_digest) {
+        if id != derive_inbox_id(leaf, generation, kind, &group_id, &source_digest) {
             return Err("MLS inbox identifier mismatch".into());
         }
         Ok(Self {
             id,
             generation,
+            kind,
             group_id,
             source_digest,
             plaintext,
         })
+    }
+
+    pub fn kind(&self) -> MlsInboxKind {
+        self.kind
     }
 
     pub fn id(&self) -> MlsInboxId {
@@ -369,6 +416,7 @@ pub(crate) fn derive_outbox_id(
 pub(crate) fn derive_inbox_id(
     leaf: &[u8],
     generation: u64,
+    kind: MlsInboxKind,
     group_id: &[u8; 16],
     source_digest: &[u8; 32],
 ) -> MlsInboxId {
@@ -376,6 +424,7 @@ pub(crate) fn derive_inbox_id(
     digest.update(INBOX_ID_DOMAIN);
     digest.update(leaf);
     digest.update(generation.to_be_bytes());
+    digest.update([kind.as_u8()]);
     digest.update(group_id);
     digest.update(source_digest);
     MlsInboxId(digest.finalize().into())
@@ -553,6 +602,7 @@ impl MlsKeyStore for InMemoryStore {
             let id = derive_inbox_id(
                 leaf,
                 expected_next,
+                projection.kind(),
                 projection.group_id(),
                 projection.source_digest(),
             );
@@ -560,6 +610,7 @@ impl MlsKeyStore for InMemoryStore {
                 leaf,
                 id,
                 expected_next,
+                projection.kind(),
                 *projection.group_id(),
                 *projection.source_digest(),
                 projection.plaintext().to_vec(),
