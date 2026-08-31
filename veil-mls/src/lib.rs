@@ -412,7 +412,7 @@ impl<S: MlsKeyStore> MlsClient<S> {
             let processed = group
                 .process_message(provider, protocol_msg)
                 .map_err(|e| MlsError::Protocol(format!("process: {e:?}")))?;
-            let result = match processed.into_content() {
+            match processed.into_content() {
                 ProcessedMessageContent::StagedCommitMessage(staged_commit) => group
                     .merge_staged_commit(provider, *staged_commit)
                     .map_err(|e| MlsError::Protocol(format!("merge: {e:?}"))),
@@ -427,7 +427,7 @@ impl<S: MlsKeyStore> MlsClient<S> {
                 Vec::new(),
             )
             .map_err(MlsError::Storage)?;
-            Ok((result, Vec::new(), vec![receipt]))
+            Ok(((), Vec::new(), vec![receipt]))
         })
     }
 

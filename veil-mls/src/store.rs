@@ -325,43 +325,48 @@ pub struct StoredMlsOutboxItem {
     bytes: Vec<u8>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct MlsOutboxMetadata {
+    pub id: MlsOutboxId,
+    pub generation: u64,
+    pub item_index: u8,
+    pub kind: MlsOutboxKind,
+    pub group_id: Option<[u8; 16]>,
+    pub payload_digest: [u8; 32],
+}
+
 impl StoredMlsOutboxItem {
-    pub fn from_parts(
+    pub(crate) fn from_parts(
         leaf: &[u8],
-        id: MlsOutboxId,
-        generation: u64,
-        item_index: u8,
-        kind: MlsOutboxKind,
-        group_id: Option<[u8; 16]>,
-        payload_digest: [u8; 32],
+        metadata: MlsOutboxMetadata,
         bytes: Vec<u8>,
     ) -> Result<Self, String> {
-        MlsOutboxPayload::new(kind, group_id, bytes.clone())?;
-        if Sha256::digest(&bytes).as_slice() != payload_digest {
+        MlsOutboxPayload::new(metadata.kind, metadata.group_id, bytes.clone())?;
+        if Sha256::digest(&bytes).as_slice() != metadata.payload_digest {
             return Err("MLS outbox payload digest mismatch".into());
         }
         if leaf.len() != 32 {
             return Err("MLS outbox leaf must be exactly 32 bytes".into());
         }
-        if id
+        if metadata.id
             != derive_outbox_id(
                 leaf,
-                generation,
-                item_index,
-                kind,
-                group_id.as_ref(),
-                &payload_digest,
+                metadata.generation,
+                metadata.item_index,
+                metadata.kind,
+                metadata.group_id.as_ref(),
+                &metadata.payload_digest,
             )
         {
             return Err("MLS outbox identifier mismatch".into());
         }
         Ok(Self {
-            id,
-            generation,
-            item_index,
-            kind,
-            group_id,
-            payload_digest,
+            id: metadata.id,
+            generation: metadata.generation,
+            item_index: metadata.item_index,
+            kind: metadata.kind,
+            group_id: metadata.group_id,
+            payload_digest: metadata.payload_digest,
             bytes,
         })
     }
@@ -587,12 +592,14 @@ impl MlsKeyStore for InMemoryStore {
             );
             let item = StoredMlsOutboxItem::from_parts(
                 leaf,
-                id,
-                expected_next,
-                item_index,
-                payload.kind(),
-                payload.group_id().copied(),
-                payload_digest,
+                MlsOutboxMetadata {
+                    id,
+                    generation: expected_next,
+                    item_index,
+                    kind: payload.kind(),
+                    group_id: payload.group_id().copied(),
+                    payload_digest,
+                },
                 payload.as_bytes().to_vec(),
             )
             .map_err(MlsPersistError::Rejected)?;

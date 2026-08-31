@@ -9,9 +9,9 @@
 
 use crate::store::{
     decode_checkpoint, derive_inbox_id, derive_outbox_id, CheckpointBlob, MlsInboxId, MlsInboxKind,
-    MlsInboxProjection, MlsKeyStore, MlsOutboxId, MlsOutboxKind, MlsOutboxPayload, MlsPersistError,
-    StoredMlsInboxProjection, StoredMlsOutboxItem, MAX_INBOX_PROJECTIONS_PER_GENERATION,
-    MAX_OUTBOX_ITEMS_PER_GENERATION,
+    MlsInboxProjection, MlsKeyStore, MlsOutboxId, MlsOutboxKind, MlsOutboxMetadata,
+    MlsOutboxPayload, MlsPersistError, StoredMlsInboxProjection, StoredMlsOutboxItem,
+    MAX_INBOX_PROJECTIONS_PER_GENERATION, MAX_OUTBOX_ITEMS_PER_GENERATION,
 };
 use sha2::{Digest, Sha256};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -300,12 +300,14 @@ impl<A: MlsRollbackAnchor> MlsKeyStore for VeilDbMlsStore<A> {
                 let exact_payload = std::mem::take(&mut item.exact_payload);
                 StoredMlsOutboxItem::from_parts(
                     leaf,
-                    MlsOutboxId::from_bytes(item.item_id),
-                    item.generation,
-                    item.item_index,
-                    MlsOutboxKind::from_u8(item.kind)?,
-                    item.group_id,
-                    item.payload_digest,
+                    MlsOutboxMetadata {
+                        id: MlsOutboxId::from_bytes(item.item_id),
+                        generation: item.generation,
+                        item_index: item.item_index,
+                        kind: MlsOutboxKind::from_u8(item.kind)?,
+                        group_id: item.group_id,
+                        payload_digest: item.payload_digest,
+                    },
                     exact_payload,
                 )
             })
