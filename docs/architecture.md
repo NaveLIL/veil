@@ -45,7 +45,7 @@ origin-hosted invitation preview и будущим узким Secure Share Viewe
 | **veil-search** | Локальный process-memory Tantivy index |
 | **veil-uploads** | Resumable encrypted upload/download primitives |
 | **veil-ffi** | UniFFI boundary для native mobile integration |
-| **veil-mls** | Экспериментальный OpenMLS foundation, не включённый в текущий desktop runtime |
+| **veil-mls** | OpenMLS 0.9 foundation с bounded atomic checkpoints; runtime пока выключен |
 | **veil-desktop** | SolidJS UI и Tauri/Rust application boundary |
 | **veil-mobile** | React Native shell + Kotlin/Rust Direct runtime; закрытый Android Preview |
 | **veil-server** | Go gateway, auth, messaging, Spaces/ACL, push, uploads и Veil Link |
