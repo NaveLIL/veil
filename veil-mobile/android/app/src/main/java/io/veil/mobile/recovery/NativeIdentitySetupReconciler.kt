@@ -78,11 +78,16 @@ internal class NativeIdentitySetupReconciler(
   private val readStrictVaultPresence: () -> Boolean,
 ) {
   fun reconcile(): NativeIdentitySetupReconciliationResult {
+    android.util.Log.d("VEIL-DEBUG", "NativeIdentitySetupReconciler.reconcile() called")
     val record = try {
       journal.readOrNull()
-    } catch (_: Throwable) {
+    } catch (e: Throwable) {
+      android.util.Log.e("VEIL-DEBUG", "journal.readOrNull() threw: ${e.message}", e)
       return unconfirmed()
-    } ?: return none()
+    } ?: run {
+      android.util.Log.d("VEIL-DEBUG", "journal.readOrNull() returned null. returning none()")
+      return none()
+    }
 
     if (record.phase == NativeIdentitySetupJournalPhase.TERMINAL) {
       return reconcileTerminalRecord(record)
@@ -130,7 +135,10 @@ internal class NativeIdentitySetupReconciler(
 
     // SETTLED proves that the exact commit work has closed and cannot publish
     // again. The vault now decides which terminal record may be persisted.
-    val present = readVaultOrNull() ?: return unconfirmed(record)
+    val present = readVaultOrNull() ?: run {
+      android.util.Log.e("VEIL-DEBUG", "readVaultOrNull returned null in reconcileSameProcessNonterminal")
+      return unconfirmed(record)
+    }
     val outcome =
       if (present) {
         NativeIdentitySetupJournalOutcome.COMMITTED
@@ -138,7 +146,10 @@ internal class NativeIdentitySetupReconciler(
         NativeIdentitySetupJournalOutcome.INTERRUPTED
       }
     val terminal = transitionToTerminalOrNull(record, outcome, currentProcessIncarnationId)
-      ?: return unconfirmed(record)
+      ?: run {
+        android.util.Log.e("VEIL-DEBUG", "transitionToTerminalOrNull returned null in reconcileSameProcessNonterminal")
+        return unconfirmed(record)
+      }
     return result(
       if (present) {
         NativeIdentitySetupReconciliationStatus.COMMITTED

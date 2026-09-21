@@ -1,125 +1,149 @@
 use rand::RngCore;
+use sha2::{Digest, Sha256};
 use zeroize::Zeroize;
 
-use crate::aead;
-use crate::kdf;
+use crate::aead::{self, NONCE_SIZE};
+use crate::kdf::hkdf_sha256;
 
-/// Encrypt data for a secure share.
-///
-/// If `password` is provided, the content key is wrapped with Argon2id(password).
-/// If no password, the content key should be embedded in the URL fragment.
-///
-/// Returns `(ciphertext, content_key, salt)`.
-/// - `ciphertext`: encrypted payload
-/// - `content_key`: 32-byte key (embed in URL fragment if no password)
-/// - `salt`: 32-byte salt (needed for password-based decryption)
-pub fn encrypt_share(payload: &[u8], password: Option<&str>) -> Result<ShareBundle, String> {
-    // Generate random content key
-    let mut content_key = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut content_key);
+const SALT_MANIFEST: &[u8] = b"veil/share/manifest/v1";
+const SALT_REDEMPTION: &[u8] = b"veil/share/redemption/v1";
+const SALT_REPORT: &[u8] = b"veil/share/report/v1";
+const SHARE_PROTOCOL_VERSION: u8 = 1;
 
-    // Encrypt payload with content key
-    let (ciphertext, nonce) = aead::encrypt(&content_key, payload)?;
+/// Bundle resulting from encrypting a v1 Secure Share.
+pub struct EncryptedShareV1 {
+    /// Encrypted payload with prepended 24-byte nonce.
+    pub ciphertext: Vec<u8>,
+    /// 256-bit root secret (placed in URL fragment #k=...).
+    pub root_secret: [u8; 32],
+    /// 256-bit redemption key sent by guest upon claiming.
+    pub redemption_key: [u8; 32],
+    /// SHA-256 hash of the redemption key stored on the server.
+    pub redemption_hash: [u8; 32],
+    /// SHA-256 hash of the report capability stored on the server.
+    pub report_capability_hash: [u8; 32],
+}
 
-    // Prepend nonce to ciphertext
-    let mut encrypted = Vec::with_capacity(aead::NONCE_SIZE + ciphertext.len());
-    encrypted.extend_from_slice(&nonce);
-    encrypted.extend_from_slice(&ciphertext);
+impl Drop for EncryptedShareV1 {
+    fn drop(&mut self) {
+        self.root_secret.zeroize();
+        self.redemption_key.zeroize();
+    }
+}
 
-    let (wrapped_key, salt) = if let Some(pwd) = password {
-        // Wrap content key with password-derived key
-        let mut salt = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut salt);
+/// Derive domain-separated keys for a Secure Share v1 from a 256-bit root secret.
+pub fn derive_share_keys(
+    root_secret: &[u8; 32],
+    selector: &str,
+) -> ([u8; 32], [u8; 32], [u8; 32]) {
+    let manifest_bytes = hkdf_sha256(SALT_MANIFEST, root_secret, selector.as_bytes(), 32);
+    let mut manifest_key = [0u8; 32];
+    manifest_key.copy_from_slice(&manifest_bytes);
 
-        let password_key = kdf::derive_key_from_password(pwd, &salt)?;
-        let (wrapped, wrap_nonce) = aead::encrypt(&password_key, &content_key)?;
+    let redemption_bytes = hkdf_sha256(SALT_REDEMPTION, root_secret, selector.as_bytes(), 32);
+    let mut redemption_key = [0u8; 32];
+    redemption_key.copy_from_slice(&redemption_bytes);
 
-        let mut wrapped_with_nonce = Vec::with_capacity(aead::NONCE_SIZE + wrapped.len());
-        wrapped_with_nonce.extend_from_slice(&wrap_nonce);
-        wrapped_with_nonce.extend_from_slice(&wrapped);
+    let report_bytes = hkdf_sha256(SALT_REPORT, root_secret, selector.as_bytes(), 32);
+    let mut report_capability = [0u8; 32];
+    report_capability.copy_from_slice(&report_bytes);
 
-        (Some(wrapped_with_nonce), Some(salt))
-    } else {
-        (None, None)
-    };
+    (manifest_key, redemption_key, report_capability)
+}
 
-    Ok(ShareBundle {
-        ciphertext: encrypted,
-        content_key,
-        wrapped_key,
-        salt,
+/// Derive only the redemption key from a root secret.
+pub fn derive_redemption_key(root_secret: &[u8; 32], selector: &str) -> [u8; 32] {
+    let redemption_bytes = hkdf_sha256(SALT_REDEMPTION, root_secret, selector.as_bytes(), 32);
+    let mut redemption_key = [0u8; 32];
+    redemption_key.copy_from_slice(&redemption_bytes);
+    redemption_key
+}
+
+/// Compute SHA-256 hash of a 32-byte key/capability.
+pub fn hash_capability(cap: &[u8; 32]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(cap);
+    let result = hasher.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&result);
+    out
+}
+
+/// Build the authenticated additional data (AAD) binding the ciphertext to the share context.
+pub fn build_share_aad(
+    version: u8,
+    origin: &str,
+    selector: &str,
+    content_type: &str,
+) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(32 + origin.len() + selector.len() + content_type.len());
+    aad.extend_from_slice(b"veil/share/v1|");
+    aad.push(version);
+    aad.push(b'|');
+    aad.extend_from_slice(origin.as_bytes());
+    aad.push(b'|');
+    aad.extend_from_slice(selector.as_bytes());
+    aad.push(b'|');
+    aad.extend_from_slice(content_type.as_bytes());
+    aad
+}
+
+/// Encrypt a Secure Share payload with v1 domain separation and AAD binding.
+pub fn encrypt_share_v1(
+    origin: &str,
+    selector: &str,
+    payload: &[u8],
+    content_type: &str,
+) -> Result<EncryptedShareV1, String> {
+    let mut root_secret = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut root_secret);
+
+    let (mut manifest_key, redemption_key, report_capability) =
+        derive_share_keys(&root_secret, selector);
+
+    let redemption_hash = hash_capability(&redemption_key);
+    let report_capability_hash = hash_capability(&report_capability);
+
+    let aad = build_share_aad(SHARE_PROTOCOL_VERSION, origin, selector, content_type);
+    let (ciphertext, nonce) = aead::encrypt_with_aad(&manifest_key, payload, &aad)?;
+    manifest_key.zeroize();
+
+    let mut full_ciphertext = Vec::with_capacity(NONCE_SIZE + ciphertext.len());
+    full_ciphertext.extend_from_slice(&nonce);
+    full_ciphertext.extend_from_slice(&ciphertext);
+
+    Ok(EncryptedShareV1 {
+        ciphertext: full_ciphertext,
+        root_secret,
+        redemption_key,
+        redemption_hash,
+        report_capability_hash,
     })
 }
 
-/// Decrypt a secure share.
-///
-/// If `password` is provided, derives the content key from the wrapped key.
-/// Otherwise, `content_key` must be provided (from URL fragment).
-pub fn decrypt_share(
-    ciphertext: &[u8],
-    content_key: Option<&[u8; 32]>,
-    password: Option<&str>,
-    wrapped_key: Option<&[u8]>,
-    salt: Option<&[u8; 32]>,
+/// Decrypt a Secure Share v1 payload using the root secret.
+pub fn decrypt_share_v1(
+    origin: &str,
+    selector: &str,
+    ciphertext_with_nonce: &[u8],
+    root_secret: &[u8; 32],
+    content_type: &str,
 ) -> Result<Vec<u8>, String> {
-    let key = if let Some(ck) = content_key {
-        *ck
-    } else if let (Some(pwd), Some(wk), Some(s)) = (password, wrapped_key, salt) {
-        // Derive password key and unwrap content key
-        let password_key = kdf::derive_key_from_password(pwd, s)?;
-
-        if wk.len() < aead::NONCE_SIZE {
-            return Err("wrapped key too short".to_string());
-        }
-        let wrap_nonce: [u8; aead::NONCE_SIZE] = wk[..aead::NONCE_SIZE]
-            .try_into()
-            .map_err(|_| "invalid wrap nonce")?;
-        let wrap_ct = &wk[aead::NONCE_SIZE..];
-
-        let unwrapped = aead::decrypt(&password_key, wrap_ct, &wrap_nonce)?;
-        if unwrapped.len() != 32 {
-            return Err("unwrapped key has wrong length".to_string());
-        }
-        let mut key = [0u8; 32];
-        key.copy_from_slice(&unwrapped);
-        key
-    } else {
-        return Err(
-            "must provide either content_key or (password + wrapped_key + salt)".to_string(),
-        );
-    };
-
-    // Decrypt payload
-    if ciphertext.len() < aead::NONCE_SIZE {
-        return Err("ciphertext too short".to_string());
+    if ciphertext_with_nonce.len() < NONCE_SIZE {
+        return Err("ciphertext too short: missing nonce".to_string());
     }
-    let nonce: [u8; aead::NONCE_SIZE] = ciphertext[..aead::NONCE_SIZE]
+
+    let (mut manifest_key, _, _) = derive_share_keys(root_secret, selector);
+    let nonce: [u8; NONCE_SIZE] = ciphertext_with_nonce[..NONCE_SIZE]
         .try_into()
-        .map_err(|_| "invalid nonce")?;
-    let ct = &ciphertext[aead::NONCE_SIZE..];
+        .map_err(|_| "invalid nonce slice")?;
+    let ciphertext = &ciphertext_with_nonce[NONCE_SIZE..];
 
-    let mut key_copy = key;
-    let result = aead::decrypt(&key_copy, ct, &nonce);
-    key_copy.zeroize();
+    let aad = build_share_aad(SHARE_PROTOCOL_VERSION, origin, selector, content_type);
+    let result = aead::decrypt_with_aad(&manifest_key, ciphertext, &nonce, &aad);
+    manifest_key.zeroize();
+
     result
-}
-
-/// Bundle returned from share encryption.
-pub struct ShareBundle {
-    /// Encrypted payload (nonce prepended)
-    pub ciphertext: Vec<u8>,
-    /// Content encryption key (32 bytes) — embed in URL fragment if no password
-    pub content_key: [u8; 32],
-    /// Wrapped content key (if password-protected)
-    pub wrapped_key: Option<Vec<u8>>,
-    /// Salt for password derivation (if password-protected)
-    pub salt: Option<[u8; 32]>,
-}
-
-impl Drop for ShareBundle {
-    fn drop(&mut self) {
-        self.content_key.zeroize();
-    }
 }
 
 #[cfg(test)]
@@ -127,19 +151,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_share_no_password() {
-        let payload = b"Secret data for sharing";
-        let bundle = encrypt_share(payload, None).unwrap();
+    fn test_share_v1_encrypt_decrypt_roundtrip() {
+        let origin = "https://node.example.com";
+        let selector = "dGVzdC1zZWxlY3Rvci0xMjM0NQ";
+        let payload = b"Hello, this is a secure guest share message!";
+        let content_type = "text";
 
-        assert!(bundle.wrapped_key.is_none());
-        assert!(bundle.salt.is_none());
+        let encrypted = encrypt_share_v1(origin, selector, payload, content_type).unwrap();
+        assert_ne!(encrypted.ciphertext, payload);
 
-        let decrypted = decrypt_share(
-            &bundle.ciphertext,
-            Some(&bundle.content_key),
-            None,
-            None,
-            None,
+        let decrypted = decrypt_share_v1(
+            origin,
+            selector,
+            &encrypted.ciphertext,
+            &encrypted.root_secret,
+            content_type,
         )
         .unwrap();
 
@@ -147,71 +173,68 @@ mod tests {
     }
 
     #[test]
-    fn test_share_with_password() {
-        let payload = b"Password-protected secret";
-        let password = "str0ng_p@ssw0rd!";
+    fn test_share_v1_key_derivation_deterministic() {
+        let root_secret = [0x42u8; 32];
+        let selector = "selector-abc";
 
-        let bundle = encrypt_share(payload, Some(password)).unwrap();
+        let (m1, r1, p1) = derive_share_keys(&root_secret, selector);
+        let (m2, r2, p2) = derive_share_keys(&root_secret, selector);
 
-        assert!(bundle.wrapped_key.is_some());
-        assert!(bundle.salt.is_some());
-
-        let decrypted = decrypt_share(
-            &bundle.ciphertext,
-            None,
-            Some(password),
-            bundle.wrapped_key.as_deref(),
-            bundle.salt.as_ref(),
-        )
-        .unwrap();
-
-        assert_eq!(decrypted, payload);
+        assert_eq!(m1, m2);
+        assert_eq!(r1, r2);
+        assert_eq!(p1, p2);
+        assert_ne!(m1, r1);
+        assert_ne!(r1, p1);
     }
 
     #[test]
-    fn test_share_wrong_password() {
-        let payload = b"Secret";
-        let bundle = encrypt_share(payload, Some("correct")).unwrap();
+    fn test_share_v1_fails_on_tampered_ciphertext() {
+        let origin = "https://node.example.com";
+        let selector = "dGVzdC1zZWxlY3Rvci0xMjM0NQ";
+        let payload = b"Sensitive document";
+        let content_type = "text";
 
-        let result = decrypt_share(
-            &bundle.ciphertext,
-            None,
-            Some("wrong"),
-            bundle.wrapped_key.as_deref(),
-            bundle.salt.as_ref(),
+        let mut encrypted = encrypt_share_v1(origin, selector, payload, content_type).unwrap();
+        let last_idx = encrypted.ciphertext.len() - 1;
+        encrypted.ciphertext[last_idx] ^= 0x01; // Tamper 1 bit
+
+        let res = decrypt_share_v1(
+            origin,
+            selector,
+            &encrypted.ciphertext,
+            &encrypted.root_secret,
+            content_type,
         );
-
-        assert!(result.is_err(), "Wrong password must fail");
+        assert!(res.is_err());
     }
 
     #[test]
-    fn test_share_large_payload() {
-        let payload = vec![0xAB; 1_000_000]; // 1 MB
-        let bundle = encrypt_share(&payload, Some("test")).unwrap();
+    fn test_share_v1_fails_on_wrong_origin_or_selector() {
+        let origin = "https://node.example.com";
+        let selector = "dGVzdC1zZWxlY3Rvci0xMjM0NQ";
+        let payload = b"Secret payload";
+        let content_type = "text";
 
-        let decrypted = decrypt_share(
-            &bundle.ciphertext,
-            None,
-            Some("test"),
-            bundle.wrapped_key.as_deref(),
-            bundle.salt.as_ref(),
-        )
-        .unwrap();
+        let encrypted = encrypt_share_v1(origin, selector, payload, content_type).unwrap();
 
-        assert_eq!(decrypted, payload);
-    }
+        // Wrong origin
+        let res = decrypt_share_v1(
+            "https://fake.example.com",
+            selector,
+            &encrypted.ciphertext,
+            &encrypted.root_secret,
+            content_type,
+        );
+        assert!(res.is_err());
 
-    #[test]
-    fn test_share_empty_payload() {
-        let bundle = encrypt_share(b"", None).unwrap();
-        let decrypted = decrypt_share(
-            &bundle.ciphertext,
-            Some(&bundle.content_key),
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-        assert_eq!(decrypted, b"");
+        // Wrong selector
+        let res = decrypt_share_v1(
+            origin,
+            "wrong-selector",
+            &encrypted.ciphertext,
+            &encrypted.root_secret,
+            content_type,
+        );
+        assert!(res.is_err());
     }
 }

@@ -97,42 +97,14 @@ export default function ContactSearchScreen({ navigation }: Props) {
 
     try {
       const username = query.trim();
-      const req = await VeilRuntime.prepareContactSearch(username);
-      
-      const url = `${runtimeBinding.canonicalServerOrigin}${req.target}`;
-      const response = await fetch(url, {
-        method: req.method,
-        headers: {
-          "Accept": "application/json",
-          "X-Veil-REST-Auth-Version": req.signature.version,
-          "X-Veil-User": req.signature.userId,
-          "X-Veil-Timestamp": req.signature.timestampMs,
-          "X-Veil-Nonce": req.signature.nonceBase64url,
-          "X-Veil-Signature": req.signature.signatureBase64url,
-        },
-      });
-
-      if (!response.ok) {
-        if (response.status === 404) {
-          setError("User not found (exact match required).");
-        } else {
-          setError(`Network error: ${response.status}`);
-        }
-        return;
-      }
-
-      const buffer = await response.arrayBuffer();
-      const bytes = new Uint8Array(buffer);
-      let binary = "";
-      for (let i = 0; i < bytes.byteLength; i++) {
-        binary += String.fromCharCode(bytes[i]);
-      }
-      const base64 = btoa(binary);
-
-      const parsed = await VeilRuntime.parseContactSearchResponse(base64);
+      const parsed = await VeilRuntime.executeContactSearch(username);
       setResult(parsed);
     } catch (err: any) {
-      setError(err.message || "Failed to search. Check your connection.");
+      if (err.message?.includes("404")) {
+        setError("User not found (exact match required).");
+      } else {
+        setError(err.message || "Failed to search. Check your connection.");
+      }
     } finally {
       setSearching(false);
     }
@@ -142,37 +114,12 @@ export default function ContactSearchScreen({ navigation }: Props) {
     if (!result || !runtimeBinding) return;
     setSearching(true);
     try {
-      const req = await VeilRuntime.prepareCreateDirect(result.userId);
-      const url = `${runtimeBinding.canonicalServerOrigin}${req.target}`;
-      
-      const bodyBytes = req.bodyBase64 ? Uint8Array.from(atob(req.bodyBase64), c => c.charCodeAt(0)) : undefined;
-      
-      const response = await fetch(url, {
-        method: req.method,
-        headers: {
-          "Content-Type": "application/json",
-          "Accept": "application/json",
-          "X-Veil-REST-Auth-Version": req.signature.version,
-          "X-Veil-User": req.signature.userId,
-          "X-Veil-Timestamp": req.signature.timestampMs,
-          "X-Veil-Nonce": req.signature.nonceBase64url,
-          "X-Veil-Signature": req.signature.signatureBase64url,
-        },
-        body: bodyBytes,
-      });
-
-      if (!response.ok) {
-        throw new Error(`Failed to create Direct: ${response.status}`);
-      }
-
-      const responseBuffer = await response.arrayBuffer();
-      const responseBytes = new Uint8Array(responseBuffer);
-      let responseBinary = "";
-      for (let i = 0; i < responseBytes.byteLength; i++) {
-        responseBinary += String.fromCharCode(responseBytes[i]);
-      }
-      const parsed = await VeilRuntime.parseCreateDirectResponse(btoa(responseBinary));
-      navigation.navigate("Direct", { conversationId: parsed.conversationId });
+      const parsed = await VeilRuntime.executeCreateDirect(result.userId);
+      close();
+      // Wait for animation to finish or close immediately, but to be safe:
+      setTimeout(() => {
+        (navigation as any).navigate("Direct", { conversationId: parsed.conversationId });
+      }, reducedMotion ? 150 : 200);
     } catch (err: any) {
       setError(err.message || "Failed to start direct message");
     } finally {

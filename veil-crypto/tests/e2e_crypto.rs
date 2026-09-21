@@ -266,47 +266,48 @@ fn test_aead_integrity() {
     assert!(aead::decrypt(&key, &ct, &bad_nonce).is_err());
 }
 
-/// Secure share: full lifecycle with and without password
+/// Secure share v1: full lifecycle with domain-separated KDF and AAD
 #[test]
 fn test_share_lifecycle() {
     let payload = b"This is a confidential document that self-destructs.";
+    let origin = "https://node.example.com";
+    let selector = "sel-abcdef-123456";
+    let content_type = "text";
 
-    // Without password
-    let bundle = share::encrypt_share(payload, None).unwrap();
-    let decrypted = share::decrypt_share(
+    // Encrypt share v1
+    let bundle = share::encrypt_share_v1(origin, selector, payload, content_type).unwrap();
+
+    // Successful decrypt
+    let decrypted = share::decrypt_share_v1(
+        origin,
+        selector,
         &bundle.ciphertext,
-        Some(&bundle.content_key),
-        None,
-        None,
-        None,
+        &bundle.root_secret,
+        content_type,
     )
     .unwrap();
     assert_eq!(decrypted, payload);
 
-    // With password
-    let bundle_pw = share::encrypt_share(payload, Some("$ecureP@ss!")).unwrap();
-    assert!(bundle_pw.wrapped_key.is_some());
-    assert!(bundle_pw.salt.is_some());
-
-    let decrypted_pw = share::decrypt_share(
-        &bundle_pw.ciphertext,
-        None,
-        Some("$ecureP@ss!"),
-        bundle_pw.wrapped_key.as_deref(),
-        bundle_pw.salt.as_ref(),
-    )
-    .unwrap();
-    assert_eq!(decrypted_pw, payload);
-
-    // Wrong password
-    let result = share::decrypt_share(
-        &bundle_pw.ciphertext,
-        None,
-        Some("wrong"),
-        bundle_pw.wrapped_key.as_deref(),
-        bundle_pw.salt.as_ref(),
+    // Wrong origin fails
+    let err_origin = share::decrypt_share_v1(
+        "https://wrong.example.com",
+        selector,
+        &bundle.ciphertext,
+        &bundle.root_secret,
+        content_type,
     );
-    assert!(result.is_err());
+    assert!(err_origin.is_err());
+
+    // Wrong root secret fails
+    let wrong_secret = [0x99u8; 32];
+    let err_secret = share::decrypt_share_v1(
+        origin,
+        selector,
+        &bundle.ciphertext,
+        &wrong_secret,
+        content_type,
+    );
+    assert!(err_secret.is_err());
 }
 
 /// Ed25519 signature: sign → verify → tamper check

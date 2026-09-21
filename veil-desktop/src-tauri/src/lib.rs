@@ -11846,6 +11846,155 @@ fn revoke_all_invites(
     Ok(())
 }
 
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CreateSecureShareOptions {
+    text: String,
+    content_type: Option<String>,
+    max_claims: Option<i32>,
+    ttl_seconds: Option<i64>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CreatedSecureShareResponse {
+    share_id: String,
+    public_selector: String,
+    share_url: String,
+    max_claims: i32,
+    expires_at: String,
+    created_at: String,
+}
+
+#[tauri::command]
+fn create_secure_share(
+    state: State<'_, AppState>,
+    server_http_url: String,
+    user_id: String,
+    options: CreateSecureShareOptions,
+    expected_server_origin: String,
+    expected_binding_generation: String,
+) -> Result<CreatedSecureShareResponse, String> {
+    use base64::Engine;
+    use rand::RngCore;
+
+    let binding = capture_expected_live_action_binding(
+        &state,
+        &expected_server_origin,
+        &expected_binding_generation,
+    )?;
+    let request_url = rest_api_url(&server_http_url, &["v1", "shares"])?;
+    validate_live_action_rest_origin(&binding, &request_url)?;
+
+    let content_type = options.content_type.unwrap_or_else(|| "text".to_string());
+    let max_claims = options.max_claims.unwrap_or(1).clamp(1, 100);
+    let ttl_seconds = options.ttl_seconds.unwrap_or(86400).clamp(300, 30 * 86400);
+
+    let mut selector_bytes = [0u8; 24];
+    rand::rngs::OsRng.fill_bytes(&mut selector_bytes);
+    let public_selector = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(selector_bytes);
+
+    let origin = expected_server_origin.trim_end_matches('/');
+
+    let encrypted = veil_crypto::share::encrypt_share_v1(
+        origin,
+        &public_selector,
+        options.text.as_bytes(),
+        &content_type,
+    )?;
+
+    let root_secret_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(encrypted.root_secret);
+    let redemption_hash_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(encrypted.redemption_hash);
+    let report_cap_hash_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(encrypted.report_capability_hash);
+    let ciphertext_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&encrypted.ciphertext);
+
+    let share_url = format!("{}/s/v1/{}#k={}", origin, public_selector, root_secret_b64);
+
+    let body = serde_json::json!({
+        "public_selector": public_selector,
+        "redemption_hash_base64": redemption_hash_b64,
+        "report_capability_hash_base64": report_cap_hash_b64,
+        "ciphertext_base64": ciphertext_b64,
+        "size_bytes": options.text.len(),
+        "content_type": content_type,
+        "max_claims": max_claims,
+        "ttl_seconds": ttl_seconds,
+    });
+
+    let resp = state.runtime.block_on(rest_send_json_for_binding(
+        &state,
+        reqwest::Method::POST,
+        request_url,
+        &user_id,
+        Some(body),
+        &binding,
+    ))?;
+
+    Ok(CreatedSecureShareResponse {
+        share_id: resp["id"].as_str().unwrap_or("").to_string(),
+        public_selector,
+        share_url,
+        max_claims,
+        expires_at: resp["expires_at"].as_str().unwrap_or("").to_string(),
+        created_at: resp["created_at"].as_str().unwrap_or("").to_string(),
+    })
+}
+
+#[tauri::command]
+fn list_secure_shares(
+    state: State<'_, AppState>,
+    server_http_url: String,
+    user_id: String,
+    expected_server_origin: String,
+    expected_binding_generation: String,
+) -> Result<Vec<serde_json::Value>, String> {
+    let binding = capture_expected_live_action_binding(
+        &state,
+        &expected_server_origin,
+        &expected_binding_generation,
+    )?;
+    let request_url = rest_api_url(&server_http_url, &["v1", "shares"])?;
+    validate_live_action_rest_origin(&binding, &request_url)?;
+
+    let resp = state.runtime.block_on(rest_send_json_for_binding(
+        &state,
+        reqwest::Method::GET,
+        request_url,
+        &user_id,
+        None,
+        &binding,
+    ))?;
+
+    Ok(resp.as_array().cloned().unwrap_or_default())
+}
+
+#[tauri::command]
+fn revoke_secure_share(
+    state: State<'_, AppState>,
+    server_http_url: String,
+    user_id: String,
+    selector: String,
+    expected_server_origin: String,
+    expected_binding_generation: String,
+) -> Result<serde_json::Value, String> {
+    let binding = capture_expected_live_action_binding(
+        &state,
+        &expected_server_origin,
+        &expected_binding_generation,
+    )?;
+    let request_url = rest_api_url(&server_http_url, &["v1", "shares", &selector, "revoke"])?;
+    validate_live_action_rest_origin(&binding, &request_url)?;
+
+    state.runtime.block_on(rest_send_json_for_binding(
+        &state,
+        reqwest::Method::POST,
+        request_url,
+        &user_id,
+        None,
+        &binding,
+    ))
+}
+
 #[tauri::command]
 fn list_channel_overwrites(
     state: State<'_, AppState>,
@@ -13477,6 +13626,9 @@ pub fn run() {
             hydrate_channel_sender_keys,
             sender_key_distribution_status,
             distribute_sender_key,
+            create_secure_share,
+            list_secure_shares,
+            revoke_secure_share,
         ])
         .run(tauri::generate_context!())
         .expect("error while running veil");

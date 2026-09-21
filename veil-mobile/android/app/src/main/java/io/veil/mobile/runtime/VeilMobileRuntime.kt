@@ -1370,8 +1370,10 @@ internal class VeilMobileRuntime internal constructor(
    * never reaches JavaScript as authoritative.
    */
   fun verifyIdentityPresence(): Boolean {
+    android.util.Log.d("VEIL-DEBUG", "verifyIdentityPresence called")
     val verificationEpoch = synchronized(stateLock) {
       if (!foreground) {
+        android.util.Log.e("VEIL-DEBUG", "verifyIdentityPresence throwing E_VEIL_LOCKED: !foreground")
         throw VeilMobileRuntimeException(
           "E_VEIL_LOCKED",
           "Return to Veil before checking the local account",
@@ -1383,9 +1385,11 @@ internal class VeilMobileRuntime internal constructor(
     val identityExists = NativeIdentitySetupCoordinator.withSettledIdentityRead {
       vault.hasIdentity()
     }
+    android.util.Log.d("VEIL-DEBUG", "vault.hasIdentity returned $identityExists")
 
     return synchronized(stateLock) {
       if (!foreground || lifecycleEpoch != verificationEpoch) {
+        android.util.Log.e("VEIL-DEBUG", "verifyIdentityPresence throwing E_VEIL_LOCKED: !foreground or epoch mismatch")
         throw VeilMobileRuntimeException(
           "E_VEIL_LOCKED",
           "Return to Veil before checking the local account",

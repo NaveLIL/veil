@@ -172,10 +172,8 @@ interface VeilMobileRuntimeNative {
     expectedDirectGeneration: number,
     text: string,
   ): Promise<unknown>;
-  prepareContactSearch(username: string): Promise<NativeContactRequest>;
-  prepareCreateDirect(peerUserId: string): Promise<NativeContactRequest>;
-  parseContactSearchResponse(responseBase64: string): Promise<NativeContactSearchResult>;
-  parseCreateDirectResponse(responseBase64: string): Promise<{ conversationId: string }>;
+  executeContactSearch(username: string): Promise<NativeContactSearchResult>;
+  executeCreateDirect(peerUserId: string): Promise<{ conversationId: string }>;
   addListener(eventName: string): void;
   removeListeners(count: number): void;
 }
@@ -735,17 +733,11 @@ const VeilRuntime = {
   lock: async (): Promise<VeilMobileRuntimeSnapshot> =>
     runtimeSnapshot(await requireRuntime().lockSession()),
   
-  prepareContactSearch: async (username: string): Promise<NativeContactRequest> =>
-    requireRuntime().prepareContactSearch(username),
+  executeContactSearch: async (username: string): Promise<NativeContactSearchResult> =>
+    requireRuntime().executeContactSearch(username),
 
-  prepareCreateDirect: async (peerUserId: string): Promise<NativeContactRequest> =>
-    requireRuntime().prepareCreateDirect(peerUserId),
-
-  parseContactSearchResponse: async (responseBase64: string): Promise<NativeContactSearchResult> =>
-    requireRuntime().parseContactSearchResponse(responseBase64),
-
-  parseCreateDirectResponse: async (responseBase64: string): Promise<{ conversationId: string }> =>
-    requireRuntime().parseCreateDirectResponse(responseBase64),
+  executeCreateDirect: async (peerUserId: string): Promise<{ conversationId: string }> =>
+    requireRuntime().executeCreateDirect(peerUserId),
 
   cancelPendingAccessPass: async (flowId: string): Promise<boolean> =>
     await requireRuntime().cancelPendingAccessPass(flowId) === true,

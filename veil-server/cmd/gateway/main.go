@@ -30,6 +30,7 @@ import (
 	"github.com/NaveLIL/veil/veil-server/internal/profiles"
 	"github.com/NaveLIL/veil/veil-server/internal/push"
 	"github.com/NaveLIL/veil/veil-server/internal/servers"
+	"github.com/NaveLIL/veil/veil-server/internal/shares"
 	veiltransparency "github.com/NaveLIL/veil/veil-server/internal/transparency"
 	"github.com/NaveLIL/veil/veil-server/internal/uploads"
 )
@@ -45,6 +46,9 @@ var termsHTML []byte
 
 //go:embed web/enroll.html
 var enrollHTML []byte
+
+//go:embed web/share.html
+var shareHTML []byte
 
 //go:embed web/legal.css
 var legalCSS []byte
@@ -377,6 +381,30 @@ func main() {
 	} else {
 		log.Printf("uploads disabled (set VEIL_UPLOAD_TOKEN_KEY to enable)")
 	}
+
+	// Phase 4G — Secure Share for guests (authenticated creation, public claims, leases, viewer)
+	sharesStore := shares.NewPostgresStore(database.Pool)
+	sharesPublicRL := authmw.NewRateLimit(60, time.Minute)
+	defer sharesPublicRL.Close()
+	sharesClaimRL := authmw.NewRateLimit(15, time.Minute)
+	defer sharesClaimRL.Close()
+	sharesHandler := shares.NewHandler(sharesStore, signedMw, rl, sharesPublicRL, sharesClaimRL)
+	sharesHandler.SetRESTAuthVersionDispatcher(restDispatcher)
+	sharesHandler.RegisterRoutes(mux)
+
+	sharesJanitorCtx, sharesJanitorCancel := context.WithCancel(context.Background())
+	defer sharesJanitorCancel()
+	go shares.RunJanitor(sharesJanitorCtx, sharesStore, slog.Default())
+
+	shareViewerPage := func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("X-Robots-Tag", "noindex, nofollow, noarchive")
+		w.Header().Set("Referrer-Policy", "no-referrer")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Write(shareHTML)
+	}
+	mux.HandleFunc("GET /s/v1/{selector}", shareViewerPage)
 
 	// Landing page — served at the root so opening IP:port in a browser shows
 	// the project page instead of a blank 404.

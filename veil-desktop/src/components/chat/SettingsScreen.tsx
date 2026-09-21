@@ -23,19 +23,23 @@ import {
   Trash2,
   RefreshCw,
   UserRound,
+  Share2,
   type LucideIcon,
 } from "lucide-solid";
+import { CreateShareDialog } from "@/components/share/CreateShareDialog";
+import { SecureShareItem } from "@/stores/app";
 
 /* ═══════════════════════════════════════════════════════
    SETTINGS — Full-screen overlay with sidebar navigation
    ═══════════════════════════════════════════════════════ */
 
-type Section = "profile" | "appearance" | "security" | "network" | "notifications" | "about" | "privacy";
+type Section = "profile" | "appearance" | "security" | "share" | "network" | "notifications" | "about" | "privacy";
 
 const SECTIONS: { id: Section; label: string; icon: LucideIcon }[] = [
   { id: "profile", label: "Profile", icon: UserRound },
   { id: "appearance", label: "Appearance", icon: Palette },
   { id: "security", label: "Security", icon: Shield },
+  { id: "share", label: "Secure Share", icon: Share2 },
   { id: "network", label: "Network", icon: Network },
   { id: "notifications", label: "Notifications", icon: Bell },
   { id: "about", label: "About", icon: Info },
@@ -1369,6 +1373,98 @@ export const SettingsScreen: Component = () => {
     </>
   );
 
+  const ShareSection: Component = () => {
+    const [showDialog, setShowDialog] = createSignal(false);
+    const [shares, setShares] = createSignal<SecureShareItem[]>([]);
+    const [loading, setLoading] = createSignal(false);
+
+    const load = async () => {
+      setLoading(true);
+      try {
+        const items = await appStore.listSecureShares();
+        setShares(items);
+      } catch (e) {
+        console.error("listSecureShares failed:", e);
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    onMount(load);
+
+    const revoke = async (selector: string) => {
+      try {
+        await appStore.revokeSecureShare(selector);
+        await load();
+      } catch (e) {
+        console.error("revokeSecureShare failed:", e);
+      }
+    };
+
+    return (
+      <div>
+        <div style={S.card}>
+          <div style={S.cardTitle}>Secure Share for Guests</div>
+          <div style={S.paragraph}>
+            Create end-to-end encrypted, self-destructing links to share secret notes or credentials with recipients who do not have a Veil account. Decryption happens entirely inside the recipient's web browser.
+          </div>
+          <button style={S.btnPrimary} onClick={() => setShowDialog(true)}>
+            Create Secure Share Link
+          </button>
+        </div>
+
+        <div style={S.card}>
+          <div style={{ display: "flex", "align-items": "center", "justify-content": "space-between", "margin-bottom": "14px" }}>
+            <div style={S.cardTitle}>Your Active Shares</div>
+            <button style={S.btnSecondary} onClick={load} disabled={loading()}>
+              <RefreshCw size={13} class={loading() ? "animate-spin" : ""} /> Refresh
+            </button>
+          </div>
+
+          <Show when={loading()}>
+            <div style={{ ...S.paragraph, color: "var(--veil-text-faint)" }}>Loading active shares...</div>
+          </Show>
+
+          <Show when={!loading() && shares().length === 0}>
+            <div style={{ ...S.paragraph, color: "var(--veil-text-faint)" }}>
+              You have no active Secure Share links.
+            </div>
+          </Show>
+
+          <Show when={!loading() && shares().length > 0}>
+            <div style={{ display: "flex", "flex-direction": "column", gap: "10px" }}>
+              <For each={shares()}>
+                {(item) => (
+                  <div style={{
+                    display: "flex", "align-items": "center", "justify-content": "space-between",
+                    padding: "12px 14px", background: "var(--veil-control)",
+                    border: "1px solid var(--veil-border)", "border-radius": "8px"
+                  }}>
+                    <div>
+                      <div style={{ "font-family": "ui-monospace, monospace", "font-size": "13px", "font-weight": "600", color: "var(--veil-text)" }}>
+                        {item.public_selector}
+                      </div>
+                      <div style={{ "font-size": "11px", color: "var(--veil-text-faint)", "margin-top": "4px" }}>
+                        {item.consumed_claims}/{item.max_claims} views used • Status: {item.status}
+                      </div>
+                    </div>
+                    <Show when={item.status === "active"}>
+                      <button style={S.btnDanger} onClick={() => revoke(item.public_selector)}>
+                        Revoke
+                      </button>
+                    </Show>
+                  </div>
+                )}
+              </For>
+            </div>
+          </Show>
+        </div>
+
+        <CreateShareDialog open={showDialog()} onClose={() => { setShowDialog(false); load(); }} />
+      </div>
+    );
+  };
+
   return (
     <div style={{ ...S.overlay, ...animStyle() }}>
       {/* Close button */}
@@ -1412,6 +1508,7 @@ export const SettingsScreen: Component = () => {
           <Match when={section() === "profile"}><ProfileSection /></Match>
           <Match when={section() === "appearance"}><AppearanceSection /></Match>
           <Match when={section() === "security"}><SecuritySection /></Match>
+          <Match when={section() === "share"}><ShareSection /></Match>
           <Match when={section() === "network"}><NetworkSection /></Match>
           <Match when={section() === "notifications"}><NotificationsSection /></Match>
           <Match when={section() === "about"}><AboutSection /></Match>

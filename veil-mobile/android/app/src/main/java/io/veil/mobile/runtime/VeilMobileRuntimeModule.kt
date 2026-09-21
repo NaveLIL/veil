@@ -23,6 +23,7 @@ internal class VeilMobileRuntimeModule(
   private val runtime: VeilMobileRuntime,
 ) : ReactContextBaseJavaModule(context) {
   private val listenerCount = AtomicInteger(0)
+  private val httpClient = okhttp3.OkHttpClient()
   private val runtimeListener: (VeilMobileRuntimeSnapshot) -> Unit = { snapshot ->
     if (listenerCount.get() > 0 && reactApplicationContext.hasActiveReactInstance()) {
       reactApplicationContext
@@ -199,69 +200,127 @@ internal class VeilMobileRuntimeModule(
   }
 
   @ReactMethod
-  fun prepareContactSearch(username: String, promise: Promise) = onRuntime(promise) {
-    val req = runtime.prepareContactSearchRequest(username)
-    val sigMap = Arguments.createMap().apply {
-      putString("version", req.signature.version)
-      putString("userId", req.signature.userId)
-      putString("timestampMs", req.signature.timestampMs)
-      putString("nonceBase64url", req.signature.nonceBase64url)
-      putString("signatureBase64url", req.signature.signatureBase64url)
-    }
-    Arguments.createMap().apply {
-      putString("method", req.method)
-      putString("target", req.requestTarget)
-      putMap("signature", sigMap)
-    }
-  }
-
-  @ReactMethod
-  fun prepareCreateDirect(peerUserId: String, promise: Promise) = onRuntime(promise) {
-    val req = runtime.prepareCreateDirectRequest(peerUserId)
-    val sigMap = Arguments.createMap().apply {
-      putString("version", req.signature.version)
-      putString("userId", req.signature.userId)
-      putString("timestampMs", req.signature.timestampMs)
-      putString("nonceBase64url", req.signature.nonceBase64url)
-      putString("signatureBase64url", req.signature.signatureBase64url)
-    }
+  fun executeContactSearch(username: String, promise: Promise) = runtime.execute {
     try {
-      val bodyBase64 = android.util.Base64.encodeToString(req.body, android.util.Base64.NO_WRAP)
-      Arguments.createMap().apply {
-        putString("method", req.method)
-        putString("target", req.requestTarget)
-        putString("bodyBase64", bodyBase64)
-        putMap("signature", sigMap)
+      val req = runtime.prepareContactSearchRequest(username)
+      val current = runtime.snapshot().binding
+      if (current == null) {
+        promise.rejectRuntimeFailure("E_VEIL_UNAUTHENTICATED")
+        return@execute
       }
-    } finally {
+      val url = "${current.canonicalServerOrigin}${req.requestTarget}"
+      val okReqBuilder = okhttp3.Request.Builder().url(url)
+      okReqBuilder.addHeader("Content-Type", "application/json")
+      okReqBuilder.addHeader("Accept", "application/json")
+      okReqBuilder.addHeader("X-Veil-REST-Auth-Version", req.signature.version)
+      okReqBuilder.addHeader("X-Veil-User", req.signature.userId)
+      okReqBuilder.addHeader("X-Veil-Timestamp", req.signature.timestampMs)
+      okReqBuilder.addHeader("X-Veil-Nonce", req.signature.nonceBase64url)
+      okReqBuilder.addHeader("X-Veil-Signature", req.signature.signatureBase64url)
+
+      if (req.method == "POST" || req.method == "PUT") {
+        okReqBuilder.method(req.method, okhttp3.RequestBody.create(null, req.body))
+      } else {
+        okReqBuilder.method(req.method, null)
+      }
       req.body.fill(0)
+
+      httpClient.newCall(okReqBuilder.build()).enqueue(object : okhttp3.Callback {
+        override fun onFailure(call: okhttp3.Call, e: java.io.IOException) {
+          promise.rejectRuntimeFailure("E_VEIL_NETWORK")
+        }
+        override fun onResponse(call: okhttp3.Call, response: okhttp3.Response) {
+          response.use { res ->
+            if (!res.isSuccessful) {
+              promise.rejectRuntimeFailure("E_VEIL_HTTP")
+              return
+            }
+            val bodyBytes = res.body?.bytes() ?: ByteArray(0)
+            runtime.execute {
+              try {
+                val parsed = runtime.parseContactSearchResponse(bodyBytes)
+                val map = Arguments.createMap().apply {
+                  putString("userId", parsed.userId)
+                  putString("username", parsed.username)
+                }
+                promise.resolve(map)
+              } catch (e: VeilMobileRuntimeException) {
+                promise.rejectRuntimeFailure(e.code)
+              } catch (e: Throwable) {
+                promise.rejectRuntimeFailure("E_VEIL_PARSE")
+              } finally {
+                bodyBytes.fill(0)
+              }
+            }
+          }
+        }
+      })
+    } catch (error: VeilMobileRuntimeException) {
+      promise.rejectRuntimeFailure(error.code)
+    } catch (error: Throwable) {
+      promise.rejectRuntimeFailure("E_VEIL_RUNTIME")
     }
   }
 
   @ReactMethod
-  fun parseContactSearchResponse(responseBase64: String, promise: Promise) = onRuntime(promise) {
-    val responseBytes = android.util.Base64.decode(responseBase64, android.util.Base64.DEFAULT)
+  fun executeCreateDirect(peerUserId: String, promise: Promise) = runtime.execute {
     try {
-      val res = runtime.parseContactSearchResponse(responseBytes)
-      Arguments.createMap().apply {
-        putString("userId", res.userId)
-        putString("username", res.username)
+      val req = runtime.prepareCreateDirectRequest(peerUserId)
+      val current = runtime.snapshot().binding
+      if (current == null) {
+        promise.rejectRuntimeFailure("E_VEIL_UNAUTHENTICATED")
+        return@execute
       }
-    } finally {
-      responseBytes.fill(0)
-    }
-  }
+      val url = "${current.canonicalServerOrigin}${req.requestTarget}"
+      val okReqBuilder = okhttp3.Request.Builder().url(url)
+      okReqBuilder.addHeader("Content-Type", "application/json")
+      okReqBuilder.addHeader("Accept", "application/json")
+      okReqBuilder.addHeader("X-Veil-REST-Auth-Version", req.signature.version)
+      okReqBuilder.addHeader("X-Veil-User", req.signature.userId)
+      okReqBuilder.addHeader("X-Veil-Timestamp", req.signature.timestampMs)
+      okReqBuilder.addHeader("X-Veil-Nonce", req.signature.nonceBase64url)
+      okReqBuilder.addHeader("X-Veil-Signature", req.signature.signatureBase64url)
 
-  @ReactMethod
-  fun parseCreateDirectResponse(responseBase64: String, promise: Promise) = onRuntime(promise) {
-    val responseBytes = android.util.Base64.decode(responseBase64, android.util.Base64.DEFAULT)
-    try {
-      val conversationId = runtime.completeCreateDirectResponse(responseBytes)
-      Arguments.createMap().apply {
-        putString("conversationId", conversationId)
+      if (req.method == "POST" || req.method == "PUT") {
+        okReqBuilder.method(req.method, okhttp3.RequestBody.create(null, req.body))
+      } else {
+        okReqBuilder.method(req.method, null)
       }
-    } finally {
-      responseBytes.fill(0)
+      req.body.fill(0)
+
+      httpClient.newCall(okReqBuilder.build()).enqueue(object : okhttp3.Callback {
+        override fun onFailure(call: okhttp3.Call, e: java.io.IOException) {
+          promise.rejectRuntimeFailure("E_VEIL_NETWORK")
+        }
+        override fun onResponse(call: okhttp3.Call, response: okhttp3.Response) {
+          response.use { res ->
+            if (!res.isSuccessful) {
+              promise.rejectRuntimeFailure("E_VEIL_HTTP")
+              return
+            }
+            val bodyBytes = res.body?.bytes() ?: ByteArray(0)
+            runtime.execute {
+              try {
+                val conversationId = runtime.completeCreateDirectResponse(bodyBytes)
+                val map = Arguments.createMap().apply {
+                  putString("conversationId", conversationId)
+                }
+                promise.resolve(map)
+              } catch (e: VeilMobileRuntimeException) {
+                promise.rejectRuntimeFailure(e.code)
+              } catch (e: Throwable) {
+                promise.rejectRuntimeFailure("E_VEIL_PARSE")
+              } finally {
+                bodyBytes.fill(0)
+              }
+            }
+          }
+        }
+      })
+    } catch (error: VeilMobileRuntimeException) {
+      promise.rejectRuntimeFailure(error.code)
+    } catch (error: Throwable) {
+      promise.rejectRuntimeFailure("E_VEIL_RUNTIME")
     }
   }
 
@@ -502,12 +561,13 @@ private fun VeilMobileRuntimeSnapshot.toWritableMap(): WritableMap = Arguments.c
   publicFailureCodeV1WireValue()?.let { wireValue ->
     putString(RUNTIME_SNAPSHOT_PUBLIC_FAILURE_CODE_KEY, wireValue)
   } ?: putNull(RUNTIME_SNAPSHOT_PUBLIC_FAILURE_CODE_KEY)
-  putBoolean("directoryReady", publicDirectory.ready)
+  putBoolean("directoryReady", directoryReady)
   putString("secureSyncState", secureSyncState.name.lowercase())
   putMap("binding", binding?.toWritableMap())
-  putMap("pendingAccessPass", pendingAccessPass?.toWritableMap())
+  pendingAccessPass?.let { pass -> putMap("pendingAccessPass", pass.toWritableMap()) }
+    ?: putNull("pendingAccessPass")
   putArray("directConversations", Arguments.createArray().also { output ->
-    publicDirectory.conversations.forEach { conversation ->
+    directConversations.forEach { conversation ->
       output.pushMap(conversation.toWritableMap())
     }
   })
@@ -515,7 +575,7 @@ private fun VeilMobileRuntimeSnapshot.toWritableMap(): WritableMap = Arguments.c
 
 private const val RUNTIME_SNAPSHOT_PUBLIC_FAILURE_CODE_KEY = "publicFailureCodeV1"
 
-private fun PublicDirectConversationView.toWritableMap(): WritableMap = Arguments.createMap().apply {
+private fun NativeDirectConversationInstall.toWritableMap(): WritableMap = Arguments.createMap().apply {
   putString("conversationId", conversationId)
   putString("name", name)
   putString("peerUserId", peerUserId)

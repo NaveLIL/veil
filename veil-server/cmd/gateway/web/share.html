@@ -1,0 +1,624 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="robots" content="noindex,nofollow,noarchive">
+  <meta name="theme-color" content="#07101d">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; connect-src 'self'; img-src 'self' blob: data:; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'">
+  <title>Veil — Secure Share</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #050912;
+      color: #f2f7ff;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      min-height: 100vh;
+      min-height: 100svh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 24px 16px;
+      background:
+        radial-gradient(circle at 15% 15%, rgba(27, 149, 232, .18), transparent 40%),
+        radial-gradient(circle at 85% 85%, rgba(112, 71, 236, .18), transparent 45%),
+        linear-gradient(145deg, #07101d 0%, #070a15 50%, #0d0a1e 100%);
+    }
+    .card {
+      background: rgba(14, 20, 35, 0.85);
+      border: 1px solid rgba(80, 120, 180, 0.25);
+      border-radius: 20px;
+      padding: 36px 32px;
+      max-width: 580px;
+      width: 100%;
+      box-shadow: 0 20px 50px rgba(0, 0, 0, 0.5), inset 0 1px 1px rgba(255, 255, 255, 0.1);
+      backdrop-filter: blur(16px);
+      text-align: center;
+    }
+    .brand {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      font-size: 11px;
+      font-weight: 800;
+      letter-spacing: 0.25em;
+      color: #7eb3ff;
+      margin-bottom: 20px;
+      text-transform: uppercase;
+    }
+    .brand-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #46b4fb;
+      box-shadow: 0 0 12px #46b4fb;
+    }
+    h1 {
+      font-size: 1.5rem;
+      font-weight: 600;
+      letter-spacing: -0.02em;
+      margin-bottom: 8px;
+      color: #ffffff;
+    }
+    .subtitle {
+      font-size: 0.875rem;
+      color: #90a4c3;
+      margin-bottom: 24px;
+      line-height: 1.5;
+    }
+    .status-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 14px;
+      border-radius: 9999px;
+      font-size: 0.75rem;
+      font-weight: 500;
+      background: rgba(80, 140, 240, 0.12);
+      border: 1px solid rgba(80, 140, 240, 0.25);
+      color: #a5c7f8;
+      margin-bottom: 24px;
+    }
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      padding: 12px 28px;
+      border-radius: 12px;
+      font-size: 0.9375rem;
+      font-weight: 600;
+      background: linear-gradient(135deg, #2563eb, #7c3aed);
+      color: #ffffff;
+      border: none;
+      cursor: pointer;
+      box-shadow: 0 4px 20px rgba(37, 99, 235, 0.35);
+      transition: all 0.2s ease;
+      width: 100%;
+    }
+    .btn:hover {
+      background: linear-gradient(135deg, #1d4ed8, #6d28d9);
+      box-shadow: 0 6px 24px rgba(37, 99, 235, 0.5);
+      transform: translateY(-1px);
+    }
+    .btn:active { transform: translateY(0); }
+    .btn:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+      transform: none;
+    }
+    .btn-secondary {
+      background: rgba(255, 255, 255, 0.08);
+      color: #d1d5db;
+      box-shadow: none;
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      margin-top: 12px;
+    }
+    .btn-secondary:hover {
+      background: rgba(255, 255, 255, 0.14);
+      box-shadow: none;
+    }
+    .content-box {
+      display: none;
+      margin-top: 24px;
+      text-align: left;
+      background: rgba(5, 10, 20, 0.7);
+      border: 1px solid rgba(80, 120, 180, 0.2);
+      border-radius: 12px;
+      padding: 18px;
+    }
+    .content-text {
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+      font-size: 0.875rem;
+      line-height: 1.6;
+      color: #e2e8f0;
+      max-height: 360px;
+      overflow-y: auto;
+    }
+    .meta-footer {
+      margin-top: 24px;
+      font-size: 0.75rem;
+      color: #64748b;
+      line-height: 1.5;
+    }
+    .error-card {
+      color: #f87171;
+      background: rgba(239, 68, 68, 0.1);
+      border: 1px solid rgba(239, 68, 68, 0.25);
+      border-radius: 12px;
+      padding: 16px;
+      font-size: 0.875rem;
+      margin-top: 16px;
+      display: none;
+    }
+    .burned-banner {
+      color: #fbbf24;
+      background: rgba(245, 158, 11, 0.1);
+      border: 1px solid rgba(245, 158, 11, 0.2);
+      border-radius: 8px;
+      padding: 10px 14px;
+      font-size: 0.75rem;
+      margin-top: 16px;
+      display: none;
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="brand">
+      <span class="brand-dot"></span>
+      VEIL SECURE SHARE
+    </div>
+    <h1 id="title">End-to-End Encrypted Share</h1>
+    <p class="subtitle" id="subtitle">This encrypted message was shared with you. Decryption happens entirely inside your browser.</p>
+    
+    <div class="status-badge" id="statusBadge">Checking share status...</div>
+    
+    <div id="actionArea">
+      <button class="btn" id="decryptBtn" onclick="claimAndDecrypt()">Decrypt & View</button>
+    </div>
+
+    <div class="error-card" id="errorBox"></div>
+    <div class="burned-banner" id="burnedBanner">
+      ⚠️ This share was configured to burn after viewing. The server has now destroyed the ciphertext.
+    </div>
+
+    <div class="content-box" id="contentBox">
+      <div class="content-text" id="contentText"></div>
+      <button class="btn btn-secondary" id="copyBtn" onclick="copyContent()">Copy Plaintext</button>
+      <a class="btn btn-secondary" id="downloadBtn" style="display:none; text-decoration:none;" download="share-file">Download Decrypted File</a>
+    </div>
+
+    <div class="meta-footer">
+      Veil zero-knowledge architecture. The server never sees the plaintext or the content decryption key.
+    </div>
+  </div>
+
+  <script>
+    let rootSecretBase64 = null;
+    let selector = null;
+    let shareMeta = null;
+
+    function getSelectorFromPath() {
+      const parts = window.location.pathname.split('/');
+      for (let i = 0; i < parts.length; i++) {
+        if (parts[i] === 'v1' && i + 1 < parts.length) {
+          return parts[i + 1];
+        }
+      }
+      return parts[parts.length - 1];
+    }
+
+    function parseFragment() {
+      const hash = window.location.hash.substring(1);
+      if (!hash) return null;
+      const params = new URLSearchParams(hash);
+      return params.get('k');
+    }
+
+    function wipeFragment() {
+      if (window.location.hash) {
+        history.replaceState(null, '', window.location.pathname);
+      }
+    }
+
+    function base64ToBytes(b64) {
+      b64 = b64.replace(/-/g, '+').replace(/_/g, '/');
+      while (b64.length % 4) b64 += '=';
+      const binary = atob(b64);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+      return bytes;
+    }
+
+    function bytesToBase64Url(bytes) {
+      let binary = '';
+      for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+      return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    }
+
+    async function deriveKeyHKDF(secretBytes, saltStr, infoStr) {
+      const enc = new TextEncoder();
+      const key = await crypto.subtle.importKey(
+        'raw',
+        secretBytes,
+        { name: 'HKDF' },
+        false,
+        ['deriveBits', 'deriveKey']
+      );
+      const derivedBits = await crypto.subtle.deriveBits(
+        {
+          name: 'HKDF',
+          hash: 'SHA-256',
+          salt: enc.encode(saltStr),
+          info: enc.encode(infoStr)
+        },
+        key,
+        256
+      );
+      return new Uint8Array(derivedBits);
+    }
+
+    // Pure JS XChaCha20-Poly1305 Decryptor for zero-dependency browser compatibility
+    function hchacha20(key, nonce) {
+      const u8 = new Uint8Array(32);
+      const state = new Uint32Array(16);
+      const sigma = [0x61707865, 0x3320646e, 0x79622d32, 0x6b206574];
+      state[0] = sigma[0]; state[1] = sigma[1]; state[2] = sigma[2]; state[3] = sigma[3];
+      const keyU32 = new Uint32Array(key.buffer, key.byteOffset, 8);
+      for (let i = 0; i < 8; i++) state[4 + i] = keyU32[i];
+      const nonceU32 = new Uint32Array(nonce.buffer, nonce.byteOffset, 4);
+      for (let i = 0; i < 4; i++) state[12 + i] = nonceU32[i];
+
+      function rotl(v, c) { return (v << c) | (v >>> (32 - c)); }
+      function quarterRound(a, b, c, d) {
+        state[a] = (state[a] + state[b]) | 0; state[d] = rotl(state[d] ^ state[a], 16);
+        state[c] = (state[c] + state[d]) | 0; state[b] = rotl(state[b] ^ state[c], 12);
+        state[a] = (state[a] + state[b]) | 0; state[d] = rotl(state[d] ^ state[a], 8);
+        state[c] = (state[c] + state[d]) | 0; state[b] = rotl(state[b] ^ state[c], 7);
+      }
+
+      for (let i = 0; i < 10; i++) {
+        quarterRound(0, 4, 8, 12); quarterRound(1, 5, 9, 13);
+        quarterRound(2, 6, 10, 14); quarterRound(3, 7, 11, 15);
+        quarterRound(0, 5, 10, 15); quarterRound(1, 6, 11, 12);
+        quarterRound(2, 7, 8, 13); quarterRound(3, 4, 9, 14);
+      }
+      const outU32 = new Uint32Array(u8.buffer, u8.byteOffset, 8);
+      outU32[0] = state[0]; outU32[1] = state[1]; outU32[2] = state[2]; outU32[3] = state[3];
+      outU32[4] = state[12]; outU32[5] = state[13]; outU32[6] = state[14]; outU32[7] = state[15];
+      return u8;
+    }
+
+    function chacha20Block(key, counter, nonce) {
+      const state = new Uint32Array(16);
+      const sigma = [0x61707865, 0x3320646e, 0x79622d32, 0x6b206574];
+      state[0] = sigma[0]; state[1] = sigma[1]; state[2] = sigma[2]; state[3] = sigma[3];
+      const keyU32 = new Uint32Array(key.buffer, key.byteOffset, 8);
+      for (let i = 0; i < 8; i++) state[4 + i] = keyU32[i];
+      state[12] = counter;
+      const nonceU32 = new Uint32Array(nonce.buffer, nonce.byteOffset, 3);
+      state[13] = nonceU32[0]; state[14] = nonceU32[1]; state[15] = nonceU32[2];
+
+      const initial = new Uint32Array(state);
+      function rotl(v, c) { return (v << c) | (v >>> (32 - c)); }
+      function quarterRound(a, b, c, d) {
+        state[a] = (state[a] + state[b]) | 0; state[d] = rotl(state[d] ^ state[a], 16);
+        state[c] = (state[c] + state[d]) | 0; state[b] = rotl(state[b] ^ state[c], 12);
+        state[a] = (state[a] + state[b]) | 0; state[d] = rotl(state[d] ^ state[a], 8);
+        state[c] = (state[c] + state[d]) | 0; state[b] = rotl(state[b] ^ state[c], 7);
+      }
+      for (let i = 0; i < 10; i++) {
+        quarterRound(0, 4, 8, 12); quarterRound(1, 5, 9, 13);
+        quarterRound(2, 6, 10, 14); quarterRound(3, 7, 11, 15);
+        quarterRound(0, 5, 10, 15); quarterRound(1, 6, 11, 12);
+        quarterRound(2, 7, 8, 13); quarterRound(3, 4, 9, 14);
+      }
+      const out = new Uint8Array(64);
+      const outU32 = new Uint32Array(out.buffer);
+      for (let i = 0; i < 16; i++) outU32[i] = (state[i] + initial[i]) | 0;
+      return out;
+    }
+
+    function chacha20(key, nonce, src, counter = 1) {
+      const dst = new Uint8Array(src.length);
+      let len = src.length;
+      let offset = 0;
+      while (len > 0) {
+        const block = chacha20Block(key, counter++, nonce);
+        const take = Math.min(len, 64);
+        for (let i = 0; i < take; i++) {
+          dst[offset + i] = src[offset + i] ^ block[i];
+        }
+        len -= take;
+        offset += take;
+      }
+      return dst;
+    }
+
+    function poly1305Auth(key, message) {
+      let r0 = (key[0] | (key[1] << 8) | (key[2] << 16) | (key[3] << 24)) & 0x03ffffff;
+      let r1 = ((key[3] >>> 2) | (key[4] << 6) | (key[5] << 14) | (key[6] << 22)) & 0x03ffff03;
+      let r2 = ((key[6] >>> 4) | (key[7] << 4) | (key[8] << 12) | (key[9] << 20)) & 0x03ffc0ff;
+      let r3 = ((key[9] >>> 6) | (key[10] << 2) | (key[11] << 10) | (key[12] << 18)) & 0x03f03fff;
+      let r4 = ((key[12] >>> 8) | (key[13] << 0) | (key[14] << 8) | (key[15] << 16)) & 0x000fffff;
+
+      let s1 = (r1 * 5) | 0;
+      let s2 = (r2 * 5) | 0;
+      let s3 = (r3 * 5) | 0;
+      let s4 = (r4 * 5) | 0;
+
+      let h0 = 0, h1 = 0, h2 = 0, h3 = 0, h4 = 0;
+      let len = message.length;
+      let pos = 0;
+
+      while (len > 0) {
+        let chunk = new Uint8Array(17);
+        let take = Math.min(len, 16);
+        chunk.set(message.subarray(pos, pos + take));
+        chunk[take] = 1;
+
+        let d0 = (chunk[0] | (chunk[1] << 8) | (chunk[2] << 16) | (chunk[3] << 24)) & 0x03ffffff;
+        let d1 = ((chunk[3] >>> 2) | (chunk[4] << 6) | (chunk[5] << 14) | (chunk[6] << 22)) & 0x03ffffff;
+        let d2 = ((chunk[6] >>> 4) | (chunk[7] << 4) | (chunk[8] << 12) | (chunk[9] << 20)) & 0x03ffffff;
+        let d3 = ((chunk[9] >>> 6) | (chunk[10] << 2) | (chunk[11] << 10) | (chunk[12] << 18)) & 0x03ffffff;
+        let d4 = ((chunk[12] >>> 8) | (chunk[13] << 0) | (chunk[14] << 8) | (chunk[15] << 16) | (chunk[16] << 24));
+
+        h0 = (h0 + d0) >>> 0;
+        h1 = (h1 + d1) >>> 0;
+        h2 = (h2 + d2) >>> 0;
+        h3 = (h3 + d3) >>> 0;
+        h4 = (h4 + d4) >>> 0;
+
+        let x0 = BigInt(h0) * BigInt(r0) + BigInt(h1) * BigInt(s4) + BigInt(h2) * BigInt(s3) + BigInt(h3) * BigInt(s2) + BigInt(h4) * BigInt(s1);
+        let x1 = BigInt(h0) * BigInt(r1) + BigInt(h1) * BigInt(r0) + BigInt(h2) * BigInt(s4) + BigInt(h3) * BigInt(s3) + BigInt(h4) * BigInt(s2);
+        let x2 = BigInt(h0) * BigInt(r2) + BigInt(h1) * BigInt(r1) + BigInt(h2) * BigInt(r0) + BigInt(h3) * BigInt(s4) + BigInt(h4) * BigInt(s3);
+        let x3 = BigInt(h0) * BigInt(r3) + BigInt(h1) * BigInt(r2) + BigInt(h2) * BigInt(r1) + BigInt(h3) * BigInt(r0) + BigInt(h4) * BigInt(s4);
+        let x4 = BigInt(h0) * BigInt(r4) + BigInt(h1) * BigInt(r3) + BigInt(h2) * BigInt(r2) + BigInt(h3) * BigInt(r1) + BigInt(h4) * BigInt(r0);
+
+        let c = x0 >> 26n; h0 = Number(x0 & 0x03ffffffn); x1 += c;
+        c = x1 >> 26n; h1 = Number(x1 & 0x03ffffffn); x2 += c;
+        c = x2 >> 26n; h2 = Number(x2 & 0x03ffffffn); x3 += c;
+        c = x3 >> 26n; h3 = Number(x3 & 0x03ffffffn); x4 += c;
+        c = x4 >> 26n; h4 = Number(x4 & 0x03ffffffn); h0 = (h0 + Number(c * 5n)) >>> 0;
+        c = h0 >>> 26; h0 &= 0x03ffffff; h1 = (h1 + c) >>> 0;
+
+        len -= take;
+        pos += take;
+      }
+
+      let c = h1 >>> 26; h1 &= 0x03ffffff; h2 += c;
+      c = h2 >>> 26; h2 &= 0x03ffffff; h3 += c;
+      c = h3 >>> 26; h3 &= 0x03ffffff; h4 += c;
+      c = h4 >>> 26; h4 &= 0x03ffffff; h0 += c * 5;
+      c = h0 >>> 26; h0 &= 0x03ffffff; h1 += c;
+
+      let g0 = (h0 + 5) >>> 0; c = g0 >>> 26; g0 &= 0x03ffffff;
+      let g1 = (h1 + c) >>> 0; c = g1 >>> 26; g1 &= 0x03ffffff;
+      let g2 = (h2 + c) >>> 0; c = g2 >>> 26; g2 &= 0x03ffffff;
+      let g3 = (h3 + c) >>> 0; c = g3 >>> 26; g3 &= 0x03ffffff;
+      let g4 = (h4 + c - (1 << 26)) | 0;
+
+      let mask = (g4 >>> 31) - 1;
+      g0 &= mask; g1 &= mask; g2 &= mask; g3 &= mask; g4 &= mask;
+      mask = ~mask;
+      h0 = ((h0 & mask) | g0) >>> 0;
+      h1 = ((h1 & mask) | g1) >>> 0;
+      h2 = ((h2 & mask) | g2) >>> 0;
+      h3 = ((h3 & mask) | g3) >>> 0;
+      h4 = ((h4 & mask) | g4) >>> 0;
+
+      let f0 = ((h0) | (h1 << 26)) >>> 0;
+      let f1 = ((h1 >>> 6) | (h2 << 20)) >>> 0;
+      let f2 = ((h2 >>> 12) | (h3 << 14)) >>> 0;
+      let f3 = ((h3 >>> 18) | (h4 << 8)) >>> 0;
+
+      let pad0 = key[16] | (key[17] << 8) | (key[18] << 16) | (key[19] << 24);
+      let pad1 = key[20] | (key[21] << 8) | (key[22] << 16) | (key[23] << 24);
+      let pad2 = key[24] | (key[25] << 8) | (key[26] << 16) | (key[27] << 24);
+      let pad3 = key[28] | (key[29] << 8) | (key[30] << 16) | (key[31] << 24);
+
+      let t0 = BigInt(f0) + BigInt(pad0 >>> 0);
+      let t1 = BigInt(f1) + BigInt(pad1 >>> 0) + (t0 >> 32n);
+      let t2 = BigInt(f2) + BigInt(pad2 >>> 0) + (t1 >> 32n);
+      let t3 = BigInt(f3) + BigInt(pad3 >>> 0) + (t2 >> 32n);
+
+      const tag = new Uint8Array(16);
+      const tagU32 = new Uint32Array(tag.buffer);
+      tagU32[0] = Number(t0 & 0xffffffffn);
+      tagU32[1] = Number(t1 & 0xffffffffn);
+      tagU32[2] = Number(t2 & 0xffffffffn);
+      tagU32[3] = Number(t3 & 0xffffffffn);
+      return tag;
+    }
+
+    function decryptXChaCha20Poly1305(key, fullCiphertext, aad) {
+      if (fullCiphertext.length < 24 + 16) {
+        throw new Error('Ciphertext is too short');
+      }
+      const nonce = fullCiphertext.subarray(0, 24);
+      const tag = fullCiphertext.subarray(fullCiphertext.length - 16);
+      const ct = fullCiphertext.subarray(24, fullCiphertext.length - 16);
+
+      const subkey = hchacha20(key, nonce.subarray(0, 16));
+      const subnonce = new Uint8Array(12);
+      subnonce.set(nonce.subarray(16, 24), 4);
+
+      const polyKey = chacha20Block(subkey, 0, subnonce).subarray(0, 32);
+
+      // Construct Poly1305 MAC message: AAD + pad + CT + pad + AAD_len(8) + CT_len(8)
+      const aadPadLen = (16 - (aad.length % 16)) % 16;
+      const ctPadLen = (16 - (ct.length % 16)) % 16;
+      const macMsg = new Uint8Array(aad.length + aadPadLen + ct.length + ctPadLen + 16);
+      let p = 0;
+      macMsg.set(aad, p); p += aad.length;
+      p += aadPadLen;
+      macMsg.set(ct, p); p += ct.length;
+      p += ctPadLen;
+      const view = new DataView(macMsg.buffer, macMsg.byteOffset + p, 16);
+      view.setBigUint64(0, BigInt(aad.length), true);
+      view.setBigUint64(8, BigInt(ct.length), true);
+
+      const expectedTag = poly1305Auth(polyKey, macMsg);
+      let diff = 0;
+      for (let i = 0; i < 16; i++) diff |= (tag[i] ^ expectedTag[i]);
+      if (diff !== 0) {
+        throw new Error('Authentication tag mismatch: data corrupted or key invalid');
+      }
+
+      const padded = chacha20(subkey, subnonce, ct, 1);
+
+      // Unpad: format is [4 bytes big-endian length][plaintext][zeroes]
+      if (padded.length < 4) throw new Error('Invalid padding length');
+      const padView = new DataView(padded.buffer, padded.byteOffset, 4);
+      const plainLen = padView.getUint32(0, false);
+      if (plainLen + 4 > padded.length) throw new Error('Corrupted plaintext length header');
+      return padded.subarray(4, 4 + plainLen);
+    }
+
+    async function init() {
+      selector = getSelectorFromPath();
+      rootSecretBase64 = parseFragment();
+      wipeFragment();
+
+      if (!selector || !rootSecretBase64) {
+        showError('Invalid share URL. The decryption key in the link fragment is missing.');
+        return;
+      }
+
+      try {
+        const resp = await fetch(`/v1/shares/public/${selector}`, {
+          credentials: 'omit',
+          cache: 'no-store'
+        });
+        if (!resp.ok) {
+          showError('This secure share is unavailable, expired, or has reached its view limit.');
+          return;
+        }
+        shareMeta = await resp.json();
+        const statusBadge = document.getElementById('statusBadge');
+        statusBadge.textContent = `Valid Share (${shareMeta.content_type || 'text'}) • ${shareMeta.consumed_claims}/${shareMeta.max_claims} views used`;
+      } catch (err) {
+        showError('Failed to reach the Veil Node. Check your network connection.');
+      }
+    }
+
+    async function claimAndDecrypt() {
+      const btn = document.getElementById('decryptBtn');
+      btn.disabled = true;
+      btn.textContent = 'Decrypting...';
+
+      try {
+        const secretBytes = base64ToBytes(rootSecretBase64);
+        if (secretBytes.length !== 32) {
+          throw new Error('Invalid root secret length');
+        }
+
+        // 1. Derive redemption key
+        const redemptionKey = await deriveKeyHKDF(secretBytes, 'veil/share/redemption/v1', selector);
+        const redemptionKeyB64 = bytesToBase64Url(redemptionKey);
+
+        // 2. Claim share and obtain lease token
+        const claimResp = await fetch(`/v1/shares/public/${selector}/claim`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ redemption_key_base64: redemptionKeyB64 }),
+          credentials: 'omit',
+          cache: 'no-store'
+        });
+
+        if (!claimResp.ok) {
+          throw new Error('Failed to claim share. It may have expired or reached its claim limit.');
+        }
+
+        const claimData = await claimResp.json();
+        const leaseToken = claimData.lease_token_base64;
+
+        // 3. Download encrypted ciphertext
+        const contentResp = await fetch(`/v1/shares/public/${selector}/content`, {
+          headers: { 'Authorization': `Bearer ${leaseToken}` },
+          credentials: 'omit',
+          cache: 'no-store'
+        });
+
+        if (!contentResp.ok) {
+          throw new Error('Failed to retrieve share content.');
+        }
+
+        const ciphertextBuffer = await contentResp.arrayBuffer();
+        const fullCiphertext = new Uint8Array(ciphertextBuffer);
+
+        // 4. Derive manifest decryption key
+        const manifestKey = await deriveKeyHKDF(secretBytes, 'veil/share/manifest/v1', selector);
+
+        // 5. Build exact AAD
+        const enc = new TextEncoder();
+        const origin = window.location.origin;
+        const contentType = shareMeta?.content_type || 'text';
+        const aadStr = `veil/share/v1|1|${origin}|${selector}|${contentType}`;
+        const aad = enc.encode(aadStr);
+
+        // 6. Decrypt ciphertext
+        const plaintextBytes = decryptXChaCha20Poly1305(manifestKey, fullCiphertext, aad);
+
+        // 7. Display plaintext
+        const dec = new TextDecoder('utf-8', { fatal: false });
+        const text = dec.decode(plaintextBytes);
+
+        document.getElementById('contentText').textContent = text;
+        document.getElementById('contentBox').style.display = 'block';
+        document.getElementById('actionArea').style.display = 'none';
+        document.getElementById('statusBadge').textContent = 'Decrypted Successfully';
+        document.getElementById('statusBadge').style.background = 'rgba(34, 197, 94, 0.15)';
+        document.getElementById('statusBadge').style.color = '#4ade80';
+        document.getElementById('statusBadge').style.borderColor = 'rgba(34, 197, 94, 0.3)';
+
+        if (shareMeta && (shareMeta.consumed_claims + 1 >= shareMeta.max_claims)) {
+          document.getElementById('burnedBanner').style.display = 'block';
+        }
+
+        if (contentType === 'file') {
+          const blob = new Blob([plaintextBytes], { type: 'application/octet-stream' });
+          const dlUrl = URL.createObjectURL(blob);
+          const dlBtn = document.getElementById('downloadBtn');
+          dlBtn.href = dlUrl;
+          dlBtn.style.display = 'inline-flex';
+        }
+      } catch (err) {
+        showError(err.message || 'Decryption failed. Data may be corrupted.');
+        btn.disabled = false;
+        btn.textContent = 'Retry Decryption';
+      }
+    }
+
+    function showError(msg) {
+      const box = document.getElementById('errorBox');
+      box.textContent = msg;
+      box.style.display = 'block';
+      document.getElementById('statusBadge').textContent = 'Unavailable';
+      document.getElementById('statusBadge').style.background = 'rgba(239, 68, 68, 0.15)';
+      document.getElementById('statusBadge').style.color = '#f87171';
+      document.getElementById('statusBadge').style.borderColor = 'rgba(239, 68, 68, 0.3)';
+      document.getElementById('actionArea').style.display = 'none';
+    }
+
+    function copyContent() {
+      const text = document.getElementById('contentText').textContent;
+      navigator.clipboard.writeText(text).then(() => {
+        const btn = document.getElementById('copyBtn');
+        const orig = btn.textContent;
+        btn.textContent = 'Copied!';
+        setTimeout(() => btn.textContent = orig, 2000);
+      });
+    }
+
+    window.addEventListener('DOMContentLoaded', init);
+  </script>
+</body>
+</html>

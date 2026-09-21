@@ -54,44 +54,16 @@ export function InlineContactSearch({ onExit }: Props) {
       setResult(null);
 
       try {
-        const req = await VeilRuntime.prepareContactSearch(debouncedQuery);
-        const url = `${runtimeBinding.canonicalServerOrigin}${req.target}`;
-        
-        const response = await fetch(url, {
-          method: req.method,
-          headers: {
-            "Accept": "application/json",
-            "X-Veil-REST-Auth-Version": req.signature.version,
-            "X-Veil-User": req.signature.userId,
-            "X-Veil-Timestamp": req.signature.timestampMs,
-            "X-Veil-Nonce": req.signature.nonceBase64url,
-            "X-Veil-Signature": req.signature.signatureBase64url,
-          },
-        });
-
-        if (!active) return;
-
-        if (!response.ok) {
-          if (response.status === 404) {
-            setError("User not found (exact match required).");
-          } else {
-            setError(`Network error: ${response.status}`);
-          }
-          return;
-        }
-
-        const buffer = await response.arrayBuffer();
-        const bytes = new Uint8Array(buffer);
-        let binary = "";
-        for (let i = 0; i < bytes.byteLength; i++) {
-          binary += String.fromCharCode(bytes[i]);
-        }
-        const base64 = btoa(binary);
-
-        const parsed = await VeilRuntime.parseContactSearchResponse(base64);
+        const parsed = await VeilRuntime.executeContactSearch(debouncedQuery);
         if (active) setResult(parsed);
       } catch (err: any) {
-        if (active) setError(err.message || "Failed to search. Check your connection.");
+        if (active) {
+          if (err.message?.includes("404")) {
+            setError("User not found (exact match required).");
+          } else {
+            setError(err.message || "Failed to search. Check your connection.");
+          }
+        }
       } finally {
         if (active) setSearching(false);
       }
@@ -105,36 +77,7 @@ export function InlineContactSearch({ onExit }: Props) {
     if (!result || !runtimeBinding) return;
     setSearching(true);
     try {
-      const req = await VeilRuntime.prepareCreateDirect(result.userId);
-      const url = `${runtimeBinding.canonicalServerOrigin}${req.target}`;
-      
-      const bodyBytes = req.bodyBase64 ? Uint8Array.from(atob(req.bodyBase64), c => c.charCodeAt(0)) : undefined;
-      
-      const response = await fetch(url, {
-        method: req.method,
-        headers: {
-          "Content-Type": "application/json",
-          "Accept": "application/json",
-          "X-Veil-REST-Auth-Version": req.signature.version,
-          "X-Veil-User": req.signature.userId,
-          "X-Veil-Timestamp": req.signature.timestampMs,
-          "X-Veil-Nonce": req.signature.nonceBase64url,
-          "X-Veil-Signature": req.signature.signatureBase64url,
-        },
-        body: bodyBytes,
-      });
-
-      if (!response.ok) {
-        throw new Error(`Failed to create Direct: ${response.status}`);
-      }
-
-      // Step 7: Read binary response as base64
-      const responseBuffer = await response.arrayBuffer();
-      const responseBase64 = btoa(String.fromCharCode(...new Uint8Array(responseBuffer)));
-      
-      // Step 8: Parse response in Rust
-      const parsed = await VeilRuntime.parseCreateDirectResponse(responseBase64);
-
+      const parsed = await VeilRuntime.executeCreateDirect(result.userId);
       onExit();
       // Navigate to the direct conversation view
       // Cast navigation to any to avoid type check error in this local component

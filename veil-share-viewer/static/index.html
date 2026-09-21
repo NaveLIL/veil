@@ -1,187 +1,366 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; connect-src 'self'; img-src 'self' blob:; style-src 'self' 'unsafe-inline'">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="robots" content="noindex,nofollow,noarchive">
+  <meta name="theme-color" content="#07101d">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; connect-src 'self'; img-src 'self' blob: data:; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'">
   <title>Veil — Secure Share</title>
   <style>
-    * { margin: 0; padding: 0; box-sizing: border-box; }
+    :root {
+      color-scheme: dark;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #050912;
+      color: #f2f7ff;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
-      background: #0a0a0f;
-      color: #e5e5e5;
+      min-height: 100vh;
+      min-height: 100svh;
       display: flex;
+      flex-direction: column;
       align-items: center;
       justify-content: center;
-      min-height: 100vh;
-      padding: 20px;
+      padding: 24px 16px;
+      background:
+        radial-gradient(circle at 15% 15%, rgba(27, 149, 232, .18), transparent 40%),
+        radial-gradient(circle at 85% 85%, rgba(112, 71, 236, .18), transparent 45%),
+        linear-gradient(145deg, #07101d 0%, #070a15 50%, #0d0a1e 100%);
     }
     .card {
-      background: #12121a;
-      border: 1px solid #1e1e2e;
-      border-radius: 16px;
-      padding: 40px;
-      max-width: 520px;
+      background: rgba(14, 20, 35, 0.85);
+      border: 1px solid rgba(80, 120, 180, 0.25);
+      border-radius: 20px;
+      padding: 36px 32px;
+      max-width: 580px;
       width: 100%;
+      box-shadow: 0 20px 50px rgba(0, 0, 0, 0.5), inset 0 1px 1px rgba(255, 255, 255, 0.1);
+      backdrop-filter: blur(16px);
       text-align: center;
     }
-    h1 { font-size: 1.4em; font-weight: 400; margin-bottom: 8px; }
-    .brand { color: #6366f1; font-size: 0.75em; letter-spacing: 0.3em; margin-bottom: 24px; }
-    #status { color: #888; margin: 20px 0; }
-    #content {
-      background: #0a0a0f;
-      border: 1px solid #2a2a35;
-      border-radius: 8px;
-      padding: 20px;
+    .brand {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      font-size: 11px;
+      font-weight: 800;
+      letter-spacing: 0.25em;
+      color: #7eb3ff;
+      margin-bottom: 20px;
+      text-transform: uppercase;
+    }
+    .brand-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #46b4fb;
+      box-shadow: 0 0 12px #46b4fb;
+    }
+    h1 {
+      font-size: 1.5rem;
+      font-weight: 600;
+      letter-spacing: -0.02em;
+      margin-bottom: 8px;
+      color: #ffffff;
+    }
+    .subtitle {
+      font-size: 0.875rem;
+      color: #90a4c3;
+      margin-bottom: 24px;
+      line-height: 1.5;
+    }
+    .status-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 14px;
+      border-radius: 9999px;
+      font-size: 0.75rem;
+      font-weight: 500;
+      background: rgba(80, 140, 240, 0.12);
+      border: 1px solid rgba(80, 140, 240, 0.25);
+      color: #a5c7f8;
+      margin-bottom: 24px;
+    }
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      padding: 12px 28px;
+      border-radius: 12px;
+      font-size: 0.9375rem;
+      font-weight: 600;
+      background: linear-gradient(135deg, #2563eb, #7c3aed);
+      color: #ffffff;
+      border: none;
+      cursor: pointer;
+      box-shadow: 0 4px 20px rgba(37, 99, 235, 0.35);
+      transition: all 0.2s ease;
+      width: 100%;
+    }
+    .btn:hover {
+      background: linear-gradient(135deg, #1d4ed8, #6d28d9);
+      box-shadow: 0 6px 24px rgba(37, 99, 235, 0.5);
+      transform: translateY(-1px);
+    }
+    .btn:active { transform: translateY(0); }
+    .btn:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+      transform: none;
+    }
+    .btn-secondary {
+      background: rgba(255, 255, 255, 0.08);
+      color: #d1d5db;
+      box-shadow: none;
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      margin-top: 12px;
+    }
+    .btn-secondary:hover {
+      background: rgba(255, 255, 255, 0.14);
+      box-shadow: none;
+    }
+    .content-box {
+      display: none;
+      margin-top: 24px;
       text-align: left;
+      background: rgba(5, 10, 20, 0.7);
+      border: 1px solid rgba(80, 120, 180, 0.2);
+      border-radius: 12px;
+      padding: 18px;
+    }
+    .content-text {
       white-space: pre-wrap;
       word-break: break-word;
-      display: none;
-      max-height: 400px;
+      font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+      font-size: 0.875rem;
+      line-height: 1.6;
+      color: #e2e8f0;
+      max-height: 360px;
       overflow-y: auto;
     }
-    .password-form { margin: 20px 0; display: none; }
-    .password-form input {
-      background: #1a1a25;
-      border: 1px solid #2a2a35;
-      border-radius: 8px;
-      padding: 10px 16px;
-      color: #e5e5e5;
-      font-size: 1em;
-      width: 100%;
-      margin-bottom: 12px;
+    .meta-footer {
+      margin-top: 24px;
+      font-size: 0.75rem;
+      color: #64748b;
+      line-height: 1.5;
     }
-    .password-form button {
-      background: #6366f1;
-      color: #fff;
-      border: none;
-      border-radius: 8px;
-      padding: 10px 24px;
-      cursor: pointer;
-      font-size: 1em;
+    .error-card {
+      color: #f87171;
+      background: rgba(239, 68, 68, 0.1);
+      border: 1px solid rgba(239, 68, 68, 0.25);
+      border-radius: 12px;
+      padding: 16px;
+      font-size: 0.875rem;
+      margin-top: 16px;
+      display: none;
     }
-    .error { color: #ef4444; }
-    .expired { color: #f59e0b; }
-    img.share-image { max-width: 100%; border-radius: 8px; }
+    .burned-banner {
+      color: #fbbf24;
+      background: rgba(245, 158, 11, 0.1);
+      border: 1px solid rgba(245, 158, 11, 0.2);
+      border-radius: 8px;
+      padding: 10px 14px;
+      font-size: 0.75rem;
+      margin-top: 16px;
+      display: none;
+    }
   </style>
 </head>
 <body>
   <div class="card">
-    <div class="brand">VEIL</div>
-    <h1>Secure Share</h1>
-    <div id="status">Loading decryption engine...</div>
-    <div class="password-form" id="passwordForm">
-      <input type="password" id="passwordInput" placeholder="Enter password" autocomplete="off" />
-      <button onclick="submitPassword()">Decrypt</button>
+    <div class="brand">
+      <span class="brand-dot"></span>
+      VEIL SECURE SHARE
     </div>
-    <div id="content"></div>
+    <h1 id="title">End-to-End Encrypted Share</h1>
+    <p class="subtitle" id="subtitle">This encrypted message was shared with you. Decryption happens entirely inside your browser.</p>
+    
+    <div class="status-badge" id="statusBadge">Checking share status...</div>
+    
+    <div id="actionArea">
+      <button class="btn" id="decryptBtn" onclick="claimAndDecrypt()">Decrypt & View</button>
+    </div>
+
+    <div class="error-card" id="errorBox"></div>
+    <div class="burned-banner" id="burnedBanner">
+      ⚠️ This share was configured to burn after viewing. The server has now destroyed the ciphertext.
+    </div>
+
+    <div class="content-box" id="contentBox">
+      <div class="content-text" id="contentText"></div>
+      <button class="btn btn-secondary" id="copyBtn" onclick="copyContent()">Copy Plaintext</button>
+      <a class="btn btn-secondary" id="downloadBtn" style="display:none; text-decoration:none;" download="share-file">Download Decrypted File</a>
+    </div>
+
+    <div class="meta-footer">
+      Veil zero-knowledge architecture. The server never sees the plaintext or the content decryption key.
+    </div>
   </div>
 
   <script type="module">
-    import init, { decrypt_share, version } from './pkg/veil_share_viewer.js';
+    import initWasm, { derive_redemption_key, decrypt_share_bytes_v1, version } from './pkg/veil_share_viewer.js';
 
-    const status = document.getElementById('status');
-    const content = document.getElementById('content');
-    const passwordForm = document.getElementById('passwordForm');
+    let rootSecretBase64 = null;
+    let selector = null;
+    let shareMeta = null;
+    let wasmReady = false;
 
-    window.wasm = null;
-    window.shareData = null;
-
-    async function main() {
-      try {
-        await init();
-        window.wasm = { decrypt_share, version };
-        status.textContent = `Engine v${version()} ready`;
-
-        // Parse URL fragment: #id/key or #id (password-protected)
-        const hash = window.location.hash.slice(1);
-        if (!hash) {
-          status.textContent = 'No share data in URL';
-          status.className = 'error';
-          return;
+    function getSelectorFromPath() {
+      const parts = window.location.pathname.split('/');
+      for (let i = 0; i < parts.length; i++) {
+        if (parts[i] === 'v1' && i + 1 < parts.length) {
+          return parts[i + 1];
         }
+      }
+      return parts[parts.length - 1];
+    }
 
-        const parts = hash.split('/');
-        const shareId = parts[0];
-        const contentKey = parts[1] || null;
+    function parseFragment() {
+      const hash = window.location.hash.substring(1);
+      if (!hash) return null;
+      const params = new URLSearchParams(hash);
+      return params.get('k');
+    }
 
-        // Clear key material from URL bar
+    function wipeFragment() {
+      if (window.location.hash) {
         history.replaceState(null, '', window.location.pathname);
-
-        // Fetch share data from server
-        const resp = await fetch(`/api/share/${shareId}`);
-        if (!resp.ok) {
-          if (resp.status === 404) {
-            status.textContent = 'Share not found or expired';
-            status.className = 'expired';
-          } else {
-            status.textContent = 'Failed to load share';
-            status.className = 'error';
-          }
-          return;
-        }
-
-        const data = await resp.json();
-        window.shareData = { ...data, contentKey };
-
-        if (data.has_password && !contentKey) {
-          status.textContent = 'This share is password-protected';
-          passwordForm.style.display = 'block';
-        } else {
-          decryptAndShow(contentKey, null);
-        }
-      } catch (e) {
-        status.textContent = `Error: ${e.message || e}`;
-        status.className = 'error';
       }
     }
 
-    window.submitPassword = function () {
-      const pwd = document.getElementById('passwordInput').value;
-      if (!pwd) return;
-      decryptAndShow(window.shareData?.contentKey || null, pwd);
+    async function init() {
+      selector = getSelectorFromPath();
+      rootSecretBase64 = parseFragment();
+      wipeFragment();
+
+      if (!selector || !rootSecretBase64) {
+        showError('Invalid share URL. The decryption key in the link fragment is missing.');
+        return;
+      }
+
+      try {
+        await initWasm();
+        wasmReady = true;
+      } catch (e) {
+        console.warn('WASM init failed, will use fallback:', e);
+      }
+
+      try {
+        const resp = await fetch(`/v1/shares/public/${selector}`, {
+          credentials: 'omit',
+          cache: 'no-store'
+        });
+        if (!resp.ok) {
+          showError('This secure share is unavailable, expired, or has reached its view limit.');
+          return;
+        }
+        shareMeta = await resp.json();
+        const statusBadge = document.getElementById('statusBadge');
+        statusBadge.textContent = `Valid Share (${shareMeta.content_type || 'text'}) • ${shareMeta.consumed_claims}/${shareMeta.max_claims} views used`;
+      } catch (err) {
+        showError('Failed to reach the Veil Node. Check your network connection.');
+      }
+    }
+
+    window.claimAndDecrypt = async function() {
+      const btn = document.getElementById('decryptBtn');
+      btn.disabled = true;
+      btn.textContent = 'Decrypting...';
+
+      try {
+        let redemptionKeyB64;
+        if (wasmReady) {
+          redemptionKeyB64 = derive_redemption_key(rootSecretBase64, selector);
+        } else {
+          throw new Error('WASM engine not ready');
+        }
+
+        const claimResp = await fetch(`/v1/shares/public/${selector}/claim`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ redemption_key_base64: redemptionKeyB64 }),
+          credentials: 'omit',
+          cache: 'no-store'
+        });
+
+        if (!claimResp.ok) {
+          throw new Error('Failed to claim share. It may have expired or reached its claim limit.');
+        }
+
+        const claimData = await claimResp.json();
+        const leaseToken = claimData.lease_token_base64;
+
+        const contentResp = await fetch(`/v1/shares/public/${selector}/content`, {
+          headers: { 'Authorization': `Bearer ${leaseToken}` },
+          credentials: 'omit',
+          cache: 'no-store'
+        });
+
+        if (!contentResp.ok) {
+          throw new Error('Failed to retrieve share content.');
+        }
+
+        const ciphertextBuffer = await contentResp.arrayBuffer();
+        const fullCiphertext = new Uint8Array(ciphertextBuffer);
+
+        const origin = window.location.origin;
+        const contentType = shareMeta?.content_type || 'text';
+        const plaintextBytes = decrypt_share_bytes_v1(origin, selector, fullCiphertext, rootSecretBase64, contentType);
+
+        const dec = new TextDecoder('utf-8', { fatal: false });
+        const text = dec.decode(plaintextBytes);
+
+        document.getElementById('contentText').textContent = text;
+        document.getElementById('contentBox').style.display = 'block';
+        document.getElementById('actionArea').style.display = 'none';
+        document.getElementById('statusBadge').textContent = 'Decrypted Successfully';
+        document.getElementById('statusBadge').style.background = 'rgba(34, 197, 94, 0.15)';
+        document.getElementById('statusBadge').style.color = '#4ade80';
+        document.getElementById('statusBadge').style.borderColor = 'rgba(34, 197, 94, 0.3)';
+
+        if (shareMeta && (shareMeta.consumed_claims + 1 >= shareMeta.max_claims)) {
+          document.getElementById('burnedBanner').style.display = 'block';
+        }
+
+        if (contentType === 'file') {
+          const blob = new Blob([plaintextBytes], { type: 'application/octet-stream' });
+          const dlUrl = URL.createObjectURL(blob);
+          const dlBtn = document.getElementById('downloadBtn');
+          dlBtn.href = dlUrl;
+          dlBtn.style.display = 'inline-flex';
+        }
+      } catch (err) {
+        showError(err.message || 'Decryption failed.');
+        btn.disabled = false;
+        btn.textContent = 'Retry Decryption';
+      }
     };
 
-    function decryptAndShow(contentKeyHex, password) {
-      try {
-        const sd = window.shareData;
-        const plaintext = window.wasm.decrypt_share(
-          sd.ciphertext,
-          contentKeyHex,
-          password,
-          sd.wrapped_key || null,
-          sd.salt || null,
-        );
-
-        // Try to display as text
-        const decoder = new TextDecoder('utf-8', { fatal: true });
-        try {
-          const text = decoder.decode(new Uint8Array(plaintext));
-          content.textContent = text;
-          content.style.display = 'block';
-        } catch {
-          // Binary data — try as image
-          const blob = new Blob([new Uint8Array(plaintext)]);
-          const url = URL.createObjectURL(blob);
-          const img = document.createElement('img');
-          img.className = 'share-image';
-          img.onload = () => URL.revokeObjectURL(url);
-          img.src = url;
-          content.innerHTML = '';
-          content.appendChild(img);
-          content.style.display = 'block';
-        }
-
-        status.textContent = 'Decrypted successfully';
-        passwordForm.style.display = 'none';
-      } catch (e) {
-        status.textContent = `Decryption failed: ${e}`;
-        status.className = 'error';
-      }
+    function showError(msg) {
+      const box = document.getElementById('errorBox');
+      box.textContent = msg;
+      box.style.display = 'block';
+      document.getElementById('statusBadge').textContent = 'Unavailable';
+      document.getElementById('statusBadge').style.background = 'rgba(239, 68, 68, 0.15)';
+      document.getElementById('statusBadge').style.color = '#f87171';
+      document.getElementById('statusBadge').style.borderColor = 'rgba(239, 68, 68, 0.3)';
+      document.getElementById('actionArea').style.display = 'none';
     }
 
-    main();
+    window.copyContent = function() {
+      const text = document.getElementById('contentText').textContent;
+      navigator.clipboard.writeText(text).then(() => {
+        const btn = document.getElementById('copyBtn');
+        const orig = btn.textContent;
+        btn.textContent = 'Copied!';
+        setTimeout(() => btn.textContent = orig, 2000);
+      });
+    };
+
+    window.addEventListener('DOMContentLoaded', init);
   </script>
 </body>
 </html>

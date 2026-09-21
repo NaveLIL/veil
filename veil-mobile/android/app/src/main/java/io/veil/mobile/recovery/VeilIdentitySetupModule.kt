@@ -331,20 +331,27 @@ internal class VeilIdentitySetupModule(
       val lease = current?.lease
       if (invalidated || current?.id != requestId || record == null || lease == null) return
       if (currentActivity !== activity || !isUsableForegroundActivity(activity)) {
+        android.util.Log.e("VEIL-DEBUG", "launchFailed because isUsableForegroundActivity is false or activity changed")
         launchFailed = true
       } else {
         try {
+          android.util.Log.d("VEIL-DEBUG", "Calling startActivityForResult...")
           activity.startActivityForResult(
             RecoveryActivity.intent(activity, current.mode, lease),
             current.requestCode,
           )
+          android.util.Log.d("VEIL-DEBUG", "startActivityForResult succeeded")
           current.launched = true
-        } catch (_: Throwable) {
+        } catch (e: Throwable) {
+          android.util.Log.e("VEIL-DEBUG", "startActivityForResult failed: ${e.message}", e)
           launchFailed = true
         }
       }
     }
-    if (launchFailed) failUnlaunchedRequest(requestId, ERROR_LAUNCH)
+    if (launchFailed) {
+      android.util.Log.e("VEIL-DEBUG", "failUnlaunchedRequest called")
+      failUnlaunchedRequest(requestId, ERROR_LAUNCH)
+    }
   }
 
   private fun failUnlaunchedRequest(requestId: Long, preferredCode: String) {
@@ -402,14 +409,18 @@ internal class VeilIdentitySetupModule(
     if (!hasWaiter) return
 
     var result = try {
-      runtime.reconcileIdentitySetup(reconciler)
-    } catch (_: Throwable) {
+      val res = runtime.reconcileIdentitySetup(reconciler)
+      android.util.Log.d("VEIL-DEBUG", "runtime.reconcileIdentitySetup returned: ${res?.status}")
+      res
+    } catch (e: Throwable) {
+      android.util.Log.e("VEIL-DEBUG", "runtime.reconcileIdentitySetup threw exception: ${e.message}", e)
       NativeIdentitySetupReconciliationResult(
         status = NativeIdentitySetupReconciliationStatus.UNCONFIRMED,
         correlation = null,
         mode = null,
       )
     } ?: return
+    android.util.Log.d("VEIL-DEBUG", "runReconciliation processing result: ${result.status}")
 
     // RecoveryActivity persists TERMINAL before returning/detaching. During
     // that narrow window the exact READY coordinator is still IN_PROGRESS, so

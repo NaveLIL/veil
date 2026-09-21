@@ -61,9 +61,10 @@ internal class RecoveryActivity : Activity(), NativeIdentitySetupCoordinator.Cer
   private var interactive = false
 
   override fun onCreate(savedInstanceState: Bundle?) {
-    protectWindowBeforeContent()
-    super.onCreate(null)
-    RecoveryContentCapture.disableForActivity(this)
+    try {
+      protectWindowBeforeContent()
+      super.onCreate(null)
+      RecoveryContentCapture.disableForActivity(this)
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
       setRecentsScreenshotEnabled(false)
     }
@@ -77,7 +78,8 @@ internal class RecoveryActivity : Activity(), NativeIdentitySetupCoordinator.Cer
     val launch = readLaunchCorrelation(intent)
     val journal = try {
       (application as? MainApplication)?.identitySetupJournal
-    } catch (_: Throwable) {
+    } catch (e: Throwable) {
+      android.util.Log.e("VEIL-DEBUG", "RecoveryActivity getting journal threw", e)
       null
     }
     if (
@@ -85,6 +87,7 @@ internal class RecoveryActivity : Activity(), NativeIdentitySetupCoordinator.Cer
         journal == null ||
         launch.processIncarnationId != journal.processIncarnationId
     ) {
+      android.util.Log.e("VEIL-DEBUG", "RecoveryActivity early return 0: launch=$launch, journal=$journal, launch.id=${launch?.processIncarnationId}, journal.id=${journal?.processIncarnationId}")
       finishWithoutCorrelatedResult()
       return
     }
@@ -95,7 +98,8 @@ internal class RecoveryActivity : Activity(), NativeIdentitySetupCoordinator.Cer
     setupJournal = journal
     val record = try {
       journal.readOrNull()
-    } catch (_: Throwable) {
+    } catch (e: Throwable) {
+      android.util.Log.e("VEIL-DEBUG", "RecoveryActivity journal.readOrNull() threw", e)
       null
     }
     if (
@@ -104,6 +108,7 @@ internal class RecoveryActivity : Activity(), NativeIdentitySetupCoordinator.Cer
         record.processIncarnationId != processIncarnationId ||
         record.mode != mode.toJournalMode()
     ) {
+      android.util.Log.e("VEIL-DEBUG", "RecoveryActivity early return 1: record=$record, attemptIdMatch=${record?.attemptId == attemptId}, processMatch=${record?.processIncarnationId == processIncarnationId}, modeMatch=${record?.mode == mode.toJournalMode()}")
       finishWithoutCorrelatedResult()
       return
     }
@@ -116,11 +121,13 @@ internal class RecoveryActivity : Activity(), NativeIdentitySetupCoordinator.Cer
       savedInstanceState != null &&
         record.phase != NativeIdentitySetupJournalPhase.COMMITTING
     ) {
+      android.util.Log.e("VEIL-DEBUG", "RecoveryActivity early return 2: savedInstanceState!=null")
       ensureJournalTerminal(NativeIdentitySetupJournalOutcome.INTERRUPTED)
       finishWithoutCorrelatedResult()
       return
     }
     if (record.phase == NativeIdentitySetupJournalPhase.TERMINAL) {
+      android.util.Log.e("VEIL-DEBUG", "RecoveryActivity early return 3: phase==TERMINAL")
       finishWithoutCorrelatedResult()
       return
     }
@@ -131,10 +138,13 @@ internal class RecoveryActivity : Activity(), NativeIdentitySetupCoordinator.Cer
       processIncarnationId,
     )
     setupLease = lease
-    when (NativeIdentitySetupCoordinator.attachOrAdopt(lease, this)) {
+    val attachResult = NativeIdentitySetupCoordinator.attachOrAdopt(lease, this)
+    android.util.Log.d("VEIL-DEBUG", "RecoveryActivity attachOrAdopt returned $attachResult")
+    when (attachResult) {
       NativeIdentitySetupCoordinator.Attachment.OWNER -> {
         coordinatorAttached = true
         if (record.phase != NativeIdentitySetupJournalPhase.PREPARED) {
+          android.util.Log.e("VEIL-DEBUG", "RecoveryActivity early return 4: OWNER but phase!=PREPARED")
           ensureJournalTerminal(NativeIdentitySetupJournalOutcome.INTERRUPTED)
           finishWithoutCorrelatedResult()
           return
@@ -162,6 +172,7 @@ internal class RecoveryActivity : Activity(), NativeIdentitySetupCoordinator.Cer
         return
       }
       NativeIdentitySetupCoordinator.Attachment.REJECTED -> {
+        android.util.Log.e("VEIL-DEBUG", "RecoveryActivity early return 5: REJECTED")
         NativeIdentitySetupCoordinator.discardRejected(lease)
         finishWithoutCorrelatedResult()
         return
@@ -171,16 +182,22 @@ internal class RecoveryActivity : Activity(), NativeIdentitySetupCoordinator.Cer
     try {
       val identityVault = NativeIdentityVault(applicationContext)
       if (identityVault.hasIdentity()) {
+        android.util.Log.e("VEIL-DEBUG", "RecoveryActivity early return 6: hasIdentity()")
         finishAlreadyProvisioned()
         return
       }
       // Secret draft creation is delayed until this Activity is both resumed
       // and window-focused. onCreate alone never materializes recovery words.
       pendingMode = mode
-    } catch (_: Throwable) {
+    } catch (e: Throwable) {
+      android.util.Log.e("VEIL-DEBUG", "RecoveryActivity early return 7: vault exception", e)
       // Do not reflect crypto, word-list, or storage diagnostics into another
       // Activity. The bridge receives only the interrupted terminal status.
       finishInterrupted()
+    }
+    } catch (e: Throwable) {
+        android.util.Log.e("VEIL-DEBUG", "RecoveryActivity onCreate CRASHED", e)
+        finishWithoutCorrelatedResult()
     }
   }
 
@@ -1090,6 +1107,7 @@ internal class RecoveryActivity : Activity(), NativeIdentitySetupCoordinator.Cer
   }
 
   private fun finishWithoutCorrelatedResult() {
+    android.util.Log.e("VEIL-DEBUG", "finishWithoutCorrelatedResult called", Exception())
     if (!terminal.compareAndSet(false, true)) return
     try {
       foregroundGate.markBackground()

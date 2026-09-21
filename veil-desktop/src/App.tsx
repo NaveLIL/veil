@@ -19,6 +19,7 @@ import { ServerSettingsScreen } from "@/components/server/ServerSettingsScreen";
 import { CreateServerDialog } from "@/components/server/CreateServerDialog";
 import { CreateChannelDialog } from "@/components/server/CreateChannelDialog";
 import { CreateInviteDialog } from "@/components/server/CreateInviteDialog";
+import { CreateShareDialog } from "@/components/share/CreateShareDialog";
 import { RightIsland } from "@/components/layout/RightIsland";
 import { ServerRail } from "@/components/layout/ServerRail";
 import { SpaceCreateMenu } from "@/components/spaces/SpaceCreateMenu";
@@ -2037,6 +2038,7 @@ const App: Component = () => {
   const [showSpaceCreateMenu, setShowSpaceCreateMenu] = createSignal(false);
   const [showCreateChannel, setShowCreateChannel] = createSignal(false);
   const [showCreateInvite, setShowCreateInvite] = createSignal(false);
+  const [showCreateShare, setShowCreateShare] = createSignal(false);
 
   const resetOriginLocalState = () => {
     // Keep the monotonic sendTokenCounter intact: an older async send must
@@ -3820,6 +3822,7 @@ const App: Component = () => {
 
       {/* Protocol names remain server/channel internally; product language is Space/Room. */}
       <CreateServerDialog open={showCreateServer()} onClose={() => setShowCreateServer(false)} />
+      <CreateShareDialog open={showCreateShare()} onClose={() => setShowCreateShare(false)} />
       <Show when={appStore.activeServerId()}>
         {(sid) => (
           <>

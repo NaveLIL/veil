@@ -152,6 +152,29 @@ export interface CreatedVeilLink extends VeilLinkRecord {
   share_url: string;
 }
 
+export interface CreatedSecureShare {
+  shareId: string;
+  publicSelector: string;
+  shareUrl: string;
+  maxClaims: number;
+  expiresAt: string;
+  createdAt: string;
+}
+
+export interface SecureShareItem {
+  id: string;
+  public_selector: string;
+  creator_user_id: string;
+  size_bytes: number;
+  content_type: string;
+  max_claims: number;
+  consumed_claims: number;
+  status: string;
+  expires_at: string;
+  revoked_at?: string;
+  created_at: string;
+}
+
 export interface PendingVeilLink {
   flowId: string;
   canonicalOrigin: string;
@@ -3220,6 +3243,72 @@ export const appStore = {
     } catch (e) {
       rethrowIfStale(e);
       console.error("create_invite failed:", e);
+      throw e;
+    }
+  },
+
+  createSecureShare: async (
+    text: string,
+    maxClaims: number = 1,
+    ttlSeconds: number = 86400,
+    contentType: string = "text",
+  ): Promise<CreatedSecureShare | null> => {
+    const sessionEpoch = captureUiSessionEpoch();
+    const uid = userId();
+    if (!uid) return null;
+    const mutationScope = requirePublishedMutationScope();
+    try {
+      const share = await invoke<CreatedSecureShare>("create_secure_share", {
+        serverHttpUrl: serverHttpUrl(),
+        userId: uid,
+        options: { text, maxClaims, ttlSeconds, contentType },
+        ...authenticatedMutationScopeArgs(mutationScope),
+      });
+      requireCurrentMutationScope(sessionEpoch, mutationScope);
+      return share;
+    } catch (e) {
+      rethrowIfStale(e);
+      console.error("create_secure_share failed:", e);
+      throw e;
+    }
+  },
+
+  listSecureShares: async (): Promise<SecureShareItem[]> => {
+    const sessionEpoch = captureUiSessionEpoch();
+    const uid = userId();
+    if (!uid) return [];
+    const mutationScope = requirePublishedMutationScope();
+    try {
+      const items = await invoke<SecureShareItem[]>("list_secure_shares", {
+        serverHttpUrl: serverHttpUrl(),
+        userId: uid,
+        ...authenticatedMutationScopeArgs(mutationScope),
+      });
+      requireCurrentMutationScope(sessionEpoch, mutationScope);
+      return items || [];
+    } catch (e) {
+      rethrowIfStale(e);
+      console.error("list_secure_shares failed:", e);
+      throw e;
+    }
+  },
+
+  revokeSecureShare: async (selector: string): Promise<void> => {
+    const sessionEpoch = captureUiSessionEpoch();
+    const uid = userId();
+    if (!uid) return;
+    const mutationScope = requirePublishedMutationScope();
+    try {
+      await invoke("revoke_secure_share", {
+        serverHttpUrl: serverHttpUrl(),
+        userId: uid,
+        selector,
+        ...authenticatedMutationScopeArgs(mutationScope),
+      });
+      requireCurrentMutationScope(sessionEpoch, mutationScope);
+    } catch (e) {
+      rethrowIfStale(e);
+      console.error("revoke_secure_share failed:", e);
       throw e;
     }
   },
