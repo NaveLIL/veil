@@ -1399,6 +1399,12 @@ internal class VeilMobileRuntime internal constructor(
     }
   }
 
+  fun hasIdentityRaw(): Boolean {
+    return NativeIdentitySetupCoordinator.withSettledIdentityRead {
+      vault.hasIdentity()
+    }
+  }
+
   @VisibleForTesting
   internal fun reconnectPlanForTesting(): NativeReconnectPlanDebug? = synchronized(stateLock) {
     activeReconnect?.let { plan ->

@@ -59,7 +59,7 @@ internal class VeilIdentitySetupModule(
         record.processIncarnationId,
       ).toReconcilerState()
     },
-    readStrictVaultPresence = runtime::verifyIdentityPresence,
+    readStrictVaultPresence = runtime::hasIdentityRaw,
   )
 
   private var pending: PendingSetup? = null
