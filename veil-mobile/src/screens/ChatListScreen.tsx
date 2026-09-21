@@ -18,6 +18,7 @@ export type SettingsSectionKey =
   | "account"
   | "devices"
   | "privacy"
+  | "share"
   | "notifications"
   | "appearance"
   | "node"

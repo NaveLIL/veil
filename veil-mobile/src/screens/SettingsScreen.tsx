@@ -16,6 +16,7 @@ import {
   Database,
   Info,
   KeyRound,
+  Link,
   Palette,
   Server,
   ShieldCheck,
@@ -49,6 +50,7 @@ const SETTINGS_SECTIONS: {
   { key: "account", icon: KeyRound, title: "Account & recovery", summary: "Local identity and recovery boundaries" },
   { key: "devices", icon: Smartphone, title: "Devices", summary: "This phone, linking and revocation" },
   { key: "privacy", icon: ShieldCheck, title: "Privacy & security", summary: "Lock, capture and identity trust" },
+  { key: "share", icon: Link, title: "Secure Share", summary: "Share content with guests" },
   { key: "notifications", icon: Bell, title: "Notifications", summary: "Push privacy, mentions and replies" },
   { key: "appearance", icon: Palette, title: "Appearance", summary: "Theme, motion and readable content" },
   { key: "node", icon: Server, title: "Node & connection", summary: "Origin, transport and connection state" },
@@ -269,6 +271,21 @@ function settingsDefinition(
             note: "Veil will never copy the recovery phrase or root identity through a linking QR.",
           },
         ],
+      };
+    case "share":
+      return {
+        title: "Secure Share",
+        subtitle: "Guest access links",
+        groups: [
+          {
+            title: "Manage Links",
+            rows: [
+              { label: "Active Shares", value: "Not implemented yet", tone: "warning" },
+              { label: "Create new link", value: "Mobile integration pending", tone: "warning" },
+            ],
+            note: "Secure Share links allow you to share end-to-end encrypted content with guests who don't have a Veil account.",
+          }
+        ]
       };
     case "privacy":
       return {
