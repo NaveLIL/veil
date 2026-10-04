@@ -1,17 +1,18 @@
 import React, { useCallback, useEffect } from 'react';
-import { Keyboard, StyleSheet, useWindowDimensions, View } from 'react-native';
+import { Keyboard, StyleProp, StyleSheet, useWindowDimensions, View, ViewStyle } from 'react-native';
 import { Gesture, GestureDetector } from 'react-native-gesture-handler';
 import Animated, { cancelAnimation, ReduceMotion, runOnJS, useAnimatedStyle, useSharedValue, withSpring } from 'react-native-reanimated';
 import { swipeDestination } from './navigation';
 import { geometry } from './appearance';
 
-type Props = { navigation: React.ReactNode; profile: React.ReactNode; conversation: React.ReactNode; navigationOpen: boolean;
+type Props = { navigation: (dimStyle: StyleProp<ViewStyle>) => React.ReactNode; profile: React.ReactNode; conversation: React.ReactNode; navigationOpen: boolean;
   surfaceColor: string; edgeColor: string;
   hasChat: boolean; enabled: boolean; reduceMotion: boolean; onNavigationChange: (open: boolean) => void };
 /** Both layers retain their native views and scroll positions between swipes. */
 export function ChatDeck({ navigation, profile, conversation, navigationOpen, surfaceColor, edgeColor, hasChat, enabled, reduceMotion, onNavigationChange }: Props) {
   const { width: screenWidth } = useWindowDimensions();
-  const width = Math.max(1, screenWidth - 12);
+  // Travel through the physical viewport, not the inset navigation frame.
+  const width = Math.max(1, screenWidth);
   const progress = useSharedValue(navigationOpen ? 1 : 0);
   const start = useSharedValue(1);
   const target = useSharedValue(navigationOpen ? 1 : 0);
@@ -47,7 +48,7 @@ export function ChatDeck({ navigation, profile, conversation, navigationOpen, su
   return <GestureDetector gesture={pan}><View style={styles.root} collapsable={false}>
     <View testID="navigation-layer" pointerEvents={navigationOpen ? 'auto' : 'none'}
       accessibilityElementsHidden={!navigationOpen} importantForAccessibility={navigationOpen ? 'auto' : 'no-hide-descendants'} style={styles.layer}>
-      {navigation}<Animated.View pointerEvents="none" accessible={false} style={[styles.backdrop, backdropStyle]} />
+      {navigation(backdropStyle)}
     </View>
     <View testID="profile-layer" pointerEvents={navigationOpen ? 'box-none' : 'none'}
       accessibilityElementsHidden={!navigationOpen} importantForAccessibility={navigationOpen ? 'auto' : 'no-hide-descendants'} style={[styles.layer, styles.profile]}>{profile}</View>
@@ -57,9 +58,8 @@ export function ChatDeck({ navigation, profile, conversation, navigationOpen, su
     </Animated.View>}
   </View></GestureDetector>;
 }
-const styles = StyleSheet.create({ root: { flex: 1, overflow: 'hidden' }, layer: { ...StyleSheet.absoluteFillObject },
+const styles = StyleSheet.create({ root: { flex: 1, marginHorizontal: -geometry.inset, overflow: 'hidden' }, layer: { ...StyleSheet.absoluteFillObject, left: geometry.inset, right: geometry.inset },
   profile: { zIndex: 1 },
-  backdrop: { ...StyleSheet.absoluteFillObject, backgroundColor: '#000000', borderRadius: geometry.radius },
   chat: { zIndex: 2, borderRadius: geometry.radius, borderWidth: geometry.borderWidth, shadowColor: '#000000', shadowOpacity: 0.55, shadowRadius: 18, shadowOffset: { width: -8, height: 0 }, elevation: 12 },
   // The inset curve is concentric with the common outer radius.
   chatClip: { flex: 1, borderRadius: geometry.radius - geometry.borderWidth, overflow: 'hidden' } });

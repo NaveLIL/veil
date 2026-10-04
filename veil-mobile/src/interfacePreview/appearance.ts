@@ -1,5 +1,5 @@
 /** One rounded-rectangle standard across islands, panels and controls. */
-export const geometry = { radius: 20, borderWidth: 1 } as const;
+export const geometry = { radius: 20, borderWidth: 1, inset: 6 } as const;
 
 /** Presentation-only presets matching the desktop names; no account storage. */
 export const palettes = {
