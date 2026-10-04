@@ -12,6 +12,7 @@ import { geometry, Palette, typography } from './appearance';
 
 export function Composer({
   value,
+  editing,
   onChange,
   onSend,
   blocked,
@@ -19,6 +20,7 @@ export function Composer({
   c,
 }: {
   value: string;
+  editing?: boolean;
   onChange: (text: string) => void;
   onSend: () => void;
   blocked: boolean;
@@ -61,7 +63,9 @@ export function Composer({
           onPress={onSend}
           disabled={disabled}
           accessibilityRole="button"
-          accessibilityLabel="Отправить демо-сообщение"
+          accessibilityLabel={
+            editing ? 'Сохранить изменения' : 'Отправить демо-сообщение'
+          }
           accessibilityState={{ disabled }}
           style={({ pressed }) => [
             styles.send,

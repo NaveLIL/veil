@@ -3,14 +3,13 @@ import { Modal, Pressable, ScrollView, StyleSheet, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Check, Shield, X } from 'lucide-react-native';
 import { geometry, Palette, typography } from './appearance';
-import { DemoChat, DemoMessage, Scenario } from './model';
+import { DemoChat, Scenario } from './model';
 import { ROCKET_CHAT_MIT_NOTICE } from '../presentation/rocketChat/notice';
 import { Avatar, Button, IconButton, Label } from './Primitives';
-export type Sheet = 'profile' | 'scenarios' | 'about' | 'message' | null;
+export type Sheet = 'profile' | 'scenarios' | 'about' | null;
 type Props = {
   sheet: Sheet;
   chat?: DemoChat;
-  message: DemoMessage | null;
   scenario: Scenario;
   c: Palette;
   reduceMotion: boolean;
@@ -28,7 +27,6 @@ const scenarioNames: Record<Scenario, string> = {
 export function PreviewSheet({
   sheet,
   chat,
-  message,
   scenario,
   c,
   reduceMotion,
@@ -61,9 +59,7 @@ export function PreviewSheet({
                 ? 'О разговоре'
                 : sheet === 'scenarios'
                   ? 'Сценарии сообщений'
-                  : sheet === 'message'
-                    ? 'Демо-сообщение'
-                    : 'Veil Design'}
+                  : 'Veil Design'}
             </Label>
             <IconButton
               icon={X}
@@ -127,16 +123,6 @@ export function PreviewSheet({
                     групповое шифрование не используются.
                   </Label>
                 )}
-              </>
-            ) : sheet === 'message' && message ? (
-              <>
-                <Label color={c.text} style={styles.body}>
-                  {message.text}
-                </Label>
-                <Label color={c.muted} style={styles.body}>
-                  Ответы, вложения, изменение и удаление добавим после
-                  определения их поведения и поддержки в мобильном клиенте.
-                </Label>
               </>
             ) : (
               <>

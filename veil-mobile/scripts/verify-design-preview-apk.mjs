@@ -17,7 +17,7 @@ if (analyze('manifest', 'min-sdk').trim() !== '24' || analyze('manifest', 'targe
 const parsed = parseManifestXml(manifest);
 const a = parsed.applicationAttributes;
 const m = parsed.manifestAttributes;
-if (m.get('package') !== 'io.veil.mobile.designpreview' || m.get('android:versionCode') !== '2026100407' || m.get('android:versionName') !== '0.1.0-design.20261004.7') throw Error('Preview identity/version mismatch');
+if (m.get('package') !== 'io.veil.mobile.designpreview' || m.get('android:versionCode') !== '2026100408' || m.get('android:versionName') !== '0.1.0-design.20261004.8') throw Error('Preview identity/version mismatch');
 if (a.get('android:name') !== 'io.veil.mobile.designpreview.DesignApplication' || a.get('android:allowBackup') !== 'false' || a.get('android:fullBackupContent') !== 'false' || a.get('android:usesCleartextTraffic') !== 'false' || a.get('android:debuggable') === 'true' || a.has('android:sharedUserId')) throw Error('Preview application boundary mismatch');
 if (m.has('android:sharedUserId') || parsed.applicationIntentData.length || parsed.instrumentationCount || parsed.profileableCount) throw Error('Account/enrollment/test surface not allowed');
 const permissions = parsed.requestedPermissions.map(p => p.attributes.get('android:name'));

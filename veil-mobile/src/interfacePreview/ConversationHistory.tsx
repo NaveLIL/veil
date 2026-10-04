@@ -10,14 +10,16 @@ import {
   FlatList,
   NativeScrollEvent,
   NativeSyntheticEvent,
-  Platform,
   Pressable,
   StyleSheet,
   Text,
   View,
 } from 'react-native';
-import { ArrowDown, Check, CircleAlert, Clock3 } from 'lucide-react-native';
+import { ArrowDown } from 'lucide-react-native';
 import { geometry, Palette, typography } from './appearance';
+import { MessageRow } from './MessageRow';
+import { useQuoteNavigation } from './useQuoteNavigation';
+import { QuoteJump } from './useMessageInteractions';
 import { canGroup, DemoChat, DemoMessage, demoToday } from './model';
 import {
   dayLabel,
@@ -32,6 +34,10 @@ type Props = {
   visible: boolean;
   c: Palette;
   reduceMotion: boolean;
+  jump?: QuoteJump | null;
+  onQuote?: (id: string) => void;
+  selectedMessageId?: string;
+  onNotice?: (text: string) => void;
   onMessage: (message: DemoMessage) => void;
   onRetry: (chatId: string, messageId: string) => void;
   onRead: (chatId: string) => void;
@@ -81,6 +87,10 @@ const HistoryPage = memo(function HistoryPage({
   onMessage,
   onRetry,
   onRead,
+  jump,
+  onQuote,
+  selectedMessageId,
+  onNotice,
 }: PageProps) {
   const list = useRef<FlatList<DemoMessage>>(null);
   const [firstLoadedId, setFirstLoadedId] = useState(
@@ -111,6 +121,25 @@ const HistoryPage = memo(function HistoryPage({
     },
     [reduceMotion],
   );
+  const cancelTail = useCallback(() => {
+    if (frame.current !== null) {
+      cancelAnimationFrame(frame.current);
+      frame.current = null;
+    }
+    setAtLatest(false);
+  }, []);
+  const quoteNavigation = useQuoteNavigation({
+    chat,
+    messages,
+    active,
+    jump,
+    list,
+    following,
+    setFirstLoadedId,
+    cancelTail,
+    report: onNotice,
+    reduceMotion,
+  });
   useEffect(
     () => () => {
       if (frame.current !== null) cancelAnimationFrame(frame.current);
@@ -138,6 +167,7 @@ const HistoryPage = memo(function HistoryPage({
     (event: NativeSyntheticEvent<NativeScrollEvent>) => {
       const { contentOffset, contentSize, layoutMeasurement } =
         event.nativeEvent;
+      if (quoteNavigation.pending.current) return;
       const latest = isAtLatest(
         contentOffset.y,
         contentSize.height,
@@ -152,7 +182,7 @@ const HistoryPage = memo(function HistoryPage({
         onRead(chat.id);
       }
     },
-    [active, chat.id, onRead],
+    [active, chat.id, onRead, quoteNavigation.pending],
   );
   const loadOlder = useCallback(() => {
     if (active && !following.current)
@@ -161,6 +191,7 @@ const HistoryPage = memo(function HistoryPage({
       );
   }, [active, chat.messages, offset]);
   const jumpLatest = () => {
+    quoteNavigation.clear();
     following.current = true;
     dragging.current = false;
     setAtLatest(true);
@@ -194,7 +225,12 @@ const HistoryPage = memo(function HistoryPage({
         keyboardDismissMode="on-drag"
         scrollEventThrottle={32}
         onScroll={onScroll}
+        onScrollToIndexFailed={quoteNavigation.onFailed}
+        onViewableItemsChanged={quoteNavigation.onViewableItemsChanged}
+        viewabilityConfig={{ itemVisiblePercentThreshold: 15 }}
+        extraData={`${quoteNavigation.highlight}:${selectedMessageId}`}
         onScrollBeginDrag={() => {
+          quoteNavigation.clear();
           dragging.current = true;
           following.current = false;
         }}
@@ -269,6 +305,11 @@ const HistoryPage = memo(function HistoryPage({
                 c={c}
                 onMessage={onMessage}
                 onRetry={onRetry}
+                onQuote={onQuote}
+                highlighted={
+                  item.id === quoteNavigation.highlight ||
+                  item.id === selectedMessageId
+                }
               />
             </View>
           );
@@ -305,99 +346,6 @@ const HistoryPage = memo(function HistoryPage({
     </View>
   );
 });
-const MessageRow = memo(function MessageRow({
-  item,
-  chat,
-  grouped,
-  c,
-  onMessage,
-  onRetry,
-}: {
-  item: DemoMessage;
-  chat: DemoChat;
-  grouped: boolean;
-  c: Palette;
-  onMessage: Props['onMessage'];
-  onRetry: Props['onRetry'];
-}) {
-  const status =
-    item.delivery === 'queued'
-      ? 'В очереди'
-      : item.delivery === 'failed'
-        ? 'Не отправлено'
-        : item.delivery === 'unknown'
-          ? 'Подтверждение неизвестно'
-          : item.delivery === 'accepted'
-            ? 'Отправлено'
-            : '';
-  const StatusIcon =
-    item.delivery === 'queued'
-      ? Clock3
-      : item.delivery === 'failed' || item.delivery === 'unknown'
-        ? CircleAlert
-        : Check;
-  const name = item.own ? 'Вы' : (item.author ?? chat.name);
-  const initials = item.own
-    ? 'В'
-    : item.author
-      ? item.author.slice(0, 2).toUpperCase()
-      : chat.initials;
-  return (
-    <View style={[styles.row, { marginTop: grouped ? 2 : 18 }]}>
-      <View style={styles.gutter}>
-        {!grouped && (
-          <View
-            accessible={false}
-            style={[styles.avatar, { backgroundColor: chat.color }]}
-          >
-            <Text style={styles.initials}>{initials}</Text>
-          </View>
-        )}
-      </View>
-      <View style={styles.flex}>
-        {!grouped && (
-          <View style={styles.author}>
-            <Text
-              style={[styles.name, { color: item.own ? c.accent : c.text }]}
-            >
-              {name}
-            </Text>
-            <Text style={[styles.caption, { color: c.muted }]}>
-              {item.time}
-            </Text>
-          </View>
-        )}
-        <Pressable
-          accessibilityRole="button"
-          accessibilityLabel={`${name}: ${item.text}. ${item.time}. ${status}`}
-          onPress={() => onMessage(item)}
-          onLongPress={() => onMessage(item)}
-          style={styles.messageTap}
-        >
-          <Text style={[styles.messageText, { color: c.text }]}>
-            {item.text}
-          </Text>
-        </Pressable>
-        {!!status && (
-          <View style={styles.status}>
-            <StatusIcon size={13} color={c.muted} />
-            <Text style={[styles.caption, { color: c.muted }]}>{status}</Text>
-          </View>
-        )}
-        {item.delivery === 'failed' && (
-          <Pressable
-            accessibilityRole="button"
-            accessibilityLabel="Повторить демо-сообщение"
-            onPress={() => onRetry(chat.id, item.id)}
-            style={styles.retry}
-          >
-            <Text style={[styles.caption, { color: c.accent }]}>Повторить</Text>
-          </Pressable>
-        )}
-      </View>
-    </View>
-  );
-});
 const styles = StyleSheet.create({
   flex: { flex: 1, minWidth: 0 },
   page: { ...StyleSheet.absoluteFillObject },
@@ -418,37 +366,7 @@ const styles = StyleSheet.create({
     paddingVertical: 14,
   },
   line: { flex: 1, height: StyleSheet.hairlineWidth },
-  row: { flexDirection: 'row', gap: 10 },
-  gutter: { width: 34, paddingTop: 2 },
-  avatar: {
-    width: 34,
-    height: 34,
-    borderRadius: 17,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  initials: { color: '#FFFFFF', fontSize: 12, fontWeight: '600' },
-  author: {
-    flexDirection: 'row',
-    alignItems: 'baseline',
-    flexWrap: 'wrap',
-    gap: 8,
-    marginBottom: 3,
-  },
   name: { ...typography.name, fontWeight: '600' },
-  messageTap: { minHeight: geometry.touchTarget },
-  messageText: {
-    ...typography.message,
-    ...Platform.select({ android: { includeFontPadding: false } }),
-  },
-  status: { flexDirection: 'row', alignItems: 'center', gap: 5, marginTop: 3 },
-  retry: {
-    alignSelf: 'flex-start',
-    minHeight: geometry.touchTarget,
-    justifyContent: 'center',
-    paddingHorizontal: 8,
-    borderRadius: geometry.radius,
-  },
   jump: {
     position: 'absolute',
     right: 12,

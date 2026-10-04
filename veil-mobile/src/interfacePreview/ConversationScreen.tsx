@@ -4,12 +4,16 @@ import {
   ArrowLeft,
   CircleAlert,
   MoreHorizontal,
+  X,
+  Pencil,
   WifiOff,
 } from 'lucide-react-native';
 import { geometry, Palette, typography } from './appearance';
 import { DemoChat, DemoMessage, demoSpaces, Scenario } from './model';
 import { Avatar, IconButton, Label } from './Primitives';
 import { ConversationHistory } from './ConversationHistory';
+import { MessageQuote } from './MessageQuote';
+import { QuoteJump } from './useMessageInteractions';
 import { Composer } from './Composer';
 type Props = {
   chat: DemoChat;
@@ -19,6 +23,14 @@ type Props = {
   visible: boolean;
   c: Palette;
   reduceMotion: boolean;
+  replyId?: string;
+  editing?: boolean;
+  selectedMessageId?: string;
+  jump?: QuoteJump | null;
+  notice?: string;
+  onQuote?: (id: string) => void;
+  onCancelComposition?: () => void;
+  onNotice?: (text: string) => void;
   onDraft: (text: string) => void;
   onSend: () => void;
   onMessage: (message: DemoMessage) => void;
@@ -36,6 +48,14 @@ export function ConversationScreen({
   visible,
   c,
   reduceMotion,
+  replyId,
+  editing,
+  selectedMessageId,
+  jump,
+  notice,
+  onQuote,
+  onCancelComposition,
+  onNotice,
   onDraft,
   onSend,
   onMessage,
@@ -111,12 +131,51 @@ export function ConversationScreen({
           c={c}
           reduceMotion={reduceMotion}
           onMessage={onMessage}
+          selectedMessageId={selectedMessageId}
+          jump={jump}
+          onQuote={onQuote}
+          onNotice={onNotice}
           onRetry={onRetry}
           onRead={onRead}
         />
+        {!!notice && (
+          <Label
+            color={c.accent}
+            style={styles.notice}
+            accessibilityLiveRegion="polite"
+          >
+            {notice}
+          </Label>
+        )}
+        {(editing || replyId) && (
+          <View style={[styles.context, { backgroundColor: c.raised }]}>
+            <View style={styles.flex}>
+              {editing ? (
+                <View style={styles.editLabel}>
+                  <Pencil size={16} color={c.accent} />
+                  <Label color={c.text}>Редактирование сообщения</Label>
+                </View>
+              ) : (
+                <MessageQuote
+                  chat={chat}
+                  id={replyId!}
+                  c={c}
+                  onPress={() => onQuote?.(replyId!)}
+                />
+              )}
+            </View>
+            <IconButton
+              icon={X}
+              label={editing ? 'Отменить редактирование' : 'Отменить ответ'}
+              color={c.muted}
+              onPress={() => onCancelComposition?.()}
+            />
+          </View>
+        )}
         <Composer
           key={chat.id}
           value={draft}
+          editing={editing}
           onChange={onDraft}
           onSend={onSend}
           blocked={scenario === 'identityChanged'}
@@ -129,6 +188,21 @@ export function ConversationScreen({
 }
 const styles = StyleSheet.create({
   conversation: { flex: 1 },
+  notice: { ...typography.caption, paddingHorizontal: 14, paddingVertical: 8 },
+  context: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginHorizontal: 10,
+    marginTop: 8,
+    paddingLeft: 10,
+    borderRadius: geometry.radius,
+  },
+  editLabel: {
+    flexDirection: 'row',
+    gap: 8,
+    alignItems: 'center',
+    minHeight: geometry.touchTarget,
+  },
   chatHeader: {
     minHeight: 68,
     flexDirection: 'row',

@@ -15,6 +15,9 @@ export type DemoMessage = {
   day?: string;
   delivery?: Delivery;
   author?: string;
+  replyTo?: string;
+  edited?: boolean;
+  deleted?: boolean;
 };
 export type DemoChat = {
   id: string;
@@ -34,6 +37,8 @@ export type DemoSession = {
   drafts: Record<string, string>;
   scenario: Scenario;
   nextId: number;
+  replies?: Record<string, string | undefined>;
+  edits?: Record<string, { messageId: string; text: string } | undefined>;
 };
 export const demoSpaces = [
   {
@@ -412,11 +417,13 @@ export function sendDemo(
     text,
     time,
     delivery,
+    replyTo: session.replies?.[chatId],
   };
   return {
     ...session,
     nextId: session.nextId + 1,
     drafts: { ...session.drafts, [chatId]: '' },
+    replies: { ...session.replies, [chatId]: undefined },
     chats: session.chats.map((c) =>
       c.id === chatId ? { ...c, messages: [...c.messages, message] } : c,
     ),

@@ -4,6 +4,11 @@ import { act, cleanup, fireEvent, render } from '@testing-library/react-native';
 import { FlatList } from 'react-native';
 import { DesignApp } from './DesignApp';
 import { canGroup, createDemoSession, visibleChats } from './model';
+import { ConversationHistory } from './ConversationHistory';
+import { copyDemoText } from './clipboardBridge';
+jest.mock('./clipboardBridge', () => ({
+  copyDemoText: jest.fn<() => Promise<void>>().mockResolvedValue(undefined),
+}));
 jest.mock('react-native-reanimated', () =>
   jest.requireActual('react-native-reanimated/mock'),
 );
@@ -212,4 +217,52 @@ test('timeline groups only the same author within five forward minutes', () => {
   expect(canGroup(first, { ...first, own: true })).toBe(false);
   expect(canGroup(first, { ...first, time: '13:59' })).toBe(false);
   expect(canGroup(first, { ...first, time: '14:06' })).toBe(false);
+});
+test('message actions retain per-chat reply/draft state and edit cancellation restores the ordinary composer', async () => {
+  const ui = await mount();
+  fireEvent.press(
+    ui.getByRole('button', { name: /Анна Морозова, непрочитанных/ }),
+  );
+  fireEvent.changeText(ui.getByLabelText('Текст демо-сообщения'), 'черновик');
+  const select = (id: string) =>
+    act(() => {
+      const message = createDemoSession().chats[0].messages.find(
+        (m) => m.id === id,
+      )!;
+      ui.UNSAFE_getByType(ConversationHistory).props.onMessage(message);
+    });
+  select('fixture-a1');
+  fireEvent.press(ui.getByRole('button', { name: 'Ответить' }));
+  expect(ui.getByLabelText('Отменить ответ')).toBeTruthy();
+  fireEvent.press(ui.getByLabelText('Назад к списку'));
+  fireEvent.press(ui.getByRole('button', { name: /^Максим/ }));
+  expect(ui.queryByLabelText('Отменить ответ')).toBeNull();
+  fireEvent.press(ui.getByLabelText('Назад к списку'));
+  fireEvent.press(
+    ui.getByRole('button', { name: /Анна Морозова, есть черновик/ }),
+  );
+  expect(ui.getByLabelText('Отменить ответ')).toBeTruthy();
+  select('fixture-a2');
+  fireEvent.press(ui.getByRole('button', { name: 'Редактировать' }));
+  fireEvent.changeText(
+    ui.getByLabelText('Текст демо-сообщения'),
+    'редактирование',
+  );
+  fireEvent.press(ui.getByLabelText('Отменить редактирование'));
+  expect(ui.getByLabelText('Текст демо-сообщения').props.value).toBe(
+    'черновик',
+  );
+  expect(ui.getByLabelText('Отменить ответ')).toBeTruthy();
+  select('fixture-a2');
+  fireEvent.press(ui.getByRole('button', { name: 'Копировать' }));
+  await act(async () => {});
+  expect(copyDemoText).toHaveBeenCalledWith(
+    'Согласен. Сначала доведём личные чаты до мелочей.',
+  );
+  expect(ui.getByText('Текст скопирован')).toBeTruthy();
+  jest.mocked(copyDemoText).mockRejectedValueOnce(new Error('Unavailable'));
+  select('fixture-a1');
+  fireEvent.press(ui.getByRole('button', { name: 'Копировать' }));
+  await act(async () => {});
+  expect(ui.getByText('Не удалось скопировать текст')).toBeTruthy();
 });

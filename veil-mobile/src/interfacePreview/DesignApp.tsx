@@ -17,15 +17,7 @@ import {
   View,
 } from 'react-native';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
-import {
-  createDemoSession,
-  DemoMessage,
-  openChat,
-  receiveDemo,
-  retryDemo,
-  sendDemo,
-  setDraft,
-} from './model';
+import { createDemoSession, openChat, receiveDemo, retryDemo } from './model';
 import { geometry, motion, palettes, ThemeName } from './appearance';
 import { pickWallpaper } from './appearanceBridge';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
@@ -37,6 +29,8 @@ import { NavigationPanel } from './NavigationPanel';
 import { ConversationScreen } from './ConversationScreen';
 import { LockPreview } from './LockPreview';
 import { PreviewSheet, Sheet } from './PreviewSheet';
+import { useMessageInteractions } from './useMessageInteractions';
+import { MessageActionsPanel } from './MessageActionsPanel';
 import { KeyboardFrame } from './KeyboardFrame';
 
 export function DesignApp() {
@@ -63,7 +57,7 @@ function Workbench() {
   const [unreadOnly, setUnreadOnly] = useState(false);
   const [newChat, setNewChat] = useState(false);
   const [sheet, setSheet] = useState<Sheet>(null);
-  const [message, setMessage] = useState<DemoMessage | null>(null);
+  const interactions = useMessageInteractions(session, setSession, chatId);
   const [theme, setTheme] = useState<ThemeName>('OLED');
   const [wallpaper, setWallpaper] = useState<string | null>(null);
   const [showWallpaper, setShowWallpaper] = useState(true);
@@ -108,6 +102,10 @@ function Workbench() {
     return () => animation.stop();
   }, [destination, locked, noMotion, transition]);
   const back = useCallback(() => {
+    if (interactions.selection) {
+      interactions.close();
+      return true;
+    }
     if (sheet) {
       setSheet(null);
       return true;
@@ -139,6 +137,7 @@ function Workbench() {
     }
     return false;
   }, [
+    interactions,
     sheet,
     locked,
     ownProfileOpen,
@@ -160,21 +159,6 @@ function Workbench() {
     setSession((s) => openChat(s, id));
     dispatchDeck({ type: 'choose', id });
   }
-  function send() {
-    if (!chat) return;
-    const now = new Date();
-    setSession((s) =>
-      sendDemo(
-        s,
-        chat.id,
-        `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`,
-      ),
-    );
-  }
-  const inspectMessage = useCallback((item: DemoMessage) => {
-    setMessage(item);
-    setSheet('message');
-  }, []);
   const retryMessage = useCallback(
     (id: string, messageId: string) =>
       setSession((s) => retryDemo(s, id, messageId)),
@@ -318,7 +302,7 @@ function Workbench() {
               edgeColor={c.line}
               navigationOpen={deck.navigationOpen}
               hasChat={!!chat}
-              enabled={!sheet && !ownProfileOpen}
+              enabled={!sheet && !ownProfileOpen && !interactions.selection}
               reduceMotion={noMotion}
               onNavigationChange={(open) =>
                 dispatchDeck({ type: open ? 'reveal' : 'resume' })
@@ -337,16 +321,27 @@ function Workbench() {
                   <ConversationScreen
                     chat={chat}
                     chats={session.chats}
-                    draft={session.drafts[chat.id] ?? ''}
+                    draft={interactions.draft}
+                    replyId={interactions.replyId}
+                    editing={!!interactions.edit}
+                    jump={interactions.jump}
+                    notice={interactions.notice}
+                    selectedMessageId={interactions.message?.id}
+                    onQuote={interactions.jumpTo}
+                    onNotice={interactions.report}
+                    onCancelComposition={interactions.cancel}
                     scenario={session.scenario}
-                    visible={!deck.navigationOpen && !sheet && !ownProfileOpen}
+                    visible={
+                      !deck.navigationOpen &&
+                      !sheet &&
+                      !ownProfileOpen &&
+                      !interactions.selection
+                    }
                     c={c}
                     reduceMotion={noMotion}
-                    onDraft={(text) =>
-                      setSession((s) => setDraft(s, chat.id, text))
-                    }
-                    onSend={send}
-                    onMessage={inspectMessage}
+                    onDraft={interactions.change}
+                    onSend={interactions.submit}
+                    onMessage={interactions.inspect}
                     onRetry={retryMessage}
                     onRead={readMessages}
                     onBack={() => {
@@ -400,10 +395,19 @@ function Workbench() {
               setSheet('scenarios');
             }}
           />
+          {interactions.message && (
+            <MessageActionsPanel
+              key={interactions.message.id}
+              message={interactions.message}
+              c={c}
+              reduceMotion={noMotion}
+              onClose={interactions.close}
+              onAction={interactions.action}
+            />
+          )}
           <PreviewSheet
             sheet={sheet}
             chat={chat}
-            message={message}
             scenario={session.scenario}
             c={c}
             reduceMotion={noMotion}

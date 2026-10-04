@@ -55,8 +55,8 @@ android {
         applicationId 'io.veil.mobile.designpreview'
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 2026100407
-        versionName '0.1.0-design.20261004.7'
+        versionCode 2026100408
+        versionName '0.1.0-design.20261004.8'
         manifestPlaceholders = [veilDesignSource: sourceCommit, veilDesignLabel: 'Veil Design']
     }
     signingConfigs {

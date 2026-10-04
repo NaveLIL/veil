@@ -275,7 +275,7 @@ export function NavigationPanel({
                             {draft
                               ? `Черновик: ${draft}`
                               : latest
-                                ? `${latest.own ? 'Вы: ' : latest.author ? `${latest.author}: ` : ''}${latest.text}`
+                                ? `${latest.own ? 'Вы: ' : latest.author ? `${latest.author}: ` : ''}${latest.deleted ? 'Сообщение удалено' : latest.text}`
                                 : 'Начать разговор'}
                           </Label>
                           {item.unread > 0 && (
