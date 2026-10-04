@@ -20,7 +20,7 @@ react {
 }
 def previewLinkFile = layout.buildDirectory.file('generated/preview-autolinking/autolinking.json')
 def rootLinkFile = rootProject.layout.buildDirectory.file('generated/autolinking/autolinking.json')
-def previewLibraries = ['react-native-safe-area-context', 'react-native-svg', 'react-native-edge-to-edge']
+def previewLibraries = ['react-native-safe-area-context', 'react-native-svg', 'react-native-edge-to-edge', 'react-native-gesture-handler', 'react-native-reanimated']
 def preparePreviewAutolinking = tasks.register('preparePreviewAutolinking') {
     inputs.file(rootLinkFile)
     outputs.file(previewLinkFile)
@@ -55,8 +55,8 @@ android {
         applicationId 'io.veil.mobile.designpreview'
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 2026100402
-        versionName '0.1.0-design.20261004.2'
+        versionCode 2026100403
+        versionName '0.1.0-design.20261004.3'
         manifestPlaceholders = [veilDesignSource: sourceCommit, veilDesignLabel: 'Veil Design']
     }
     signingConfigs {

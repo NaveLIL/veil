@@ -17,7 +17,7 @@ if (analyze('manifest', 'min-sdk').trim() !== '24' || analyze('manifest', 'targe
 const parsed = parseManifestXml(manifest);
 const a = parsed.applicationAttributes;
 const m = parsed.manifestAttributes;
-if (m.get('package') !== 'io.veil.mobile.designpreview' || m.get('android:versionCode') !== '2026100402' || m.get('android:versionName') !== '0.1.0-design.20261004.2') throw Error('Preview identity/version mismatch');
+if (m.get('package') !== 'io.veil.mobile.designpreview' || m.get('android:versionCode') !== '2026100403' || m.get('android:versionName') !== '0.1.0-design.20261004.3') throw Error('Preview identity/version mismatch');
 if (a.get('android:name') !== 'io.veil.mobile.designpreview.DesignApplication' || a.get('android:allowBackup') !== 'false' || a.get('android:fullBackupContent') !== 'false' || a.get('android:usesCleartextTraffic') !== 'false' || a.get('android:debuggable') === 'true' || a.has('android:sharedUserId')) throw Error('Preview application boundary mismatch');
 if (m.has('android:sharedUserId') || parsed.applicationIntentData.length || parsed.instrumentationCount || parsed.profileableCount) throw Error('Account/enrollment/test surface not allowed');
 const permissions = parsed.requestedPermissions.map(p => p.attributes.get('android:name'));
@@ -38,6 +38,7 @@ const activity = analyze('dex', 'code', '--class', 'io.veil.mobile.designpreview
 if (!activity.includes('VeilDesign') || /Window;->(?:addFlags|setFlags|clearFlags)|setRecentsScreenshotEnabled|consumeEnrollment/.test(activity)) throw Error('Preview activity capture/entry drift');
 const nativeHost = analyze('dex', 'code', '--class', 'io.veil.mobile.designpreview.DesignApplication$reactNativeHost$1');
 if (!nativeHost.includes('MainReactPackage') || !nativeHost.includes('SafeAreaContextPackage') || !nativeHost.includes('SvgPackage') || !nativeHost.includes('DesignAppearancePackage') || /VeilMobileRuntime|VeilCrypto|ExpoModulesPackage|PackageList/.test(nativeHost)) throw Error('Preview native registration mismatch');
+if (!nativeHost.includes('RNGestureHandlerPackage') || !nativeHost.includes('ReanimatedPackage')) throw Error('Preview native gesture/animation packages missing');
 const map = JSON.parse(fs.readFileSync(sourceMap, 'utf8'));
 const found = new Map();
 map.sources.forEach((source, i) => {

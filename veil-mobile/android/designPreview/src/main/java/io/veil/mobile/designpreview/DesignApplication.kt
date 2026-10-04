@@ -14,6 +14,8 @@ import com.facebook.soloader.SoLoader
 import com.th3rdwave.safeareacontext.SafeAreaContextPackage
 import com.horcrux.svg.SvgPackage
 import com.zoontek.rnedgetoedge.EdgeToEdgePackage
+import com.swmansion.gesturehandler.RNGestureHandlerPackage
+import com.swmansion.reanimated.ReanimatedPackage
 
 /** No Veil runtime, journals, crypto bridges, Expo account modules or private data. */
 class DesignApplication : Application(), ReactApplication {
@@ -21,6 +23,7 @@ class DesignApplication : Application(), ReactApplication {
     override fun getPackages(): List<ReactPackage> = listOf(
       MainReactPackage(), SafeAreaContextPackage(), SvgPackage(), EdgeToEdgePackage(),
       DesignAppearancePackage(),
+      RNGestureHandlerPackage(), ReanimatedPackage(),
     )
     override fun getJSMainModuleName() = "design-preview-index"
     override fun getUseDeveloperSupport() = BuildConfig.DEBUG

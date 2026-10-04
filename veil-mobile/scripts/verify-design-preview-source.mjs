@@ -8,6 +8,7 @@ export const allowedSources = [
   'design-preview-index.ts', 'src/interfacePreview/DesignApp.tsx',
   'src/interfacePreview/model.ts', 'src/presentation/rocketChat/notice.ts',
   'src/interfacePreview/appearance.ts', 'src/interfacePreview/appearanceBridge.ts',
+  'src/interfacePreview/ChatDeck.tsx', 'src/interfacePreview/UserProfile.tsx', 'src/interfacePreview/navigation.ts',
 ];
 export function verifyPreviewSource() {
   const visited = new Set();
@@ -37,7 +38,7 @@ export function verifyPreviewSource() {
             const candidate = ['.ts', '.tsx'].map(extension => base + extension).find(file => fs.existsSync(file));
             if (!candidate) throw Error(`Unresolved preview import: ${name}`);
             visit(path.relative(root, candidate).replaceAll('\\', '/'));
-          } else if (!['react', 'react-native', 'react-native-safe-area-context', 'lucide-react-native'].includes(name)) throw Error(`Unapproved preview dependency: ${name}`);
+          } else if (!['react', 'react-native', 'react-native-safe-area-context', 'lucide-react-native', 'react-native-gesture-handler', 'react-native-reanimated'].includes(name)) throw Error(`Unapproved preview dependency: ${name}`);
         }
       }
       ts.forEachChild(node, check);
