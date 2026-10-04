@@ -226,7 +226,7 @@ jobs:
       - name: Fuzz transparency proofs
         run: go test ./internal/transparency -run='^$' -fuzz='^FuzzTransparencyProofRoundTrip$' -fuzztime=5s
 
-  # Integration-tagged REST and database tests against ephemeral Postgres
+  # Integration-tagged REST, database and gateway tests against ephemeral Postgres
   # containers spun up via testcontainers-go. Gated by the `integration`
   # build tag so that the default `go test ./...` job above stays Docker-free.
   integration:
@@ -250,4 +250,6 @@ jobs:
           # testcontainers-go reuses containers across tests when ryuk is
           # disabled; on CI we want clean teardown.
           TESTCONTAINERS_RYUK_DISABLED: "false"
-        run: go test -tags=integration -timeout 5m -v ./internal/integration/... ./internal/db
+        # Packages run serially to bound concurrent ephemeral databases. Include
+        # every internal package so newly tagged suites cannot silently miss CI.
+        run: go test -tags=integration -race -p 1 -timeout 15m -v ./internal/...

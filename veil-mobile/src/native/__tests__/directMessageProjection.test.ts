@@ -7,6 +7,9 @@ const messageId = "30000000-0000-4000-8000-000000000001";
 
 const message = (index: number, text: string) => ({
   messageId: `30000000-0000-4000-8000-${index.toString(16).padStart(12, "0")}`,
+  stableUiId: `30000000-0000-4000-8000-${index.toString(16).padStart(12, "0")}`,
+  clientMessageId: null,
+  serverMessageId: `30000000-0000-4000-8000-${index.toString(16).padStart(12, "0")}`,
   text,
   timestampMs: 1_700_000_000_000 + index,
   direction: "incoming",
@@ -20,7 +23,7 @@ function installRuntime(result: unknown) {
   Object.defineProperty(NativeModules, "VeilMobileRuntime", {
     configurable: true,
     value: {
-      projectDirectMessages,
+      projectDirectMessagesV2: projectDirectMessages,
       addListener: jest.fn(),
       removeListeners: jest.fn(),
     },
@@ -52,6 +55,9 @@ describe("Direct message native projection", () => {
       availability: "available",
       messages: [{
         messageId,
+        stableUiId: messageId,
+        clientMessageId: null,
+        serverMessageId: messageId,
         text: "authenticated preview",
         timestampMs: 1_700_000_000_123,
         direction: "incoming",
@@ -67,6 +73,9 @@ describe("Direct message native projection", () => {
       availability: "available",
       messages: [{
         messageId,
+        stableUiId: messageId,
+        clientMessageId: null,
+        serverMessageId: messageId,
         text: "authenticated preview",
         timestampMs: 1_700_000_000_123,
         direction: "incoming",
@@ -87,6 +96,39 @@ describe("Direct message native projection", () => {
       availability: "unavailable",
       messages: [],
     });
+  });
+
+  it("retains the same original client identity across pending and ACK domain IDs", async () => {
+    const clientId = "40000000-0000-4000-8000-000000000001";
+    const pending = { messageId: clientId, stableUiId: clientId, clientMessageId: clientId,
+      serverMessageId: null, text: "same committed intent", timestampMs: null,
+      direction: "outgoing", delivery: "sending" };
+    const acknowledged = { ...pending, messageId, serverMessageId: messageId,
+      timestampMs: 1_700_000_000_123, delivery: "sent" };
+    const installed = installRuntime({ availability: "available", messages: [pending] });
+    const before = await installed.runtime.getDirectMessages(conversationId);
+    installed.projectDirectMessages.mockResolvedValue({ availability: "available",
+      messages: [acknowledged] });
+    const after = await installed.runtime.getDirectMessages(conversationId);
+    expect(before.messages[0]?.stableUiId).toBe(clientId);
+    expect(after.messages[0]?.stableUiId).toBe(clientId);
+    expect(after.messages[0]?.messageId).toBe(messageId);
+  });
+
+  it("denies ambiguous aliases and raw UI identity collisions across directions", async () => {
+    const clientId = "40000000-0000-4000-8000-000000000001";
+    const outgoing = { messageId, stableUiId: clientId, clientMessageId: clientId,
+      serverMessageId: messageId, text: "outgoing", timestampMs: 1_700_000_000_123,
+      direction: "outgoing", delivery: "sent" };
+    const incoming = { ...message(2, "incoming"), messageId: clientId,
+      stableUiId: clientId, serverMessageId: clientId };
+    for (const rows of [[outgoing, incoming], [{ ...outgoing, clientMessageId: null }],
+      [{ ...outgoing, serverMessageId: null }], [{ ...incoming, clientMessageId: clientId }],
+      [{ ...outgoing, stableUiId: messageId }], [{ ...outgoing, timestampMs: null }]]) {
+      const installed = installRuntime({ availability: "available", messages: rows });
+      await expect(installed.runtime.getDirectMessages(conversationId)).resolves
+        .toEqual({ availability: "unavailable", messages: [] });
+    }
   });
 
   it("fails closed before native code for a non-canonical conversation id", async () => {

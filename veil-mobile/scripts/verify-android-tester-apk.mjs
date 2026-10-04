@@ -259,12 +259,13 @@ const ARGUMENTS = new Set([
   "--expected-version-code",
   "--expected-version-name",
   "--forbidden-cert-sha256",
+  "--forbidden-debug-cert-sha256",
+  "--production-certificate-state",
 ]);
 
 const REQUIRED_ARGUMENTS = Object.freeze([
   "--apk",
   "--expected-cert-sha256",
-  "--forbidden-cert-sha256",
   "--expected-version-code",
   "--expected-version-name",
   "--expected-source-commit",
@@ -331,11 +332,27 @@ export function parseArguments(argv) {
 
   const certificateSha256 = values.get("--expected-cert-sha256");
   if (!/^[0-9a-f]{64}$/.test(certificateSha256)) fail("ARGS_CERT_SHA256");
-  const forbiddenCertificateSha256 = values.get("--forbidden-cert-sha256");
-  if (!/^[0-9a-f]{64}$/.test(forbiddenCertificateSha256)) {
-    fail("ARGS_FORBIDDEN_CERT_SHA256");
+  const productionCertificateState = values.get("--production-certificate-state") ?? "provisioned";
+  const forbiddenCertificateSha256 = values.get("--forbidden-cert-sha256") ?? null;
+  const forbiddenDebugCertificateSha256 = values.get("--forbidden-debug-cert-sha256") ?? null;
+  if (values.has("--production-certificate-state") && productionCertificateState !== "not-provisioned") {
+    fail("ARGS_PRODUCTION_STATE");
   }
-  if (certificateSha256 === forbiddenCertificateSha256) fail("ARGS_CERT_NOT_DISTINCT");
+  if (productionCertificateState === "not-provisioned") {
+    if (forbiddenCertificateSha256 !== null) fail("ARGS_CERT_MODE");
+    if (forbiddenDebugCertificateSha256 === null) fail("ARGS_REQUIRED");
+    if (!/^[0-9a-f]{64}$/.test(forbiddenDebugCertificateSha256)) {
+      fail("ARGS_FORBIDDEN_DEBUG_CERT_SHA256");
+    }
+    if (certificateSha256 === forbiddenDebugCertificateSha256) fail("ARGS_CERT_NOT_DISTINCT");
+  } else {
+    if (forbiddenDebugCertificateSha256 !== null) fail("ARGS_CERT_MODE");
+    if (forbiddenCertificateSha256 === null) fail("ARGS_REQUIRED");
+    if (!/^[0-9a-f]{64}$/.test(forbiddenCertificateSha256)) {
+      fail("ARGS_FORBIDDEN_CERT_SHA256");
+    }
+    if (certificateSha256 === forbiddenCertificateSha256) fail("ARGS_CERT_NOT_DISTINCT");
+  }
 
   const sourceCommit = values.get("--expected-source-commit");
   if (!/^[0-9a-f]{40}$/.test(sourceCommit)) fail("ARGS_SOURCE_COMMIT");
@@ -362,6 +379,8 @@ export function parseArguments(argv) {
     evidencePath,
     certificateSha256,
     forbiddenCertificateSha256,
+    forbiddenDebugCertificateSha256,
+    productionCertificateState,
     sourceCommit,
     versionCode,
     versionName,
@@ -1473,6 +1492,8 @@ export function buildEvidence({
   apkSizeBytes,
   certificateSha256,
   forbiddenCertificateSha256,
+  forbiddenDebugCertificateSha256 = null,
+  productionCertificateState = "provisioned",
   signatureSchemePolicy,
   branding,
   resources,
@@ -1491,11 +1512,20 @@ export function buildEvidence({
   if (!Number.isSafeInteger(apkSizeBytes) || apkSizeBytes <= 0) fail("EVIDENCE_APK_SIZE");
   if (apkSizeBytes > MAX_APK_BYTES) fail("EVIDENCE_APK_SIZE");
   if (!/^[0-9a-f]{64}$/.test(certificateSha256)) fail("EVIDENCE_CERT_SHA256");
-  if (!/^[0-9a-f]{64}$/.test(forbiddenCertificateSha256)) {
-    fail("EVIDENCE_FORBIDDEN_CERT_SHA256");
-  }
-  if (certificateSha256 === forbiddenCertificateSha256) {
-    fail("EVIDENCE_CERT_NOT_DISTINCT");
+  const bootstrap = productionCertificateState === "not-provisioned";
+  if (!bootstrap && productionCertificateState !== "provisioned") fail("EVIDENCE_PRODUCTION_STATE");
+  if (bootstrap) {
+    if (forbiddenCertificateSha256 != null) fail("EVIDENCE_CERT_MODE");
+    if (!/^[0-9a-f]{64}$/.test(forbiddenDebugCertificateSha256)) {
+      fail("EVIDENCE_FORBIDDEN_DEBUG_CERT_SHA256");
+    }
+    if (certificateSha256 === forbiddenDebugCertificateSha256) fail("EVIDENCE_CERT_NOT_DISTINCT");
+  } else {
+    if (forbiddenDebugCertificateSha256 !== null) fail("EVIDENCE_CERT_MODE");
+    if (!/^[0-9a-f]{64}$/.test(forbiddenCertificateSha256)) {
+      fail("EVIDENCE_FORBIDDEN_CERT_SHA256");
+    }
+    if (certificateSha256 === forbiddenCertificateSha256) fail("EVIDENCE_CERT_NOT_DISTINCT");
   }
   if (
     signatureSchemePolicy === null
@@ -1529,14 +1559,26 @@ export function buildEvidence({
   }
 
   return Object.freeze({
-    schema: "veil.android-tester-apk-evidence.v1",
+    schema: bootstrap
+      ? "veil.android-first-tester-bootstrap-evidence.v1"
+      : "veil.android-tester-apk-evidence.v1",
+    ...(bootstrap ? {
+      verificationScope: "first-tester-bootstrap",
+      releaseReady: false,
+      deferredGates: Object.freeze(["production-certificate-separation", "release-readiness", "physical-device"]),
+    } : {}),
     verified: true,
     verifiedAtUtc,
     apk: Object.freeze({ sha256: apkSha256, sizeBytes: apkSizeBytes }),
     signer: Object.freeze({
       count: 1,
       certificateSha256,
-      differentFromForbiddenCertificate: true,
+      ...(bootstrap ? {
+        productionCertificateState: "not-provisioned",
+        productionSeparationVerified: false,
+        expectedTesterCertificateMatched: true,
+        debugCertificateRejected: true,
+      } : { differentFromForbiddenCertificate: true }),
       signatureSchemePolicy: EXPECTED_SIGNATURE_SCHEME_POLICY,
     }),
     branding: Object.freeze({
@@ -1943,7 +1985,9 @@ export async function verifyAndroidTesterApk(configuration, options = {}) {
     const signer = parseApkSignerOutput(
       signatureOutput,
       configuration.certificateSha256,
-      configuration.forbiddenCertificateSha256,
+      configuration.productionCertificateState === "not-provisioned"
+        ? configuration.forbiddenDebugCertificateSha256
+        : configuration.forbiddenCertificateSha256,
     );
 
     const analyze = (args, maximum = MAX_SMALL_OUTPUT_BYTES) => boundedToolRun(
@@ -2055,6 +2099,8 @@ export async function verifyAndroidTesterApk(configuration, options = {}) {
       apkSizeBytes: snapshotInfo.size,
       certificateSha256: signer.certificateSha256,
       forbiddenCertificateSha256: configuration.forbiddenCertificateSha256,
+      forbiddenDebugCertificateSha256: configuration.forbiddenDebugCertificateSha256,
+      productionCertificateState: configuration.productionCertificateState,
       signatureSchemePolicy: signer.signatureSchemePolicy,
       branding: verifiedBranding,
       resources: verifiedResources,

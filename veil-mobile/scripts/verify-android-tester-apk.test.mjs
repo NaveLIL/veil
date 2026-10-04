@@ -151,6 +151,43 @@ function sdkArguments(overrides = {}) {
   return Object.entries(values).flat();
 }
 
+function bootstrapArguments(overrides = {}) {
+  const args = sdkArguments({
+    "--forbidden-cert-sha256": undefined,
+    "--production-certificate-state": "not-provisioned",
+    "--forbidden-debug-cert-sha256": FORBIDDEN_CERTIFICATE,
+    ...overrides,
+  });
+  for (let index = args.length - 2; index >= 0; index -= 2) {
+    if (args[index + 1] === undefined) args.splice(index, 2);
+  }
+  return args;
+}
+
+function bootstrapEvidenceInputs(overrides = {}) {
+  return {
+    apkSha256: "ef".repeat(32),
+    apkSizeBytes: 123456,
+    certificateSha256: CERTIFICATE,
+    forbiddenDebugCertificateSha256: FORBIDDEN_CERTIFICATE,
+    productionCertificateState: "not-provisioned",
+    signatureSchemePolicy: { v1: false, v2: true, v3: false, "v3.1": false, v4: false },
+    branding: BRANDING,
+    resources: RESOURCES,
+    backupPolicy: BACKUP_POLICY,
+    sdkVersions: { minSdkVersion: 24, targetSdkVersion: 35 },
+    permissions: PERMISSIONS,
+    components: COMPONENTS,
+    backupManifestPolicy: BACKUP_MANIFEST_POLICY,
+    versionCode: 42,
+    versionName: "0.2.0-tester",
+    sourceCommit: SOURCE_COMMIT,
+    toolMode: "android-sdk",
+    verifiedAtUtc: "2026-10-04T10:11:12.345Z",
+    ...overrides,
+  };
+}
+
 function signerOutput(digest = CERTIFICATE) {
   return [
     "Verifies",
@@ -329,6 +366,59 @@ test("parseArguments accepts exactly three explicit tool paths", () => {
   assert.equal(parsed.toolMode, "explicit-paths");
   assert.ok(parsed.aapt2Path.endsWith("aapt2"));
   assert.ok(parsed.apksignerPath.endsWith("apksigner"));
+});
+
+test("first tester bootstrap requires explicit not-provisioned mode and independent debug baseline", () => {
+  const parsed = parseArguments(bootstrapArguments());
+  assert.equal(parsed.productionCertificateState, "not-provisioned");
+  assert.equal(parsed.forbiddenCertificateSha256, null);
+  assert.equal(parsed.forbiddenDebugCertificateSha256, FORBIDDEN_CERTIFICATE);
+  assert.equal(parsed.certificateSha256, CERTIFICATE);
+  assert.equal(parsed.sourceCommit, SOURCE_COMMIT);
+  expectCode(() => parseArguments(bootstrapArguments({
+    "--production-certificate-state": undefined,
+  })), "ARGS_CERT_MODE");
+  expectCode(() => parseArguments(bootstrapArguments({
+    "--forbidden-debug-cert-sha256": undefined,
+  })), "ARGS_REQUIRED");
+  expectCode(() => parseArguments(bootstrapArguments({
+    "--expected-cert-sha256": undefined,
+  })), "ARGS_REQUIRED");
+  expectCode(() => parseArguments(bootstrapArguments({
+    "--forbidden-cert-sha256": OTHER_CERTIFICATE,
+  })), "ARGS_CERT_MODE");
+  expectCode(() => parseArguments(bootstrapArguments({
+    "--production-certificate-state": "provisioned",
+  })), "ARGS_PRODUCTION_STATE");
+  expectCode(() => parseArguments(bootstrapArguments({
+    "--production-certificate-state": "unknown",
+  })), "ARGS_PRODUCTION_STATE");
+  expectCode(() => parseArguments(bootstrapArguments({
+    "--forbidden-debug-cert-sha256": FORBIDDEN_CERTIFICATE.toUpperCase(),
+  })), "ARGS_FORBIDDEN_DEBUG_CERT_SHA256");
+  expectCode(() => parseArguments(bootstrapArguments({
+    "--forbidden-debug-cert-sha256": CERTIFICATE,
+  })), "ARGS_CERT_NOT_DISTINCT");
+  expectCode(() => parseArguments(bootstrapArguments({
+    "--expected-source-commit": "dirty-worktree",
+  })), "ARGS_SOURCE_COMMIT");
+});
+
+test("bootstrap shares exact signer and v2-only verification without accepting debug or rotated signer", () => {
+  const config = parseArguments(bootstrapArguments());
+  const verify = (output) => parseApkSignerOutput(
+    output, config.certificateSha256, config.forbiddenDebugCertificateSha256,
+  );
+  assert.equal(verify(signerOutput()).certificateSha256, CERTIFICATE);
+  expectCode(() => verify(signerOutput(FORBIDDEN_CERTIFICATE)), "SIGNER_FORBIDDEN_CERTIFICATE");
+  expectCode(() => verify(signerOutput(OTHER_CERTIFICATE)), "SIGNER_DIGEST_MISMATCH");
+  expectCode(() => verify(signerOutput().replace("Number of signers: 1", "Number of signers: 2")), "SIGNER_COUNT");
+  for (const scheme of ["v1", "v3", "v3.1", "v4"]) {
+    const output = signerOutput().split("\n").map((line) =>
+      line.startsWith(`Verified using ${scheme} scheme`) ? line.replace(": false", ": true") : line,
+    ).join("\n");
+    expectCode(() => verify(output), "SIGNER_SCHEME");
+  }
 });
 
 test("parseArguments rejects unknown, duplicate, missing, and mixed tool arguments", () => {
@@ -1596,6 +1686,55 @@ test("evidence builder emits only the reviewed sanitized contract", () => {
   const serialized = JSON.stringify(evidence);
   assert.doesNotMatch(serialized, /certificate DN|stdout|stderr|toolPath|apkPath/);
   assert.doesNotMatch(serialized, new RegExp(FORBIDDEN_CERTIFICATE));
+});
+
+test("bootstrap evidence explicitly defers production separation and retains every artifact policy", () => {
+  const bootstrap = buildEvidence(bootstrapEvidenceInputs());
+  const strict = buildEvidence(bootstrapEvidenceInputs({
+    productionCertificateState: "provisioned",
+    forbiddenDebugCertificateSha256: null,
+    forbiddenCertificateSha256: FORBIDDEN_CERTIFICATE,
+  }));
+  assert.equal(bootstrap.schema, "veil.android-first-tester-bootstrap-evidence.v1");
+  assert.equal(bootstrap.verified, true);
+  assert.equal(bootstrap.verificationScope, "first-tester-bootstrap");
+  assert.equal(bootstrap.releaseReady, false);
+  assert.deepEqual(bootstrap.deferredGates, ["production-certificate-separation", "release-readiness", "physical-device"]);
+  assert.equal(bootstrap.signer.productionCertificateState, "not-provisioned");
+  assert.equal(bootstrap.signer.productionSeparationVerified, false);
+  assert.equal(bootstrap.signer.expectedTesterCertificateMatched, true);
+  assert.equal(bootstrap.signer.debugCertificateRejected, true);
+  assert.equal("differentFromForbiddenCertificate" in bootstrap.signer, false);
+  assert.equal("differentFromProductionCertificate" in bootstrap.signer, false);
+  assert.equal(strict.schema, "veil.android-tester-apk-evidence.v1");
+  assert.equal("verificationScope" in strict, false);
+  assert.equal("deferredGates" in strict, false);
+  assert.equal("productionCertificateState" in strict.signer, false);
+  for (const field of ["apk", "branding", "manifest", "contents", "tools"]) {
+    assert.deepEqual(bootstrap[field], strict[field], field);
+  }
+  assert.deepEqual(bootstrap.signer.signatureSchemePolicy, strict.signer.signatureSchemePolicy);
+  const serialized = JSON.stringify(bootstrap);
+  assert.doesNotMatch(serialized, /certificate DN|stdout|stderr|toolPath|apkPath|keystore|password/);
+  assert.doesNotMatch(serialized, new RegExp(FORBIDDEN_CERTIFICATE));
+});
+
+test("bootstrap evidence cannot infer absent production cert or bypass signer and provenance checks", () => {
+  for (const [overrides, code] of [
+    [{ productionCertificateState: undefined }, "EVIDENCE_CERT_MODE"],
+    [{ productionCertificateState: "unknown" }, "EVIDENCE_PRODUCTION_STATE"],
+    [{ forbiddenCertificateSha256: OTHER_CERTIFICATE }, "EVIDENCE_CERT_MODE"],
+    [{ forbiddenDebugCertificateSha256: undefined }, "EVIDENCE_FORBIDDEN_DEBUG_CERT_SHA256"],
+    [{ forbiddenDebugCertificateSha256: "bad" }, "EVIDENCE_FORBIDDEN_DEBUG_CERT_SHA256"],
+    [{ forbiddenDebugCertificateSha256: CERTIFICATE }, "EVIDENCE_CERT_NOT_DISTINCT"],
+    [{ sourceCommit: "dirty-worktree" }, "EVIDENCE_SOURCE_COMMIT"],
+    [{ verifiedAtUtc: "unknown" }, "EVIDENCE_TIMESTAMP"],
+    [{ signatureSchemePolicy: { v1: false, v2: true, v3: true, "v3.1": false, v4: false } }, "EVIDENCE_SIGNATURE_SCHEMES"],
+    [{ branding: { ...BRANDING, app_name: "Veil" } }, "BRANDING_VALUE_MISMATCH"],
+    [{ resources: { ...RESOURCES, iconResource: "@drawable/ic_veil_launcher" } }, "EVIDENCE_TESTER_RESOURCES"],
+  ]) {
+    expectCode(() => buildEvidence(bootstrapEvidenceInputs(overrides)), code);
+  }
 });
 
 test("evidence builder rejects malformed hashes, sizes, commits, and timestamps", () => {

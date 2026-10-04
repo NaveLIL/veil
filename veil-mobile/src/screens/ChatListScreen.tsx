@@ -6,12 +6,8 @@ import { useReducedMotionPreference } from "../hooks/useReducedMotionPreference"
 import { colors } from "../lib/theme";
 import { useChatStore } from "../stores/chat";
 import DirectConversationScreen from "./DirectConversationScreen";
-import DesignPreviewHomeScreen from "../designPreview/DesignPreviewHomeScreen";
-import {
-  DesignCircleScreen,
-  DesignSpaceScreen,
-  DesignRoomScreen,
-} from "../designPreview/DesignPreviewScreens";
+import HomeScreen from "./HomeScreen";
+import ContactSearchScreen from "./ContactSearchScreen";
 import SettingsScreen, { SettingsDetailScreen } from "./SettingsScreen";
 
 export type SettingsSectionKey =
@@ -26,12 +22,10 @@ export type SettingsSectionKey =
 
 export type AuthenticatedStackParamList = {
   Home: undefined;
+  Contacts: undefined;
   Direct: { conversationId: string };
   Settings: undefined;
   SettingsDetail: { section: SettingsSectionKey };
-  DesignCircle: undefined;
-  DesignSpace: undefined;
-  DesignRoom: { roomId: string };
 };
 
 const Stack = createNativeStackNavigator<AuthenticatedStackParamList>();
@@ -80,13 +74,11 @@ export default function ChatListScreen() {
           headerShown: false,
         }}
       >
-        <Stack.Screen name="Home" component={DesignPreviewHomeScreen as any} />
+        <Stack.Screen name="Home" component={HomeScreen} />
+        <Stack.Screen name="Contacts" component={ContactSearchScreen} />
         <Stack.Screen name="Direct" component={DirectConversationScreen} />
         <Stack.Screen name="Settings" component={SettingsScreen} />
         <Stack.Screen name="SettingsDetail" component={SettingsDetailScreen} />
-        <Stack.Screen name="DesignCircle" component={DesignCircleScreen as any} />
-        <Stack.Screen name="DesignSpace" component={DesignSpaceScreen as any} />
-        <Stack.Screen name="DesignRoom" component={DesignRoomScreen as any} />
       </Stack.Navigator>
     </NavigationContainer>
   );

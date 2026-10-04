@@ -70,6 +70,9 @@ export interface DmConversation {
 
 export interface Message {
   id: string;
+  stableUiId: string;
+  clientMessageId: string | null;
+  serverMessageId: string | null;
   author: Member;
   text: string;
   ts: string;
@@ -368,6 +371,9 @@ function toRenderableMessages(
     const deliveryPublicFailureCodeV1 = directDeliveryPublicFailureCodeV1(message.delivery);
     return {
       id: message.messageId,
+      stableUiId: message.stableUiId,
+      clientMessageId: message.clientMessageId,
+      serverMessageId: message.serverMessageId,
       author: message.direction === "outgoing" ? members.self : members.peer,
       text: message.text,
       ts: formatTimestamp(message.timestampMs),

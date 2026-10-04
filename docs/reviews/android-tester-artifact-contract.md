@@ -1,4 +1,5 @@
-CONTRACT CHECKPOINT ONLY — no signed tester APK has been produced or tested.
+ARTIFACT CONTRACT — see the dated execution evidence for any produced APK;
+this document alone does not establish physical-device testing.
 
 # Android tester artifact contract
 
@@ -73,8 +74,12 @@ packaging. The tester variant must never inherit the production release signer
 and must never fall back to the debug key. Its signing configuration explicitly
 enables only APK Signature Scheme v2; the independent verifier checks the exact
 scheme matrix again on the finished artifact. No keystore or password is
-checked into the repository. A stable tester certificate still has to be provisioned in
-the protected build environment before an artifact can exist.
+checked into the repository. A stable tester certificate must be provisioned in
+the build environment before an artifact can exist. On 2026-10-04 the user
+authorized a permanent local tester key outside the repository; its independent
+public certificate expectation is
+`f5df868d3f517c0853225840e2c4f67f2d7b20d05b183bf1ab396e530fc3f250`.
+This does not provision the protected GitHub environment or a production key.
 
 The protected environment separately supplies
 `VEIL_ANDROID_TESTER_CERT_SHA256` and the known
@@ -84,6 +89,57 @@ expectation, not a value derived from the APK under test; the production value
 is a protected provisioning baseline. Repository/environment reviewers and
 allowed-ref rules must be configured in GitHub before the manual workflow is
 authorized for use.
+
+### First tester bootstrap when no production certificate exists
+
+On 2026-10-04 the user explicitly confirmed that no production certificate has
+been provisioned. A local first tester artifact may therefore use the narrowly
+scoped verifier mode `--production-certificate-state not-provisioned`. It is
+not a release artifact or evidence that tester and production certificates
+differ. The default verifier and protected CI workflow still require the known
+production fingerprint exactly as above; no CI secret or guard is bypassed.
+
+Bootstrap requires both `--expected-cert-sha256` from the independently
+provisioned permanent tester key and `--forbidden-debug-cert-sha256` from the
+actual debug signing certificate, exported independently with the installed
+JDK's `keytool`. Do not derive either expectation from the APK under test.
+The repository `android/app/debug.keystore` is absent in this checkout; find
+the actual configured debug signer instead of inventing a debug fingerprint.
+Do not use a debug fingerprint in `--forbidden-cert-sha256` and call it
+production separation. Never substitute an arbitrary or all-zero production
+fingerprint. If a production certificate is provisioned later, use strict mode.
+
+The two modes are mutually exclusive: bootstrap rejects a production forbidden
+fingerprint; strict mode rejects a debug-baseline argument without bootstrap.
+Missing, malformed or tester-equal debug fingerprints fail closed. Bootstrap
+uses the same verified single signer, v2-only/no-rotation policy, exact package,
+version/source metadata, SDK, privacy/backup/transfer/recovery rules, permission
+and component inventories, branding, bundled JS and exact native ABI checks.
+It never falls back to accepting a debug build or another signer.
+
+Successful bootstrap writes the distinct sanitized schema
+`veil.android-first-tester-bootstrap-evidence.v1`, with
+`verificationScope=first-tester-bootstrap`, `releaseReady=false`,
+`productionCertificateState=not-provisioned`,
+`productionSeparationVerified=false`, `expectedTesterCertificateMatched=true`
+and `debugCertificateRejected=true`. Its deferred gates explicitly include
+production separation, release readiness and physical-device testing. Strict
+`veil.android-tester-apk-evidence.v1` is unchanged. A consumer must not treat
+bootstrap evidence as successful strict evidence based on `verified` alone.
+Neither record contains private credentials or tool/keystore paths.
+
+Example, with public fingerprints and source/version values supplied from the
+independent build record:
+
+```powershell
+pnpm verify:android-tester-apk -- --android-sdk $env:ANDROID_HOME --apk $apkPath --expected-cert-sha256 $testerCertificateSha256 --production-certificate-state not-provisioned --forbidden-debug-cert-sha256 $debugCertificateSha256 --expected-version-code $testerVersionCode --expected-version-name $testerVersionName --expected-source-commit $sourceCommit --evidence-out $evidencePath
+```
+
+The verifier still binds the exact packaged source-commit metadata. A local
+dirty checkout cannot acquire clean-commit/CI provenance merely by passing its
+HEAD as that metadata: retain the base commit and reviewed source/diff record
+with the artifact, label the build accordingly, and keep the clean-source
+release gate open. No physical test is inferred from a host-only APK check.
 
 ## Protected build path
 
@@ -153,9 +209,10 @@ evidence claim.
 
 ## Deferred physical handoff
 
-This checkpoint intentionally stops before generating, installing, or testing
-an APK because stable tester signing material has not been supplied and the
-physical gate is deferred. When that gate is explicitly resumed, the exact APK
+The initial 2026-07-20 checkpoint stopped before generating an APK. On 2026-10-04
+the user resumed host-only artifact preparation and authorized the stable local
+tester key above. Physical execution remains a separate recorded gate. Before
+any authorized manual physical handoff, the exact APK
 hash and certificate fingerprint must be recorded first. A new disposable
 identity's recovery phrase must then be recorded and confirmed locally before
 any Node Access Pass is issued or applied. The complete matrix remains in the

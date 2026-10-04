@@ -23,6 +23,7 @@ export interface VeilRuntimeController {
   verifyIdentityPresence: () => Promise<"present" | "absent" | "unknown">;
   unlock: () => Promise<void>;
   connect: (canonicalOrigin: string) => Promise<void>;
+  importAccessPass: () => Promise<void>;
   usePendingAccessPass: (flowId: string) => Promise<void>;
   discardPendingAccessPass: (flowId: string) => Promise<void>;
 }
@@ -293,6 +294,17 @@ export function useVeilRuntimeLifecycle(): VeilRuntimeController {
     await runOperation("connecting", () => VeilRuntime.connect(canonicalOrigin));
   }, [runOperation]);
 
+  const importAccessPass = useCallback(async (): Promise<void> => {
+    useChatStore.getState().clearRenderableChat();
+    await runOperation("importing_access_pass", async () => {
+      const imported = await VeilRuntime.importNodeAccessPassFromClipboard();
+      if (!imported) {
+        // A bounded local presentation outcome; never read clipboard text in JS.
+        throw { publicFailureCodeV1: "VEIL-PASS-003" };
+      }
+    });
+  }, [runOperation]);
+
   const usePendingAccessPass = useCallback(async (flowId: string): Promise<void> => {
     const current = useRuntimeGateStore.getState();
     const pending = current.snapshot?.pendingAccessPass;
@@ -323,10 +335,12 @@ export function useVeilRuntimeLifecycle(): VeilRuntimeController {
     verifyIdentityPresence,
     unlock,
     connect,
+    importAccessPass,
     usePendingAccessPass,
     discardPendingAccessPass,
   }), [
     connect,
+    importAccessPass,
     discardPendingAccessPass,
     refresh,
     retryBootstrap,

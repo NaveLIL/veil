@@ -30,6 +30,7 @@ interface SecureRuntimeGateProps {
   reducedMotion: boolean;
   onUnlock: () => void;
   onConnect: (canonicalOrigin: string) => void;
+  onImportAccessPass: () => void;
   onUsePendingAccessPass: (flowId: string) => void;
   onDiscardPendingAccessPass: (flowId: string) => void;
   onRefresh: () => void;
@@ -45,6 +46,7 @@ export function SecureRuntimeGate({
   reducedMotion,
   onUnlock,
   onConnect,
+  onImportAccessPass,
   onUsePendingAccessPass,
   onDiscardPendingAccessPass,
   onRefresh,
@@ -131,6 +133,10 @@ export function SecureRuntimeGate({
     && !needsUnlock
     && (snapshot.connectionState === "disconnected" || snapshot.connectionState === "error");
   const bindingIsExact = hasExactAuthenticatedBinding(snapshot.binding);
+  const canImportPass = pending === null
+    && snapshot.sessionState !== "opening"
+    && snapshot.sessionState !== "closing"
+    && (snapshot.connectionState === "disconnected" || snapshot.connectionState === "error");
 
   return (
     <SafeAreaView testID="secure-runtime-gate" style={styles.root} edges={["top", "bottom"]}>
@@ -177,6 +183,22 @@ export function SecureRuntimeGate({
                   disabled={busy}
                 />
               </View>
+            </View>
+          ) : null}
+
+          {canImportPass ? (
+            <View style={styles.card}>
+              <Text accessibilityRole="header" style={styles.cardTitle}>Have a Node invitation?</Text>
+              <Text style={styles.cardBody}>
+                Copy the HTTPS invitation link from your Node, then import it here to review the origin before registration.
+              </Text>
+              <ActionButton
+                testID="import-access-pass"
+                label={operation === "importing_access_pass" ? "Importing securely..." : "Import invitation from clipboard"}
+                onPress={onImportAccessPass}
+                disabled={busy}
+              />
+              <Text style={styles.cardBody}>The link stays in the clipboard until you replace or clear it.</Text>
             </View>
           ) : null}
 

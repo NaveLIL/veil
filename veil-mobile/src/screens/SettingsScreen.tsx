@@ -29,6 +29,7 @@ import { Island } from "../components/ui/Island";
 import { colors, radii, spacing } from "../lib/theme";
 import { useRuntimeGateStore } from "../stores/runtime";
 import { useMobileSettingsStore } from "../stores/settings";
+import { ROCKET_CHAT_MIT_NOTICE } from "../presentation/rocketChat/notice";
 import type {
   AuthenticatedStackParamList,
   SettingsSectionKey,
@@ -426,6 +427,11 @@ function settingsDefinition(
               { label: "Licensing", value: "AGPL-3.0-or-later" },
             ],
             note: "Diagnostics must exclude recovery words, Passes, keys, plaintext, raw URLs and account/device/message identifiers.",
+          },
+          {
+            title: "Third-party presentation",
+            rows: [{ label: "Rocket.Chat React Native", value: "4.77.0 · MIT", detail: "Modified Direct UI source port; native runtime belongs to Veil." }],
+            note: ROCKET_CHAT_MIT_NOTICE,
           },
         ],
       };

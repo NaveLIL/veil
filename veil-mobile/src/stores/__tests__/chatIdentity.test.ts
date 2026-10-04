@@ -88,6 +88,9 @@ const available = (
   availability: "available",
   messages: [{
     messageId,
+    stableUiId: messageId,
+    clientMessageId: direction === "outgoing" ? messageId : null,
+    serverMessageId: messageId,
     text,
     timestampMs: 1_720_000_000_000,
     direction,
@@ -158,20 +161,29 @@ describe("production Direct chat store", () => {
       messages: [
         {
           messageId: "11111111-2222-4333-8444-555555555551",
+          stableUiId: "11111111-2222-4333-8444-555555555551",
+          clientMessageId: "11111111-2222-4333-8444-555555555551",
+          serverMessageId: null,
           text: "definitely failed",
-          timestampMs: 1_720_000_000_000,
+          timestampMs: null,
           direction: "outgoing",
           delivery: "failed",
         },
         {
           messageId: "11111111-2222-4333-8444-555555555552",
+          stableUiId: "11111111-2222-4333-8444-555555555552",
+          clientMessageId: "11111111-2222-4333-8444-555555555552",
+          serverMessageId: null,
           text: "delivery unknown",
-          timestampMs: 1_720_000_000_001,
+          timestampMs: null,
           direction: "outgoing",
           delivery: "unknown",
         },
         {
           messageId: "11111111-2222-4333-8444-555555555553",
+          stableUiId: "11111111-2222-4333-8444-555555555553",
+          clientMessageId: "11111111-2222-4333-8444-555555555553",
+          serverMessageId: null,
           text: "still sending",
           timestampMs: null,
           direction: "outgoing",
@@ -191,6 +203,52 @@ describe("production Direct chat store", () => {
       { delivery: "unknown", publicFailureCodeV1: "VEIL-DIRECT-002" },
       { delivery: "sending", publicFailureCodeV1: null },
     ]);
+  });
+
+  test("keeps the native UI identity when an ACK replaces the local domain message ID", async () => {
+    const clientId = "66666666-6666-4666-8666-666666666666";
+    const serverId = "77777777-7777-4777-8777-777777777777";
+    useChatStore.getState().hydrateRuntimeDirectory(snapshot([anya]));
+    useChatStore.getState().selectDm(anya.conversationId);
+    runtime.getDirectMessages.mockResolvedValueOnce({
+      availability: "available",
+      messages: [{
+        messageId: clientId,
+        stableUiId: clientId,
+        clientMessageId: clientId,
+        serverMessageId: null,
+        text: "native accepted",
+        timestampMs: null,
+        direction: "outgoing",
+        delivery: "sending",
+      }],
+    });
+    await useChatStore.getState().loadSelectedDirectMessages();
+    const pending = useChatStore.getState().messagesByChannel[anya.conversationId][0];
+    expect(pending.timestampMs).toBeNull();
+    runtime.getDirectMessages.mockResolvedValueOnce({
+      availability: "available",
+      messages: [{
+        messageId: serverId,
+        stableUiId: clientId,
+        clientMessageId: clientId,
+        serverMessageId: serverId,
+        text: "native accepted",
+        timestampMs: 1_720_000_000_000,
+        direction: "outgoing",
+        delivery: "sent",
+      }],
+    });
+    await useChatStore.getState().loadSelectedDirectMessages();
+    const rows = useChatStore.getState().messagesByChannel[anya.conversationId];
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      id: serverId,
+      stableUiId: pending.stableUiId,
+      clientMessageId: clientId,
+      serverMessageId: serverId,
+      delivery: "sent",
+    });
   });
 
   test("drops a late projection after the selected conversation changes", async () => {

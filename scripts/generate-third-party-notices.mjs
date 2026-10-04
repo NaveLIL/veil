@@ -36,7 +36,7 @@ function usage(message) {
   }
   console.error(
     "Usage: node scripts/generate-third-party-notices.mjs " +
-      "--component <desktop|gateway> --output <path> [--repo-root <path>]",
+      "--component <desktop|gateway> --output <path> [--repo-root <path>] [--pnpm-cli <path>]",
   );
   process.exit(2);
 }
@@ -54,6 +54,12 @@ function parseArguments(argv) {
       index += 1;
     } else if (name === "--repo-root" && value) {
       options.repoRoot = resolve(value);
+      index += 1;
+    } else if (name === "--pnpm-cli" && value) {
+      options.pnpmCli = realpathSync(resolve(value));
+      if (!statSync(options.pnpmCli).isFile() || !/\.(?:cjs|mjs|js)$/.test(options.pnpmCli)) {
+        usage("--pnpm-cli must name the installed pnpm JavaScript entry point");
+      }
       index += 1;
     } else {
       usage(`Unknown or incomplete argument: ${name}`);
@@ -139,9 +145,12 @@ function normalizedRepository(value) {
     .replace(/\/$/, "");
 }
 
-function collectNpmComponents(repositoryRoot) {
+function collectNpmComponents(repositoryRoot, pnpmCli) {
   const desktopDirectory = join(repositoryRoot, "veil-desktop");
-  const groups = JSON.parse(run("pnpm", ["licenses", "list", "--prod", "--json"], desktopDirectory));
+  const licenseArgs = ["licenses", "list", "--prod", "--json"];
+  const groups = JSON.parse(pnpmCli
+    ? run(process.execPath, [pnpmCli, ...licenseArgs], desktopDirectory)
+    : run("pnpm", licenseArgs, desktopDirectory));
   const components = new Map();
 
   for (const entries of Object.values(groups)) {
@@ -458,7 +467,7 @@ let components;
 if (options.component === "desktop") {
   components = [
     ...collectCargoComponents(options.repoRoot),
-    ...collectNpmComponents(options.repoRoot),
+    ...collectNpmComponents(options.repoRoot, options.pnpmCli),
   ];
 } else {
   components = collectGoComponents(options.repoRoot);

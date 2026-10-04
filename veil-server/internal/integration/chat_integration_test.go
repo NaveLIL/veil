@@ -439,13 +439,19 @@ func TestChat_AddGroupMember_NonMemberCannotAdd(t *testing.T) {
 	mate := h.CreateUser("mate")
 	intruder := h.CreateUser("intruder")
 
-	_, _, body := h.Do(owner, http.MethodPost, "/v1/groups", map[string]any{
+	createStatus, createRaw, body := h.Do(owner, http.MethodPost, "/v1/groups", map[string]any{
 		"name": "Closed",
 		"members": []map[string]string{{
 			"user_id": mate.ID, "identity_key": hex.EncodeToString(mate.IdentityKey),
 		}},
 	})
-	groupID := body["conversation_id"].(string)
+	if createStatus != http.StatusCreated {
+		t.Fatalf("create group prerequisite: status=%d body=%s", createStatus, createRaw)
+	}
+	groupID, ok := body["conversation_id"].(string)
+	if !ok || groupID == "" {
+		t.Fatalf("create group prerequisite: missing conversation_id in status=%d body=%s", createStatus, createRaw)
+	}
 
 	status, _, errBody := h.Do(intruder, http.MethodPost, "/v1/groups/"+groupID+"/members", map[string]string{
 		"user_id": mate.ID,

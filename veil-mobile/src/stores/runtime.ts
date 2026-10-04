@@ -15,6 +15,7 @@ export type RuntimeGatePhase = "bootstrapping" | "privacy" | "ready" | "error";
 export type RuntimeOperation =
   | "unlocking"
   | "connecting"
+  | "importing_access_pass"
   | "using_access_pass"
   | "discarding_access_pass"
   | "refreshing"

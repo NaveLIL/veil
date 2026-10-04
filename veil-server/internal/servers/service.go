@@ -410,14 +410,9 @@ func validateChannelMetadata(name, topic *string) error {
 }
 
 // ReorderItem describes a single channel’s new placement.
-type ReorderItem struct {
-	ChannelID     string
-	Position      int16
-	CategoryID    *string // nil + ClearCategory=true means move to top-level
-	ClearCategory bool
-}
+type ReorderItem = db.ChannelReorderItem
 
-// ReorderChannels applies multiple position/category changes in one transaction-ish
+// ReorderChannels applies multiple position/category changes atomically.
 // pass. Caller must have ManageChannels permission on the server. All channels
 // referenced must belong to the same server.
 func (s *Service) ReorderChannels(ctx context.Context, serverID, requesterID string, items []ReorderItem) error {
@@ -428,28 +423,13 @@ func (s *Service) ReorderChannels(ctx context.Context, serverID, requesterID str
 	if len(items) == 0 {
 		return nil
 	}
-	for _, it := range items {
-		ch, err := s.db.GetChannel(ctx, it.ChannelID)
-		if err != nil {
-			return errors.New("channel not found: " + it.ChannelID)
-		}
-		if ch.ServerID != serverID {
-			return errors.New("channel does not belong to server")
-		}
-		canManage, permissionErr := s.db.HasAllChannelPermissions(ctx, ch.ID, requesterID, db.PermManageChannels)
-		if permissionErr != nil || !canManage {
-			return errors.New("insufficient permissions")
-		}
-		pos := it.Position
-		if err := s.db.UpdateChannel(ctx, it.ChannelID, nil, nil, nil, nil, &pos, it.CategoryID, it.ClearCategory); err != nil {
-			return err
-		}
+	updated, err := s.db.ReorderChannels(ctx, serverID, requesterID, items)
+	if err != nil {
+		return err
 	}
 	// Broadcast a single UPDATED per channel so clients refresh the tree.
-	for _, it := range items {
-		if updated, _ := s.db.GetChannel(ctx, it.ChannelID); updated != nil {
-			s.broadcastChannelEvent(ctx, updated.ID, pb.ChannelEvent_UPDATED, channelToInfo(updated))
-		}
+	for i := range updated {
+		s.broadcastChannelEvent(ctx, updated[i].ID, pb.ChannelEvent_UPDATED, channelToInfo(&updated[i]))
 	}
 	return nil
 }

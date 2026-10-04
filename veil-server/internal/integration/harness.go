@@ -2,7 +2,8 @@
 
 // Package integration provides a shared test harness for end-to-end tests
 // of the veil-server REST surface. It spins up an ephemeral PostgreSQL
-// instance via testcontainers-go, applies all migrations, and mounts the
+// instance via testcontainers-go (or an isolated local TEST_DATABASE_URL
+// database), applies all migrations, and mounts the
 // full HTTP mux (chat + servers + auth handlers, all gated by the real
 // authmw signing middleware).
 //
@@ -43,9 +44,7 @@ import (
 	"github.com/NaveLIL/veil/veil-server/internal/servers"
 	pb "github.com/NaveLIL/veil/veil-server/pkg/proto/v1"
 
-	"github.com/testcontainers/testcontainers-go"
-	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
-	"github.com/testcontainers/testcontainers-go/wait"
+	"github.com/NaveLIL/veil/veil-server/internal/testpostgres"
 	"golang.org/x/crypto/curve25519"
 )
 
@@ -61,8 +60,6 @@ type Harness struct {
 	Chat   *chat.Service
 	Server *httptest.Server
 	mw     *authmw.Middleware
-
-	pgContainer testcontainers.Container
 }
 
 // nullBroadcaster is a stub server.Broadcaster that drops all envelopes.
@@ -71,7 +68,7 @@ type nullBroadcaster struct{}
 
 func (nullBroadcaster) BroadcastToUsers([]string, *pb.Envelope) {}
 
-// New brings up a Postgres container, applies every SQL file in the
+// New provisions isolated Postgres, applies every SQL file in the
 // veil-server `migrations/` directory in lexicographic order, and starts an
 // httptest server with the production handler chain (chat + servers + auth).
 // All resources are cleaned up via t.Cleanup.
@@ -85,28 +82,7 @@ func New(t *testing.T) *Harness {
 		t.Fatalf("load migrations: %v", err)
 	}
 
-	pgC, err := tcpostgres.Run(ctx,
-		"postgres:16-alpine",
-		tcpostgres.WithDatabase("veil"),
-		tcpostgres.WithUsername("veil"),
-		tcpostgres.WithPassword("veil"),
-		testcontainers.WithWaitStrategy(
-			wait.ForLog("database system is ready to accept connections").
-				WithOccurrence(2).
-				WithStartupTimeout(60*time.Second),
-		),
-	)
-	if err != nil {
-		t.Fatalf("start postgres container: %v", err)
-	}
-	t.Cleanup(func() {
-		_ = pgC.Terminate(context.Background())
-	})
-
-	dsn, err := pgC.ConnectionString(ctx, "sslmode=disable")
-	if err != nil {
-		t.Fatalf("postgres dsn: %v", err)
-	}
+	dsn := testpostgres.Provision(t, ctx)
 
 	database, err := db.Connect(ctx, dsn)
 	if err != nil {
@@ -131,6 +107,7 @@ func New(t *testing.T) *Harness {
 	}
 
 	authSvc := auth.NewService(database, cfg)
+	t.Cleanup(authSvc.Close)
 	chatSvc := chat.NewService(database, cfg)
 	serversSvc := servers.NewService(database, nullBroadcaster{})
 
@@ -171,12 +148,11 @@ func New(t *testing.T) *Harness {
 	t.Cleanup(srv.Close)
 
 	return &Harness{
-		t:           t,
-		DB:          database,
-		Chat:        chatSvc,
-		Server:      srv,
-		mw:          mw,
-		pgContainer: pgC,
+		t:      t,
+		DB:     database,
+		Chat:   chatSvc,
+		Server: srv,
+		mw:     mw,
 	}
 }
 

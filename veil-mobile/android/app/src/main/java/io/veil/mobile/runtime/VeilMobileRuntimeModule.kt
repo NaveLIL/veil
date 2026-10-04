@@ -7,6 +7,7 @@ import com.facebook.react.bridge.ReactContextBaseJavaModule
 import com.facebook.react.bridge.ReactMethod
 import com.facebook.react.bridge.WritableMap
 import com.facebook.react.modules.core.DeviceEventManagerModule
+import io.veil.mobile.MainActivity
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicInteger
 
@@ -23,6 +24,7 @@ internal class VeilMobileRuntimeModule(
   private val runtime: VeilMobileRuntime,
 ) : ReactContextBaseJavaModule(context) {
   private val listenerCount = AtomicInteger(0)
+  private val contactAuthority = NativeContactBridgeAuthority()
   private val runtimeListener: (VeilMobileRuntimeSnapshot) -> Unit = { snapshot ->
     if (listenerCount.get() > 0 && reactApplicationContext.hasActiveReactInstance()) {
       reactApplicationContext
@@ -39,6 +41,7 @@ internal class VeilMobileRuntimeModule(
   }
 
   override fun invalidate() {
+    contactAuthority.close { runtime.cancelContactOperations() }
     runtime.removeListener(runtimeListener)
     listenerCount.set(0)
     super.invalidate()
@@ -87,6 +90,22 @@ internal class VeilMobileRuntimeModule(
     runtime.cancelPendingAccessPass(flowId)
   }
 
+  /** Explicit native clipboard import; URI and bearer bytes never enter JS. */
+  @ReactMethod
+  fun importNodeAccessPassFromClipboard(promise: Promise) {
+    reactApplicationContext.runOnUiQueueThread {
+      contactAuthority.runIfOpen({
+        try {
+          promise.resolve((currentActivity as? MainActivity)?.importNodeAccessPassFromClipboard() == true)
+        } catch (_: Throwable) {
+          promise.rejectRuntimeFailure("E_VEIL_RUNTIME")
+        }
+      }) {
+        promise.rejectRuntimeFailure("E_VEIL_RUNTIME")
+      }
+    }
+  }
+
   @ReactMethod
   fun startWsEventsForegroundService(promise: Promise) = onRuntime(promise) {
     val context = reactApplicationContext
@@ -98,7 +117,7 @@ internal class VeilMobileRuntimeModule(
   }
 
   @ReactMethod
-  fun projectDirectMessages(conversationId: String, promise: Promise) = onRuntimePublication(promise) {
+  fun projectDirectMessagesV2(conversationId: String, promise: Promise) = onRuntimePublication(promise) {
     runtime.publishDirectMessages(conversationId) { projection ->
       promise.resolve(projection.toWritableMap())
     }
@@ -181,11 +200,11 @@ internal class VeilMobileRuntimeModule(
 
   /**
    * Accept one explicit text intent for the exact native Direct generation.
-   * Success is deliberately payload-free: message identity, sequence,
-   * ciphertext, and timestamps remain owned by Rust and SQLCipher.
+   * Return only the original persisted client/local identity. Sequence,
+   * ciphertext, and ratchet state remain owned by Rust and SQLCipher.
    */
   @ReactMethod
-  fun sendDirectText(
+  fun sendDirectTextV2(
     conversationId: String,
     expectedDirectGeneration: Double,
     text: String,
@@ -193,77 +212,41 @@ internal class VeilMobileRuntimeModule(
   ) = onRuntimePublication(promise) {
     val generation = expectedDirectGeneration.toSafeDirectGenerationOrNull()
       ?: throw VeilMobileRuntimeException(DIRECT_SEND_UNAVAILABLE_CODE, DIRECT_SEND_UNAVAILABLE)
-    runtime.sendDirectText(conversationId, generation, text) { result ->
-      promise.publishDirectTextSendResult(result)
+    runtime.sendDirectTextV2(conversationId, generation, text) { result ->
+      promise.publishDirectTextSendResultV2(result)
+    }
+  }
+
+  /** Signing, HTTP bytes and parsing remain exclusively inside native. */
+  @ReactMethod
+  fun searchContact(username: String, expectedDirectGeneration: Double, actionId: String,
+    promise: Promise) = onContactRuntime(promise) {
+    val generation = expectedDirectGeneration.toSafeDirectGenerationOrNull()
+      ?: throw VeilMobileRuntimeException("E_VEIL_DIRECT", "Direct messaging is unavailable")
+    runtime.searchContact(username, generation, actionId) { result ->
+      promise.publishContactOperationResult(if (contactAuthority.isOpen()) result
+        else NativeContactOperationResult.Unavailable)
     }
   }
 
   @ReactMethod
-  fun prepareContactSearch(username: String, promise: Promise) = onRuntime(promise) {
-    val req = runtime.prepareContactSearchRequest(username)
-    val sigMap = Arguments.createMap().apply {
-      putString("version", req.signature.version)
-      putString("userId", req.signature.userId)
-      putString("timestampMs", req.signature.timestampMs)
-      putString("nonceBase64url", req.signature.nonceBase64url)
-      putString("signatureBase64url", req.signature.signatureBase64url)
-    }
-    Arguments.createMap().apply {
-      putString("method", req.method)
-      putString("target", req.requestTarget)
-      putMap("signature", sigMap)
+  fun createDirect(peerUserId: String, expectedDirectGeneration: Double, actionId: String,
+    promise: Promise) = onContactRuntime(promise) {
+    val generation = expectedDirectGeneration.toSafeDirectGenerationOrNull()
+      ?: throw VeilMobileRuntimeException("E_VEIL_DIRECT", "Direct messaging is unavailable")
+    runtime.createDirect(peerUserId, generation, actionId) { result ->
+      promise.publishContactOperationResult(if (contactAuthority.isOpen()) result
+        else NativeContactOperationResult.Unavailable)
     }
   }
 
   @ReactMethod
-  fun prepareCreateDirect(peerUserId: String, promise: Promise) = onRuntime(promise) {
-    val req = runtime.prepareCreateDirectRequest(peerUserId)
-    val sigMap = Arguments.createMap().apply {
-      putString("version", req.signature.version)
-      putString("userId", req.signature.userId)
-      putString("timestampMs", req.signature.timestampMs)
-      putString("nonceBase64url", req.signature.nonceBase64url)
-      putString("signatureBase64url", req.signature.signatureBase64url)
+  fun cancelContacts(expectedDirectGeneration: Double, actionId: String, promise: Promise) =
+    onContactRuntime(promise) {
+      promise.resolve(expectedDirectGeneration.toSafeDirectGenerationOrNull()?.let {
+        runtime.cancelContacts(it, actionId)
+      } ?: false)
     }
-    try {
-      val bodyBase64 = android.util.Base64.encodeToString(req.body, android.util.Base64.NO_WRAP)
-      Arguments.createMap().apply {
-        putString("method", req.method)
-        putString("target", req.requestTarget)
-        putString("bodyBase64", bodyBase64)
-        putMap("signature", sigMap)
-      }
-    } finally {
-      req.body.fill(0)
-    }
-  }
-
-  @ReactMethod
-  fun parseContactSearchResponse(responseBase64: String, promise: Promise) = onRuntime(promise) {
-    val responseBytes = android.util.Base64.decode(responseBase64, android.util.Base64.DEFAULT)
-    try {
-      val res = runtime.parseContactSearchResponse(responseBytes)
-      Arguments.createMap().apply {
-        putString("userId", res.userId)
-        putString("username", res.username)
-      }
-    } finally {
-      responseBytes.fill(0)
-    }
-  }
-
-  @ReactMethod
-  fun parseCreateDirectResponse(responseBase64: String, promise: Promise) = onRuntime(promise) {
-    val responseBytes = android.util.Base64.decode(responseBase64, android.util.Base64.DEFAULT)
-    try {
-      val conversationId = runtime.completeCreateDirectResponse(responseBytes)
-      Arguments.createMap().apply {
-        putString("conversationId", conversationId)
-      }
-    } finally {
-      responseBytes.fill(0)
-    }
-  }
 
   /** Required by React Native's NativeEventEmitter contract. */
   @ReactMethod
@@ -300,9 +283,35 @@ internal class VeilMobileRuntimeModule(
     }
   }
 
+  private fun onContactRuntime(promise: Promise, operation: () -> Unit) {
+    onRuntimePublication(promise) {
+      contactAuthority.runIfOpen(operation) {
+        promise.rejectRuntimeFailure("E_VEIL_RUNTIME")
+      }
+    }
+  }
+
   companion object {
     const val EVENT_STATE_CHANGED = "VeilRuntimeStateChanged"
   }
+}
+
+internal fun Promise.publishContactOperationResult(
+  result: NativeContactOperationResult,
+  mapFactory: () -> WritableMap = { Arguments.createMap() },
+) {
+  when (result) {
+    is NativeContactOperationResult.Found -> resolve(mapFactory().apply {
+      putString("userId", result.userId)
+      putString("username", result.username)
+    })
+    NativeContactOperationResult.NotFound -> resolve(null)
+    is NativeContactOperationResult.Created -> resolve(mapFactory().apply {
+      putString("conversationId", result.conversationId)
+    })
+    NativeContactOperationResult.Unavailable -> rejectRuntimeFailure("E_VEIL_DIRECT", mapFactory)
+  }
+
 }
 
 internal fun Promise.publishDirectSessionResult(
@@ -326,6 +335,25 @@ internal fun Promise.publishDirectTextSendResult(
       rejectRuntimeFailure(DIRECT_SEND_REJECTED_CODE, userInfoFactory)
     NativeDirectTextSendResult.UNAVAILABLE ->
       rejectRuntimeFailure(DIRECT_SEND_UNAVAILABLE_CODE, userInfoFactory)
+  }
+}
+
+internal fun Promise.publishDirectTextSendResultV2(
+  result: NativeDirectTextSendResultV2,
+  userInfoFactory: () -> WritableMap = { Arguments.createMap() },
+) {
+  val acceptance = result.acceptance
+  if (result.outcome == NativeDirectTextSendResult.ACCEPTED) {
+    if (acceptance?.isStructurallySafe() != true) {
+      rejectRuntimeFailure(DIRECT_SEND_UNAVAILABLE_CODE, userInfoFactory)
+      return
+    }
+    resolve(userInfoFactory().apply {
+      putString("clientMessageId", acceptance.clientMessageId)
+      putString("localMessageId", acceptance.localMessageId)
+    })
+  } else {
+    publishDirectTextSendResult(result.outcome, userInfoFactory)
   }
 }
 
@@ -543,6 +571,9 @@ private fun NativeDirectMessageProjection.toWritableMap(): WritableMap = Argumen
 
 private fun NativeDirectMessageView.toWritableMap(): WritableMap = Arguments.createMap().apply {
   putString("messageId", messageId)
+  putString("stableUiId", stableUiId)
+  clientMessageId?.let { putString("clientMessageId", it) } ?: putNull("clientMessageId")
+  serverMessageId?.let { putString("serverMessageId", it) } ?: putNull("serverMessageId")
   putString("text", text)
   timestampMs?.let { putDouble("timestampMs", it.toDouble()) } ?: putNull("timestampMs")
   putString("direction", direction.name.lowercase())

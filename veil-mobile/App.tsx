@@ -173,6 +173,7 @@ export default function App() {
         reducedMotion={reducedMotion}
         onUnlock={() => void runtime.unlock()}
         onConnect={(origin) => void runtime.connect(origin)}
+        onImportAccessPass={() => void runtime.importAccessPass()}
         onUsePendingAccessPass={(flowId) => void runtime.usePendingAccessPass(flowId)}
         onDiscardPendingAccessPass={(flowId) => void runtime.discardPendingAccessPass(flowId)}
         onRefresh={() => void runtime.refresh()}

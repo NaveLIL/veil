@@ -61,9 +61,11 @@ type wsLimit struct {
 // wsRateLimiter is a process-wide map of (userID, kind) → token bucket.
 // Buckets are lazily created on first use and evicted by an idle GC.
 type wsRateLimiter struct {
-	mu      sync.Mutex
-	buckets map[string]*wsBucket
-	stop    chan struct{}
+	mu        sync.Mutex
+	buckets   map[string]*wsBucket
+	stop      chan struct{}
+	done      chan struct{}
+	closeOnce sync.Once
 }
 
 type wsBucket struct {
@@ -83,6 +85,7 @@ func newWSRateLimiter() *wsRateLimiter {
 	rl := &wsRateLimiter{
 		buckets: make(map[string]*wsBucket),
 		stop:    make(chan struct{}),
+		done:    make(chan struct{}),
 	}
 	go rl.gcLoop()
 	return rl
@@ -91,6 +94,7 @@ func newWSRateLimiter() *wsRateLimiter {
 func (rl *wsRateLimiter) gcLoop() {
 	t := time.NewTicker(wsIdleEvictAfter)
 	defer t.Stop()
+	defer close(rl.done)
 	for {
 		select {
 		case <-rl.stop:
@@ -106,6 +110,15 @@ func (rl *wsRateLimiter) gcLoop() {
 		}
 	}
 }
+
+func (rl *wsRateLimiter) Close() {
+	rl.closeOnce.Do(func() { close(rl.stop) })
+	<-rl.done
+}
+
+// CloseRateLimiter joins the process-owned WS bucket janitor after all
+// sockets have drained. This is a terminal process shutdown operation.
+func CloseRateLimiter() { globalWSLimiter.Close() }
 
 // allow returns true if the user may send one more message of `kind`.
 // Updates the bucket as a side effect.

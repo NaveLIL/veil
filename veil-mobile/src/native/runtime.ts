@@ -77,6 +77,10 @@ export type DirectMessageDelivery = "sending" | "sent" | "failed" | "unknown";
 
 export interface DirectMessageView {
   messageId: string;
+  /** Existing durable client ID for outgoing; canonical server ID for incoming. */
+  stableUiId: string;
+  clientMessageId: string | null;
+  serverMessageId: string | null;
   text: string;
   timestampMs: number | null;
   direction: DirectMessageDirection;
@@ -105,6 +109,12 @@ export interface DirectIdentityVerification {
 
 export type DirectTextSendFailure = "rejected" | "unavailable";
 
+/** Identity of the single native-committed intent; never an optimistic UI row. */
+export interface DirectTextSendAcceptance {
+  clientMessageId: string;
+  localMessageId: string;
+}
+
 /** Opaque failure category for a payload-free native Direct send. */
 export class DirectTextSendError extends Error {
   readonly reason: DirectTextSendFailure;
@@ -123,21 +133,6 @@ export class DirectTextSendError extends Error {
   }
 }
 
-export interface NativeRestSignatureData {
-  version: "2";
-  userId: string;
-  timestampMs: string;
-  nonceBase64url: string;
-  signatureBase64url: string;
-}
-
-export interface NativeContactRequest {
-  method: string;
-  target: string;
-  bodyBase64?: string;
-  signature: NativeRestSignatureData;
-}
-
 export interface NativeContactSearchResult {
   userId: string;
   username: string;
@@ -152,7 +147,8 @@ interface VeilMobileRuntimeNative {
   disconnect(): Promise<unknown>;
   lockSession(): Promise<unknown>;
   cancelPendingAccessPass(flowId: string): Promise<unknown>;
-  projectDirectMessages(conversationId: string): Promise<unknown>;
+  importNodeAccessPassFromClipboard(): Promise<unknown>;
+  projectDirectMessagesV2(conversationId: string): Promise<unknown>;
   getDirectIdentityVerification(
     conversationId: string,
     expectedDirectGeneration: number,
@@ -167,15 +163,14 @@ interface VeilMobileRuntimeNative {
     expectedDirectGeneration: number,
     scannedQrPayload: string,
   ): Promise<unknown>;
-  sendDirectText(
+  sendDirectTextV2(
     conversationId: string,
     expectedDirectGeneration: number,
     text: string,
   ): Promise<unknown>;
-  prepareContactSearch(username: string): Promise<NativeContactRequest>;
-  prepareCreateDirect(peerUserId: string): Promise<NativeContactRequest>;
-  parseContactSearchResponse(responseBase64: string): Promise<NativeContactSearchResult>;
-  parseCreateDirectResponse(responseBase64: string): Promise<{ conversationId: string }>;
+  searchContact(username: string, expectedDirectGeneration: number, actionId: string): Promise<unknown>;
+  createDirect(peerUserId: string, expectedDirectGeneration: number, actionId: string): Promise<unknown>;
+  cancelContacts(expectedDirectGeneration: number, actionId: string): Promise<unknown>;
   addListener(eventName: string): void;
   removeListeners(count: number): void;
 }
@@ -214,6 +209,22 @@ const MAX_DIRECT_PROJECTION_TEXT_BYTES = 1024 * 1024;
 const DIRECT_SEND_REJECTED_CODE = "E_VEIL_DIRECT_SEND_REJECTED";
 
 const isCanonicalUuid = (value: string): boolean => value !== nilUuid && canonicalUuid.test(value);
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function hasExactKeys(record: Record<string, unknown>, keys: readonly string[]): boolean {
+  const actual = Object.keys(record);
+  return actual.length === keys.length && keys.every((key) => actual.includes(key));
+}
+
+function requireContactScope(generation: number, actionId: string): void {
+  if (!Number.isSafeInteger(generation) || generation < 1
+    || typeof actionId !== "string" || !/^[A-Za-z0-9_-]{1,64}$/.test(actionId)) {
+    throw new Error("Contact operation is unavailable");
+  }
+}
 
 function isCanonicalOrigin(value: string, allowLoopbackHttp = true): boolean {
   const match = canonicalOriginPattern.exec(value);
@@ -546,6 +557,7 @@ function directMessageProjection(value: unknown): DirectMessageProjection {
     return unavailableDirectProjection();
   }
   const ids = new Set<string>();
+  const stableIds = new Set<string>();
   const messages: DirectMessageView[] = [];
   let totalTextBytes = 0;
   for (const candidate of record.messages) {
@@ -559,6 +571,13 @@ function directMessageProjection(value: unknown): DirectMessageProjection {
       typeof message.messageId !== "string" ||
       !isCanonicalUuid(message.messageId) ||
       ids.has(message.messageId) ||
+      typeof message.stableUiId !== "string" ||
+      !isCanonicalUuid(message.stableUiId) ||
+      stableIds.has(message.stableUiId) ||
+      (message.clientMessageId !== null &&
+        (typeof message.clientMessageId !== "string" || !isCanonicalUuid(message.clientMessageId))) ||
+      (message.serverMessageId !== null &&
+        (typeof message.serverMessageId !== "string" || !isCanonicalUuid(message.serverMessageId))) ||
       totalTextBytes > MAX_DIRECT_PROJECTION_TEXT_BYTES - textBytes ||
       (message.timestampMs !== null &&
         (typeof message.timestampMs !== "number" ||
@@ -570,10 +589,26 @@ function directMessageProjection(value: unknown): DirectMessageProjection {
     ) {
       return unavailableDirectProjection();
     }
+    if (message.direction === "incoming") {
+      if (message.clientMessageId !== null || message.serverMessageId !== message.messageId ||
+        message.stableUiId !== message.messageId || message.delivery !== "sent" ||
+        message.timestampMs === null) return unavailableDirectProjection();
+    } else if (message.clientMessageId !== message.stableUiId ||
+      (message.serverMessageId === null
+        ? message.messageId !== message.stableUiId || message.delivery === "sent" ||
+          message.timestampMs !== null
+        : message.messageId !== message.serverMessageId || message.delivery !== "sent" ||
+          message.timestampMs === null)) {
+      return unavailableDirectProjection();
+    }
     totalTextBytes += textBytes;
     ids.add(message.messageId);
+    stableIds.add(message.stableUiId);
     messages.push({
       messageId: message.messageId,
+      stableUiId: message.stableUiId,
+      clientMessageId: message.clientMessageId as string | null,
+      serverMessageId: message.serverMessageId as string | null,
       text,
       timestampMs: message.timestampMs as number | null,
       direction: message.direction,
@@ -708,6 +743,21 @@ function normalizeNativeDirectTextSendError(value: unknown): DirectTextSendError
   );
 }
 
+function directTextSendAcceptance(value: unknown): DirectTextSendAcceptance | null {
+  try {
+    if (!isNonArrayObject(value) || !hasExactKeys(value as Record<string, unknown>,
+      ["clientMessageId", "localMessageId"])) return null;
+    const client = ownDataProperty(value, "clientMessageId");
+    const local = ownDataProperty(value, "localMessageId");
+    if (client.kind !== "data" || typeof client.value !== "string" ||
+      !isCanonicalUuid(client.value) || local.kind !== "data" ||
+      local.value !== client.value) return null;
+    return { clientMessageId: client.value, localMessageId: client.value };
+  } catch {
+    return null;
+  }
+}
+
 const VeilRuntime = {
   getSnapshot: async (): Promise<VeilMobileRuntimeSnapshot> =>
     runtimeSnapshot(await requireRuntime().getRuntimeSnapshot()),
@@ -735,24 +785,56 @@ const VeilRuntime = {
   lock: async (): Promise<VeilMobileRuntimeSnapshot> =>
     runtimeSnapshot(await requireRuntime().lockSession()),
   
-  prepareContactSearch: async (username: string): Promise<NativeContactRequest> =>
-    requireRuntime().prepareContactSearch(username),
+  searchContact: async (
+    username: string, expectedDirectGeneration: number, actionId: string,
+  ): Promise<NativeContactSearchResult | null> => {
+    requireContactScope(expectedDirectGeneration, actionId);
+    if (typeof username !== "string" || boundedUtf8Length(username, 128) === null
+      || !username.length || /[\u0000-\u001f\u007f-\u009f]/.test(username)) {
+      throw new Error("Contact lookup is unavailable");
+    }
+    const result = await requireRuntime().searchContact(username, expectedDirectGeneration, actionId);
+    if (result === null) return null;
+    if (!isRecord(result) || typeof result.userId !== "string"
+      || !isCanonicalUuid(result.userId) || result.username !== username
+      || !hasExactKeys(result, ["userId", "username"])) {
+      throw new Error("Native contact lookup returned an invalid result");
+    }
+    return { userId: result.userId, username };
+  },
 
-  prepareCreateDirect: async (peerUserId: string): Promise<NativeContactRequest> =>
-    requireRuntime().prepareCreateDirect(peerUserId),
+  createDirect: async (
+    peerUserId: string, expectedDirectGeneration: number, actionId: string,
+  ): Promise<{ conversationId: string }> => {
+    requireContactScope(expectedDirectGeneration, actionId);
+    if (typeof peerUserId !== "string" || !isCanonicalUuid(peerUserId)) {
+      throw new Error("Direct creation is unavailable");
+    }
+    const result = await requireRuntime().createDirect(peerUserId, expectedDirectGeneration, actionId);
+    if (!isRecord(result) || typeof result.conversationId !== "string"
+      || !isCanonicalUuid(result.conversationId)
+      || !hasExactKeys(result, ["conversationId"])) {
+      throw new Error("Native Direct creation returned an invalid result");
+    }
+    return { conversationId: result.conversationId };
+  },
 
-  parseContactSearchResponse: async (responseBase64: string): Promise<NativeContactSearchResult> =>
-    requireRuntime().parseContactSearchResponse(responseBase64),
-
-  parseCreateDirectResponse: async (responseBase64: string): Promise<{ conversationId: string }> =>
-    requireRuntime().parseCreateDirectResponse(responseBase64),
+  cancelContacts: async (expectedDirectGeneration: number, actionId: string): Promise<boolean> => {
+    requireContactScope(expectedDirectGeneration, actionId);
+    return await requireRuntime().cancelContacts(expectedDirectGeneration, actionId) === true;
+  },
 
   cancelPendingAccessPass: async (flowId: string): Promise<boolean> =>
     await requireRuntime().cancelPendingAccessPass(flowId) === true,
+  importNodeAccessPassFromClipboard: async (): Promise<boolean> => {
+    const result = await requireRuntime().importNodeAccessPassFromClipboard();
+    if (typeof result !== "boolean") throw new Error("Native access-pass import is unavailable");
+    return result;
+  },
   getDirectMessages: async (conversationId: string): Promise<DirectMessageProjection> => {
     if (!isCanonicalUuid(conversationId)) return unavailableDirectProjection();
     try {
-      return directMessageProjection(await requireRuntime().projectDirectMessages(conversationId));
+      return directMessageProjection(await requireRuntime().projectDirectMessagesV2(conversationId));
     } catch {
       return unavailableDirectProjection();
     }
@@ -827,7 +909,7 @@ const VeilRuntime = {
     conversationId: string,
     expectedDirectGeneration: number,
     text: string,
-  ): Promise<void> => {
+  ): Promise<DirectTextSendAcceptance> => {
     if (
       typeof conversationId !== "string"
       || typeof expectedDirectGeneration !== "number"
@@ -842,7 +924,7 @@ const VeilRuntime = {
     }
     let result: unknown;
     try {
-      result = await requireRuntime().sendDirectText(
+      result = await requireRuntime().sendDirectTextV2(
         conversationId,
         expectedDirectGeneration,
         text,
@@ -850,9 +932,11 @@ const VeilRuntime = {
     } catch (error) {
       throw normalizeNativeDirectTextSendError(error);
     }
-    if (result !== null) {
+    const acceptance = directTextSendAcceptance(result);
+    if (acceptance === null) {
       throw new DirectTextSendError("unavailable", UNKNOWN_PUBLIC_FAILURE_CODE_V1);
     }
+    return acceptance;
   },
   subscribe(listener: (snapshot: VeilMobileRuntimeSnapshot) => void): EmitterSubscription {
     const emitter = runtimeEmitter;

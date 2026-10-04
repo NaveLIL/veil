@@ -23,6 +23,25 @@ const forbiddenSourceFragments = [
   "/src/designPreview/",
   "/src/components/navigation/RootDock.tsx",
   "/src/screens/DesignPreviewScreens.tsx",
+  "/node_modules/@rocket.chat/",
+  "/node_modules/rocketchat-sdk/",
+  "/node_modules/@nozbe/watermelondb/",
+];
+
+const requiredSourcePaths = [
+  "/src/screens/HomeScreen.tsx",
+  "/src/screens/ContactSearchScreen.tsx",
+  "/src/components/layout/ChatIsland.tsx",
+  "/src/components/runtime/SecureRuntimeGate.tsx",
+  "/src/hooks/useVeilRuntimeLifecycle.ts",
+  "/src/presenters/directTimeline.ts",
+  "/src/presenters/contacts.ts",
+  "/src/presentation/rocketChat/RoomItem.tsx",
+  "/src/presentation/rocketChat/ContactItem.tsx",
+  "/src/presentation/rocketChat/Message.tsx",
+  "/src/presentation/rocketChat/Composer.tsx",
+  "/src/presentation/rocketChat/theme.ts",
+  "/src/presentation/rocketChat/notice.ts",
 ];
 
 function runExpoExport() {
@@ -61,9 +80,10 @@ function runExpoExport() {
 try {
   await runExpoExport();
 
-  const [bundle, sourceMapText] = await Promise.all([
+  const [bundle, sourceMapText, licenseText] = await Promise.all([
     readFile(bundlePath, "utf8"),
     readFile(sourceMapPath, "utf8"),
+    readFile(join(projectDirectory, "third-party/rocket-chat-reactnative/LICENSE"), "utf8"),
   ]);
   const sourceMap = JSON.parse(sourceMapText);
   const sources = Array.isArray(sourceMap.sources) ? sourceMap.sources : [];
@@ -73,18 +93,35 @@ try {
   const sourceMatches = normalizedSources.filter((source) =>
     forbiddenSourceFragments.some((fragment) => source.includes(fragment)),
   );
+  const missingSources = requiredSourcePaths.filter((required) =>
+    !normalizedSources.some((source) => source.endsWith(required)),
+  );
+  // Inspect the actual exported JS, not inventory text or an unreferenced source file.
+  // --minify false preserves a literal; tolerate Babel's supported quote styles.
+  const notice = licenseText.replaceAll("\r\n", "\n").trim();
+  const noticeLiterals = [
+    JSON.stringify(notice),
+    `\`${notice}\``,
+    `'${notice.replaceAll("\\", "\\\\").replaceAll("'", "\\'").replaceAll("\n", "\\n")}'`,
+  ];
+  const hasShippedNotice = noticeLiterals.some((literal) => bundle.includes(literal));
 
-  if (literalMatches.length > 0 || sourceMatches.length > 0) {
+  if (literalMatches.length > 0 || sourceMatches.length > 0 || missingSources.length > 0 || !hasShippedNotice) {
     if (literalMatches.length > 0) {
       console.error(`Forbidden preview literals in production bundle: ${literalMatches.join(", ")}`);
     }
     if (sourceMatches.length > 0) {
-      console.error("Forbidden preview modules in production source map:");
+      console.error("Forbidden preview or upstream SDK/database modules in production source map:");
       for (const source of sourceMatches) console.error(`- ${source}`);
     }
+    if (missingSources.length > 0) {
+      console.error("Required Veil/Rocket.Chat presentation modules absent from production source map:");
+      for (const source of missingSources) console.error(`- ${source}`);
+    }
+    if (!hasShippedNotice) console.error("Full Rocket.Chat MIT notice is absent from the exported production JS.");
     process.exitCode = 1;
   } else {
-    console.log(`Android production bundle boundary verified across ${normalizedSources.length} sources.`);
+    console.log(`Android production JS boundary, source-port modules and shipped MIT notice verified across ${normalizedSources.length} sources. This does not verify a native APK or device behavior.`);
   }
 } finally {
   await rm(outputDirectory, { recursive: true, force: true });

@@ -7535,6 +7535,7 @@ dependencies = [
  "uuid",
  "veil-client",
  "veil-crypto",
+ "veil-store",
  "zeroize",
 ]
 

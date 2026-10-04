@@ -48,6 +48,7 @@ jest.mock("../../hooks/useReducedMotionPreference", () => ({
   useReducedMotionPreference: () => true,
 }));
 jest.mock("../HomeScreen", () => ({ __esModule: true, default: () => null }));
+jest.mock("../ContactSearchScreen", () => ({ __esModule: true, default: () => null }));
 jest.mock("../DirectConversationScreen", () => ({ __esModule: true, default: () => null }));
 jest.mock("../SettingsScreen", () => ({
   __esModule: true,
@@ -92,17 +93,15 @@ describe("ChatListScreen authenticated navigation scope", () => {
     expect(mountId()).not.toBe(initialMount);
   });
 
-  it("registers the native-backed routes and explicitly labelled preview routes", () => {
+  it("registers the Direct GUI and keeps fixture destinations outside production", () => {
     expect([...new Set(renderer.root.findAllByProps({ testID: "authenticated-stack-screen" })
       .map((screen) => screen.props.accessibilityLabel))])
       .toEqual([
         "Home",
+        "Contacts",
         "Direct",
         "Settings",
         "SettingsDetail",
-        "DesignCircle",
-        "DesignSpace",
-        "DesignRoom",
       ]);
   });
 

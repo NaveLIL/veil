@@ -32,7 +32,7 @@ type RuntimeMock = {
     conversationId: string,
     expectedDirectGeneration: number,
     text: string,
-  ) => Promise<void>>;
+  ) => Promise<{ clientMessageId: string; localMessageId: string }>>;
 };
 
 const runtime = (jest.requireMock("../../native/runtime") as { default: RuntimeMock }).default;
@@ -63,7 +63,10 @@ const runtimeSnapshot: VeilMobileRuntimeSnapshot = {
 describe("ChatIsland native Direct projection", () => {
   beforeEach(() => {
     jest.clearAllMocks();
-    runtime.sendDirectText.mockResolvedValue(undefined);
+    runtime.sendDirectText.mockResolvedValue({
+      clientMessageId: "66666666-6666-4666-8666-666666666666",
+      localMessageId: "66666666-6666-4666-8666-666666666666",
+    });
     resetChatStoreForTests();
     useChatStore.getState().hydrateRuntimeDirectory(runtimeSnapshot);
     useChatStore.getState().selectDm(conversationId);
@@ -112,6 +115,9 @@ describe("ChatIsland native Direct projection", () => {
       availability: "available",
       messages: [{
         messageId: "44444444-4444-4444-8444-444444444444",
+        stableUiId: "44444444-4444-4444-8444-444444444444",
+        clientMessageId: null,
+        serverMessageId: "44444444-4444-4444-8444-444444444444",
         text: "verified native history",
         timestampMs: 1_720_000_000_000,
         direction: "incoming",
@@ -126,7 +132,7 @@ describe("ChatIsland native Direct projection", () => {
     expect(composer.props.editable).toBe(true);
     expect(composer.props.accessibilityState).toEqual({ disabled: false });
     expect(view.getByTestId("direct-send-button").props.accessibilityState)
-      .toEqual({ disabled: true });
+      .toMatchObject({ disabled: true, busy: false });
   });
 
   it("renders catalog delivery failures without Retry or assertive repeated announcements", async () => {
@@ -137,6 +143,9 @@ describe("ChatIsland native Direct projection", () => {
       messages: [
         {
           messageId: failedMessageId,
+          stableUiId: failedMessageId,
+          clientMessageId: failedMessageId,
+          serverMessageId: null,
           text: "definitely rejected",
           timestampMs: 1_720_000_000_000,
           direction: "outgoing",
@@ -144,6 +153,9 @@ describe("ChatIsland native Direct projection", () => {
         },
         {
           messageId: unknownMessageId,
+          stableUiId: unknownMessageId,
+          clientMessageId: unknownMessageId,
+          serverMessageId: null,
           text: "possibly delivered",
           timestampMs: 1_720_000_000_001,
           direction: "outgoing",
@@ -201,6 +213,9 @@ describe("ChatIsland native Direct projection", () => {
         availability: "available",
         messages: [{
           messageId: "55555555-5555-4555-8555-555555555555",
+          stableUiId: "55555555-5555-4555-8555-555555555555",
+          clientMessageId: null,
+          serverMessageId: "55555555-5555-4555-8555-555555555555",
           text: "late plaintext",
           timestampMs: null,
           direction: "incoming",
@@ -214,13 +229,16 @@ describe("ChatIsland native Direct projection", () => {
     expect(useChatStore.getState().messagesByChannel).toEqual({});
   });
 
-  it("keeps the draft during native work and clears it only after accepted projection", async () => {
+  it("keeps the draft during native work and publishes rows only from post-commit projection", async () => {
     runtime.getDirectMessages
       .mockResolvedValueOnce({ availability: "available", messages: [] })
       .mockResolvedValueOnce({
         availability: "available",
         messages: [{
           messageId: "66666666-6666-4666-8666-666666666666",
+          stableUiId: "66666666-6666-4666-8666-666666666666",
+          clientMessageId: "66666666-6666-4666-8666-666666666666",
+          serverMessageId: null,
           text: "native accepted text",
           timestampMs: null,
           direction: "outgoing",
@@ -228,8 +246,11 @@ describe("ChatIsland native Direct projection", () => {
         }],
       });
     let resolveSend!: () => void;
-    runtime.sendDirectText.mockReturnValue(new Promise<void>((resolve) => {
-      resolveSend = resolve;
+    runtime.sendDirectText.mockReturnValue(new Promise<{ clientMessageId: string; localMessageId: string }>((resolve) => {
+      resolveSend = () => resolve({
+        clientMessageId: "66666666-6666-4666-8666-666666666666",
+        localMessageId: "66666666-6666-4666-8666-666666666666",
+      });
     }));
 
     const view = render(<ChatIsland />);
@@ -281,8 +302,11 @@ describe("ChatIsland native Direct projection", () => {
   it("does not clear an identical draft entered under a newer generation", async () => {
     runtime.getDirectMessages.mockResolvedValue({ availability: "available", messages: [] });
     let resolveOldSend!: () => void;
-    runtime.sendDirectText.mockReturnValue(new Promise<void>((resolve) => {
-      resolveOldSend = resolve;
+    runtime.sendDirectText.mockReturnValue(new Promise<{ clientMessageId: string; localMessageId: string }>((resolve) => {
+      resolveOldSend = () => resolve({
+        clientMessageId: "66666666-6666-4666-8666-666666666666",
+        localMessageId: "66666666-6666-4666-8666-666666666666",
+      });
     }));
 
     const view = render(<ChatIsland />);

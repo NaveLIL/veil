@@ -27,12 +27,14 @@ const renderGate = (
   snapshot: VeilMobileRuntimeSnapshot = lockedSnapshot,
   callbacks: {
     onUnlock?: jest.Mock;
+    onImportAccessPass?: jest.Mock;
     onUsePendingAccessPass?: jest.Mock;
     onDiscardPendingAccessPass?: jest.Mock;
     publicFailureCode?: PublicFailureCodeV1 | null;
   } = {},
 ) => {
   const onUnlock = callbacks.onUnlock ?? jest.fn();
+  const onImportAccessPass = callbacks.onImportAccessPass ?? jest.fn();
   const onUsePendingAccessPass = callbacks.onUsePendingAccessPass ?? jest.fn();
   const onDiscardPendingAccessPass = callbacks.onDiscardPendingAccessPass ?? jest.fn();
   const view = render(
@@ -44,15 +46,24 @@ const renderGate = (
       reducedMotion
       onUnlock={onUnlock}
       onConnect={jest.fn()}
+      onImportAccessPass={onImportAccessPass}
       onUsePendingAccessPass={onUsePendingAccessPass}
       onDiscardPendingAccessPass={onDiscardPendingAccessPass}
       onRefresh={jest.fn()}
     />,
   );
-  return { ...view, onUnlock, onUsePendingAccessPass, onDiscardPendingAccessPass };
+  return { ...view, onUnlock, onImportAccessPass, onUsePendingAccessPass, onDiscardPendingAccessPass };
 };
 
 describe("SecureRuntimeGate", () => {
+  it("offers an explicit native-only clipboard import before registration", () => {
+    const view = renderGate();
+    fireEvent.press(view.getByTestId("import-access-pass"));
+    expect(view.onImportAccessPass).toHaveBeenCalledWith();
+    expect(view.queryByTestId("access-pass-review")).toBeNull();
+    expect(view.queryByTestId("node-origin-input")).toBeNull();
+  });
+
   it("shows a polished explicit unlock action for an existing locked identity", () => {
     const { getByTestId, getByText, onUnlock } = renderGate();
 
@@ -83,6 +94,7 @@ describe("SecureRuntimeGate", () => {
       view.getByTestId("runtime-brand-phase-shift-mark", { includeHiddenElements: true }),
     ).toBeTruthy();
     expect(view.getByTestId("access-pass-origin").props.children).toBe("https://veil.erez.pro:443");
+    expect(view.queryByTestId("import-access-pass")).toBeNull();
     expect(view.getByTestId("access-pass-reference").props.children).toBe("1a2b3c4d5e6f");
     expect(view.getByTestId("access-pass-ttl").props.children).toBe("2m 05s");
     expect(JSON.stringify(view.toJSON())).not.toContain(FLOW_ID);

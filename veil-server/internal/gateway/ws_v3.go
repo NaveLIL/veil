@@ -80,6 +80,16 @@ const wsV3AuthReadTimeout = 8 * time.Second
 // connection primitives (per-IP cap, upgrader, Client, Hub registration,
 // pumps, gated retained-batch publication) and the mandatory v3 handshake.
 func HandleWebSocketV3(hub *Hub, w http.ResponseWriter, r *http.Request) {
+	if !hub.admitSession() {
+		http.Error(w, "server shutting down", http.StatusServiceUnavailable)
+		return
+	}
+	transferred := false
+	defer func() {
+		if !transferred {
+			hub.sessions.Done()
+		}
+	}()
 	ip := wsClientIP(r)
 
 	// Enforce the pre-upgrade per-IP budget before any WebSocket allocation.
@@ -98,6 +108,7 @@ func HandleWebSocketV3(hub *Hub, w http.ResponseWriter, r *http.Request) {
 	}
 
 	connID := fmt.Sprintf("%p-%d", conn, time.Now().UnixNano())
+	connectionCtx, connectionCancel := context.WithCancel(hub.lifecycleContext())
 	client := &Client{
 		hub:        hub,
 		conn:       conn,
@@ -105,21 +116,47 @@ func HandleWebSocketV3(hub *Hub, w http.ResponseWriter, r *http.Request) {
 		connID:     connID,
 		ip:         ip,
 		registered: make(chan struct{}),
+		ctx:        connectionCtx,
+		cancel:     connectionCancel,
 	}
 
-	hub.register <- client
+	select {
+	case hub.register <- client:
+	case <-connectionCtx.Done():
+		client.failClosed()
+		hub.releaseIP(ip)
+		return
+	}
 	<-client.registered
+	// A connection accepted just before shutdown must not escape the shutdown
+	// snapshot while its handshake is blocked on network I/O.
+	stopClose := context.AfterFunc(connectionCtx, client.failClosed)
+	defer func() {
+		if !transferred {
+			stopClose()
+		}
+	}()
 
 	// The whole handshake runs synchronously on this goroutine BEFORE the
 	// pumps start. Challenge write, the single response read and any failure
 	// result write use the connection directly while it is still exclusively
 	// owned, so a failure result is flushed before Close instead of racing a
 	// writePump shutdown.
-	if !client.runWSAuthV3(context.Background()) {
+	if !hub.beginCommand() {
+		client.unregisterClient()
+		return
+	}
+	authCtx, authCancel := context.WithTimeout(connectionCtx, hub.budgets.Auth)
+	stopAuthClose := context.AfterFunc(authCtx, client.failClosed)
+	authenticated := client.runWSAuthV3(authCtx)
+	stopAuthClose()
+	authCancel()
+	hub.commands.Done()
+	if !authenticated {
 		// Pumps never started, so no readPump defer exists to return the
 		// registered client, IP slot and send channel to Hub.Run (same
 		// pattern as the v2 pre-pump failure path).
-		hub.unregister <- client
+		client.unregisterClient()
 		return
 	}
 
@@ -136,8 +173,15 @@ func HandleWebSocketV3(hub *Hub, w http.ResponseWriter, r *http.Request) {
 		return err
 	})
 
-	go client.writePump()
-	go client.readPump()
+	transferred = true
+	writerDone := make(chan struct{})
+	go func() { defer close(writerDone); client.writePump() }()
+	go func() {
+		defer hub.sessions.Done()
+		defer stopClose()
+		client.readPump()
+		<-writerDone
+	}()
 }
 
 // runWSAuthV3 performs the single-attempt v3 handshake. takeChallenge burns

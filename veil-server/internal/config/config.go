@@ -33,6 +33,15 @@ type Config struct {
 	MaxMessageSize        int // Max ciphertext size (bytes)
 	MessageBatchLimit     int // Max messages per sync request
 	MaxConversationFanout int // Max recipients in a DM fan-out
+
+	DatabaseConnectTimeout time.Duration
+	StartupAuditTimeout    time.Duration
+	WSAuthTimeout          time.Duration
+	WSReadTimeout          time.Duration
+	WSMutationTimeout      time.Duration
+	WSEphemeralTimeout     time.Duration
+	ShutdownTimeout        time.Duration
+	ShutdownGrace          time.Duration
 }
 
 // IdentityTransparencyConfig contains the Node-local seed used only to sign
@@ -77,7 +86,41 @@ func LoadGateway() (*Config, error) {
 		return nil, err
 	}
 	cfg.IdentityTransparency = transparencyConfig
+	if err := loadRuntimeBudgets(cfg); err != nil {
+		return nil, err
+	}
 	return cfg, nil
+}
+
+func loadRuntimeBudgets(cfg *Config) error {
+	for _, item := range []struct {
+		key               string
+		target            *time.Duration
+		fallback, maximum time.Duration
+	}{
+		{"VEIL_DB_CONNECT_TIMEOUT", &cfg.DatabaseConnectTimeout, 10 * time.Second, time.Minute},
+		{"VEIL_STARTUP_AUDIT_TIMEOUT", &cfg.StartupAuditTimeout, 5 * time.Minute, time.Hour},
+		{"VEIL_WS_AUTH_TIMEOUT", &cfg.WSAuthTimeout, 10 * time.Second, time.Minute},
+		{"VEIL_WS_READ_TIMEOUT", &cfg.WSReadTimeout, 10 * time.Second, 5 * time.Minute},
+		{"VEIL_WS_MUTATION_TIMEOUT", &cfg.WSMutationTimeout, 15 * time.Second, 5 * time.Minute},
+		{"VEIL_WS_EPHEMERAL_TIMEOUT", &cfg.WSEphemeralTimeout, 3 * time.Second, time.Minute},
+		{"VEIL_SHUTDOWN_TIMEOUT", &cfg.ShutdownTimeout, 30 * time.Second, 5 * time.Minute},
+		{"VEIL_SHUTDOWN_GRACE", &cfg.ShutdownGrace, 15 * time.Second, 5 * time.Minute},
+	} {
+		value := item.fallback
+		if raw, exists := os.LookupEnv(item.key); exists {
+			parsed, err := time.ParseDuration(raw)
+			if err != nil || strings.TrimSpace(raw) != raw || parsed <= 0 || parsed > item.maximum {
+				return fmt.Errorf("%s must be a positive duration no greater than %s", item.key, item.maximum)
+			}
+			value = parsed
+		}
+		*item.target = value
+	}
+	if cfg.ShutdownGrace >= cfg.ShutdownTimeout {
+		return errors.New("VEIL_SHUTDOWN_GRACE must be shorter than VEIL_SHUTDOWN_TIMEOUT")
+	}
+	return nil
 }
 
 func loadIdentityTransparencyConfig() (*IdentityTransparencyConfig, error) {

@@ -19,9 +19,10 @@ import okhttp3.Interceptor
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.RequestBody
 import okhttp3.Response
 import okhttp3.ResponseBody
+import okio.BufferedSink
 
 /** Response limits mirrored from the native Direct contract. */
 internal object NativeDirectHttpLimits {
@@ -30,6 +31,9 @@ internal object NativeDirectHttpLimits {
   const val PREKEY_BYTES: Long = 64L * 1024L
   const val OWN_PREKEY_COUNT_BYTES: Long = 64L * 1024L
   const val OWN_PREKEY_UPLOAD_BYTES: Long = 4L * 1024L
+  const val CONTACT_SEARCH_BYTES: Long = 16L * 1024L
+  const val CONTACT_CREATE_BYTES: Long = 4L * 1024L
+  const val CONTACT_CREATE_BODY_BYTES: Int = 4 * 1024
 }
 
 internal enum class NativeDirectHttpMethod {
@@ -65,6 +69,7 @@ internal enum class NativeDirectHttpFailure {
   NETWORK,
   UNEXPECTED_STATUS,
   RESPONSE_TOO_LARGE,
+  NOT_FOUND,
 }
 
 internal sealed interface NativeDirectHttpResult {
@@ -164,8 +169,9 @@ internal class NativeDirectHttpCompletion(
 }
 
 /**
- * Isolated asynchronous HTTP executor for native Direct directory/prekey
- * GETs and the exact own-prekey publication POST.
+ * Isolated asynchronous HTTP executor for native Direct directory/prekey and
+ * contact GETs, the exact own-prekey publication POST, and the exact create-DM
+ * POST. Contact selection/signing authority remains in VeilMobileRuntime.
  *
  * Production always starts from a clean OkHttp builder and therefore keeps
  * Android's system trust manager, hostname verifier, DNS, dispatcher, cookie
@@ -212,6 +218,7 @@ internal class NativeDirectHttpTransport private constructor(
     val call = client.newCall(prepared)
     val networkCallback = object : Callback {
       override fun onFailure(call: Call, error: java.io.IOException) {
+        (prepared.body as? OwnedDirectRequestBody)?.wipe()
         completion.complete(NativeDirectHttpResult.Failure(NativeDirectHttpFailure.NETWORK))
       }
 
@@ -220,6 +227,9 @@ internal class NativeDirectHttpTransport private constructor(
           response.use { received ->
             when {
               !completion.isActive() -> NativeDirectHttpResult.Failure(NativeDirectHttpFailure.CANCELLED)
+              received.code == 404 && request.method == NativeDirectHttpMethod.GET &&
+                request.requestTarget.startsWith(CONTACT_SEARCH_TARGET_PREFIX) ->
+                NativeDirectHttpResult.Failure(NativeDirectHttpFailure.NOT_FOUND)
               received.code != HTTP_OK ->
                 NativeDirectHttpResult.Failure(NativeDirectHttpFailure.UNEXPECTED_STATUS)
               else -> received.body?.let { body ->
@@ -232,6 +242,7 @@ internal class NativeDirectHttpTransport private constructor(
         } catch (_: RuntimeException) {
           NativeDirectHttpResult.Failure(NativeDirectHttpFailure.NETWORK)
         }
+        (prepared.body as? OwnedDirectRequestBody)?.wipe()
         completion.complete(result)
       }
     }
@@ -246,6 +257,11 @@ internal class NativeDirectHttpTransport private constructor(
     when (input.method) {
       NativeDirectHttpMethod.GET -> {
         require(input.body.isEmpty()) { "Direct GET body must be empty" }
+        if (input.requestTarget.startsWith(CONTACT_SEARCH_TARGET_PREFIX)) {
+          require(input.responseLimitBytes <= NativeDirectHttpLimits.CONTACT_SEARCH_BYTES) {
+            "Contact search response limit is invalid"
+          }
+        }
         if (isOwnPreKeyCountTarget(input.requestTarget)) {
           require(input.responseLimitBytes <= NativeDirectHttpLimits.OWN_PREKEY_COUNT_BYTES) {
             "Own prekey count response limit is invalid"
@@ -253,14 +269,24 @@ internal class NativeDirectHttpTransport private constructor(
         }
       }
       NativeDirectHttpMethod.POST -> {
-        require(input.requestTarget == OWN_PREKEY_UPLOAD_TARGET) {
-          "Direct POST target is invalid"
-        }
-        require(input.body.size in 1..MAX_REQUEST_BODY_BYTES) {
-          "Own prekey upload body is empty or oversized"
-        }
-        require(input.responseLimitBytes <= NativeDirectHttpLimits.OWN_PREKEY_UPLOAD_BYTES) {
-          "Own prekey upload response limit is invalid"
+        when (input.requestTarget) {
+          OWN_PREKEY_UPLOAD_TARGET -> {
+            require(input.body.size in 1..MAX_REQUEST_BODY_BYTES) {
+              "Own prekey upload body is empty or oversized"
+            }
+            require(input.responseLimitBytes <= NativeDirectHttpLimits.OWN_PREKEY_UPLOAD_BYTES) {
+              "Own prekey upload response limit is invalid"
+            }
+          }
+          CONTACT_CREATE_TARGET -> {
+            require(input.body.size in 1..NativeDirectHttpLimits.CONTACT_CREATE_BODY_BYTES) {
+              "Contact create body is empty or oversized"
+            }
+            require(input.responseLimitBytes <= NativeDirectHttpLimits.CONTACT_CREATE_BYTES) {
+              "Contact create response limit is invalid"
+            }
+          }
+          else -> throw IllegalArgumentException("Direct POST target is invalid")
         }
       }
     }
@@ -311,8 +337,7 @@ internal class NativeDirectHttpTransport private constructor(
       NativeDirectHttpMethod.POST -> {
         // OkHttp writes asynchronously. Own an exact copy so the caller can
         // clear or reuse its buffer without changing the signed wire body.
-        val exactBody = input.body.copyOf()
-        builder.post(exactBody.toRequestBody(JSON_MEDIA_TYPE_VALUE))
+        builder.post(OwnedDirectRequestBody(input.body))
       }
     }
     return builder.build()
@@ -441,6 +466,7 @@ internal class NativeDirectHttpTransport private constructor(
       try {
         call.enqueue(callback)
       } catch (_: RuntimeException) {
+        (call.request().body as? OwnedDirectRequestBody)?.wipe()
         completion.complete(NativeDirectHttpResult.Failure(NativeDirectHttpFailure.NETWORK))
       }
     }
@@ -450,11 +476,15 @@ internal class NativeDirectHttpTransport private constructor(
         when (state.get()) {
           CallState.CANCELLED -> return
           CallState.CREATED -> if (state.compareAndSet(CallState.CREATED, CallState.CANCELLED)) {
+            (call.request().body as? OwnedDirectRequestBody)?.wipe()
             completion.cancel()
             return
           }
           CallState.STARTED -> if (state.compareAndSet(CallState.STARTED, CallState.CANCELLED)) {
-            completion.cancel { call.cancel() }
+            completion.cancel {
+              call.cancel()
+              (call.request().body as? OwnedDirectRequestBody)?.wipe()
+            }
             return
           }
         }
@@ -462,6 +492,33 @@ internal class NativeDirectHttpTransport private constructor(
     }
 
     override fun toString(): String = "NativeDirectHttpCall($completion)"
+  }
+
+  /** One exact wire copy; writing and cancellation cannot race a buffer wipe. */
+  private class OwnedDirectRequestBody(input: ByteArray) : RequestBody() {
+    private val bytes = input.copyOf()
+    private var cleared = false
+    override fun contentType() = JSON_MEDIA_TYPE_VALUE
+    override fun contentLength(): Long = bytes.size.toLong()
+    override fun isOneShot(): Boolean = true
+
+    override fun writeTo(sink: BufferedSink) {
+      synchronized(this) {
+        if (cleared) throw IOException("Direct request body is no longer available")
+        try {
+          sink.write(bytes)
+        } finally {
+          wipe()
+        }
+      }
+    }
+
+    fun wipe() {
+      synchronized(this) {
+        bytes.fill(0)
+        cleared = true
+      }
+    }
   }
 
   private class RejectedDirectHttpCall(
@@ -525,6 +582,8 @@ internal class NativeDirectHttpTransport private constructor(
     const val JSON_MEDIA_TYPE = "application/json"
     val JSON_MEDIA_TYPE_VALUE = JSON_MEDIA_TYPE.toMediaType()
     const val OWN_PREKEY_UPLOAD_TARGET = "/v1/prekeys"
+    const val CONTACT_CREATE_TARGET = "/v1/conversations/dm"
+    const val CONTACT_SEARCH_TARGET_PREFIX = "/v1/users/search?username="
     val OWN_PREKEY_COUNT_TARGET = Regex("^/v1/prekeys/[0-9a-f]{64}/count$")
     const val MAX_REQUEST_TARGET_CHARS = 8 * 1024
     const val MAX_REQUEST_BODY_BYTES = 64 * 1024

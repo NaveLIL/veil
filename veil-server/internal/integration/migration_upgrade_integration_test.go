@@ -16,17 +16,16 @@ import (
 	"time"
 
 	veildb "github.com/NaveLIL/veil/veil-server/internal/db"
+	"github.com/NaveLIL/veil/veil-server/internal/testpostgres"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/testcontainers/testcontainers-go"
-	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
-	"github.com/testcontainers/testcontainers-go/wait"
 )
 
 // TestMigrationUpgradePreflights exercises the upgrade boundaries that a
 // fresh-schema integration run cannot reach. Each subtest gets an independent
-// database in one PostgreSQL container so an intentionally failed migration
+// database in one PostgreSQL instance so an intentionally failed migration
 // cannot contaminate the next fixture.
 func TestMigrationUpgradePreflights(t *testing.T) {
 	migrations, err := loadMigrations()
@@ -2085,25 +2084,8 @@ func startMigrationPostgres(t *testing.T) (string, *pgxpool.Pool) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
-	container, err := tcpostgres.Run(ctx,
-		"postgres:16-alpine",
-		tcpostgres.WithDatabase("veil"),
-		tcpostgres.WithUsername("veil"),
-		tcpostgres.WithPassword("veil"),
-		testcontainers.WithWaitStrategy(
-			wait.ForLog("database system is ready to accept connections").
-				WithOccurrence(2).
-				WithStartupTimeout(60*time.Second),
-		),
-	)
-	if err != nil {
-		t.Fatalf("start migration postgres container: %v", err)
-	}
-	t.Cleanup(func() { _ = container.Terminate(context.Background()) })
-	baseDSN, err := container.ConnectionString(ctx, "sslmode=disable")
-	if err != nil {
-		t.Fatalf("migration postgres dsn: %v", err)
-	}
+	baseDSN := testpostgres.Provision(t, ctx)
+
 	admin, err := pgxpool.New(ctx, baseDSN)
 	if err != nil {
 		t.Fatalf("connect migration postgres admin: %v", err)
@@ -2120,14 +2102,23 @@ func newMigrationDatabase(t *testing.T, admin *pgxpool.Pool, baseDSN, name strin
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	if _, err := admin.Exec(ctx, "CREATE DATABASE "+pgx.Identifier{name}.Sanitize()); err != nil {
+	databaseName := "veil_migration_" + uuid.NewString()
+	identifier := pgx.Identifier{databaseName}.Sanitize()
+	if _, err := admin.Exec(ctx, "CREATE DATABASE "+identifier); err != nil {
 		t.Fatalf("create migration database %s: %v", name, err)
 	}
+	t.Cleanup(func() {
+		cleanup, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		if _, err := admin.Exec(cleanup, "DROP DATABASE "+identifier+" WITH (FORCE)"); err != nil {
+			t.Errorf("drop migration database %s: %v", name, err)
+		}
+	})
 	parsed, err := url.Parse(baseDSN)
 	if err != nil {
 		t.Fatalf("parse migration postgres dsn: %v", err)
 	}
-	parsed.Path = "/" + name
+	parsed.Path = "/" + databaseName
 	pool, err := pgxpool.New(ctx, parsed.String())
 	if err != nil {
 		t.Fatalf("connect migration database %s: %v", name, err)

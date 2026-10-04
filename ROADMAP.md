@@ -5,6 +5,9 @@
 > April hardening notes and design rationale; its old “Next candidates” order
 > is historical and must not override the canonical roadmap.
 
+The [backend and Android reliability proposal dated 2026-10-04](docs/roadmaps/backend-and-mobile-reliability-2026-10-04.md)
+adds implementation dependencies and acceptance criteria without changing these historical statuses.
+
 ## Current status of the W-items
 
 | Item | Status on 2026-07-12 |

@@ -56,6 +56,10 @@ type Service struct {
 
 	mu         sync.Mutex
 	challenges map[string]*pendingChallenge
+	closed     bool
+	stop       chan struct{}
+	done       chan struct{}
+	closeOnce  sync.Once
 }
 
 func NewService(database *db.DB, cfg *config.Config) *Service {
@@ -63,6 +67,7 @@ func NewService(database *db.DB, cfg *config.Config) *Service {
 		db:         database,
 		cfg:        cfg,
 		challenges: make(map[string]*pendingChallenge),
+		stop:       make(chan struct{}), done: make(chan struct{}),
 	}
 	if database != nil {
 		s.wsAuthV3Store = database
@@ -93,6 +98,11 @@ func (s *Service) CreateChallengeV3(connID string) (ChallengeV3, error) {
 
 	canonicalOrigin := s.cfg.PublicOrigin.String()
 	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		clear(private[:])
+		return result, ErrChallengeUnknown
+	}
 	if previous := s.challenges[connID]; previous != nil {
 		clear(previous.private[:])
 	}
@@ -180,7 +190,13 @@ func (s *Service) RemoveChallenge(connID string) {
 func (s *Service) cleanupLoop() {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
-	for range ticker.C {
+	defer close(s.done)
+	for {
+		select {
+		case <-s.stop:
+			return
+		case <-ticker.C:
+		}
 		s.mu.Lock()
 		if s.cfg == nil {
 			for id, challenge := range s.challenges {
@@ -198,5 +214,28 @@ func (s *Service) cleanupLoop() {
 			}
 		}
 		s.mu.Unlock()
+	}
+}
+
+// Close joins the challenge janitor and clears every retained ephemeral key.
+// It is idempotent and prevents new challenge allocation during shutdown.
+func (s *Service) Close() {
+	if s == nil {
+		return
+	}
+	s.closeOnce.Do(func() {
+		s.mu.Lock()
+		s.closed = true
+		for id, challenge := range s.challenges {
+			clear(challenge.private[:])
+			delete(s.challenges, id)
+		}
+		s.mu.Unlock()
+		if s.stop != nil {
+			close(s.stop)
+		}
+	})
+	if s.done != nil {
+		<-s.done
 	}
 }

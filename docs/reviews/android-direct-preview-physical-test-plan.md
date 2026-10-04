@@ -53,9 +53,32 @@ Record all of the following before touching a physical device:
 A differently signed tester APK cannot replace an existing debug package in
 place. The checked-in contract reserves `io.veil.mobile.tester`, `veil-tester`,
 distinct visual branding, and a package-scoped Keystore/database for this
-purpose. This is packaging code only: no signed artifact has yet been produced
-or tested. Do not solve a failed preflight by uninstalling the user's current
+purpose. Artifact production/verification must be evidenced by the dated
+execution record; this plan alone does not prove an APK exists or was tested.
+Do not solve a failed preflight by uninstalling the user's current
 package.
+
+### First tester bootstrap clarification — 2026-10-04
+
+The user confirmed that no production certificate exists and authorized a
+permanent local tester signing key. The artifact contract now permits an
+explicit **local first tester bootstrap** verifier mode using the independently
+expected tester certificate and actual forbidden debug certificate. All
+signature, v2-only/no-rotation, package/version/source, privacy, bundled JS and
+native ABI guards remain required. Protected CI and strict evidence still
+require the production fingerprint; the bootstrap mode does not invent it.
+
+Its evidence schema is `veil.android-first-tester-bootstrap-evidence.v1` and
+must record `productionSeparationVerified=false` and `releaseReady=false`, with
+the production separation and physical testing gates deferred. A bootstrap
+artifact can be identified for an explicitly authorized manual tester handoff;
+it cannot satisfy full R24/production readiness. Host verification does not
+execute any matrix case, authorize automated device mutation or complete the
+recovery ceremony. A dirty local source tree must retain its reviewed source
+record and base commit; the clean exact-source release prerequisite stays open.
+
+The original physical matrix remains unexecuted until actual observations are
+recorded. Do not fill missing results using build, unit-test or APK evidence.
 
 ## Evidence record
 

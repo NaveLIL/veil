@@ -51,6 +51,15 @@ pub struct DirectMessageOutboxScopeV1 {
     pub device_id: [u8; 16],
 }
 
+/// Native-only scoped timeline row. Public IDs are aliases of existing durable
+/// identities; the renderer never creates a second identity for the same send.
+pub struct DirectMessageProjectionRowV2 {
+    pub message: Message,
+    pub stable_ui_id: String,
+    pub client_message_id: Option<String>,
+    pub server_message_id: Option<String>,
+}
+
 /// All state required to publish one new Direct ciphertext without exposing a
 /// ratchet/message split-brain window.
 ///
@@ -8559,6 +8568,121 @@ impl VeilDb {
                 |row| row.get(0),
             )
             .map_err(|e| format!("check discardable outgoing message: {e}"))
+    }
+
+    /// Read one consistent Direct timeline with stable identities from existing
+    /// durable outbox receipts. Legacy outgoing rows without a receipt fail
+    /// closed; no timestamp/text heuristic or new presentation UUID is used.
+    /// Terminal receipt retention is part of this identity contract.
+    pub fn get_direct_messages_with_ui_identity_v2(
+        &self,
+        scope: &DirectMessageOutboxScopeV1,
+        conversation_id: &str,
+        limit: u32,
+    ) -> Result<Vec<DirectMessageProjectionRowV2>, String> {
+        validate_direct_message_outbox_scope_v1(scope)?;
+        validate_canonical_uuid("Direct UI conversation id", conversation_id)?;
+        if limit == 0 || limit > 500 {
+            return Err("Direct UI projection limit is invalid".to_string());
+        }
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)
+            .map_err(|error| format!("begin Direct UI projection snapshot: {error}"))?;
+        let self_binding = require_current_direct_outbox_self_v1(&tx, scope)?;
+        let route =
+            resolve_current_direct_outbox_route_v1(&tx, scope, &self_binding, conversation_id)?;
+        // get_messages uses this same connection and therefore this read snapshot.
+        let messages = self.get_messages(conversation_id, limit)?;
+        let receipt_sql = format!(
+            "SELECT {DIRECT_MESSAGE_OUTBOX_SELECT_V1}
+             FROM direct_message_outbox_v1
+             WHERE local_message_id = ?1 OR server_message_id = ?1
+             LIMIT 2"
+        );
+        let mut receipt_query = tx
+            .prepare(&receipt_sql)
+            .map_err(|error| format!("prepare Direct UI receipt resolution: {error}"))?;
+        let mut stable_ids = HashSet::with_capacity(messages.len());
+        let mut projected = Vec::with_capacity(messages.len());
+        for message in messages {
+            validate_canonical_uuid("Direct UI message id", &message.id)?;
+            if message.conversation_id != conversation_id {
+                return Err("Direct UI message conversation changed".to_string());
+            }
+            let (stable_ui_id, client_message_id, server_message_id) = if message.is_outgoing {
+                if message.sender_key.as_slice() != self_binding.identity_key.as_slice() {
+                    return Err("Direct UI outgoing author binding is invalid".to_string());
+                }
+                let receipts = receipt_query
+                    .query_map(
+                        rusqlite::params![&message.id],
+                        stored_direct_message_outbox_row_v1,
+                    )
+                    .map_err(|error| format!("load Direct UI receipt aliases: {error}"))?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| format!("read Direct UI receipt aliases: {error}"))?;
+                if receipts.len() != 1 {
+                    return Err("Direct UI outgoing identity is absent or ambiguous".to_string());
+                }
+                let receipt = &receipts[0];
+                validate_stored_direct_outbox_row_v1(receipt, scope, Some(&route))?;
+                if receipt.conversation_id != conversation_id {
+                    return Err("Direct UI receipt belongs to another conversation".to_string());
+                }
+                let correct_message = match receipt.state {
+                    0 => {
+                        message.id == receipt.local_message_id
+                            && message.server_timestamp.is_none()
+                            && matches!(
+                                message.status,
+                                crate::models::MessageStatus::Sending
+                                    | crate::models::MessageStatus::Unknown
+                            )
+                    }
+                    1 => {
+                        Some(message.id.as_str()) == receipt.server_message_id.as_deref()
+                            && message.server_timestamp == receipt.server_timestamp_ms
+                            && matches!(
+                                message.status,
+                                crate::models::MessageStatus::Sent
+                                    | crate::models::MessageStatus::Delivered
+                                    | crate::models::MessageStatus::Read
+                            )
+                    }
+                    2 => {
+                        message.id == receipt.local_message_id
+                            && message.server_timestamp.is_none()
+                            && message.status == crate::models::MessageStatus::Failed
+                    }
+                    _ => false,
+                };
+                if !correct_message {
+                    return Err("Direct UI message differs from its durable receipt".to_string());
+                }
+                (
+                    receipt.client_message_id.clone(),
+                    Some(receipt.client_message_id.clone()),
+                    receipt.server_message_id.clone(),
+                )
+            } else {
+                if message.sender_key.as_slice() != route.peer_identity_key.as_slice() {
+                    return Err("Direct UI incoming author binding is invalid".to_string());
+                }
+                (message.id.clone(), None, Some(message.id.clone()))
+            };
+            if !stable_ids.insert(stable_ui_id.clone()) {
+                return Err("Direct UI projection repeats a stable identity".to_string());
+            }
+            projected.push(DirectMessageProjectionRowV2 {
+                message,
+                stable_ui_id,
+                client_message_id,
+                server_message_id,
+            });
+        }
+        drop(receipt_query);
+        tx.commit()
+            .map_err(|error| format!("commit Direct UI projection snapshot: {error}"))?;
+        Ok(projected)
     }
 
     pub fn get_messages(
@@ -19702,6 +19826,192 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("db-wal"));
         let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn direct_ui_identity_survives_ack_and_sqlcipher_reopen_without_a_new_uuid() {
+        let path = std::env::temp_dir().join(format!("veil-direct-ui-{}.db", uuid::Uuid::new_v4()));
+        let key = [0xD9; 32];
+        let db = VeilDb::open(&path, &key).unwrap();
+        let fixture = install_direct_outbox_fixture(&db);
+        let mut input =
+            direct_outbox_input(&fixture, DIRECT_CLIENT_ID_1, b"exact-original-send", 0);
+        input.attachments.clear();
+        db.enqueue_direct_message_outbox_v1(&input).unwrap();
+        let pending = db
+            .get_direct_messages_with_ui_identity_v2(&fixture.scope, DIRECT_CONVERSATION_ID, 100)
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].message.id, DIRECT_CLIENT_ID_1);
+        assert_eq!(pending[0].stable_ui_id, DIRECT_CLIENT_ID_1);
+        assert_eq!(
+            pending[0].client_message_id.as_deref(),
+            Some(DIRECT_CLIENT_ID_1)
+        );
+        assert_eq!(pending[0].server_message_id, None);
+        db.acknowledge_direct_message_outbox_v1(
+            &fixture.scope,
+            DIRECT_CLIENT_ID_1,
+            DIRECT_SERVER_ID_1,
+            1_700_000_000_001,
+        )
+        .unwrap();
+        drop(db);
+        let db = VeilDb::open(&path, &key).unwrap();
+        let acknowledged = db
+            .get_direct_messages_with_ui_identity_v2(&fixture.scope, DIRECT_CONVERSATION_ID, 100)
+            .unwrap();
+        assert_eq!(acknowledged.len(), 1);
+        assert_eq!(acknowledged[0].message.id, DIRECT_SERVER_ID_1);
+        assert_eq!(acknowledged[0].stable_ui_id, pending[0].stable_ui_id);
+        assert_eq!(
+            acknowledged[0].server_message_id.as_deref(),
+            Some(DIRECT_SERVER_ID_1)
+        );
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn direct_ui_identity_is_exactly_scoped_and_never_fabricates_a_legacy_alias() {
+        let db = VeilDb::open_memory(&[0xDA; 32]).unwrap();
+        let fixture = install_direct_outbox_fixture(&db);
+        let input = direct_outbox_input(&fixture, DIRECT_CLIENT_ID_1, b"scope-bound-id", 0);
+        db.enqueue_direct_message_outbox_v1(&input).unwrap();
+        let mut wrong_origin = fixture.scope.clone();
+        wrong_origin.canonical_server_origin = ORIGIN_B.to_string();
+        let mut wrong_user = fixture.scope.clone();
+        wrong_user.user_id = USER_B.to_string();
+        let mut wrong_device = fixture.scope.clone();
+        wrong_device.device_id = [0x76; 16];
+        for scope in [wrong_origin, wrong_user, wrong_device] {
+            assert!(db
+                .get_direct_messages_with_ui_identity_v2(&scope, DIRECT_CONVERSATION_ID, 100)
+                .is_err());
+        }
+        db.conn
+            .execute(
+                "UPDATE direct_message_outbox_v1 SET device_id = ?1",
+                rusqlite::params![[0x76_u8; 16].as_slice()],
+            )
+            .unwrap();
+        assert!(db
+            .get_direct_messages_with_ui_identity_v2(&fixture.scope, DIRECT_CONVERSATION_ID, 100)
+            .is_err());
+        db.conn
+            .execute("DELETE FROM direct_message_outbox_v1", [])
+            .unwrap();
+        assert_eq!(
+            db.get_messages(DIRECT_CONVERSATION_ID, 100).unwrap().len(),
+            1
+        );
+        assert!(db
+            .get_direct_messages_with_ui_identity_v2(&fixture.scope, DIRECT_CONVERSATION_ID, 100)
+            .is_err());
+    }
+
+    #[test]
+    fn direct_ui_identity_rejects_ambiguous_receipt_aliases() {
+        let db = VeilDb::open_memory(&[0xDB; 32]).unwrap();
+        let fixture = install_direct_outbox_fixture(&db);
+        db.enqueue_direct_message_outbox_v1(&direct_outbox_input(
+            &fixture,
+            DIRECT_CLIENT_ID_1,
+            b"first-exact-send",
+            0,
+        ))
+        .unwrap();
+        db.acknowledge_direct_message_outbox_v1(
+            &fixture.scope,
+            DIRECT_CLIENT_ID_1,
+            DIRECT_SERVER_ID_1,
+            1_700_000_000_001,
+        )
+        .unwrap();
+        db.enqueue_direct_message_outbox_v1(&direct_outbox_input(
+            &fixture,
+            DIRECT_CLIENT_ID_2,
+            b"second-exact-send",
+            1,
+        ))
+        .unwrap();
+        db.conn
+            .execute(
+                "UPDATE direct_message_outbox_v1 SET server_message_id = ?1
+            WHERE client_message_id = ?2",
+                rusqlite::params![DIRECT_CLIENT_ID_2, DIRECT_CLIENT_ID_1],
+            )
+            .unwrap();
+        let error = db
+            .get_direct_messages_with_ui_identity_v2(&fixture.scope, DIRECT_CONVERSATION_ID, 1)
+            .err()
+            .unwrap();
+        assert!(error.contains("absent or ambiguous"));
+    }
+
+    #[test]
+    fn direct_ui_identity_rejects_a_cross_direction_server_id_alias_collision() {
+        let db = VeilDb::open_memory(&[0xDD; 32]).unwrap();
+        let fixture = install_direct_outbox_fixture(&db);
+        db.enqueue_direct_message_outbox_v1(&direct_outbox_input(
+            &fixture,
+            DIRECT_CLIENT_ID_1,
+            b"original-own-intent",
+            0,
+        ))
+        .unwrap();
+        db.acknowledge_direct_message_outbox_v1(
+            &fixture.scope,
+            DIRECT_CLIENT_ID_1,
+            DIRECT_SERVER_ID_1,
+            1_700_000_000_001,
+        )
+        .unwrap();
+        db.insert_message(
+            DIRECT_CLIENT_ID_1,
+            DIRECT_CONVERSATION_ID,
+            &fixture.peer_account.locator.identity_key,
+            "peer reuses original client ID",
+            false,
+            Some(1_700_000_000_002),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            db.get_messages(DIRECT_CONVERSATION_ID, 100).unwrap().len(),
+            2
+        );
+        let error = db
+            .get_direct_messages_with_ui_identity_v2(&fixture.scope, DIRECT_CONVERSATION_ID, 100)
+            .err()
+            .unwrap();
+        assert!(error.contains("repeats a stable identity"));
+    }
+
+    #[test]
+    fn direct_ui_incoming_identity_is_the_canonical_server_id() {
+        let db = VeilDb::open_memory(&[0xDC; 32]).unwrap();
+        let fixture = install_direct_outbox_fixture(&db);
+        db.insert_message(
+            DIRECT_SERVER_ID_1,
+            DIRECT_CONVERSATION_ID,
+            &fixture.peer_account.locator.identity_key,
+            "authenticated peer text",
+            false,
+            Some(1_700_000_000_001),
+            None,
+        )
+        .unwrap();
+        let incoming = db
+            .get_direct_messages_with_ui_identity_v2(&fixture.scope, DIRECT_CONVERSATION_ID, 100)
+            .unwrap();
+        assert_eq!(incoming.len(), 1);
+        assert_eq!(incoming[0].stable_ui_id, DIRECT_SERVER_ID_1);
+        assert_eq!(
+            incoming[0].server_message_id.as_deref(),
+            Some(DIRECT_SERVER_ID_1)
+        );
+        assert_eq!(incoming[0].client_message_id, None);
     }
 
     #[test]

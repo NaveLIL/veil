@@ -430,6 +430,29 @@ pub enum MobileDirectTextSendOutcome {
     Unavailable,
 }
 
+/// Public correlation of one already committed native intent. These are the
+/// existing SQLCipher outbox IDs, never IDs allocated by a renderer.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MobileDirectTextSendAcceptanceV2 {
+    pub client_message_id: String,
+    pub local_message_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MobileDirectTextSendResultV2 {
+    pub outcome: MobileDirectTextSendOutcome,
+    pub acceptance: Option<MobileDirectTextSendAcceptanceV2>,
+}
+
+impl MobileDirectTextSendResultV2 {
+    fn unaccepted(outcome: MobileDirectTextSendOutcome) -> Self {
+        Self {
+            outcome,
+            acceptance: None,
+        }
+    }
+}
+
 /// Opaque UI availability for one caller-supplied Direct conversation.
 ///
 /// The unavailable state deliberately does not distinguish a quarantined
@@ -539,6 +562,61 @@ impl MobileDirectMessageData {
 pub struct MobileDirectMessageProjection {
     pub availability: MobileDirectMessageProjectionAvailability,
     pub messages: Vec<Arc<MobileDirectMessageData>>,
+}
+
+/// Strict v2 projection retains one native identity across local echo and ACK.
+/// The v1 object/projection remain unchanged for existing native callers.
+#[derive(uniffi::Object)]
+pub struct MobileDirectMessageDataV2 {
+    message_id: Zeroizing<String>,
+    stable_ui_id: Zeroizing<String>,
+    client_message_id: Option<Zeroizing<String>>,
+    server_message_id: Option<Zeroizing<String>>,
+    text: Zeroizing<String>,
+    timestamp_ms: Option<i64>,
+    direction: MobileDirectMessageDirection,
+    delivery: MobileDirectMessageDelivery,
+}
+
+#[uniffi::export]
+impl MobileDirectMessageDataV2 {
+    pub fn message_id(&self) -> String {
+        self.message_id.to_string()
+    }
+    pub fn stable_ui_id(&self) -> String {
+        self.stable_ui_id.to_string()
+    }
+    pub fn client_message_id(&self) -> Option<String> {
+        self.client_message_id.as_ref().map(|id| id.to_string())
+    }
+    pub fn server_message_id(&self) -> Option<String> {
+        self.server_message_id.as_ref().map(|id| id.to_string())
+    }
+    pub fn text(&self) -> String {
+        self.text.to_string()
+    }
+    pub fn timestamp_ms(&self) -> Option<i64> {
+        self.timestamp_ms
+    }
+    pub fn direction(&self) -> MobileDirectMessageDirection {
+        self.direction
+    }
+    pub fn delivery(&self) -> MobileDirectMessageDelivery {
+        self.delivery
+    }
+}
+
+#[derive(uniffi::Record)]
+pub struct MobileDirectMessageProjectionV2 {
+    pub availability: MobileDirectMessageProjectionAvailability,
+    pub messages: Vec<Arc<MobileDirectMessageDataV2>>,
+}
+
+fn unavailable_mobile_direct_message_projection_v2() -> MobileDirectMessageProjectionV2 {
+    MobileDirectMessageProjectionV2 {
+        availability: MobileDirectMessageProjectionAvailability::Unavailable,
+        messages: Vec::new(),
+    }
 }
 
 const MOBILE_DIRECT_MESSAGE_PROJECTION_LIMIT: u32 = 100;
@@ -2742,20 +2820,40 @@ impl VeilMobileSession {
         conversation_id: String,
         plaintext_utf8: Vec<u8>,
     ) -> Result<MobileDirectTextSendOutcome, VeilError> {
+        self.send_direct_text_v2(lease_token, conversation_id, plaintext_utf8)
+            .map(|result| result.outcome)
+    }
+
+    /// v2 returns only the original accepted client/local IDs, after the atomic
+    /// enqueue. Transport status never authorizes a second user intent.
+    pub fn send_direct_text_v2(
+        &self,
+        lease_token: String,
+        conversation_id: String,
+        plaintext_utf8: Vec<u8>,
+    ) -> Result<MobileDirectTextSendResultV2, VeilError> {
         let plaintext_utf8 = Zeroizing::new(plaintext_utf8);
         if require_mobile_sync_token(&lease_token).is_err() {
-            return Ok(MobileDirectTextSendOutcome::Unavailable);
+            return Ok(MobileDirectTextSendResultV2::unaccepted(
+                MobileDirectTextSendOutcome::Unavailable,
+            ));
         }
         let Ok(conversation_id) =
             require_canonical_user_id("Direct conversation ID", &conversation_id)
         else {
-            return Ok(MobileDirectTextSendOutcome::Unavailable);
+            return Ok(MobileDirectTextSendResultV2::unaccepted(
+                MobileDirectTextSendOutcome::Unavailable,
+            ));
         };
         let Ok(plaintext) = std::str::from_utf8(plaintext_utf8.as_slice()) else {
-            return Ok(MobileDirectTextSendOutcome::Rejected);
+            return Ok(MobileDirectTextSendResultV2::unaccepted(
+                MobileDirectTextSendOutcome::Rejected,
+            ));
         };
         if plaintext.is_empty() || plaintext.len() > MOBILE_DIRECT_MESSAGE_MAX_PLAINTEXT_BYTES {
-            return Ok(MobileDirectTextSendOutcome::Rejected);
+            return Ok(MobileDirectTextSendResultV2::unaccepted(
+                MobileDirectTextSendOutcome::Rejected,
+            ));
         }
 
         let mut sync = self
@@ -2765,7 +2863,9 @@ impl VeilMobileSession {
                 msg: format!("lock mobile Direct sync: {error}"),
             })?;
         let Some(state) = sync.as_mut() else {
-            return Ok(MobileDirectTextSendOutcome::Unavailable);
+            return Ok(MobileDirectTextSendResultV2::unaccepted(
+                MobileDirectTextSendOutcome::Unavailable,
+            ));
         };
         let mut binding = self.binding.lock().map_err(|error| VeilError::Session {
             msg: format!("lock mobile binding: {error}"),
@@ -2774,7 +2874,9 @@ impl VeilMobileSession {
             msg: format!("lock mobile client: {error}"),
         })?;
         if state.outstanding_request.is_some() {
-            return Ok(MobileDirectTextSendOutcome::Unavailable);
+            return Ok(MobileDirectTextSendResultV2::unaccepted(
+                MobileDirectTextSendOutcome::Unavailable,
+            ));
         }
         match mobile_direct_send_readiness_for_current_lease(
             &client,
@@ -2784,67 +2886,78 @@ impl VeilMobileSession {
             &conversation_id,
         ) {
             MobileDirectSendReadiness::NeedsPreKey => {
-                return Ok(MobileDirectTextSendOutcome::NeedsPreKey)
+                return Ok(MobileDirectTextSendResultV2::unaccepted(
+                    MobileDirectTextSendOutcome::NeedsPreKey,
+                ))
             }
             MobileDirectSendReadiness::Unavailable => {
-                return Ok(MobileDirectTextSendOutcome::Unavailable)
+                return Ok(MobileDirectTextSendResultV2::unaccepted(
+                    MobileDirectTextSendOutcome::Unavailable,
+                ))
             }
             MobileDirectSendReadiness::Ready => {}
         }
 
-        match self
+        let report = match self
             .runtime
             .block_on(client.enqueue_direct_text_v1(&conversation_id, plaintext))
         {
-            Ok(report)
-                if matches!(
-                    report.transport_stop,
-                    Some(
-                        veil_client::api::DirectLiveReplayStopV1::EpochInvalid
-                            | veil_client::api::DirectLiveReplayStopV1::StorageUncertain
-                    )
-                ) =>
-            {
-                // SQLCipher already owns the exact user intent, but this
-                // source-typed terminal is outside the reconnect allowlist.
-                revoke_mobile_direct_epoch_locked(state, &mut binding, &mut client);
-                Ok(MobileDirectTextSendOutcome::AcceptedSessionInvalid)
-            }
-            Ok(report)
-                if matches!(
-                    report.transport_stop,
-                    Some(
-                        veil_client::api::DirectLiveReplayStopV1::RetryableTransport
-                            | veil_client::api::DirectLiveReplayStopV1::AckDeadline
-                    )
-                ) =>
-            {
-                revoke_mobile_direct_epoch_locked(state, &mut binding, &mut client);
-                Ok(MobileDirectTextSendOutcome::AcceptedForReplay)
-            }
-            Ok(report) if report.transport_enqueued && report.sequence > 0 => {
-                Ok(MobileDirectTextSendOutcome::Accepted)
-            }
-            Ok(_) => {
-                // SQLCipher already owns this exact user intent, but the
-                // native enqueue report violated its positive success
-                // contract. Fail closed without granting reconnect.
-                revoke_mobile_direct_epoch_locked(state, &mut binding, &mut client);
-                Ok(MobileDirectTextSendOutcome::AcceptedSessionInvalid)
-            }
+            Ok(report) => report,
             Err(veil_client::api::DirectSendErrorV1::Rejected(_)) => {
-                Ok(MobileDirectTextSendOutcome::Rejected)
+                return Ok(MobileDirectTextSendResultV2::unaccepted(
+                    MobileDirectTextSendOutcome::Rejected,
+                ));
             }
             Err(veil_client::api::DirectSendErrorV1::StorageUncertain(_)) => {
                 *binding = None;
                 fail_mobile_direct_sync_sticky(state);
-                Err(VeilError::Session {
+                return Err(VeilError::Session {
                     msg: "mobile Direct send storage is uncertain".to_string(),
-                })
+                });
             }
+        };
+        if report.client_message_id != report.local_message_id
+            || require_canonical_user_id("Direct accepted client ID", &report.client_message_id)
+                .is_err()
+            || require_canonical_user_id("Direct accepted local ID", &report.local_message_id)
+                .is_err()
+        {
+            revoke_mobile_direct_epoch_locked(state, &mut binding, &mut client);
+            return Err(VeilError::Session {
+                msg: "mobile Direct accepted identity is invalid".to_string(),
+            });
         }
+        let outcome = match report.transport_stop {
+            Some(
+                veil_client::api::DirectLiveReplayStopV1::EpochInvalid
+                | veil_client::api::DirectLiveReplayStopV1::StorageUncertain,
+            ) => {
+                revoke_mobile_direct_epoch_locked(state, &mut binding, &mut client);
+                MobileDirectTextSendOutcome::AcceptedSessionInvalid
+            }
+            Some(
+                veil_client::api::DirectLiveReplayStopV1::RetryableTransport
+                | veil_client::api::DirectLiveReplayStopV1::AckDeadline,
+            ) => {
+                revoke_mobile_direct_epoch_locked(state, &mut binding, &mut client);
+                MobileDirectTextSendOutcome::AcceptedForReplay
+            }
+            None if report.transport_enqueued && report.sequence > 0 => {
+                MobileDirectTextSendOutcome::Accepted
+            }
+            _ => {
+                revoke_mobile_direct_epoch_locked(state, &mut binding, &mut client);
+                MobileDirectTextSendOutcome::AcceptedSessionInvalid
+            }
+        };
+        Ok(MobileDirectTextSendResultV2 {
+            outcome,
+            acceptance: Some(MobileDirectTextSendAcceptanceV2 {
+                client_message_id: report.client_message_id,
+                local_message_id: report.local_message_id,
+            }),
+        })
     }
-
     /// Return coarse, advisory send readiness for one exact Direct route under
     /// the current Ready lease.
     ///
@@ -3037,6 +3150,156 @@ impl VeilMobileSession {
     /// availability, and the guarded client projection while retaining the
     /// documented `direct_sync -> binding -> client` lock order. Every denied
     /// state is collapsed to the same opaque result with no identifiers.
+    /// Strict v2 UI identity projection. Outgoing legacy rows without their
+    /// original scoped receipt are unavailable rather than assigned a new ID.
+    pub fn project_direct_messages_v2(
+        &self,
+        conversation_id: String,
+    ) -> Result<MobileDirectMessageProjectionV2, VeilError> {
+        let conversation_id =
+            require_canonical_user_id("Direct conversation ID", &conversation_id)?;
+        let sync = self
+            .direct_sync
+            .lock()
+            .map_err(|error| VeilError::Session {
+                msg: format!("lock mobile Direct sync: {error}"),
+            })?;
+        let Some(state) = sync.as_ref() else {
+            return Ok(unavailable_mobile_direct_message_projection_v2());
+        };
+        if state.phase != MobileDirectSyncPhase::Ready || !state.outbox_replay_complete {
+            return Ok(unavailable_mobile_direct_message_projection_v2());
+        }
+
+        let binding = self.binding.lock().map_err(|error| VeilError::Session {
+            msg: format!("lock mobile binding: {error}"),
+        })?;
+        if binding.as_ref() != Some(&state.epoch) {
+            return Ok(unavailable_mobile_direct_message_projection_v2());
+        }
+
+        let client = self.client.lock().map_err(|error| VeilError::Session {
+            msg: format!("lock mobile client: {error}"),
+        })?;
+        let availability = mobile_direct_projection_availability(
+            client.direct_conversation_availability_v1(&conversation_id),
+        );
+        if availability != MobileDirectMessageProjectionAvailability::Available
+            || state.blocked_conversations.contains_key(&conversation_id)
+        {
+            return Ok(unavailable_mobile_direct_message_projection_v2());
+        }
+        let Some((self_identity_key, peer_identity_key)) =
+            mobile_direct_projection_scope(&client, state, &conversation_id)
+        else {
+            return Ok(unavailable_mobile_direct_message_projection_v2());
+        };
+
+        let messages = match client
+            .direct_messages_projection_v2(&conversation_id, MOBILE_DIRECT_MESSAGE_PROJECTION_LIMIT)
+        {
+            Ok(messages) => messages,
+            Err(_) => return Ok(unavailable_mobile_direct_message_projection_v2()),
+        };
+        if messages.len() > MOBILE_DIRECT_MESSAGE_PROJECTION_LIMIT as usize {
+            return Ok(unavailable_mobile_direct_message_projection_v2());
+        }
+        let mut total_plaintext_bytes = 0usize;
+        for row in &messages {
+            let message = &row.message;
+            const MAX_TIMESTAMP_MS: i64 = 253_402_300_799_999;
+            let canonical_message_id = uuid::Uuid::parse_str(&message.id).is_ok_and(|parsed| {
+                !parsed.is_nil() && parsed.hyphenated().to_string() == message.id
+            });
+            let timestamp_is_valid = message
+                .server_timestamp
+                .is_none_or(|timestamp_ms| (0..=MAX_TIMESTAMP_MS).contains(&timestamp_ms));
+            if mobile_direct_message_delivery(message.status as u8).is_none() {
+                return Ok(unavailable_mobile_direct_message_projection_v2());
+            }
+            let expected_sender = if message.is_outgoing {
+                &self_identity_key
+            } else {
+                &peer_identity_key
+            };
+            let plaintext_bytes = message.plaintext.len();
+            let Some(next_total_plaintext_bytes) =
+                total_plaintext_bytes.checked_add(plaintext_bytes)
+            else {
+                return Ok(unavailable_mobile_direct_message_projection_v2());
+            };
+            // Stage 5 publishes only immutable, non-expiring Direct text.
+            // Future protocol shapes need an explicit projection contract.
+            if message.conversation_id != conversation_id
+                || message.sender_key.as_slice() != expected_sender.as_slice()
+                || message.plaintext.is_empty()
+                || plaintext_bytes > MOBILE_DIRECT_MESSAGE_MAX_PLAINTEXT_BYTES
+                || next_total_plaintext_bytes > MOBILE_DIRECT_MESSAGE_PROJECTION_MAX_PLAINTEXT_BYTES
+                || message.msg_type != 0
+                || message.reply_to_id.is_some()
+                || message.expires_at.is_some()
+                || !message.attachments.is_empty()
+                || !canonical_message_id
+                || !timestamp_is_valid
+            {
+                return Ok(unavailable_mobile_direct_message_projection_v2());
+            }
+            total_plaintext_bytes = next_total_plaintext_bytes;
+        }
+
+        for row in &messages {
+            let message = &row.message;
+            let valid_identity = if message.is_outgoing {
+                row.client_message_id.as_deref() == Some(row.stable_ui_id.as_str())
+                    && row
+                        .server_message_id
+                        .as_deref()
+                        .is_none_or(|server_id| server_id == message.id)
+            } else {
+                row.client_message_id.is_none()
+                    && row.stable_ui_id == message.id
+                    && row.server_message_id.as_deref() == Some(message.id.as_str())
+            };
+            if !valid_identity
+                || require_canonical_user_id("Direct stable UI ID", &row.stable_ui_id).is_err()
+                || row
+                    .client_message_id
+                    .as_deref()
+                    .is_some_and(|id| require_canonical_user_id("Direct client ID", id).is_err())
+                || row
+                    .server_message_id
+                    .as_deref()
+                    .is_some_and(|id| require_canonical_user_id("Direct server ID", id).is_err())
+            {
+                return Ok(unavailable_mobile_direct_message_projection_v2());
+            }
+        }
+
+        let mut projected = Vec::with_capacity(messages.len());
+        for row in messages {
+            let message = row.message;
+            projected.push(Arc::new(MobileDirectMessageDataV2 {
+                stable_ui_id: Zeroizing::new(row.stable_ui_id),
+                client_message_id: row.client_message_id.map(Zeroizing::new),
+                server_message_id: row.server_message_id.map(Zeroizing::new),
+                message_id: Zeroizing::new(message.id),
+                text: Zeroizing::new(message.plaintext),
+                timestamp_ms: message.server_timestamp,
+                direction: if message.is_outgoing {
+                    MobileDirectMessageDirection::Outgoing
+                } else {
+                    MobileDirectMessageDirection::Incoming
+                },
+                delivery: mobile_direct_message_delivery(message.status as u8)
+                    .expect("delivery state preflighted"),
+            }));
+        }
+        Ok(MobileDirectMessageProjectionV2 {
+            availability: MobileDirectMessageProjectionAvailability::Available,
+            messages: projected,
+        })
+    }
+
     pub fn project_direct_messages(
         &self,
         conversation_id: String,
@@ -7828,6 +8091,164 @@ mod tests {
             MobileDirectSendReadiness::Ready
         );
 
+        drop(session);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn mobile_direct_v2_acceptance_and_projection_use_the_original_durable_ids() {
+        let (session, path, token, conversation_id, peer, mut outbound) =
+            mobile_test_ready_prekey_fixture(165);
+        mobile_test_establish_direct_v2(&session, &conversation_id, peer);
+        let result = session
+            .send_direct_text_v2(
+                token,
+                conversation_id.clone(),
+                b"one native intent".to_vec(),
+            )
+            .unwrap();
+        assert_eq!(result.outcome, MobileDirectTextSendOutcome::Accepted);
+        let accepted = result.acceptance.unwrap();
+        assert_eq!(accepted.client_message_id, accepted.local_message_id);
+        let _wire = session
+            .runtime
+            .block_on(async { outbound.recv().await })
+            .unwrap();
+        let projection = session
+            .project_direct_messages_v2(conversation_id.clone())
+            .unwrap();
+        assert_eq!(
+            projection.availability,
+            MobileDirectMessageProjectionAvailability::Available
+        );
+        assert_eq!(projection.messages.len(), 1);
+        let message = &projection.messages[0];
+        assert_eq!(message.message_id(), accepted.local_message_id);
+        assert_eq!(message.stable_ui_id(), accepted.client_message_id);
+        assert_eq!(
+            message.client_message_id(),
+            Some(accepted.client_message_id.clone())
+        );
+        assert_eq!(message.server_message_id(), None);
+        assert_eq!(message.text(), "one native intent");
+        let binding = session
+            .binding
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .binding
+            .clone();
+        let server_id = "30000000-0000-4000-8000-000000000165";
+        {
+            let client = session.client.lock().unwrap();
+            let scope = veil_store::db::DirectMessageOutboxScopeV1 {
+                canonical_server_origin: binding.canonical_server_origin,
+                user_id: binding.user_id,
+                device_id: client.device_id(),
+            };
+            client
+                .db()
+                .unwrap()
+                .acknowledge_direct_message_outbox_v1(
+                    &scope,
+                    &accepted.client_message_id,
+                    server_id,
+                    1_700_000_000_165,
+                )
+                .unwrap();
+        }
+        let acknowledged = session
+            .project_direct_messages_v2(conversation_id.clone())
+            .unwrap();
+        assert_eq!(acknowledged.messages.len(), 1);
+        assert_eq!(acknowledged.messages[0].message_id(), server_id);
+        assert_eq!(
+            acknowledged.messages[0].stable_ui_id(),
+            accepted.client_message_id
+        );
+        assert_eq!(
+            acknowledged.messages[0].delivery(),
+            MobileDirectMessageDelivery::Sent
+        );
+        session
+            .client
+            .lock()
+            .unwrap()
+            .db()
+            .unwrap()
+            .conn()
+            .execute("DELETE FROM direct_message_outbox_v1", [])
+            .unwrap();
+        let legacy = session
+            .project_direct_messages(conversation_id.clone())
+            .unwrap();
+        assert_eq!(
+            legacy.availability,
+            MobileDirectMessageProjectionAvailability::Available
+        );
+        let denied = session.project_direct_messages_v2(conversation_id).unwrap();
+        assert_eq!(
+            denied.availability,
+            MobileDirectMessageProjectionAvailability::Unavailable
+        );
+        assert!(denied.messages.is_empty());
+        drop(session);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn mobile_direct_v2_retryable_post_commit_keeps_the_original_acceptance() {
+        let (session, path, token, conversation_id, peer, _outbound) =
+            mobile_test_ready_prekey_fixture(167);
+        mobile_test_establish_direct_v2(&session, &conversation_id, peer);
+        session
+            .client
+            .lock()
+            .unwrap()
+            .test_only_retryable_after_next_direct_commit_v1();
+        let result = session
+            .send_direct_text_v2(
+                token,
+                conversation_id,
+                b"same intent after reconnect".to_vec(),
+            )
+            .unwrap();
+        assert_eq!(
+            result.outcome,
+            MobileDirectTextSendOutcome::AcceptedForReplay
+        );
+        let accepted = result.acceptance.unwrap();
+        assert_eq!(accepted.client_message_id, accepted.local_message_id);
+        assert!(session.binding.lock().unwrap().is_none());
+        let stored: (String, String) = session
+            .client
+            .lock()
+            .unwrap()
+            .db()
+            .unwrap()
+            .conn()
+            .query_row(
+                "SELECT client_message_id, local_message_id FROM direct_message_outbox_v1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stored.0, accepted.client_message_id);
+        assert_eq!(stored.1, accepted.local_message_id);
+        drop(session);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn mobile_direct_v2_prekey_denial_never_claims_an_accepted_identity() {
+        let (session, path, token, conversation_id, _peer, _outbound) =
+            mobile_test_ready_prekey_fixture(166);
+        let result = session
+            .send_direct_text_v2(token, conversation_id, b"not accepted".to_vec())
+            .unwrap();
+        assert_eq!(result.outcome, MobileDirectTextSendOutcome::NeedsPreKey);
+        assert_eq!(result.acceptance, None);
         drop(session);
         let _ = std::fs::remove_file(path);
     }

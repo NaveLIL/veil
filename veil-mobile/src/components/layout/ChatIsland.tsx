@@ -1,336 +1,139 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
-import {
-  Pressable,
-  ScrollView,
-  StyleSheet,
-  Text,
-  TextInput,
-  View,
-} from "react-native";
-
-import { colors, radii, spacing } from "../../lib/theme";
-import { DM_HOME_ID, type Member, useChatStore } from "../../stores/chat";
+/**
+ * Source adaptation: Rocket.Chat.ReactNative 4.77.0 / 0a7df3d82a2e9d20e37f9ec5651fd3c74b98ab36.
+ * app/views/RoomView/List/components/List.tsx (FlatList layout/tuning).
+ * Copyright (c) 2015-2018 Rocket.Chat Technologies Corp. MIT.
+ * Changes: native bounded projection, Veil identity/delivery and composer slots;
+ * remove Rocket history loaders, database subscriptions, gestures and model stores.
+ * See third-party/rocket-chat-reactnative/SOURCE_INVENTORY.md.
+ */
+import React, { useEffect, useRef } from "react";
+import { FlatList, KeyboardAvoidingView, Platform, Pressable, StyleSheet, Text, View } from "react-native";
+import { type Member, type Message as ProjectedMessage } from "../../stores/chat";
+import { useDirectTimelinePresenter } from "../../presenters/directTimeline";
+import { Composer } from "../../presentation/rocketChat/Composer";
+import { Message } from "../../presentation/rocketChat/Message";
+import { rocketColors } from "../../presentation/rocketChat/theme";
 import { UserAvatar } from "../identity/UserAvatar";
 import { PublicFailureCard } from "../runtime/PublicFailureCard";
-import { Island } from "../ui/Island";
 
-const EMPTY_MESSAGES: never[] = [];
-
+/**
+ * Veil controller + Rocket.Chat source-ported Direct presentation.
+ * FlatList layout follows Rocket.Chat 4.77.0 RoomView/List/components/List.tsx;
+ * native owns the bounded window. No Rocket history loaders or model observers.
+ */
 export const ChatIsland: React.FC<{
   bottomInset?: number;
   leftInset?: number;
   onOpenIdentity?: (member: Member, triggerHandle: string | number) => void;
   rightInset?: number;
   showHeader?: boolean;
-}> = ({
-  bottomInset = 0,
-  leftInset = 0,
-  onOpenIdentity,
-  rightInset = 0,
-  showHeader = true,
-}) => {
-  const selectedServerId = useChatStore((state) => state.selectedServerId);
-  const selectedChannelId = useChatStore((state) => state.selectedChannelId);
-  const selectedDmId = useChatStore((state) => state.selectedDmId);
-  const messagesByChannel = useChatStore((state) => state.messagesByChannel);
-  const projectionStateByConversation = useChatStore(
-    (state) => state.projectionStateByConversation,
-  );
-  const directoryRevision = useChatStore((state) => state.directoryRevision);
-  const channels = useChatStore((state) => state.channels);
-  const dms = useChatStore((state) => state.dms);
-  const loadSelectedDirectMessages = useChatStore(
-    (state) => state.loadSelectedDirectMessages,
-  );
-  const directGeneration = useChatStore((state) => state.directGeneration);
-  const directSendPending = useChatStore((state) => state.directSendPending);
-  const directSendError = useChatStore((state) => state.directSendError);
-  const sendSelectedDirectText = useChatStore((state) => state.sendSelectedDirectText);
-  const [draft, setDraft] = useState("");
-
-  const key = selectedServerId === DM_HOME_ID ? selectedDmId : selectedChannelId;
-  const messages = key ? messagesByChannel[key] ?? EMPTY_MESSAGES : EMPTY_MESSAGES;
-  const projectionState = selectedDmId
-    ? projectionStateByConversation[selectedDmId] ?? "idle"
-    : "idle";
-  const title = useMemo(() => {
-    if (selectedServerId === DM_HOME_ID) {
-      return dms.find((dm) => dm.id === selectedDmId)?.name ?? "Direct messages";
-    }
-    const channel = channels.find((candidate) => candidate.id === selectedChannelId);
-    return channel ? `# ${channel.name}` : "Channel";
-  }, [selectedServerId, selectedDmId, selectedChannelId, dms, channels]);
-  const scrollRef = useRef<ScrollView>(null);
-  const canCompose = selectedServerId === DM_HOME_ID
-    && selectedDmId !== null
-    && directGeneration !== null
-    && projectionState === "available"
-    && !directSendPending;
-  const canSend = canCompose && draft.length > 0;
-
-  useEffect(() => {
-    if (selectedServerId !== DM_HOME_ID || !selectedDmId) return;
-    void loadSelectedDirectMessages();
-  }, [
-    directoryRevision,
-    loadSelectedDirectMessages,
-    selectedDmId,
-    selectedServerId,
-  ]);
-
-  useEffect(() => {
-    requestAnimationFrame(() => scrollRef.current?.scrollToEnd({ animated: false }));
-  }, [messages.length]);
-
-  useEffect(() => {
-    // A draft must never follow the user to another peer or Direct generation.
-    setDraft("");
-  }, [directGeneration, selectedDmId]);
-
-  const sendDraft = async () => {
-    if (!canSend) return;
-    const submitted = draft;
-    const submittedConversationId = selectedDmId;
-    const submittedGeneration = directGeneration;
-    const result = await sendSelectedDirectText(submitted);
-    const current = useChatStore.getState();
-    if (
-      result === "accepted"
-      && current.selectedDmId === submittedConversationId
-      && current.directGeneration === submittedGeneration
-    ) {
-      setDraft((current) => current === submitted ? "" : current);
-    }
-  };
+}> = ({ bottomInset = 0, leftInset = 0, onOpenIdentity, rightInset = 0, showHeader = true }) => {
+  const p = useDirectTimelinePresenter();
+  const list = useRef<FlatList<ProjectedMessage>>(null);
+  const followsNewest = useRef(true);
+  const viewportOffset = useRef(0);
+  useEffect(() => { followsNewest.current = true; viewportOffset.current = 0; }, [p.scope]);
+  const empty = !p.conversationId
+    ? ["Choose a Direct conversation", "Encrypted history opens only after selection."]
+    : p.projectionState === "loading" || p.projectionState === "idle"
+      ? ["Opening encrypted history...", "Verifying this conversation with the native runtime."]
+      : p.projectionState === "unavailable"
+        ? ["Messages are unavailable", "Veil withheld the entire projection because it could not be verified."]
+        : ["No messages yet", "This immutable Direct history is securely synchronized."];
 
   return (
-    <View
-      testID="chat-island-wrap"
-      style={[
-        styles.wrap,
-        {
-          paddingBottom: spacing.md + Math.max(0, bottomInset),
-          paddingLeft: Math.max(spacing.md, leftInset),
-          paddingRight: Math.max(spacing.md, rightInset),
-        },
-      ]}
-    >
-      <Island variant="solid" glow={false} padding={0} style={styles.island}>
-        {showHeader ? (
-          <View style={styles.header}>
-            <Text numberOfLines={1} style={styles.title}>{title}</Text>
-            <Text style={styles.headerHint}>Direct conversation</Text>
-          </View>
-        ) : null}
-
-        <ScrollView
-          ref={scrollRef}
-          style={styles.scroller}
+    <KeyboardAvoidingView style={styles.flex} behavior={Platform.OS === "ios" ? "padding" : undefined}>
+      <View
+        testID="chat-island-wrap"
+        style={[styles.wrap, {
+          paddingBottom: 12 + Math.max(0, bottomInset),
+          paddingLeft: Math.max(12, leftInset),
+          paddingRight: Math.max(12, rightInset),
+        }]}
+      >
+        {showHeader ? <View style={styles.header}><Text style={styles.title}>{p.title}</Text></View> : null}
+        <FlatList
+          ref={list}
+          testID="direct-message-list"
+          data={p.messages}
+          keyExtractor={(message) => `${p.scope ?? "unavailable"}\u0000${message.stableUiId}`}
+          style={styles.flex}
           contentContainerStyle={styles.messages}
-          onContentSizeChange={() => scrollRef.current?.scrollToEnd({ animated: true })}
-        >
-          {!selectedDmId ? (
-            <View style={styles.empty}>
-              <Text style={styles.emptyText}>Choose a Direct conversation</Text>
-              <Text style={styles.emptyHint}>Encrypted history opens only after selection.</Text>
-            </View>
-          ) : projectionState === "loading" || projectionState === "idle" ? (
-            <View testID="direct-history-loading" style={styles.empty}>
-              <Text style={styles.emptyText}>Opening encrypted history...</Text>
-              <Text style={styles.emptyHint}>Verifying this conversation with the native runtime.</Text>
-            </View>
-          ) : projectionState === "unavailable" ? (
-            <View testID="direct-history-unavailable" style={styles.empty}>
-              <Text style={styles.emptyText}>Messages are unavailable</Text>
-              <Text style={styles.emptyHint}>
-                Veil withheld the entire projection because it could not be verified.
-              </Text>
-              <Pressable
-                accessibilityRole="button"
-                onPress={() => void loadSelectedDirectMessages()}
-                style={({ pressed }) => [styles.retry, pressed && styles.retryPressed]}
-              >
-                <Text style={styles.retryText}>Verify again</Text>
-              </Pressable>
-            </View>
-          ) : messages.length === 0 ? (
-            <View style={styles.empty}>
-              <Text style={styles.emptyText}>No messages yet</Text>
-              <Text style={styles.emptyHint}>This immutable Direct history is securely synchronized.</Text>
-            </View>
-          ) : (
-            messages.map((message) => (
-              <View key={message.id} style={styles.messageRow}>
-                <Pressable
-                  accessibilityRole="button"
-                  accessibilityLabel={`View identity for ${message.author.name}`}
-                  onPress={(event) => onOpenIdentity?.(message.author, event.nativeEvent.target)}
-                  style={styles.identityTrigger}
-                >
-                  <UserAvatar
-                    identityKey={message.author.identityKey}
-                    canonicalServerOrigin={message.author.canonicalServerOrigin}
-                    userId={message.author.userId}
-                    technicalUsername={message.author.username}
-                    size={36}
-                  />
+          keyboardShouldPersistTaps="handled"
+          initialNumToRender={20}
+          maxToRenderPerBatch={5}
+          windowSize={10}
+          scrollEventThrottle={32}
+          onScroll={({ nativeEvent: { contentOffset, contentSize, layoutMeasurement } }) => {
+            // Native invalidation clears plaintext during verification. Its empty
+            // layout must not overwrite the reader's transient viewport position.
+            if (p.projectionState !== "available" || p.messages.length === 0) return;
+            viewportOffset.current = Math.max(0, contentOffset.y);
+            followsNewest.current = contentSize.height - layoutMeasurement.height - contentOffset.y <= 96;
+          }}
+          onContentSizeChange={() => {
+            if (p.projectionState !== "available" || p.messages.length === 0) return;
+            if (followsNewest.current) list.current?.scrollToEnd({ animated: false });
+            else list.current?.scrollToOffset({ offset: viewportOffset.current, animated: false });
+          }}
+          ListEmptyComponent={(
+            <View
+              testID={p.conversationId && (p.projectionState === "loading" || p.projectionState === "idle")
+                ? "direct-history-loading" : p.projectionState === "unavailable" ? "direct-history-unavailable" : undefined}
+              style={styles.empty}
+            >
+              <Text style={styles.emptyTitle}>{empty[0]}</Text>
+              <Text style={styles.emptyHint}>{empty[1]}</Text>
+              {p.projectionState === "unavailable" ? (
+                <Pressable accessibilityRole="button" onPress={() => void p.reload()} style={styles.retry}>
+                  <Text style={styles.retryText}>Verify again</Text>
                 </Pressable>
-                <View style={styles.messageBody}>
-                  <View style={styles.messageHead}>
-                    <Text style={[styles.author, { color: message.author.color }]}>
-                      {message.author.name}
-                    </Text>
-                    <Text style={styles.timestamp}>{message.ts}</Text>
-                  </View>
-                  <Text style={styles.text}>{message.text}</Text>
-                  {message.direction === "outgoing" && message.deliveryPublicFailureCodeV1 ? (
-                    <View
-                      testID={`direct-delivery-failure-${message.id}`}
-                      style={styles.deliveryFailure}
-                    >
-                      <PublicFailureCard
-                        announce={false}
-                        code={message.deliveryPublicFailureCodeV1}
-                        compact
-                      />
-                    </View>
-                  ) : message.direction === "outgoing" && message.delivery !== "sent" ? (
-                    <Text style={styles.delivery}>{message.delivery}</Text>
-                  ) : null}
-                </View>
-              </View>
-            ))
+              ) : null}
+            </View>
           )}
-        </ScrollView>
-
-        <View style={styles.composer}>
-          <TextInput
-            testID="direct-composer"
-            value={draft}
-            onChangeText={setDraft}
-            editable={canCompose}
-            accessibilityLabel="Direct message"
-            accessibilityState={{ disabled: !canCompose }}
-            placeholder={canCompose ? "Message securely" : "Direct messaging unavailable"}
-            placeholderTextColor={colors.textLo}
-            style={styles.input}
-            multiline
-          />
-          <Pressable
-            testID="direct-send-button"
-            accessibilityRole="button"
-            accessibilityLabel="Send Direct message"
-            accessibilityState={{ disabled: !canSend }}
-            disabled={!canSend}
-            onPress={() => void sendDraft()}
-            style={({ pressed }) => [
-              styles.sendButton,
-              !canSend && styles.sendButtonDisabled,
-              pressed && canSend && styles.sendButtonPressed,
-            ]}
-          >
-            <Text style={styles.sendButtonText}>{directSendPending ? "..." : "Send"}</Text>
-          </Pressable>
-        </View>
-        {directSendError ? (
-          <View testID="direct-send-error" style={styles.sendError}>
-            <PublicFailureCard code={directSendError.publicFailureCodeV1} compact />
-          </View>
-        ) : null}
-      </Island>
-    </View>
+          renderItem={({ item: message }) => (
+            <Message
+              renderKey={message.stableUiId}
+              authorName={message.author.name}
+              text={message.text}
+              timestamp={message.timestampMs === null ? null : message.ts}
+              onOpenIdentity={(event) => onOpenIdentity?.(message.author, event.nativeEvent.target)}
+              avatar={<UserAvatar
+                identityKey={message.author.identityKey}
+                canonicalServerOrigin={message.author.canonicalServerOrigin}
+                userId={message.author.userId}
+                technicalUsername={message.author.username}
+                size={36}
+              />}
+              delivery={message.direction === "outgoing" && message.deliveryPublicFailureCodeV1 ? (
+                <View testID={`direct-delivery-failure-${message.stableUiId}`} style={styles.deliveryFailure}>
+                  <PublicFailureCard announce={false} code={message.deliveryPublicFailureCodeV1} compact />
+                </View>
+              ) : message.direction === "outgoing" && message.delivery !== "sent" ? (
+                <Text style={styles.delivery}>{message.delivery}</Text>
+              ) : null}
+            />
+          )}
+        />
+        <Composer value={p.draft} onChangeText={p.setDraft} editable={p.canCompose} pending={p.pending} onSend={() => void p.sendDraft()} />
+        {p.error ? <View testID="direct-send-error" style={styles.sendError}><PublicFailureCard code={p.error.publicFailureCodeV1} compact /></View> : null}
+      </View>
+    </KeyboardAvoidingView>
   );
 };
 
 const styles = StyleSheet.create({
-  wrap: { flex: 1 },
-  island: { flex: 1 },
-  header: {
-    paddingHorizontal: spacing.md,
-    paddingTop: spacing.md,
-    paddingBottom: spacing.sm,
-    borderBottomWidth: StyleSheet.hairlineWidth,
-    borderBottomColor: colors.border,
-  },
-  title: { color: colors.textHi, fontSize: 16, fontWeight: "700" },
-  headerHint: { color: colors.textLo, fontSize: 10, marginTop: 2 },
-  scroller: { flex: 1 },
-  messages: { padding: spacing.md, gap: spacing.md, flexGrow: 1 },
-  empty: { flex: 1, alignItems: "center", justifyContent: "center", paddingTop: 80 },
-  emptyText: { color: colors.textMd, fontSize: 14, textAlign: "center" },
-  emptyHint: {
-    color: colors.textLo,
-    fontSize: 12,
-    lineHeight: 18,
-    marginTop: 4,
-    maxWidth: 300,
-    textAlign: "center",
-  },
-  retry: {
-    minHeight: 48,
-    alignItems: "center",
-    justifyContent: "center",
-    borderRadius: radii.pill,
-    borderWidth: StyleSheet.hairlineWidth,
-    borderColor: colors.border,
-    paddingHorizontal: spacing.lg,
-    marginTop: spacing.md,
-  },
-  retryPressed: { opacity: 0.72 },
-  retryText: { color: colors.primaryHi, fontSize: 12, fontWeight: "700" },
-  messageRow: { flexDirection: "row", gap: spacing.sm },
-  identityTrigger: { minWidth: 48, minHeight: 48, alignItems: "center", justifyContent: "center" },
-  messageBody: { flex: 1, minWidth: 0 },
-  messageHead: { flexDirection: "row", alignItems: "baseline", gap: spacing.sm },
-  author: { fontSize: 13, fontWeight: "700" },
-  timestamp: { color: colors.textLo, fontSize: 10 },
-  text: { color: colors.textHi, fontSize: 14, lineHeight: 20, marginTop: 2 },
-  delivery: {
-    color: colors.textLo,
-    fontSize: 10,
-    marginTop: 4,
-    textTransform: "uppercase",
-    letterSpacing: 0.8,
-  },
+  flex: { flex: 1 },
+  wrap: { flex: 1, backgroundColor: rocketColors.surfaceRoom },
+  header: { padding: 12, borderBottomWidth: StyleSheet.hairlineWidth, borderColor: rocketColors.strokeLight },
+  title: { color: rocketColors.fontTitlesLabels, fontSize: 17, fontWeight: "600" },
+  messages: { paddingTop: 10, flexGrow: 1 },
+  empty: { flex: 1, alignItems: "center", justifyContent: "center", padding: 24 },
+  emptyTitle: { color: rocketColors.fontTitlesLabels, fontSize: 16, textAlign: "center" },
+  emptyHint: { color: rocketColors.fontSecondaryInfo, fontSize: 14, lineHeight: 22, marginTop: 8, textAlign: "center" },
+  retry: { minHeight: 48, justifyContent: "center", paddingHorizontal: 16 },
+  retryText: { color: rocketColors.strokeHighlight, fontSize: 16, fontWeight: "600" },
+  delivery: { color: rocketColors.fontSecondaryInfo, fontSize: 12 },
   deliveryFailure: { maxWidth: 420 },
-  composer: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: spacing.sm,
-    padding: spacing.sm,
-    borderTopWidth: StyleSheet.hairlineWidth,
-    borderTopColor: colors.border,
-  },
-  input: {
-    flex: 1,
-    color: colors.textHi,
-    fontSize: 13,
-    minHeight: 48,
-    paddingHorizontal: spacing.md,
-    paddingVertical: spacing.sm,
-    borderRadius: radii.lg,
-    backgroundColor: "rgba(255,255,255,0.04)",
-  },
-  sendButton: {
-    minWidth: 48,
-    minHeight: 48,
-    paddingHorizontal: spacing.sm,
-    borderRadius: radii.pill,
-    borderWidth: StyleSheet.hairlineWidth,
-    borderColor: colors.border,
-    backgroundColor: colors.primary,
-    alignItems: "center",
-    justifyContent: "center",
-  },
-  sendButtonDisabled: { opacity: 0.38 },
-  sendButtonPressed: { opacity: 0.72 },
-  sendButtonText: {
-    color: colors.textHi,
-    fontSize: 11,
-    fontWeight: "800",
-  },
-  sendError: {
-    paddingHorizontal: spacing.md,
-    paddingBottom: spacing.sm,
-  },
+  sendError: { paddingHorizontal: 16, paddingBottom: 8 },
 });

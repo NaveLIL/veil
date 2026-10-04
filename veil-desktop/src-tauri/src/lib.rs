@@ -6388,6 +6388,9 @@ fn connect_to_server(
         let raw_app_handle = app.clone();
         std::thread::spawn(move || {
             let state_inner = raw_app_handle.state::<AppState>();
+            let mut direct_replay_binding = None;
+            let mut direct_replay_cursor = None;
+            let mut next_direct_replay = Instant::now();
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(50));
                 if !state_inner.offline_sync_ready.load(Ordering::Acquire) {
@@ -6412,7 +6415,34 @@ fn connect_to_server(
                     Ok(c) => c,
                     Err(_) => break,
                 };
-                let event = match state_inner.runtime.block_on(client.poll_event()) {
+                if direct_replay_binding.as_ref() != Some(&event_binding) {
+                    direct_replay_binding = Some(event_binding.clone());
+                    direct_replay_cursor = None;
+                    next_direct_replay = Instant::now();
+                }
+                let event = match state_inner.runtime.block_on(async {
+                    // Replay bounded pages of the existing SQLCipher outbox
+                    // after history sync and after every replacement binding.
+                    // Never make a new user intent or re-encrypt lost-ACK bytes.
+                    if Instant::now() >= next_direct_replay && client.is_connected() {
+                        let report = client
+                            .replay_direct_outbox_v1(direct_replay_cursor, 16)
+                            .await
+                            .map_err(|error| match error {
+                                veil_client::api::DirectSendErrorV1::Rejected(detail)
+                                | veil_client::api::DirectSendErrorV1::StorageUncertain(detail) => {
+                                    detail
+                                }
+                            })?;
+                        direct_replay_cursor = if report.reached_end {
+                            None
+                        } else {
+                            report.next_queue_order
+                        };
+                        next_direct_replay = Instant::now() + Duration::from_millis(250);
+                    }
+                    client.poll_event_with_direct_ack_deadline_v1().await
+                }) {
                     Ok(event) => event,
                     Err(error) => {
                         drop(client);
@@ -7850,6 +7880,23 @@ fn connect_to_server(
 
 // ─── Messaging ────────────────────────────────────────
 
+#[derive(Debug, serde::Serialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+enum MessageSendAcceptance {
+    DurableDirect {
+        client_message_id: String,
+        local_message_id: String,
+        transport_enqueued: bool,
+    },
+    ExistingSend {
+        sequence: u64,
+    },
+}
+
 #[tauri::command]
 fn send_message(
     state: State<'_, AppState>,
@@ -7858,7 +7905,7 @@ fn send_message(
     reply_to_id: Option<String>,
     expected_server_origin: String,
     expected_binding_generation: String,
-) -> Result<u64, String> {
+) -> Result<MessageSendAcceptance, String> {
     let live_action_binding = capture_confirmed_live_action_binding(&state)?;
     validate_expected_live_action_binding(
         &live_action_binding,
@@ -7872,9 +7919,28 @@ fn send_message(
     if let Some(reply_to_id) = reply_to_id.as_deref() {
         require_persisted_message_conversation(&client, reply_to_id, &conversation_id)?;
     }
+    if !client.is_channel_conversation(&conversation_id) && reply_to_id.is_none() {
+        let report = state
+            .runtime
+            .block_on(client.enqueue_direct_text_v1(&conversation_id, &text))
+            .map_err(|error| match error {
+                veil_client::api::DirectSendErrorV1::Rejected(detail)
+                | veil_client::api::DirectSendErrorV1::StorageUncertain(detail) => detail,
+            })?;
+        // Even a blocked transport means durable acceptance. Returning an
+        // error here would invite the composer to create a duplicate intent.
+        return Ok(MessageSendAcceptance::DurableDirect {
+            client_message_id: report.client_message_id,
+            local_message_id: report.local_message_id,
+            transport_enqueued: report.transport_enqueued,
+        });
+    }
+    // Reply/media and Sender-Key sends keep their existing contract until
+    // their typed durable intent work (R06); no Direct/channel fallback.
     state
         .runtime
         .block_on(client.send_message(&conversation_id, &text, reply_to_id.as_deref()))
+        .map(|sequence| MessageSendAcceptance::ExistingSend { sequence })
 }
 
 #[derive(serde::Deserialize)]

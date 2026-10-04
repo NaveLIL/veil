@@ -17,6 +17,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/NaveLIL/veil/veil-server/internal/logsafe"
@@ -54,6 +55,11 @@ func (c unifiedPushHTTPClient) Do(request *http.Request) (*http.Response, error)
 }
 
 type Dispatcher struct {
+	ctx            context.Context
+	cancel         context.CancelFunc
+	mu             sync.Mutex
+	stopping       bool
+	workers        sync.WaitGroup
 	store          Store
 	httpClient     *http.Client
 	endpointPolicy *EndpointPolicy
@@ -82,7 +88,9 @@ func New(opts Options) *Dispatcher {
 	if maxConcurrent <= 0 {
 		maxConcurrent = defaultMaxConcurrentDeliveries
 	}
+	ctx, cancel := context.WithCancel(context.Background())
 	d := &Dispatcher{
+		ctx: ctx, cancel: cancel,
 		store: opts.Store, httpClient: opts.HTTPClient, endpointPolicy: opts.EndpointPolicy,
 		vapid: opts.VAPID, maxJitter: opts.MaxJitter,
 		deliverySlots: make(chan struct{}, maxConcurrent), log: opts.Logger,
@@ -126,14 +134,42 @@ func (d *Dispatcher) NotifyOffline(_ context.Context, userID string, env *pb.Env
 	if !d.enabled || env == nil {
 		return
 	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.stopping {
+		return
+	}
 	select {
 	case d.deliverySlots <- struct{}{}:
+		d.workers.Add(1)
 		go func() {
+			defer d.workers.Done()
 			defer func() { <-d.deliverySlots }()
-			d.deliver(context.Background(), userID)
+			// A committed message's wake must outlive the sender's command
+			// context, but never the dispatcher lifecycle or this total budget.
+			ctx, cancel := context.WithTimeout(d.ctx, time.Minute)
+			defer cancel()
+			d.deliver(ctx, userID)
 		}()
 	default:
 		d.log.Warn("push: delivery queue saturated", "user_ref", logsafe.Ref("user", userID))
+	}
+}
+
+// Shutdown prevents new deliveries, cancels SQL/network/jitter waits, and
+// joins admitted workers before the application closes its database pool.
+func (d *Dispatcher) Shutdown(ctx context.Context) error {
+	d.mu.Lock()
+	d.stopping = true
+	d.cancel()
+	d.mu.Unlock()
+	done := make(chan struct{})
+	go func() { d.workers.Wait(); close(done) }()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
@@ -147,9 +183,18 @@ func (d *Dispatcher) deliver(ctx context.Context, userID string) {
 		return
 	}
 	if d.maxJitter > 0 {
-		time.Sleep(jitter(d.maxJitter))
+		timer := time.NewTimer(jitter(d.maxJitter))
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			return
+		}
 	}
 	for _, sub := range subs {
+		if ctx.Err() != nil {
+			return
+		}
 		if err := d.post(ctx, sub, wakePayload(), WakeTTLSeconds); err != nil {
 			d.log.Warn("push: dispatch failed", "endpoint_ref", logsafe.Ref("push_endpoint", sub.EndpointURL), "error_class", logsafe.ErrorClass(err))
 			continue

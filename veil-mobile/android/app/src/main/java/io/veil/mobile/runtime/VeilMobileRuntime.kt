@@ -11,6 +11,7 @@ import io.veil.mobile.recovery.NativeIdentitySetupCoordinator
 import io.veil.mobile.recovery.NativeIdentitySetupReconciler
 import io.veil.mobile.recovery.NativeIdentitySetupReconciliationResult
 import java.io.File
+import java.net.URLDecoder
 import java.nio.CharBuffer
 import java.nio.charset.CharacterCodingException
 import java.nio.charset.CodingErrorAction
@@ -39,10 +40,10 @@ import uniffi.veil_ffi.MobileDirectIdentityVerification
 import uniffi.veil_ffi.MobileDirectIdentityVerificationState
 import uniffi.veil_ffi.MobileDirectLiveBufferProgress
 import uniffi.veil_ffi.MobileDirectLiveReplayProgress
-import uniffi.veil_ffi.MobileDirectMessageData
+import uniffi.veil_ffi.MobileDirectMessageDataV2
 import uniffi.veil_ffi.MobileDirectMessageDelivery
 import uniffi.veil_ffi.MobileDirectMessageDirection
-import uniffi.veil_ffi.MobileDirectMessageProjection
+import uniffi.veil_ffi.MobileDirectMessageProjectionV2
 import uniffi.veil_ffi.MobileDirectMessageProjectionAvailability
 import uniffi.veil_ffi.MobileDirectOutboxReplayProgress
 import uniffi.veil_ffi.MobileDirectOwnPreKeyProgress
@@ -51,6 +52,7 @@ import uniffi.veil_ffi.MobileDirectRestRequest
 import uniffi.veil_ffi.MobileDirectSendReadiness
 import uniffi.veil_ffi.MobileDirectSyncLease
 import uniffi.veil_ffi.MobileDirectTextSendOutcome
+import uniffi.veil_ffi.MobileDirectTextSendResultV2
 import uniffi.veil_ffi.MobileReconnectTarget
 import uniffi.veil_ffi.MobileRetryableReason
 import uniffi.veil_ffi.MobileWsEventsCallback
@@ -368,6 +370,18 @@ internal data class NativeContactSearchResult(
     "NativeContactSearchResult(userId=[REDACTED], username=[REDACTED], keys=[REDACTED])"
 }
 
+/** Closed public results of native-owned contact HTTP. No request authority crosses JS. */
+internal sealed interface NativeContactOperationResult {
+  data class Found(val userId: String, val username: String) : NativeContactOperationResult
+  data object NotFound : NativeContactOperationResult
+  data class Created(val conversationId: String) : NativeContactOperationResult
+  data object Unavailable : NativeContactOperationResult
+}
+
+internal fun interface NativeContactOperationCallback {
+  fun onComplete(result: NativeContactOperationResult)
+}
+
 /** Strict create-DM response retained inside the native runtime. */
 internal data class NativeDirectCreatedConversation(
   val conversationId: String,
@@ -473,6 +487,9 @@ internal enum class NativeDirectMessageDelivery {
  */
 internal data class NativeDirectMessageView(
   val messageId: String,
+  val stableUiId: String,
+  val clientMessageId: String?,
+  val serverMessageId: String?,
   val text: String,
   val timestampMs: Long?,
   val direction: NativeDirectMessageDirection,
@@ -595,6 +612,7 @@ internal fun NativeDirectMessageProjection.isStructurallySafe(): Boolean {
   }
   if (messages.size > 100) return false
   val ids = HashSet<String>(messages.size)
+  val stableIds = HashSet<String>(messages.size)
   var totalTextBytes = 0
   return messages.all { message ->
     val parsedId = try {
@@ -609,8 +627,26 @@ internal fun NativeDirectMessageProjection.isStructurallySafe(): Boolean {
       ?: return@all false
     if (totalTextBytes > MAX_DIRECT_PROJECTION_TEXT_BYTES - textBytes) return@all false
     totalTextBytes += textBytes
+    val safeAliases = if (message.direction == NativeDirectMessageDirection.INCOMING) {
+      message.clientMessageId == null && message.serverMessageId == message.messageId &&
+        message.stableUiId == message.messageId &&
+        message.delivery == NativeDirectMessageDelivery.SENT && message.timestampMs != null
+    } else {
+      message.clientMessageId == message.stableUiId &&
+        if (message.serverMessageId == null) {
+          message.messageId == message.stableUiId &&
+            message.delivery != NativeDirectMessageDelivery.SENT && message.timestampMs == null
+        } else {
+          message.messageId == message.serverMessageId &&
+            message.delivery == NativeDirectMessageDelivery.SENT && message.timestampMs != null
+        }
+    }
     canonicalId == message.messageId &&
+      isCanonicalDirectUuid(message.stableUiId) &&
+      message.clientMessageId?.let(::isCanonicalDirectUuid) != false &&
+      message.serverMessageId?.let(::isCanonicalDirectUuid) != false &&
       ids.add(message.messageId) &&
+      stableIds.add(message.stableUiId) && safeAliases &&
       message.timestampMs?.let { it in 0L..253_402_300_799_999L } != false
   }
 }
@@ -652,7 +688,7 @@ internal fun <Handle : AutoCloseable, Output> mapAndCloseAllNativeHandles(
   }
 }
 
-private fun closeAllDirectMessageHandles(handles: List<MobileDirectMessageData>) {
+private fun closeAllDirectMessageHandles(handles: List<MobileDirectMessageDataV2>) {
   handles.forEach { handle ->
     try {
       handle.close()
@@ -678,7 +714,7 @@ internal enum class NativeDirectSendReadiness {
   UNAVAILABLE,
 }
 
-/** Opaque result of the atomic Rust send boundary; no IDs cross into Kotlin. */
+/** Transport outcome of the atomic Rust send boundary. */
 internal enum class NativeDirectTextSendOutcome {
   ACCEPTED,
   ACCEPTED_FOR_REPLAY,
@@ -697,6 +733,31 @@ internal enum class NativeDirectTextSendResult {
 
 internal fun interface NativeDirectTextSendCallback {
   fun onComplete(result: NativeDirectTextSendResult)
+}
+
+/** IDs of the original committed outbox intent, never allocated by Kotlin. */
+internal data class NativeDirectTextAcceptanceV2(
+  val clientMessageId: String,
+  val localMessageId: String,
+) {
+  fun isStructurallySafe(): Boolean = isCanonicalDirectUuid(clientMessageId) &&
+    localMessageId == clientMessageId
+
+  override fun toString(): String = "NativeDirectTextAcceptanceV2(ids=[REDACTED])"
+}
+
+internal data class NativeDirectTextAttemptV2(
+  val outcome: NativeDirectTextSendOutcome,
+  val acceptance: NativeDirectTextAcceptanceV2?,
+)
+
+internal data class NativeDirectTextSendResultV2(
+  val outcome: NativeDirectTextSendResult,
+  val acceptance: NativeDirectTextAcceptanceV2?,
+)
+
+internal fun interface NativeDirectTextSendCallbackV2 {
+  fun onComplete(result: NativeDirectTextSendResultV2)
 }
 
 /** Opaque terminal result for one explicit Direct-session user action. */
@@ -842,7 +903,7 @@ internal interface NativeMobileSession : AutoCloseable {
     leaseToken: String,
     conversationId: String,
     plaintextUtf8: ByteArray,
-  ): NativeDirectTextSendOutcome
+  ): NativeDirectTextAttemptV2
 
   fun prepareDirectPreKeyRequest(
     leaseToken: String,
@@ -959,8 +1020,7 @@ internal class VeilMobileRuntime internal constructor(
   private var reconnectBackoffScope: ReconnectBackoffScope? = null
   private var activeDirectBootstrap: ActiveDirectBootstrap? = null
   private var activeDirectSync: ActiveDirectSync? = null
-  private var verifiedContact: VerifiedContact? = null
-  private var pendingContactOperation: PendingContactOperation? = null
+  private var contactFlow: ContactFlow? = null
 
   private data class ActiveConnect(
     val session: NativeMobileSession,
@@ -1103,18 +1163,38 @@ internal class VeilMobileRuntime internal constructor(
     override fun toString(): String = "VerifiedContact(metadata=[REDACTED], keys=[REDACTED])"
   }
 
-  private sealed interface PendingContactOperation {
-    val sync: ActiveDirectSync
+  /** Native object identity is authority; actionId is only bounded UI correlation. */
+  private class ContactFlow(
+    val sync: ActiveDirectSync,
+    val actionId: String,
+    val username: String,
+  ) {
+    var verified: VerifiedContact? = null
+    var pending: PendingContactRequest? = null
+    override fun toString(): String = "ContactFlow(scope=[REDACTED], query=[REDACTED])"
   }
 
-  private data class PendingContactSearch(
-    override val sync: ActiveDirectSync,
-  ) : PendingContactOperation
+  private class PendingContactRequest(
+    val create: Boolean,
+    private val callback: NativeContactOperationCallback,
+  ) {
+    var call: NativeDirectHttpCall? = null
+    private var completed = false
 
-  private data class PendingDirectCreate(
-    override val sync: ActiveDirectSync,
-    val peerUserId: String,
-  ) : PendingContactOperation
+    fun complete(result: NativeContactOperationResult) {
+      val owns = synchronized(this) {
+        if (completed) false else {
+          completed = true
+          true
+        }
+      }
+      if (owns) try {
+        callback.onComplete(result)
+      } catch (_: Throwable) {
+        // A detached renderer cannot escape native cancellation/publication.
+      }
+    }
+  }
 
   private class PendingDirectRequest(
     val requestToken: String,
@@ -1170,10 +1250,11 @@ internal class VeilMobileRuntime internal constructor(
     val completion: DirectSendActionCompletion,
   ) : PendingDirectAction(lifecycleEpoch, generation, conversationId) {
     var enqueueAttempts = 0
+    var acceptance: NativeDirectTextAcceptanceV2? = null
 
     fun complete(result: NativeDirectTextSendResult): Boolean {
       plaintext.close()
-      return completion.complete(result)
+      return completion.complete(result, acceptance)
     }
 
     override fun completeUnavailable(): Boolean =
@@ -1212,11 +1293,12 @@ internal class VeilMobileRuntime internal constructor(
   }
 
   private class DirectSendActionCompletion(
-    private val callback: NativeDirectTextSendCallback,
+    private val callback: NativeDirectTextSendCallbackV2,
   ) {
     private var completed = false
 
-    fun complete(result: NativeDirectTextSendResult): Boolean {
+    fun complete(result: NativeDirectTextSendResult,
+      acceptance: NativeDirectTextAcceptanceV2? = null): Boolean {
       val ownsCompletion = synchronized(this) {
         if (completed) false else {
           completed = true
@@ -1225,7 +1307,7 @@ internal class VeilMobileRuntime internal constructor(
       }
       if (!ownsCompletion) return false
       try {
-        callback.onComplete(result)
+        callback.onComplete(NativeDirectTextSendResultV2(result, acceptance))
       } catch (_: Throwable) {
         // A detached React context must not escape the native lifecycle gate.
       }
@@ -1631,217 +1713,235 @@ internal class VeilMobileRuntime internal constructor(
     }
   }
 
-  /** Prepare one account/origin-bound exact contact lookup under the Ready lease. */
-  fun prepareContactSearchRequest(username: String): NativeContactRequest {
-    val sync = synchronized(stateLock) {
-      val selected = currentContactSyncLocked()
-        ?: throw VeilMobileRuntimeException("E_VEIL_DIRECT", "Direct messaging is unavailable")
-      clearVerifiedContactLocked()
-      pendingContactOperation = PendingContactSearch(selected)
-      selected
+  /** Native owns query, signed request, bounded HTTP and verified selection. */
+  fun searchContact(username: String, expectedGeneration: Long, actionId: String,
+    callback: NativeContactOperationCallback) {
+    val pending = PendingContactRequest(false, callback)
+    if (!CONTACT_ACTION_ID.matches(actionId) ||
+      username.boundedUtf8Length(128)?.let { it > 0 } != true ||
+      username.any { Character.isISOControl(it) } ||
+      expectedGeneration !in 1L..MAX_PUBLIC_SNAPSHOT_REVISION) {
+      pending.complete(NativeContactOperationResult.Unavailable)
+      return
     }
-    val prepared = try {
-      sync.session.prepareContactSearchRequest(username)
-    } catch (error: Throwable) {
-      synchronized(stateLock) {
-        if ((pendingContactOperation as? PendingContactSearch)?.sync === sync) {
-          pendingContactOperation = null
+    val flow = synchronized(stateLock) {
+      val sync = currentContactSyncLocked()
+      if (sync == null || sync.generation != expectedGeneration) null else {
+        detachContactFlowLocked()
+        ContactFlow(sync, actionId, username).also {
+          it.pending = pending
+          contactFlow = it
         }
       }
-      throw error
     }
-    val accepted = synchronized(stateLock) {
-      currentContactSyncLocked() === sync &&
-        (pendingContactOperation as? PendingContactSearch)?.sync === sync &&
-        prepared.method == HTTP_GET_METHOD &&
-        prepared.requestTarget.startsWith(CONTACT_SEARCH_TARGET_PREFIX) &&
-        prepared.body.isEmpty() &&
-        prepared.signature.version == REST_AUTH_VERSION &&
-        prepared.signature.userId == sync.userId
-    }
-    if (!accepted) {
-      prepared.body.fill(0)
-      synchronized(stateLock) {
-        if ((pendingContactOperation as? PendingContactSearch)?.sync === sync) {
-          pendingContactOperation = null
-        }
-      }
-      throw VeilMobileRuntimeException("E_VEIL_DIRECT", "Direct messaging is unavailable")
-    }
-    return prepared
+    if (flow == null) pending.complete(NativeContactOperationResult.Unavailable)
+    else prepareContactHttp(flow, pending)
   }
 
-  /** Parse and retain the exact peer keys without publishing them to React Native. */
-  fun parseContactSearchResponse(response: ByteArray): NativeContactSearchResult {
-    val sync = synchronized(stateLock) {
-      val pending = pendingContactOperation as? PendingContactSearch
-      val selected = currentContactSyncLocked()
-      if (pending == null || selected !== pending.sync) null else selected
-    } ?: run {
-      response.fill(0)
-      throw VeilMobileRuntimeException("E_VEIL_DIRECT", "Direct messaging is unavailable")
+  /** Consume only the exact native selection from this one search flow. */
+  fun createDirect(peerUserId: String, expectedGeneration: Long, actionId: String,
+    callback: NativeContactOperationCallback) {
+    val pending = PendingContactRequest(true, callback)
+    val flow = synchronized(stateLock) {
+      val selected = contactFlow
+      if (!CONTACT_ACTION_ID.matches(actionId) || !isCanonicalDirectUuid(peerUserId) ||
+        selected == null || selected.actionId != actionId ||
+        selected.sync.generation != expectedGeneration ||
+        currentContactSyncLocked() !== selected.sync ||
+        selected.pending != null || selected.verified?.userId != peerUserId) null
+      else selected.also { it.pending = pending }
     }
-    val parsed = sync.session.parseContactSearchResponse(response)
-    val accepted = synchronized(stateLock) {
-      val pending = pendingContactOperation as? PendingContactSearch
-      if (currentContactSyncLocked() !== sync || pending?.sync !== sync) {
-        false
-      } else {
-        clearVerifiedContactLocked()
-        verifiedContact = VerifiedContact(
-          sync = sync,
-          userId = parsed.userId,
-          username = parsed.username,
-          identityKey = parsed.identityKey,
-          signingKey = parsed.signingKey,
-        )
-        pendingContactOperation = null
+    if (flow == null) pending.complete(NativeContactOperationResult.Unavailable)
+    else prepareContactHttp(flow, pending)
+  }
+
+  /** Cancel only this correlated scope, never a newer flow. */
+  fun cancelContacts(expectedGeneration: Long, actionId: String): Boolean =
+    synchronized(stateLock) {
+      val flow = contactFlow
+      if (flow == null || flow.actionId != actionId ||
+        flow.sync.generation != expectedGeneration) false else {
+        detachContactFlowLocked()
         true
       }
     }
-    if (!accepted) {
-      parsed.identityKey.fill(0)
-      parsed.signingKey.fill(0)
-      throw VeilMobileRuntimeException("E_VEIL_DIRECT", "Direct messaging is unavailable")
-    }
-    return parsed
+
+  /** Native bridge teardown owns no future contact selection. Not a React API. */
+  fun cancelContactOperations() {
+    synchronized(stateLock) { detachContactFlowLocked() }
   }
 
-  /** Prepare create-DM only for the peer keys pinned by the latest exact lookup. */
-  fun prepareCreateDirectRequest(peerUserId: String): NativeContactRequest {
-    val selection = synchronized(stateLock) {
-      val sync = currentContactSyncLocked()
-      val contact = verifiedContact
-      if (sync == null || contact == null || contact.sync !== sync || contact.userId != peerUserId) {
-        null
-      } else {
-        pendingContactOperation = PendingDirectCreate(sync, peerUserId)
-        Pair(sync, contact)
-      }
-    } ?: throw VeilMobileRuntimeException("E_VEIL_DIRECT", "Direct messaging is unavailable")
-    val (sync, _) = selection
+  private fun isCurrentContactRequestLocked(flow: ContactFlow, pending: PendingContactRequest) =
+    contactFlow === flow && flow.pending === pending &&
+      currentContactSyncLocked() === flow.sync
+
+  private fun prepareContactHttp(flow: ContactFlow, pending: PendingContactRequest) {
     val prepared = try {
-      sync.session.prepareCreateDirectRequest(peerUserId)
-    } catch (error: Throwable) {
-      synchronized(stateLock) {
-        if ((pendingContactOperation as? PendingDirectCreate)?.sync === sync) {
-          pendingContactOperation = null
-        }
+      check(synchronized(stateLock) { isCurrentContactRequestLocked(flow, pending) })
+      if (pending.create) {
+        val peer = synchronized(stateLock) { flow.verified?.userId }
+        flow.sync.session.prepareCreateDirectRequest(checkNotNull(peer))
+      } else flow.sync.session.prepareContactSearchRequest(flow.username)
+    } catch (_: Throwable) {
+      failContactRequest(flow, pending)
+      return
+    }
+    try {
+      val valid = synchronized(stateLock) {
+        isCurrentContactRequestLocked(flow, pending) &&
+          prepared.signature.version == REST_AUTH_VERSION &&
+          prepared.signature.userId == flow.sync.userId &&
+          (if (pending.create) {
+            flow.verified != null && prepared.method == HTTP_POST_METHOD &&
+              prepared.requestTarget == CREATE_DIRECT_TARGET &&
+              prepared.body.size in 1..MAX_CONTACT_REQUEST_BODY_BYTES
+          } else {
+            prepared.method == HTTP_GET_METHOD && prepared.body.isEmpty() &&
+              contactTargetMatchesQuery(prepared.requestTarget, flow.username)
+          })
       }
-      throw error
-    }
-    val accepted = synchronized(stateLock) {
-      val pending = pendingContactOperation as? PendingDirectCreate
-      val contact = verifiedContact
-      currentContactSyncLocked() === sync &&
-        pending?.sync === sync &&
-        pending.peerUserId == peerUserId &&
-        contact?.sync === sync &&
-        contact.userId == peerUserId &&
-        prepared.method == HTTP_POST_METHOD &&
-        prepared.requestTarget == CREATE_DIRECT_TARGET &&
-        prepared.body.isNotEmpty() &&
-        prepared.body.size <= MAX_CONTACT_REQUEST_BODY_BYTES &&
-        prepared.signature.version == REST_AUTH_VERSION &&
-        prepared.signature.userId == sync.userId
-    }
-    if (!accepted) {
+      check(valid)
+      val call = directTransport.createCall(NativeDirectHttpRequest(
+        canonicalServerOrigin = flow.sync.canonicalServerOrigin,
+        requestTarget = prepared.requestTarget, signature = prepared.signature,
+        responseLimitBytes = if (pending.create) NativeDirectHttpLimits.CONTACT_CREATE_BYTES
+          else NativeDirectHttpLimits.CONTACT_SEARCH_BYTES,
+        method = if (pending.create) NativeDirectHttpMethod.POST else NativeDirectHttpMethod.GET,
+        body = prepared.body,
+      )) { result -> enqueueContactResult(flow, pending, result) }
       prepared.body.fill(0)
       synchronized(stateLock) {
-        if ((pendingContactOperation as? PendingDirectCreate)?.sync === sync) {
-          pendingContactOperation = null
+        if (!isCurrentContactRequestLocked(flow, pending)) {
+          call.cancelQuietly()
+          failContactRequest(flow, pending)
+        } else {
+          pending.call = call
+          // Same lock as cancellation: a revoked, unstarted POST cannot start.
+          // Cancellation cannot undo a POST already transmitted to the server.
+          call.start()
         }
       }
-      throw VeilMobileRuntimeException("E_VEIL_DIRECT", "Direct messaging is unavailable")
+    } catch (_: Throwable) {
+      failContactRequest(flow, pending)
+    } finally {
+      prepared.body.fill(0)
     }
-    return prepared
   }
 
-  /**
-   * Parse, cross-check, durably install, and publish one create-DM response.
-   * The response-supplied keys must exactly match the independent contact
-   * lookup, so neither endpoint can silently substitute the peer identity.
-   */
-  fun completeCreateDirectResponse(response: ByteArray): String {
-    val selection = synchronized(stateLock) {
-      val pending = pendingContactOperation as? PendingDirectCreate
-      val sync = currentContactSyncLocked()
-      val contact = verifiedContact
-      if (
-        pending == null || sync == null || pending.sync !== sync ||
-        contact == null || contact.sync !== sync || contact.userId != pending.peerUserId
-      ) {
-        null
-      } else {
-        Pair(sync, contact)
-      }
-    } ?: run {
-      response.fill(0)
-      throw VeilMobileRuntimeException("E_VEIL_DIRECT", "Direct messaging is unavailable")
-    }
-    val (sync, contact) = selection
-    val created = sync.session.parseCreateDirectResponse(response)
+  private fun contactTargetMatchesQuery(target: String, username: String): Boolean {
+    if (!target.startsWith(CONTACT_SEARCH_TARGET_PREFIX)) return false
+    val encoded = target.removePrefix(CONTACT_SEARCH_TARGET_PREFIX)
+    if (encoded.isEmpty() || '&' in encoded || '#' in encoded) return false
+    return try {
+      URLDecoder.decode(encoded, StandardCharsets.UTF_8.name()) == username
+    } catch (_: IllegalArgumentException) { false }
+  }
+
+  private fun enqueueContactResult(flow: ContactFlow, pending: PendingContactRequest,
+    result: NativeDirectHttpResult) {
     try {
-      if (
-        !MessageDigest.isEqual(contact.identityKey, created.peerIdentityKey) ||
-        !MessageDigest.isEqual(contact.signingKey, created.peerSigningKey)
-      ) {
-        throw VeilMobileRuntimeException("E_VEIL_DIRECT", "The peer identity changed during setup")
+      executor.execute { handleContactResult(flow, pending, result) }
+    } catch (_: RuntimeException) {
+      result.wipeSensitiveBody()
+      failContactRequest(flow, pending)
+    }
+  }
+
+  private fun handleContactResult(flow: ContactFlow, pending: PendingContactRequest,
+    result: NativeDirectHttpResult) {
+    try {
+      check(synchronized(stateLock) { isCurrentContactRequestLocked(flow, pending) })
+      if (!pending.create && result is NativeDirectHttpResult.Failure &&
+        result.reason == NativeDirectHttpFailure.NOT_FOUND) {
+        synchronized(stateLock) {
+          if (isCurrentContactRequestLocked(flow, pending)) {
+            flow.pending = null
+            detachContactFlowLocked()
+            pending.complete(NativeContactOperationResult.NotFound)
+          } else failContactRequest(flow, pending)
+        }
+        return
       }
-      val stillCurrent = synchronized(stateLock) {
-        val pending = pendingContactOperation as? PendingDirectCreate
-        currentContactSyncLocked() === sync &&
-          pending?.sync === sync &&
-          pending.peerUserId == contact.userId &&
-          verifiedContact === contact
-      }
-      if (!stillCurrent) {
-        throw VeilMobileRuntimeException("E_VEIL_DIRECT", "Direct messaging is unavailable")
-      }
-      sync.session.installDirectConversation(
-        leaseToken = sync.leaseToken,
-        conversationId = created.conversationId,
-        peerUserId = contact.userId,
-        peerIdentityKey = contact.identityKey.copyOf(),
-        peerSigningKey = contact.signingKey.copyOf(),
-      )
-      val installed = synchronized(stateLock) {
-        val pending = pendingContactOperation as? PendingDirectCreate
-        if (
-          currentContactSyncLocked() !== sync || pending?.sync !== sync ||
-          pending.peerUserId != contact.userId || verifiedContact !== contact
-        ) {
-          false
-        } else {
-          val conversation = NativeDirectConversationInstall(
-            conversationId = created.conversationId,
-            name = contact.username,
-            peerUserId = contact.userId,
-            peerUsername = contact.username,
-            needsPreKey = true,
-          )
-          val previous = sync.conversations[created.conversationId]
-          check(previous == null || previous.peerUserId == contact.userId) {
-            "native Direct create collided with another peer"
+      check(result is NativeDirectHttpResult.Success)
+      val limit = if (pending.create) NativeDirectHttpLimits.CONTACT_CREATE_BYTES
+        else NativeDirectHttpLimits.CONTACT_SEARCH_BYTES
+      check(result.body.isNotEmpty() && result.body.size.toLong() <= limit)
+      if (pending.create) completeNativeDirectCreate(flow, pending, result.body)
+      else {
+        val parsed = flow.sync.session.parseContactSearchResponse(result.body)
+        var retained = false
+        try {
+          check(parsed.username == flow.username && isCanonicalDirectUuid(parsed.userId))
+          check(parsed.userId != flow.sync.userId)
+          check(parsed.identityKey.size == 32 && parsed.signingKey.size == 32)
+          synchronized(stateLock) {
+            if (isCurrentContactRequestLocked(flow, pending)) {
+              flow.verified = VerifiedContact(flow.sync, parsed.userId, parsed.username,
+                parsed.identityKey, parsed.signingKey)
+              retained = true
+              flow.pending = null
+              pending.complete(NativeContactOperationResult.Found(parsed.userId, parsed.username))
+            } else failContactRequest(flow, pending)
           }
-          check(previous != null || sync.conversations.size < MAX_DIRECT_CONVERSATIONS) {
-            "native Direct conversation bound exhausted"
+        } finally {
+          if (!retained) {
+            parsed.identityKey.fill(0)
+            parsed.signingKey.fill(0)
           }
-          sync.conversations[created.conversationId] = conversation
-          directConversations = sync.conversations.values.sortedBy { it.conversationId }
-          pendingContactOperation = null
-          clearVerifiedContactLocked()
-          true
         }
       }
-      if (!installed) {
-        throw VeilMobileRuntimeException("E_VEIL_DIRECT", "Direct messaging is unavailable")
+    } catch (_: Throwable) {
+      failContactRequest(flow, pending)
+    } finally {
+      result.wipeSensitiveBody()
+    }
+  }
+
+  private fun completeNativeDirectCreate(flow: ContactFlow, pending: PendingContactRequest,
+    response: ByteArray) {
+    val created = flow.sync.session.parseCreateDirectResponse(response)
+    try {
+      synchronized(stateLock) {
+        check(isCurrentContactRequestLocked(flow, pending))
+        val contact = checkNotNull(flow.verified)
+        check(isCanonicalDirectUuid(created.conversationId))
+        check(MessageDigest.isEqual(contact.identityKey, created.peerIdentityKey))
+        check(MessageDigest.isEqual(contact.signingKey, created.peerSigningKey))
+        val previous = flow.sync.conversations[created.conversationId]
+        check(previous == null || previous.peerUserId == contact.userId)
+        check(previous != null || flow.sync.conversations.size < MAX_DIRECT_CONVERSATIONS)
+        // No await between the scope check and mutation. Cancellation uses this
+        // same lock; Rust independently verifies exact lease/device authority.
+        val identity = contact.identityKey.copyOf()
+        val signing = contact.signingKey.copyOf()
+        try {
+          flow.sync.session.installDirectConversation(flow.sync.leaseToken,
+            created.conversationId, contact.userId, identity, signing)
+        } finally {
+          identity.fill(0)
+          signing.fill(0)
+        }
+        check(isCurrentContactRequestLocked(flow, pending))
+        flow.sync.conversations[created.conversationId] = NativeDirectConversationInstall(
+          created.conversationId, contact.username, contact.userId, contact.username, true)
+        directConversations = flow.sync.conversations.values.sortedBy { it.conversationId }
+        flow.pending = null
+        detachContactFlowLocked()
+        publishSnapshot()
+        pending.complete(if (currentContactSyncLocked() === flow.sync) {
+          NativeContactOperationResult.Created(created.conversationId)
+        } else NativeContactOperationResult.Unavailable)
       }
-      publishSnapshot()
-      return created.conversationId
     } finally {
       created.peerIdentityKey.fill(0)
       created.peerSigningKey.fill(0)
+    }
+  }
+
+  private fun failContactRequest(flow: ContactFlow, pending: PendingContactRequest) {
+    synchronized(stateLock) {
+      if (contactFlow === flow) detachContactFlowLocked()
+      pending.complete(NativeContactOperationResult.Unavailable)
     }
   }
 
@@ -1858,6 +1958,15 @@ internal class VeilMobileRuntime internal constructor(
     expectedGeneration: Long,
     plaintext: String,
     callback: NativeDirectTextSendCallback,
+  ) = sendDirectTextV2(rawConversationId, expectedGeneration, plaintext) { result ->
+    callback.onComplete(result.outcome)
+  }
+
+  fun sendDirectTextV2(
+    rawConversationId: String,
+    expectedGeneration: Long,
+    plaintext: String,
+    callback: NativeDirectTextSendCallbackV2,
   ) {
     val completion = DirectSendActionCompletion(callback)
     val ownedPlaintext = OwnedDirectPlaintext.fromString(plaintext)
@@ -1936,12 +2045,18 @@ internal class VeilMobileRuntime internal constructor(
     check(isReadyDirectConversationLocked(sync, action.conversationId))
     check(action.enqueueAttempts in 0..1)
     action.enqueueAttempts += 1
-    val outcome = sync.session.sendDirectText(
+    val attempt = sync.session.sendDirectText(
       sync.leaseToken,
       action.conversationId,
       action.plaintext.borrow(),
     )
-    return when (outcome) {
+    val accepted = attempt.outcome == NativeDirectTextSendOutcome.ACCEPTED ||
+      attempt.outcome == NativeDirectTextSendOutcome.ACCEPTED_FOR_REPLAY ||
+      attempt.outcome == NativeDirectTextSendOutcome.ACCEPTED_SESSION_INVALID
+    check(if (accepted) attempt.acceptance?.isStructurallySafe() == true
+      else attempt.acceptance == null) { "invalid native send acceptance" }
+    action.acceptance = attempt.acceptance
+    return when (attempt.outcome) {
       NativeDirectTextSendOutcome.ACCEPTED -> {
         sync.directSessionAction = null
           if (sync.contentRevision >= MAX_PUBLIC_SNAPSHOT_REVISION) {
@@ -4118,9 +4233,14 @@ internal class VeilMobileRuntime internal constructor(
   }
 
   /** Caller holds [stateLock]. */
-  private fun clearVerifiedContactLocked() {
-    verifiedContact?.clear()
-    verifiedContact = null
+  private fun detachContactFlowLocked() {
+    val flow = contactFlow ?: return
+    contactFlow = null
+    flow.pending?.call?.cancelQuietly()
+    flow.pending?.complete(NativeContactOperationResult.Unavailable)
+    flow.pending = null
+    flow.verified?.clear()
+    flow.verified = null
   }
 
   /** Caller holds [stateLock]. */
@@ -4182,8 +4302,7 @@ internal class VeilMobileRuntime internal constructor(
   ): DetachedDirectSync? {
     val selected = activeDirectSync
     activeDirectSync = null
-    pendingContactOperation = null
-    clearVerifiedContactLocked()
+    detachContactFlowLocked()
     val pendingCall = selected?.pendingRequest?.call
     val directAction = selected?.directSessionAction
     // Cancel under the same lock that revokes the generation. This closes the
@@ -4676,6 +4795,7 @@ internal class VeilMobileRuntime internal constructor(
     private const val CONTACT_SEARCH_TARGET_PREFIX = "/v1/users/search?username="
     private const val CREATE_DIRECT_TARGET = "/v1/conversations/dm"
     private const val MAX_CONTACT_REQUEST_BODY_BYTES = 4 * 1024
+    private val CONTACT_ACTION_ID = Regex("^[A-Za-z0-9_-]{1,64}$")
     private const val OWN_PREKEY_UPLOAD_TARGET = "/v1/prekeys"
     private val PEER_PREKEY_TARGET =
       Regex("^/v1/prekeys/[0-9a-f]{64}\\?transparency_from_size=(0|[1-9][0-9]{0,18})$")
@@ -4822,7 +4942,7 @@ private class UniFfiMobileSession(
     }
 
   override fun projectDirectMessages(conversationId: String): NativeDirectMessageProjection =
-    delegate.projectDirectMessages(conversationId).toNativeDirectMessageProjection()
+    delegate.projectDirectMessagesV2(conversationId).toNativeDirectMessageProjection()
 
   override fun directIdentityVerification(conversationId: String):
     NativeDirectIdentityVerification? =
@@ -4852,8 +4972,8 @@ private class UniFfiMobileSession(
     leaseToken: String,
     conversationId: String,
     plaintextUtf8: ByteArray,
-  ): NativeDirectTextSendOutcome =
-    delegate.sendDirectText(leaseToken, conversationId, plaintextUtf8).toNativeDirectTextSendOutcome()
+  ): NativeDirectTextAttemptV2 =
+    delegate.sendDirectTextV2(leaseToken, conversationId, plaintextUtf8).toNativeDirectTextAttemptV2()
 
   override fun prepareDirectPreKeyRequest(
     leaseToken: String,
@@ -5033,7 +5153,7 @@ internal fun MobileDirectOutboxReplayProgress.toNativeDirectOutboxReplayProgress
     replayComplete = replayComplete,
   )
 
-internal fun MobileDirectMessageProjection.toNativeDirectMessageProjection(): NativeDirectMessageProjection {
+internal fun MobileDirectMessageProjectionV2.toNativeDirectMessageProjection(): NativeDirectMessageProjection {
   if (availability == MobileDirectMessageProjectionAvailability.UNAVAILABLE) {
     closeAllDirectMessageHandles(messages)
     return unavailableDirectMessageProjection()
@@ -5043,7 +5163,7 @@ internal fun MobileDirectMessageProjection.toNativeDirectMessageProjection(): Na
       availability = NativeDirectMessageProjectionAvailability.AVAILABLE,
       messages = mapAndCloseAllNativeHandles(
         messages,
-        MobileDirectMessageData::toNativeDirectMessageView,
+        MobileDirectMessageDataV2::toNativeDirectMessageView,
       ),
     )
   } catch (_: Throwable) {
@@ -5051,9 +5171,12 @@ internal fun MobileDirectMessageProjection.toNativeDirectMessageProjection(): Na
   }
 }
 
-private fun MobileDirectMessageData.toNativeDirectMessageView(): NativeDirectMessageView =
+private fun MobileDirectMessageDataV2.toNativeDirectMessageView(): NativeDirectMessageView =
   NativeDirectMessageView(
     messageId = messageId(),
+    stableUiId = stableUiId(),
+    clientMessageId = clientMessageId(),
+    serverMessageId = serverMessageId(),
     text = text(),
     timestampMs = timestampMs(),
     direction = when (direction()) {
@@ -5115,6 +5238,12 @@ internal fun MobileDirectTextSendOutcome.toNativeDirectTextSendOutcome(): Native
     MobileDirectTextSendOutcome.REJECTED -> NativeDirectTextSendOutcome.REJECTED
     MobileDirectTextSendOutcome.UNAVAILABLE -> NativeDirectTextSendOutcome.UNAVAILABLE
   }
+
+internal fun MobileDirectTextSendResultV2.toNativeDirectTextAttemptV2(): NativeDirectTextAttemptV2 =
+  NativeDirectTextAttemptV2(
+    outcome = outcome.toNativeDirectTextSendOutcome(),
+    acceptance = acceptance?.let { NativeDirectTextAcceptanceV2(it.clientMessageId, it.localMessageId) },
+  )
 
 internal fun MobileContactRequest.toNativeContactRequest(): NativeContactRequest {
   val ownedBody = body.copyOf()

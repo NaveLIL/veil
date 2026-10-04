@@ -1,6 +1,7 @@
 package gateway_test
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -26,6 +27,14 @@ func setupTestServer(t *testing.T) (*httptest.Server, *gateway.Hub) {
 	authSvc := auth.NewService(nil, cfg)
 	hub := gateway.NewHub(authSvc, nil)
 	go hub.Run()
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if err := hub.Shutdown(ctx); err != nil {
+			t.Errorf("hub shutdown: %v", err)
+		}
+		authSvc.Close()
+	})
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v3/events", func(w http.ResponseWriter, r *http.Request) {

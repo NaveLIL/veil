@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sort"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -726,7 +727,8 @@ func (db *DB) UpdateChannel(ctx context.Context, channelID string, name, topic *
 	return err
 }
 
-// DeleteChannel removes a channel and its backing conversation.
+// DeleteChannel removes a channel and its backing conversation atomically.
+// Account-scoped send outcome tombstones intentionally survive this purge.
 func (db *DB) DeleteChannel(ctx context.Context, channelID string) error {
 	tx, err := db.Pool.Begin(ctx)
 	if err != nil {
@@ -735,9 +737,34 @@ func (db *DB) DeleteChannel(ctx context.Context, channelID string) error {
 	defer tx.Rollback(ctx)
 
 	var convID *string
-	err = tx.QueryRow(ctx, `SELECT conversation_id FROM channels WHERE id = $1`, channelID).Scan(&convID)
+	err = tx.QueryRow(ctx, `SELECT conversation_id FROM channels WHERE id = $1 FOR UPDATE`, channelID).Scan(&convID)
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return err
+	}
+	// Categories are containers, not ownership of their children. Keep those
+	// channels and move them to the top level when their category is deleted.
+	if _, err := tx.Exec(ctx, `UPDATE channels SET category_id = NULL WHERE category_id = $1`, channelID); err != nil {
+		return err
+	}
+	if convID != nil {
+		// Serialize against accepted sends and roster transitions before purge.
+		var lockedID string
+		if err := tx.QueryRow(ctx, `SELECT id FROM conversations WHERE id = $1 FOR UPDATE`, *convID).Scan(&lockedID); err != nil {
+			return err
+		}
+		// Prototype MLS tables use text IDs without conversation FKs.
+		for _, statement := range []string{
+			`DELETE FROM mls_welcomes WHERE conversation_id = $1`,
+			`DELETE FROM mls_commits WHERE conversation_id = $1`,
+			`DELETE FROM reactions WHERE conversation_id = $1::uuid`,
+			// Attachments cascade from messages; upload blobs follow their own
+			// retention/cleanup lifecycle rather than being deleted in SQL.
+			`DELETE FROM messages WHERE conversation_id = $1::uuid`,
+		} {
+			if _, err := tx.Exec(ctx, statement, *convID); err != nil {
+				return err
+			}
+		}
 	}
 	if _, err := tx.Exec(ctx, `DELETE FROM channels WHERE id = $1`, channelID); err != nil {
 		return err
@@ -748,6 +775,132 @@ func (db *DB) DeleteChannel(ctx context.Context, channelID string) error {
 		}
 	}
 	return tx.Commit(ctx)
+}
+
+// ChannelReorderItem describes a channel placement. An absent CategoryID
+// preserves the category unless ClearCategory is true.
+type ChannelReorderItem struct {
+	ChannelID     string
+	Position      int16
+	CategoryID    *string
+	ClearCategory bool
+}
+
+// ReorderChannels validates the complete batch and its ACL snapshot before any
+// write. Sorted row locks serialize overlapping batches without lock inversion;
+// SERIALIZABLE provides one consistent category/permission snapshot.
+// Returned snapshots may be broadcast only after successful commit.
+func (db *DB) ReorderChannels(ctx context.Context, serverID, requesterID string, items []ChannelReorderItem) ([]Channel, error) {
+	if !isCanonicalNonNilUUID(serverID) || !isCanonicalNonNilUUID(requesterID) {
+		return nil, errors.New("invalid reorder scope")
+	}
+	seen := make(map[string]bool, len(items))
+	lockIDs := make(map[string]bool, len(items))
+	for _, item := range items {
+		if !isCanonicalNonNilUUID(item.ChannelID) || item.Position < 0 || seen[item.ChannelID] ||
+			(item.ClearCategory && item.CategoryID != nil) {
+			return nil, errors.New("invalid channel reorder item")
+		}
+		seen[item.ChannelID], lockIDs[item.ChannelID] = true, true
+		if item.CategoryID != nil {
+			if !isCanonicalNonNilUUID(*item.CategoryID) || *item.CategoryID == item.ChannelID {
+				return nil, errors.New("invalid channel category")
+			}
+			lockIDs[*item.CategoryID] = true
+		}
+	}
+	if len(items) == 0 {
+		return nil, nil
+	}
+	ids := make([]string, 0, len(lockIDs))
+	for id := range lockIDs {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for attempt := 0; ; attempt++ {
+		updated, err := db.reorderChannelsOnce(ctx, serverID, requesterID, items, ids)
+		var pgErr *pgconn.PgError
+		retryable := errors.As(err, &pgErr) && (pgErr.Code == "40001" || pgErr.Code == "40P01")
+		if err == nil || !retryable || attempt >= 2 || ctx.Err() != nil {
+			return updated, err
+		}
+	}
+}
+
+func (db *DB) reorderChannelsOnce(ctx context.Context, serverID, requesterID string, items []ChannelReorderItem, ids []string) ([]Channel, error) {
+	tx, err := db.Pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+
+	channels := make(map[string]Channel, len(ids))
+	for _, id := range ids {
+		var channel Channel
+		if err := tx.QueryRow(ctx,
+			`SELECT id, server_id, conversation_id, name, channel_type, category_id, position, topic,
+			        COALESCE(nsfw, FALSE), COALESCE(slowmode_secs, 0), COALESCE(created_at, now())
+			 FROM channels WHERE id = $1::uuid FOR UPDATE`, id,
+		).Scan(&channel.ID, &channel.ServerID, &channel.ConversationID, &channel.Name, &channel.ChannelType,
+			&channel.CategoryID, &channel.Position, &channel.Topic, &channel.NSFW, &channel.SlowmodeSecs, &channel.CreatedAt); err != nil {
+			return nil, err
+		}
+		if channel.ServerID != serverID {
+			return nil, errors.New("channel does not belong to server")
+		}
+		channels[id] = channel
+	}
+	var serverAllowed bool
+	if err := tx.QueryRow(ctx,
+		`SELECT s.owner_id = $2::uuid OR COALESCE(BIT_OR(r.permissions), 0) & $3::bigint <> 0
+		 FROM servers s
+		 JOIN server_members m ON m.server_id = s.id AND m.user_id = $2::uuid
+		 LEFT JOIN roles r ON r.server_id = s.id AND (r.is_default OR EXISTS (
+		   SELECT 1 FROM member_roles mr WHERE mr.server_id = s.id AND mr.user_id = m.user_id AND mr.role_id = r.id
+		 ))
+		 WHERE s.id = $1::uuid AND s.deleted_at IS NULL GROUP BY s.owner_id`,
+		serverID, requesterID, int64(PermAdministrator|PermManageChannels),
+	).Scan(&serverAllowed); err != nil {
+		return nil, err
+	}
+	if !serverAllowed {
+		return nil, errors.New("insufficient permissions")
+	}
+	for _, item := range items {
+		permissions, err := getChannelPermissions(ctx, tx, item.ChannelID, requesterID)
+		if err != nil {
+			return nil, err
+		}
+		if permissions&PermAdministrator == 0 && permissions&PermManageChannels == 0 {
+			return nil, errors.New("insufficient permissions")
+		}
+		channel := channels[item.ChannelID]
+		if item.CategoryID != nil {
+			category := channels[*item.CategoryID]
+			if category.ChannelType != 2 || channel.ChannelType == 2 {
+				return nil, errors.New("invalid channel category")
+			}
+		}
+	}
+	updated := make([]Channel, 0, len(items))
+	for _, item := range items {
+		channel := channels[item.ChannelID]
+		channel.Position = item.Position
+		if item.ClearCategory {
+			channel.CategoryID = nil
+		} else if item.CategoryID != nil {
+			channel.CategoryID = item.CategoryID
+		}
+		if _, err := tx.Exec(ctx, `UPDATE channels SET position = $2, category_id = $3 WHERE id = $1::uuid`,
+			channel.ID, channel.Position, channel.CategoryID); err != nil {
+			return nil, err
+		}
+		updated = append(updated, channel)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return updated, nil
 }
 
 // GetChannel returns a channel by ID.

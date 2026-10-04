@@ -31,6 +31,7 @@ zeroize = "1"
 
 [dev-dependencies]
 veil-client = { path = "../veil-client", features = ["test-utils"] }
+veil-store = { path = "../veil-store" }
 prost = "0.13"
 
 [build-dependencies]

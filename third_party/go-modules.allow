@@ -29,5 +29,5 @@ all golang.org/x/image v0.44.0
 all golang.org/x/net v0.56.0
 all golang.org/x/sync v0.22.0
 all golang.org/x/sys v0.47.0
-all golang.org/x/text v0.40.0
+all golang.org/x/text v0.41.0
 all google.golang.org/protobuf v1.36.11

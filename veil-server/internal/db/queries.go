@@ -1310,6 +1310,31 @@ func (db *DB) storeMessageOnce(ctx context.Context, m *Message) error {
 		return err
 	}
 	defer tx.Rollback(ctx)
+	if err := db.StoreMessageTx(ctx, tx, m); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// StoreMessageTx applies the same message, security-snapshot, reply and upload
+// validation as StoreMessage inside a caller-owned transaction. The caller
+// must commit before publishing m.ID/CreatedAt or enqueueing external work,
+// and retry the entire transaction on serialization failure. This seam does
+// not implement send-idempotency; live sends still use StoreMessageIdempotent.
+func (db *DB) StoreMessageTx(ctx context.Context, tx pgx.Tx, m *Message) error {
+	if tx == nil || m == nil || m.ConversationID == "" || m.SenderID == "" || len(m.Ciphertext) == 0 {
+		return errors.New("invalid message transaction")
+	}
+	if m.SecurityContext != nil {
+		var isolation string
+		if err := tx.QueryRow(ctx, "SHOW transaction_isolation").Scan(&isolation); err != nil {
+			return err
+		}
+		if isolation != "serializable" {
+			return errors.New("secure message transaction must be serializable")
+		}
+	}
+	var err error
 	var conversationType int16
 	if err := tx.QueryRow(ctx,
 		`SELECT conv_type FROM conversations WHERE id = $1::uuid FOR UPDATE`,
@@ -1438,7 +1463,7 @@ func (db *DB) storeMessageOnce(ctx context.Context, m *Message) error {
 			return fmt.Errorf("store message attachment: %w", err)
 		}
 	}
-	return tx.Commit(ctx)
+	return nil
 }
 
 func validateMessageSecurityContext(security *MessageSecurityContext) error {

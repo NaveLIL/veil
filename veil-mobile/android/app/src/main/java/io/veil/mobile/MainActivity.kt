@@ -1,9 +1,13 @@
 package io.veil.mobile
 
+import android.content.ClipDescription
+import android.content.ClipboardManager
 import android.content.Intent
 import android.os.Build
 import android.os.Bundle
+import android.os.Looper
 import android.view.WindowManager
+import io.veil.mobile.runtime.NodeAccessPassParser
 
 import com.facebook.react.ReactActivity
 import com.facebook.react.ReactActivityDelegate
@@ -17,6 +21,7 @@ class MainActivity : ReactActivity() {
 
   @Volatile
   private var publishedReadyScreenCaptureGeneration = 0L
+  private var resumedForClipboardImport = false
 
   override fun onCreate(savedInstanceState: Bundle?) {
     revokeReadyScreenCaptureEligibility()
@@ -50,10 +55,12 @@ class MainActivity : ReactActivity() {
 
   override fun onResume() {
     super.onResume()
+    resumedForClipboardImport = true
     publishedReadyScreenCaptureGeneration = readyScreenCaptureGate.grantForeground()
   }
 
   override fun onPause() {
+    resumedForClipboardImport = false
     revokeReadyScreenCaptureEligibility()
     // Re-apply before Android is allowed to snapshot or background the task.
     // A ready debug shell may explicitly clear this again after foreground
@@ -71,6 +78,46 @@ class MainActivity : ReactActivity() {
 
   private fun revokeReadyScreenCaptureEligibility() {
     publishedReadyScreenCaptureGeneration = readyScreenCaptureGate.revoke()
+  }
+
+  /** Zero-argument React command, dispatched on the UI thread after an explicit click. */
+  internal fun importNodeAccessPassFromClipboard(): Boolean {
+    if (Looper.myLooper() != Looper.getMainLooper()) return false
+    return NativeEnrollmentClipboardImport.importExplicit(
+      isForeground = {
+        resumedForClipboardImport && hasWindowFocus() && !isFinishing && !isDestroyed
+      },
+      protectWindow = {
+        revokeReadyScreenCaptureEligibility()
+        window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+        window.attributes.flags and WindowManager.LayoutParams.FLAG_SECURE != 0
+      },
+      readPlainText = {
+        val clipboard = getSystemService(CLIPBOARD_SERVICE) as? ClipboardManager
+        val clip = clipboard?.primaryClip
+        if (clip == null || clip.itemCount != 1 || clip.description.mimeTypeCount != 1 ||
+          clip.description.getMimeType(0) != ClipDescription.MIMETYPE_TEXT_PLAIN
+        ) {
+          null
+        } else {
+          val item = clip.getItemAt(0)
+          // Never coerce URI/Intent/provider content into text.
+          if (item.uri != null || item.intent != null) null else item.text
+        }
+      },
+      stage = { raw ->
+        // consumeEnrollmentUri returns "handled" for malformed invitations as
+        // well. Validate first, then confirm that a new native flow was staged.
+        val parsed = NodeAccessPassParser.parse(raw)
+        parsed.close()
+        val runtime = (application as MainApplication).veilMobileRuntime
+        val before = runtime.snapshot().pendingAccessPass?.flowId
+        runtime.consumeEnrollmentUri(raw) &&
+          runtime.snapshot().pendingAccessPass?.flowId?.let { it != before } == true
+      },
+    )
+    // Deliberately retain the clipboard: Android has no atomic compare/clear
+    // operation, and a later user copy must never be erased by this import.
   }
 
   /**

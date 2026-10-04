@@ -25,6 +25,58 @@ afterEach(() => {
 });
 
 describe("authenticated event listener boundary", () => {
+  it("preserves native durable acceptance when the binding disconnects before IPC returns", async () => {
+    vi.resetModules();
+    mocks.handlers.clear();
+    mocks.listen.mockReset();
+    mocks.invoke.mockReset();
+    mocks.listen.mockImplementation(async (event: string, handler: (event: any) => unknown) => {
+      mocks.handlers.set(event, handler);
+      return vi.fn();
+    });
+    const acceptance = {
+      kind: "durable_direct",
+      clientMessageId: "550e8400-e29b-41d4-a716-446655440099",
+      localMessageId: "550e8400-e29b-41d4-a716-446655440099",
+      transportEnqueued: false,
+    };
+    let resolveSend!: (value: unknown) => void;
+    const nativeSend = new Promise<unknown>((resolve) => { resolveSend = resolve; });
+    mocks.invoke.mockImplementation(async (command: string) => {
+      if (command === "connect_to_server") return {
+        userId: USER_ID,
+        canonicalServerOrigin: "http://127.0.0.1:9080",
+        bindingGeneration: "1",
+      };
+      if (command === "send_message") return nativeSend;
+      if (["get_conversation_crypto_diagnostics", "get_conversations", "get_messages", "list_servers"].includes(command)) return [];
+      return undefined;
+    });
+    const { appStore } = await import("@/stores/app");
+    await appStore.setupEventListeners();
+    await appStore.connectToServer();
+    const conversationId = "550e8400-e29b-41d4-a716-446655440010";
+    appStore.setConversations([{ id: conversationId, type: "dm", name: "Peer", unreadCount: 0 }]);
+    appStore.selectConversation(conversationId);
+    const send = appStore.sendMessage("already persisted");
+    await vi.waitFor(() => expect(mocks.invoke.mock.calls.filter(([command]) => command === "send_message")).toHaveLength(1));
+    const projectionsBeforeDisconnect = mocks.invoke.mock.calls.filter(([command]) => command === "get_messages").length;
+    vi.useFakeTimers();
+    mocks.handlers.get("veil://disconnected")?.({
+      event: "veil://disconnected", id: 1,
+      payload: {
+        reason: "socket closed",
+        serverScopeOrigin: "http://127.0.0.1:9080",
+        serverBindingGeneration: "1",
+      },
+    });
+    expect(appStore.connected()).toBe(false);
+    resolveSend(acceptance);
+    await expect(send).resolves.toEqual(acceptance);
+    expect(mocks.invoke.mock.calls.filter(([command]) => command === "get_messages")).toHaveLength(projectionsBeforeDisconnect);
+    expect(mocks.invoke.mock.calls.filter(([command]) => command === "send_message")).toHaveLength(1);
+  });
+
   it("rolls back partial registration and observes an immediate scoped disconnect", async () => {
     vi.resetModules();
     const firstUnlisten = vi.fn();
@@ -41,6 +93,14 @@ describe("authenticated event listener boundary", () => {
           userId: USER_ID,
           canonicalServerOrigin: "http://127.0.0.1:9080",
           bindingGeneration: "1",
+        };
+      }
+      if (command === "send_message") {
+        return {
+          kind: "durable_direct",
+          clientMessageId: "550e8400-e29b-41d4-a716-446655440099",
+          localMessageId: "550e8400-e29b-41d4-a716-446655440099",
+          transportEnqueued: false,
         };
       }
       if (

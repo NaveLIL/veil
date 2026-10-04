@@ -20,6 +20,15 @@
 > включается. Следующий шаг — exact account/origin/device credential binding,
 > затем подписанный Delivery Service/KeyPackage lifecycle и runtime orchestration.
 >
+> **Reliability roadmap proposal 2026-10-04:** подробный
+> [план исправлений бэкенда и Android](docs/roadmaps/backend-and-mobile-reliability-2026-10-04.md)
+> связывает существующий код с проверенными upstream решениями и критериями
+> готовности. Это предложение по реализации, а не закрытие текущих gates или
+> автоматический пересмотр ADR-0004.
+> Уточнение: графический Android-клиент ещё не готов. Сначала M00 выбирает
+> готовую frontend основу, затем обязательные M01–M04 предшествуют пользовательской
+> проверке ПК ↔ Android; M05 доводит интерфейс до согласованного mobile release scope.
+>
 > **Dependency checkpoint 2026-08-30:** patched the actionable desktop/mobile
 > `nanoid` and `js-yaml` advisories with narrow pnpm overrides. Mobile CI keeps
 > only the two exact, time-bounded `image-size` build-tool exceptions documented

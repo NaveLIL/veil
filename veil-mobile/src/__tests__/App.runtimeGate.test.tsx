@@ -50,6 +50,7 @@ jest.mock("../native/runtime", () => ({
     getSnapshot: jest.fn(),
     openSession: jest.fn(),
     connect: jest.fn(),
+    importNodeAccessPassFromClipboard: jest.fn(),
     connectPendingAccessPass: jest.fn(),
     disconnect: jest.fn(),
     lock: jest.fn(),
@@ -128,6 +129,7 @@ type RuntimeMock = {
   getSnapshot: jest.Mock<() => Promise<VeilMobileRuntimeSnapshot>>;
   openSession: jest.Mock<() => Promise<VeilMobileRuntimeSnapshot>>;
   connect: jest.Mock<(canonicalOrigin: string) => Promise<unknown>>;
+  importNodeAccessPassFromClipboard: jest.Mock<() => Promise<boolean>>;
   connectPendingAccessPass: jest.Mock<(flowId: string) => Promise<unknown>>;
   disconnect: jest.Mock;
   lock: jest.Mock<() => Promise<VeilMobileRuntimeSnapshot>>;
@@ -202,10 +204,14 @@ describe("App native runtime privacy gate", () => {
     resetMobileSettingsStoreForTests();
     mockBeginIdentitySetup.mockResolvedValue("committed");
     mockReconcileIdentitySetup.mockResolvedValue({ status: "none" });
+    mockRuntime.importNodeAccessPassFromClipboard.mockResolvedValue(false);
     useChatStore.setState({
       messagesByChannel: {
         secret: [{
           id: "secret",
+          stableUiId: "secret",
+          clientMessageId: null,
+          serverMessageId: "secret",
           author: {} as never,
           text: "renderable plaintext",
           ts: "now",
@@ -230,6 +236,87 @@ describe("App native runtime privacy gate", () => {
       runtimeListener = listener;
       return { remove: jest.fn() };
     });
+  });
+
+  it("imports a clipboard invitation through a zero-argument native command and reviews sanitized metadata", async () => {
+    const locked = runtimeSnapshot({
+      sessionState: "locked",
+      connectionState: "disconnected",
+      directoryReady: false,
+      secureSyncState: "idle",
+      binding: null,
+      directGeneration: null,
+      directContentRevision: null,
+    });
+    mockRuntime.getSnapshot.mockResolvedValue(locked);
+    const view = render(<App />);
+    await waitFor(() => expect(view.getByTestId("import-access-pass")).toBeTruthy());
+    const staged = {
+      ...locked,
+      runtimeRevision: 2,
+      pendingAccessPass: {
+        flowId: "ab".repeat(32),
+        canonicalOrigin: "https://veil.erez.pro:443",
+        tokenRef: "0123456789ab",
+        expiresInSeconds: 120,
+      },
+    };
+    mockRuntime.importNodeAccessPassFromClipboard.mockResolvedValue(true);
+    mockRuntime.getSnapshot.mockResolvedValue(staged);
+    fireEvent.press(view.getByTestId("import-access-pass"));
+    await waitFor(() => expect(view.getByTestId("access-pass-review")).toBeTruthy());
+    expect(mockRuntime.importNodeAccessPassFromClipboard).toHaveBeenCalledWith();
+    expect(view.getByTestId("access-pass-origin").props.children).toBe("https://veil.erez.pro:443");
+    expect(view.queryByTestId("import-access-pass")).toBeNull();
+    expect(mockRuntime.connectPendingAccessPass).not.toHaveBeenCalled();
+    expect(view.queryByText("CHAT_PLAINTEXT")).toBeNull();
+    expect(JSON.stringify(view.toJSON())).not.toContain("invite=");
+  });
+
+  it("does not publish a late clipboard import result after backgrounding", async () => {
+    const locked = runtimeSnapshot({
+      sessionState: "locked",
+      connectionState: "disconnected",
+      directoryReady: false,
+      secureSyncState: "idle",
+      binding: null,
+      directGeneration: null,
+      directContentRevision: null,
+    });
+    mockRuntime.getSnapshot.mockResolvedValue(locked);
+    mockRuntime.lock.mockResolvedValue(locked);
+    const result = deferred<boolean>();
+    mockRuntime.importNodeAccessPassFromClipboard.mockReturnValue(result.promise);
+    const view = render(<App />);
+    await waitFor(() => expect(view.getByTestId("import-access-pass")).toBeTruthy());
+    fireEvent.press(view.getByTestId("import-access-pass"));
+    const readsBeforeBackground = mockRuntime.getSnapshot.mock.calls.length;
+    act(() => appStateListener?.("background"));
+    await act(async () => result.resolve(true));
+    expect(mockRuntime.getSnapshot).toHaveBeenCalledTimes(readsBeforeBackground);
+    expect(view.queryByTestId("access-pass-review")).toBeNull();
+    expect(view.queryByTestId("import-access-pass")).toBeNull();
+    expect(useRuntimeGateStore.getState().snapshot).toBeNull();
+    expect(useRuntimeGateStore.getState().curtainVisible).toBe(true);
+  });
+
+  it("shows only the bounded local outcome when clipboard import is rejected", async () => {
+    const locked = runtimeSnapshot({
+      sessionState: "locked",
+      connectionState: "disconnected",
+      directoryReady: false,
+      secureSyncState: "idle",
+      binding: null,
+      directGeneration: null,
+      directContentRevision: null,
+    });
+    mockRuntime.getSnapshot.mockResolvedValue(locked);
+    const view = render(<App />);
+    await waitFor(() => expect(view.getByTestId("import-access-pass")).toBeTruthy());
+    fireEvent.press(view.getByTestId("import-access-pass"));
+    await waitFor(() => expect(view.getByTestId("public-failure-code-v1").props.children).toBe("VEIL-PASS-003"));
+    expect(view.queryByTestId("access-pass-review")).toBeNull();
+    expect(view.queryByText("CHAT_PLAINTEXT")).toBeNull();
   });
 
   it("never renders onboarding while cold durable reconciliation is unresolved", async () => {
@@ -487,6 +574,9 @@ describe("App native runtime privacy gate", () => {
       messagesByChannel: {
         [directConversation.conversationId]: [{
           id: "44444444-4444-4444-8444-444444444444",
+          stableUiId: "44444444-4444-4444-8444-444444444444",
+          clientMessageId: null,
+          serverMessageId: "44444444-4444-4444-8444-444444444444",
           author: {} as never,
           text: "newer projection",
           ts: "12:00",
@@ -536,6 +626,9 @@ describe("App native runtime privacy gate", () => {
         availability: "available",
         messages: [{
           messageId: "44444444-4444-4444-8444-444444444444",
+          stableUiId: "44444444-4444-4444-8444-444444444444",
+          clientMessageId: null,
+          serverMessageId: "44444444-4444-4444-8444-444444444444",
           text: "before live event",
           timestampMs: 1_720_000_000_000,
           direction: "incoming",
@@ -547,6 +640,9 @@ describe("App native runtime privacy gate", () => {
       availability: "available",
       messages: [{
         messageId: "55555555-5555-4555-8555-555555555555",
+        stableUiId: "55555555-5555-4555-8555-555555555555",
+        clientMessageId: null,
+        serverMessageId: "55555555-5555-4555-8555-555555555555",
         text: "after live event",
         timestampMs: 1_720_000_000_001,
         direction: "incoming",

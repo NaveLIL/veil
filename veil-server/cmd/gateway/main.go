@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -176,17 +177,21 @@ func main() {
 	sourceInfoJSON = append(sourceInfoJSON, '\n')
 
 	// Connect to PostgreSQL
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	database, err := db.Connect(ctx, cfg.DatabaseURL)
+	connectCtx, connectCancel := context.WithTimeout(context.Background(), cfg.DatabaseConnectTimeout)
+	database, err := db.Connect(connectCtx, cfg.DatabaseURL)
+	connectCancel()
 	if err != nil {
 		log.Fatalf("database connection failed: %v", err)
 	}
-	defer database.Close()
+	// The full audit has a separate budget: growing history must not consume
+	// the connection budget. No listener/readiness is exposed before success.
+	ctx, auditCancel := context.WithTimeout(context.Background(), cfg.StartupAuditTimeout)
+	defer auditCancel()
+	log.Println("startup audit: validating cryptographic public keys")
 	if err := database.ValidateCryptographicPublicKeys(ctx); err != nil {
 		log.Fatalf("database cryptographic-key preflight failed: %v", err)
 	}
+	log.Println("startup audit: checking membership epochs")
 	if err := database.AuditMembershipEpochsV1(ctx, cfg.PublicOrigin.String()); err != nil {
 		log.Fatalf("membership epoch startup audit failed: %v", err)
 	}
@@ -233,6 +238,14 @@ func main() {
 		log.Println("identity transparency account-registration log enabled")
 	}
 	log.Println("database connected")
+	auditCancel()
+	workerCtx, workerCancel := context.WithCancel(context.Background())
+	defer workerCancel()
+	var workers sync.WaitGroup
+	startWorker := func(fn func(context.Context)) {
+		workers.Add(1)
+		go func() { defer workers.Done(); fn(workerCtx) }()
+	}
 
 	// Initialize services
 	authSvc := auth.NewService(database, cfg)
@@ -240,6 +253,10 @@ func main() {
 
 	// Start hub
 	hub := gateway.NewHub(authSvc, chatSvc)
+	hub.SetCommandBudgets(gateway.CommandBudgets{
+		Auth: cfg.WSAuthTimeout, Read: cfg.WSReadTimeout,
+		Mutation: cfg.WSMutationTimeout, Ephemeral: cfg.WSEphemeralTimeout,
+	})
 	chatSvc.SetBroadcaster(hub)
 	if err := gateway.ConfigureFromEnv(); err != nil {
 		log.Fatalf("gateway config: %v", err)
@@ -277,9 +294,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("REST auth version dispatcher configuration: %v", err)
 	}
-	replayJanitorCtx, replayJanitorCancel := context.WithCancel(context.Background())
-	defer replayJanitorCancel()
-	go runRESTAuthV2ReplayJanitor(replayJanitorCtx, database)
+	startWorker(func(ctx context.Context) { runRESTAuthV2ReplayJanitor(ctx, database) })
 	rl := authmw.NewRateLimit(240, time.Minute) // 4 req/sec sustained, burst 240
 	defer rl.Close()
 	profileMutationRL := authmw.NewRateLimit(12, time.Minute)
@@ -298,9 +313,7 @@ func main() {
 	profilesHandler := profiles.NewHandler(profileStore, signedMw, rl, profileMutationRL, hub)
 	profilesHandler.SetRESTAuthVersionDispatcher(restDispatcher)
 	profilesHandler.RegisterRoutes(mux)
-	avatarJanitorCtx, avatarJanitorCancel := context.WithCancel(context.Background())
-	defer avatarJanitorCancel()
-	go profiles.RunAvatarJanitor(avatarJanitorCtx, profileStore, slog.Default())
+	startWorker(func(ctx context.Context) { profiles.RunAvatarJanitor(ctx, profileStore, slog.Default()) })
 
 	// Chat REST endpoints (message sync, conversations)
 	chatHandler := chat.NewHandler(chatSvc, signedMw, rl)
@@ -371,9 +384,7 @@ func main() {
 	if uploadSvc.Enabled() {
 		log.Printf("uploads enabled (dir=%s, quota=%d/%s)",
 			uploadCfg.LocalDir, uploadCfg.UserDailyQuota, uploadCfg.QuotaWindow)
-		uploadCtx, uploadCancel := context.WithCancel(context.Background())
-		defer uploadCancel()
-		go uploadSvc.Sweeper(uploadCtx)
+		startWorker(uploadSvc.Sweeper)
 	} else {
 		log.Printf("uploads disabled (set VEIL_UPLOAD_TOKEN_KEY to enable)")
 	}
@@ -500,9 +511,10 @@ func main() {
 		log.Fatalf("CORS configuration error: %v", err)
 	}
 	publicHandler := http.HandlerFunc(preAuthRL.Wrap(mux.ServeHTTP))
+	requests := newRequestRuntime()
 	server := &http.Server{
 		Addr:              ":" + cfg.Port,
-		Handler:           httpmw.Chain(httpmw.SecurityHeaders, httpmw.CORS(corsOrigins), httpmw.AccessLog(slog.Default()))(publicHandler),
+		Handler:           requests.Wrap(httpmw.Chain(httpmw.SecurityHeaders, httpmw.CORS(corsOrigins), httpmw.AccessLog(slog.Default()))(publicHandler)),
 		ReadHeaderTimeout: 10 * time.Second,
 		// Encrypted tus chunks and large signed REST responses must not be cut
 		// off by the old 15-second whole-request deadline. HeaderTimeout keeps
@@ -546,14 +558,75 @@ func main() {
 	// Graceful shutdown
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(quit)
 	<-quit
 	log.Println("shutting down...")
 
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 	defer shutdownCancel()
-	server.Shutdown(shutdownCtx)
+	requests.StopAdmission()
+	hub.StopAdmission()
+	graceCtx, graceCancel := context.WithTimeout(shutdownCtx, cfg.ShutdownGrace)
+	var drains sync.WaitGroup
+	for _, drain := range []func(){
+		func() { _ = server.Shutdown(graceCtx) },
+		func() { _ = hub.DrainCommands(graceCtx) },
+		func() {
+			if internalSrv != nil {
+				_ = internalSrv.Shutdown(graceCtx)
+			}
+		},
+	} {
+		drains.Add(1)
+		go func() { defer drains.Done(); drain() }()
+	}
+	_ = awaitRuntime(graceCtx, &drains)
+	graceCancel()
+	// Join cancellable DB users and WebSocket pumps, including hijacked
+	// connections that net/http Shutdown does not own.
+	requests.cancel()
+	_ = server.Close()
 	if internalSrv != nil {
-		internalSrv.Shutdown(shutdownCtx)
+		_ = internalSrv.Close()
+	}
+	workerCancel()
+	var cleanup sync.WaitGroup
+	errors := make(chan error, 4)
+	for _, stop := range []func() error{
+		func() error { return awaitRuntime(shutdownCtx, &requests.active) },
+		func() error { return awaitRuntime(shutdownCtx, &workers) },
+		func() error { return pushDispatcher.Shutdown(shutdownCtx) },
+		func() error { return hub.Shutdown(shutdownCtx) },
+	} {
+		cleanup.Add(1)
+		go func() { defer cleanup.Done(); errors <- stop() }()
+	}
+	if err := awaitRuntime(shutdownCtx, &cleanup); err != nil {
+		// Do not close a pool beneath still-running handlers. Exit is bounded
+		// even if a dependency violated its context cancellation contract.
+		log.Printf("runtime shutdown exceeded budget: class=%s", logsafe.ErrorClass(err))
+		os.Exit(1)
+	}
+	close(errors)
+	for err := range errors {
+		if err != nil {
+			log.Printf("runtime shutdown incomplete: class=%s", logsafe.ErrorClass(err))
+			os.Exit(1)
+		}
+	}
+	poolClosed := make(chan struct{})
+	go func() {
+		authSvc.Close()
+		gateway.CloseRateLimiter()
+		database.Close()
+		close(poolClosed)
+	}()
+	select {
+	case <-poolClosed:
+		log.Println("shutdown complete")
+	case <-shutdownCtx.Done():
+		log.Println("database pool shutdown exceeded budget")
+		os.Exit(1)
 	}
 }
 

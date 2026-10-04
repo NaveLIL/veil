@@ -10,6 +10,66 @@ import org.junit.Test
 
 class VeilMobileRuntimeModuleTest {
   @Test
+  fun `contacts expose only closed public results and sanitized errors`() {
+    val found = capturePromise()
+    found.promise.publishContactOperationResult(
+      NativeContactOperationResult.Found("peer-id", "alice")) { JavaOnlyMap() }
+    val foundMap = found.resolveCalls.single().single() as WritableMap
+    assertEquals(mapOf("userId" to "peer-id", "username" to "alice"), foundMap.toHashMap())
+    val missing = capturePromise()
+    missing.promise.publishContactOperationResult(NativeContactOperationResult.NotFound) {
+      JavaOnlyMap()
+    }
+    assertEquals(listOf(listOf<Any?>(null)), missing.resolveCalls)
+    val created = capturePromise()
+    created.promise.publishContactOperationResult(
+      NativeContactOperationResult.Created("conversation-id")) { JavaOnlyMap() }
+    val createdMap = created.resolveCalls.single().single() as WritableMap
+    assertEquals(mapOf("conversationId" to "conversation-id"), createdMap.toHashMap())
+    val unavailable = capturePromise()
+    unavailable.promise.publishContactOperationResult(NativeContactOperationResult.Unavailable) {
+      JavaOnlyMap()
+    }
+    assertExactRejection(unavailable, "E_VEIL_RUNTIME", "VEIL-RUNTIME-999",
+      listOf("signature", "body", "identity_key", "signing_key"))
+  }
+
+  @Test
+  fun `React production surface has no contact signer request or parser capability`() {
+    val names = VeilMobileRuntimeModule::class.java.declaredMethods.map { it.name }.toSet()
+    listOf("prepareContactSearch", "prepareCreateDirect", "parseContactSearchResponse",
+      "parseCreateDirectResponse").forEach { assertFalse(names.contains(it)) }
+  }
+
+  @Test
+  fun `V2 send exports publish only exact committed identity and never legacy null`() {
+    val names = VeilMobileRuntimeModule::class.java.declaredMethods.map { it.name }.toSet()
+    assertFalse(names.contains("sendDirectText"))
+    assertFalse(names.contains("projectDirectMessages"))
+    assertEquals(true, names.contains("sendDirectTextV2"))
+    assertEquals(true, names.contains("projectDirectMessagesV2"))
+    val receipt = NativeDirectTextAcceptanceV2("40000000-0000-4000-8000-000000000001",
+      "40000000-0000-4000-8000-000000000001")
+    val accepted = capturePromise()
+    accepted.promise.publishDirectTextSendResultV2(
+      NativeDirectTextSendResultV2(NativeDirectTextSendResult.ACCEPTED, receipt)) { JavaOnlyMap() }
+    val published = accepted.resolveCalls.single().single() as WritableMap
+    assertEquals(mapOf("clientMessageId" to receipt.clientMessageId,
+      "localMessageId" to receipt.localMessageId), published.toHashMap())
+    assertEquals(1, accepted.completionCount())
+    listOf(null, receipt.copy(localMessageId = "40000000-0000-4000-8000-000000000002"))
+      .forEach { malformed ->
+        val denied = capturePromise()
+        denied.promise.publishDirectTextSendResultV2(
+          NativeDirectTextSendResultV2(NativeDirectTextSendResult.ACCEPTED, malformed)) {
+          JavaOnlyMap()
+        }
+        assertExactRejection(denied, "E_VEIL_DIRECT_SEND_UNAVAILABLE", "VEIL-RUNTIME-999",
+          listOf(receipt.clientMessageId))
+      }
+  }
+
+  @Test
   fun `Direct session unavailable routes through one sanitized rejection`() {
     val capture = capturePromise()
 

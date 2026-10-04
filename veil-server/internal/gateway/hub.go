@@ -159,9 +159,13 @@ var upgrader = websocket.Upgrader{
 
 // Client represents a connected WebSocket client.
 type Client struct {
-	hub  *Hub
-	conn *websocket.Conn
-	send chan outboundBatch
+	hub    *Hub
+	conn   *websocket.Conn
+	send   chan outboundBatch
+	ctx    context.Context
+	cancel context.CancelFunc
+	// activeCommand belongs exclusively to the synchronous reader/dispatcher.
+	activeCommand context.Context
 
 	// closing is set before a saturated client is disconnected. Fan-out skips
 	// such sessions immediately, even while the read pump is still unwinding
@@ -256,6 +260,9 @@ func (c *Client) markClosing() bool {
 
 func (c *Client) closeTransportOnce() {
 	c.closeOnce.Do(func() {
+		if c.cancel != nil {
+			c.cancel()
+		}
 		if c.closeFn != nil {
 			_ = c.closeFn()
 			return
@@ -273,6 +280,17 @@ func (c *Client) failClosed() {
 
 // Hub maintains active clients and routes messages.
 type Hub struct {
+	ctx         context.Context
+	cancel      context.CancelFunc
+	budgets     CommandBudgets
+	lifecycleMu sync.Mutex
+	stopping    bool
+	commands    sync.WaitGroup
+	sessions    sync.WaitGroup
+	background  sync.WaitGroup
+	stopRun     chan struct{}
+	runDone     chan struct{}
+	stopRunOnce sync.Once
 	// All connected clients
 	clients map[*Client]bool
 	// Index: userID → set of clients (for message fan-out)
@@ -299,7 +317,10 @@ type Hub struct {
 }
 
 func NewHub(authSvc *auth.Service, chatSvc *chat.Service) *Hub {
+	ctx, cancel := context.WithCancel(context.Background())
 	return &Hub{
+		ctx: ctx, cancel: cancel, budgets: DefaultCommandBudgets(),
+		stopRun: make(chan struct{}), runDone: make(chan struct{}),
 		clients:       make(map[*Client]bool),
 		userClients:   make(map[string]map[*Client]bool),
 		deviceClients: make(map[string]map[*Client]bool),
@@ -346,8 +367,11 @@ func (h *Hub) releaseIP(ip string) {
 }
 
 func (h *Hub) Run() {
+	defer close(h.runDone)
 	for {
 		select {
+		case <-h.stopRun:
+			return
 		case client := <-h.register:
 			h.mu.Lock()
 			h.clients[client] = true
@@ -372,7 +396,7 @@ func (h *Hub) Run() {
 						if len(uc) == 0 {
 							delete(h.userClients, client.userID)
 							// Last connection for this user — broadcast offline
-							go h.broadcastPresenceOnDisconnect(client.userID, client.identityKey)
+							h.startBackground(func() { h.broadcastPresenceOnDisconnect(client.userID, client.identityKey) })
 						}
 					}
 				}
@@ -390,7 +414,9 @@ func (h *Hub) Run() {
 			metrics.WSConnectionsActive.Set(float64(n))
 			h.releaseIP(client.ip)
 			// Clean up auth challenge
-			h.authSvc.RemoveChallenge(client.connID)
+			if h.authSvc != nil {
+				h.authSvc.RemoveChallenge(client.connID)
+			}
 			log.Printf("client disconnected: %s (total: %d)", client.connID, n)
 		}
 	}
@@ -606,10 +632,7 @@ func (h *Hub) BroadcastToUsers(userIDs []string, env *pb.Envelope) {
 }
 
 func (c *Client) readPump() {
-	defer func() {
-		c.hub.unregister <- c
-		c.failClosed()
-	}()
+	defer c.unregisterClient()
 
 	c.conn.SetReadLimit(maxMessageSize)
 	c.conn.SetReadDeadline(time.Now().Add(pongWait))
@@ -691,7 +714,6 @@ func (c *Client) handleEnvelope(env *pb.Envelope) {
 		c.failClosed()
 		return
 	}
-	ctx := context.Background()
 	clientMessageID, sendMessageReason := sendMessageEnvelopeContext(env)
 
 	if !c.authenticated {
@@ -718,6 +740,14 @@ func (c *Client) handleEnvelope(env *pb.Envelope) {
 		return
 	}
 
+	ctx, finish, admitted := c.beginEnvelope(env)
+	if !admitted {
+		// Do not report a permanent rejection: the original ID is safe to
+		// reconcile/retry after reconnect, including an earlier lost ACK.
+		c.failClosed()
+		return
+	}
+	defer finish()
 	switch p := env.Payload.(type) {
 	case *pb.Envelope_SendMessage:
 		c.handleSendMessage(ctx, env.Seq, p.SendMessage)
@@ -1540,7 +1570,8 @@ func (c *Client) handlePresence(ctx context.Context, ev *pb.PresenceUpdate) {
 
 // broadcastPresenceOnDisconnect sends OFFLINE status to all friends when a user's last client disconnects.
 func (h *Hub) broadcastPresenceOnDisconnect(userID string, identityKey []byte) {
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(h.lifecycleContext(), h.budgets.Ephemeral)
+	defer cancel()
 	friendIDs, err := h.chatSvc.DB().GetFriendIDs(ctx, userID)
 	if err != nil || len(friendIDs) == 0 {
 		return
@@ -1834,6 +1865,13 @@ func isValidFriendRequestInput(targetUserID string, message *string) bool {
 // --- Helpers ---
 
 func (c *Client) sendEnvelope(env *pb.Envelope) {
+	if c.activeCommand != nil && c.activeCommand.Err() != nil {
+		c.failClosed()
+		return
+	}
+	if c.closing.Load() {
+		return
+	}
 	data, err := marshalEnvelope(env)
 	if err != nil {
 		log.Printf("marshal error: class=%s", logsafe.ErrorClass(err))
@@ -1930,6 +1968,8 @@ func (c *Client) writePump() {
 
 	for {
 		select {
+		case <-c.connectionContext().Done():
+			return
 		case batch, ok := <-c.send:
 			if !ok {
 				c.conn.WriteMessage(websocket.CloseMessage, []byte{})

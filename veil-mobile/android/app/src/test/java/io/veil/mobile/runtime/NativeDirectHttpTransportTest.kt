@@ -1,6 +1,7 @@
 package io.veil.mobile.runtime
 
 import io.veil.mobile.BuildConfig
+import java.net.InetAddress
 import java.util.Base64
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
@@ -27,6 +28,90 @@ import org.junit.Before
 import org.junit.Test
 
 class NativeDirectHttpTransportTest {
+  @Test
+  fun contactCreatePostPreservesExactBodyAndNeverFollowsRedirect() {
+    requireDebugTestTlsFixture()
+    server.enqueue(MockResponse().setResponseCode(302)
+      .setHeader("Location", "$serverOrigin/v1/conversations/dm"))
+    val body = "{\"peer_user_id\":\"$USER_ID\"}".toByteArray()
+    val original = body.copyOf()
+    val request = signedRequest(target = "/v1/conversations/dm",
+      responseLimit = NativeDirectHttpLimits.CONTACT_CREATE_BYTES,
+      method = NativeDirectHttpMethod.POST, body = body)
+    val completed = CountDownLatch(1)
+    val result = AtomicReference<NativeDirectHttpResult>()
+    val call = transport.createCall(request) {
+      result.set(it)
+      completed.countDown()
+    }
+    body.fill(0)
+    call.start()
+    assertTrue(completed.await(5, TimeUnit.SECONDS))
+    assertFailure(NativeDirectHttpFailure.UNEXPECTED_STATUS, checkNotNull(result.get()))
+    val received = checkNotNull(server.takeRequest(5, TimeUnit.SECONDS))
+    assertEquals("POST", received.method)
+    assertEquals("/v1/conversations/dm", received.path)
+    assertArrayEquals(original, received.body.readByteArray())
+    assertEquals(SIGNATURE_BASE64URL, received.getHeader("X-Veil-Signature"))
+    assertEquals(1, server.requestCount)
+  }
+
+  @Test
+  fun contactNotFoundIsPublicOnlyForTheExactSearchRoute() {
+    requireDebugTestTlsFixture()
+    server.enqueue(MockResponse().setResponseCode(404).setBody("untrusted diagnostic"))
+    assertFailure(NativeDirectHttpFailure.NOT_FOUND, executeAndAwait(signedRequest(
+      target = "/v1/users/search?username=alice",
+      responseLimit = NativeDirectHttpLimits.CONTACT_SEARCH_BYTES)))
+    server.enqueue(MockResponse().setResponseCode(404).setBody("untrusted diagnostic"))
+    assertFailure(NativeDirectHttpFailure.UNEXPECTED_STATUS, executeAndAwait(signedRequest()))
+  }
+
+  @Test
+  fun contactBodyAndResponseLimitsAndExactPostTargetAreEnforcedBeforeNetwork() {
+    requireDebugTestTlsFixture()
+    val invalid = listOf(
+      signedRequest(target = "/v1/users/search?username=alice",
+        responseLimit = NativeDirectHttpLimits.CONTACT_SEARCH_BYTES + 1),
+      signedRequest(target = "/v1/conversations/dm?extra=true",
+        responseLimit = NativeDirectHttpLimits.CONTACT_CREATE_BYTES,
+        method = NativeDirectHttpMethod.POST, body = byteArrayOf(1)),
+      signedRequest(target = "/v1/conversations/dm",
+        responseLimit = NativeDirectHttpLimits.CONTACT_CREATE_BYTES + 1,
+        method = NativeDirectHttpMethod.POST, body = byteArrayOf(1)),
+      signedRequest(target = "/v1/conversations/dm",
+        responseLimit = NativeDirectHttpLimits.CONTACT_CREATE_BYTES,
+        method = NativeDirectHttpMethod.POST,
+        body = ByteArray(NativeDirectHttpLimits.CONTACT_CREATE_BODY_BYTES + 1)),
+    )
+    invalid.forEach {
+      assertFailure(NativeDirectHttpFailure.INVALID_REQUEST, executeAndAwait(it))
+    }
+    assertEquals(0, server.requestCount)
+    server.enqueue(MockResponse().setBody(Buffer().write(
+      ByteArray(NativeDirectHttpLimits.CONTACT_SEARCH_BYTES.toInt() + 1))))
+    assertFailure(NativeDirectHttpFailure.RESPONSE_TOO_LARGE, executeAndAwait(signedRequest(
+      target = "/v1/users/search?username=alice",
+      responseLimit = NativeDirectHttpLimits.CONTACT_SEARCH_BYTES)))
+  }
+
+  @Test
+  fun exactContactRequestBodyIsOneShotAndClearedAfterWriting() {
+    val input = "{\"peer_user_id\":\"$USER_ID\"}".toByteArray()
+    val prepared = NativeDirectHttpTransport().prepareRequest(signedRequest(
+      origin = "https://example.test:443", target = "/v1/conversations/dm",
+      responseLimit = NativeDirectHttpLimits.CONTACT_CREATE_BYTES,
+      method = NativeDirectHttpMethod.POST, body = input))
+    val body = checkNotNull(prepared.body)
+    assertTrue(body.isOneShot())
+    val original = input.copyOf()
+    input.fill(0)
+    val written = Buffer()
+    body.writeTo(written)
+    assertArrayEquals(original, written.readByteArray())
+    assertThrows(java.io.IOException::class.java) { body.writeTo(Buffer()) }
+  }
+
   private lateinit var server: MockWebServer
   private lateinit var transport: NativeDirectHttpTransport
   private lateinit var serverOrigin: String
@@ -50,8 +135,12 @@ class NativeDirectHttpTransportTest {
     server = MockWebServer()
     server.useHttps(serverCertificates.sslSocketFactory(), false)
     server.protocols = listOf(Protocol.HTTP_1_1)
-    server.start()
-    serverOrigin = "https://${server.url("/").host}:${server.port}"
+    // Avoid reverse-DNS Docker aliases on Windows; keep the default hostname
+    // verifier and the existing certificate SANs exactly aligned.
+    server.start(InetAddress.getByAddress("127.0.0.1", byteArrayOf(127, 0, 0, 1)), 0)
+    // MockWebServer.url() can reverse-resolve the bound socket on Windows.
+    // The signed URL authority must also remain the certificate's numeric SAN.
+    serverOrigin = "https://127.0.0.1:${server.port}"
     transport = NativeDirectHttpTransport(
       clientCertificates.sslSocketFactory(),
       clientCertificates.trustManager,
@@ -78,7 +167,7 @@ class NativeDirectHttpTransportTest {
     assertEquals("GET", recorded.method)
     assertEquals(target, recorded.path)
     assertEquals(0L, recorded.bodySize)
-    assertEquals("${server.url("/").host}:${server.port}", recorded.getHeader("Host"))
+    assertEquals(serverOrigin.removePrefix("https://"), recorded.getHeader("Host"))
     assertEquals("application/json", recorded.getHeader("Accept"))
     assertEquals(REST_AUTH_VERSION, recorded.getHeader("X-Veil-REST-Auth-Version"))
     assertEquals(USER_ID, recorded.getHeader("X-Veil-User"))
@@ -186,7 +275,7 @@ class NativeDirectHttpTransportTest {
     server.enqueue(
       MockResponse()
         .setResponseCode(302)
-        .setHeader("Location", server.url("/must-not-be-followed")),
+        .setHeader("Location", "$serverOrigin/must-not-be-followed"),
     )
 
     val result = executeAndAwait(signedRequest())

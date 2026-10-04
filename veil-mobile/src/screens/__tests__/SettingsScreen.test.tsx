@@ -9,6 +9,7 @@ import {
   useMobileSettingsStore,
 } from "../../stores/settings";
 import SettingsScreen, { SettingsDetailScreen } from "../SettingsScreen";
+import { ROCKET_CHAT_MIT_NOTICE } from "../../presentation/rocketChat/notice";
 
 const metrics = {
   frame: { x: 0, y: 0, width: 390, height: 844 },
@@ -96,5 +97,8 @@ describe("SettingsScreen", () => {
 
     expect(view.getByText("0.1.0")).toBeTruthy();
     expect(view.getByText("Development build")).toBeTruthy();
+    expect(view.getByText("Rocket.Chat React Native")).toBeTruthy();
+    expect(view.getByText("4.77.0 · MIT")).toBeTruthy();
+    expect(view.getByText(ROCKET_CHAT_MIT_NOTICE)).toBeTruthy();
   });
 });

@@ -1,5 +1,6 @@
 import { createSignal } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
+import { validatedMessageSendAcceptance } from "@/lib/messageSendAcceptance";
 import { decisionDialog } from "@/lib/decisionDialog";
 import { listen, type EventCallback, type UnlistenFn } from "@tauri-apps/api/event";
 import {
@@ -1714,25 +1715,38 @@ export const appStore = {
         requireCurrentMutationScope(sessionEpoch, mutationScope);
       }
       requireCurrentMutationScope(sessionEpoch, mutationScope);
-      await invoke("send_message", {
+      const acceptance = validatedMessageSendAcceptance(await invoke("send_message", {
         conversationId: convId,
         text,
         replyToId: replyToId ?? null,
         ...authenticatedMutationScopeArgs(mutationScope),
-      });
+      }));
+      if (
+        conversation?.type === "dm"
+        && !replyToId
+        && acceptance.kind !== "durable_direct"
+      ) {
+        throw new Error("Direct text was not accepted by the native outbox");
+      }
+      if (acceptance.kind === "durable_direct") {
+        // A changed transport scope cannot revoke an already committed intent.
+        // Revalidate only publication, never turn its receipt into a rejection.
+        if (
+          isUiSessionEpochCurrent(sessionEpoch)
+          && authenticatedScopesEqual(authenticatedServerScope(), mutationScope)
+        ) {
+          void appStore.loadMessages(convId).catch(() => {});
+        }
+        return acceptance;
+      }
       requireCurrentMutationScope(sessionEpoch, mutationScope);
-      setConversations((prev) =>
-        prev.map((conversation) =>
-          conversation.id === convId
-            ? { ...conversation, lastMessage: text, lastMessageTime: Date.now() }
-            : conversation,
-        ),
-      );
-      // Backend already persisted the outgoing message to the local DB
-      // (api.rs send_message inserts before returning). The gateway filters
+      // Native acceptance already committed the outgoing row (and, for
+      // Direct text, its exact outbox payload), even if transport is blocked.
+      // The gateway filters
       // the sender from broadcast, so we won't get a veil://message echo.
       // Refresh from DB to display the just-sent message exactly once.
       appStore.loadMessages(convId).catch(() => {});
+      return acceptance;
     } catch (e) {
       rethrowIfStale(e);
       console.error("send failed:", e);

@@ -35,13 +35,16 @@ import uniffi.veil_ffi.MobileDirectHistoryOutcome
 import uniffi.veil_ffi.MobileDirectHistoryProgress
 import uniffi.veil_ffi.MobileDirectLiveBufferProgress
 import uniffi.veil_ffi.MobileDirectLiveReplayProgress
-import uniffi.veil_ffi.MobileDirectMessageData
-import uniffi.veil_ffi.MobileDirectMessageProjection
+import uniffi.veil_ffi.MobileDirectMessageDataV2
+import uniffi.veil_ffi.MobileDirectMessageProjectionV2
 import uniffi.veil_ffi.MobileDirectMessageProjectionAvailability
 import uniffi.veil_ffi.MobileDirectPreKeyResult
 import uniffi.veil_ffi.MobileDirectRestRequest
 import uniffi.veil_ffi.MobileDirectSendReadiness
 import uniffi.veil_ffi.MobileDirectSyncLease
+import uniffi.veil_ffi.MobileDirectTextSendOutcome
+import uniffi.veil_ffi.MobileDirectTextSendAcceptanceV2
+import uniffi.veil_ffi.MobileDirectTextSendResultV2
 import uniffi.veil_ffi.MobileRetryableReason
 import uniffi.veil_ffi.MobileWsEventsCallback
 import uniffi.veil_ffi.MobileWsEventsController
@@ -49,6 +52,249 @@ import uniffi.veil_ffi.RestSignatureData
 import uniffi.veil_ffi.VeilException
 
 class VeilMobileRuntimeTest {
+  @Test
+  fun nativeContactFlowOwnsBoundedSearchAndOneExactCreate() {
+    val executor = daemonExecutor()
+    val session = FakeSession()
+    val transport = ControllableDirectTransport()
+    val runtime = runtime(executor, session, directTransport = transport)
+    try {
+      val generation = completeDirectReadyBootstrap(runtime, session, transport,
+        directConversation("10", "Other", "11", "other", true))
+      val found = ContactCapture()
+      runtime.searchContact("alice", generation, "contact-1", found)
+      assertEquals("/v1/users/search?username=alice", transport.requests.last().requestTarget)
+      assertEquals(NativeDirectHttpLimits.CONTACT_SEARCH_BYTES,
+        transport.requests.last().responseLimitBytes)
+      val searchBody = "native-contact-response".toByteArray()
+      transport.completeNext(NativeDirectHttpResult.Success(searchBody))
+      assertEquals(NativeContactOperationResult.Found(session.contactUserId, "alice"), found.await())
+      assertTrue(searchBody.all { it == 0.toByte() })
+      val created = ContactCapture()
+      runtime.createDirect(session.contactUserId, generation, "contact-1", created)
+      val request = transport.requests.last()
+      assertEquals(NativeDirectHttpMethod.POST, request.method)
+      assertEquals("/v1/conversations/dm", request.requestTarget)
+      assertEquals(NativeDirectHttpLimits.CONTACT_CREATE_BYTES, request.responseLimitBytes)
+      assertTrue(request.body.all { it == 0.toByte() })
+      assertEquals("{\"peer_user_id\":\"" + session.contactUserId + "\"}",
+        String(transport.capturedBodies.last()))
+      val duplicate = ContactCapture()
+      runtime.createDirect(session.contactUserId, generation, "contact-1", duplicate)
+      assertEquals(NativeContactOperationResult.Unavailable, duplicate.await())
+      val body = "native-create-response".toByteArray()
+      transport.completeNext(NativeDirectHttpResult.Success(body))
+      assertEquals(NativeContactOperationResult.Created(session.createdConversationId), created.await())
+      assertEquals(1, session.contactInstallCount)
+      assertTrue(body.all { it == 0.toByte() })
+      assertTrue(session.parsedContactKeys.all { key -> key.all { it == 0.toByte() } })
+      assertTrue(runtime.snapshot().directConversations.any {
+        it.conversationId == session.createdConversationId
+      })
+      val consumed = ContactCapture()
+      runtime.createDirect(session.contactUserId, generation, "contact-1", consumed)
+      assertEquals(NativeContactOperationResult.Unavailable, consumed.await())
+      assertEquals(1, session.contactCreatePrepareCount)
+    } finally {
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun lateSearchACannotConsumeOrReplacePendingSearchB() {
+    val executor = daemonExecutor()
+    val session = FakeSession()
+    val transport = ControllableDirectTransport()
+    val runtime = runtime(executor, session, directTransport = transport)
+    try {
+      val generation = completeDirectReadyBootstrap(runtime, session, transport,
+        directConversation("10", "Other", "11", "other", true))
+      val first = ContactCapture()
+      runtime.searchContact("alice", generation, "contact-A", first)
+      val firstCall = transport.calls.last()
+      val second = ContactCapture()
+      runtime.searchContact("bob", generation, "contact-B", second)
+      assertTrue(firstCall.cancelled.get())
+      assertEquals(NativeContactOperationResult.Unavailable, first.await())
+      assertFalse(runtime.cancelContacts(generation, "contact-A"))
+      val staleBody = "stale-A".toByteArray()
+      transport.completeNext(NativeDirectHttpResult.Success(staleBody))
+      awaitRuntimeIdle(runtime)
+      assertTrue(staleBody.all { it == 0.toByte() })
+      assertEquals(0, session.contactSearchParseCount)
+      session.contactUsername = "bob"
+      transport.completeNext(NativeDirectHttpResult.Success("current-B".toByteArray()))
+      assertEquals(NativeContactOperationResult.Found(session.contactUserId, "bob"), second.await())
+      val staleCreate = ContactCapture()
+      runtime.createDirect(session.contactUserId, generation, "contact-A", staleCreate)
+      assertEquals(NativeContactOperationResult.Unavailable, staleCreate.await())
+      assertEquals(0, session.contactCreatePrepareCount)
+      assertTrue(runtime.cancelContacts(generation, "contact-B"))
+      assertTrue(session.parsedContactKeys.all { key -> key.all { it == 0.toByte() } })
+      assertEquals(1, first.completionCount.get())
+    } finally {
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun cancelledContactCreateBeforeAttachNeverStartsPost() {
+    val executor = daemonExecutor()
+    val session = FakeSession()
+    val cancelAtCreation = AtomicBoolean(false)
+    lateinit var runtime: VeilMobileRuntime
+    var generation = 0L
+    val transport = ControllableDirectTransport {
+      if (cancelAtCreation.get()) runtime.cancelContacts(generation, "contact-1")
+    }
+    runtime = runtime(executor, session, directTransport = transport)
+    try {
+      generation = completeDirectReadyBootstrap(runtime, session, transport,
+        directConversation("10", "Other", "11", "other", true))
+      val found = ContactCapture()
+      runtime.searchContact("alice", generation, "contact-1", found)
+      transport.completeNext(NativeDirectHttpResult.Success("contact".toByteArray()))
+      found.await()
+      val sent = transport.requests.size
+      cancelAtCreation.set(true)
+      val created = ContactCapture()
+      runtime.createDirect(session.contactUserId, generation, "contact-1", created)
+      assertEquals(NativeContactOperationResult.Unavailable, created.await())
+      assertFalse(transport.calls.last().started.get())
+      assertTrue(transport.calls.last().cancelled.get())
+      assertEquals(sent, transport.requests.size)
+      assertEquals(0, session.contactInstallCount)
+      assertTrue(session.parsedContactKeys.all { key -> key.all { it == 0.toByte() } })
+    } finally {
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun cancelledCreateDuringResponseParsingCannotStartDurableInstall() {
+    val executor = daemonExecutor()
+    val session = FakeSession()
+    val transport = ControllableDirectTransport()
+    val runtime = runtime(executor, session, directTransport = transport)
+    try {
+      val generation = completeDirectReadyBootstrap(runtime, session, transport,
+        directConversation("10", "Other", "11", "other", true))
+      val found = ContactCapture()
+      runtime.searchContact("alice", generation, "contact-1", found)
+      transport.completeNext(NativeDirectHttpResult.Success("contact".toByteArray()))
+      found.await()
+      session.contactCreateParseBoundary = { runtime.cancelContacts(generation, "contact-1") }
+      val created = ContactCapture()
+      runtime.createDirect(session.contactUserId, generation, "contact-1", created)
+      val body = "create".toByteArray()
+      transport.completeNext(NativeDirectHttpResult.Success(body))
+      assertEquals(NativeContactOperationResult.Unavailable, created.await())
+      awaitRuntimeIdle(runtime)
+      assertEquals(0, session.contactInstallCount)
+      assertEquals(1, created.completionCount.get())
+      assertTrue(body.all { it == 0.toByte() })
+    } finally {
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun nativeContactRejectsOversizeNotFoundWrongQueryAndStaleGenerationWithoutSelection() {
+    val executor = daemonExecutor()
+    val session = FakeSession()
+    val transport = ControllableDirectTransport()
+    val runtime = runtime(executor, session, directTransport = transport)
+    try {
+      val generation = completeDirectReadyBootstrap(runtime, session, transport,
+        directConversation("10", "Other", "11", "other", true))
+      val invalid = ContactCapture()
+      val requests = transport.requests.size
+      runtime.searchContact("alice", generation + 1, "stale", invalid)
+      assertEquals(NativeContactOperationResult.Unavailable, invalid.await())
+      assertEquals(requests, transport.requests.size)
+      val missing = ContactCapture()
+      runtime.searchContact("alice", generation, "missing", missing)
+      transport.completeNext(NativeDirectHttpResult.Failure(NativeDirectHttpFailure.NOT_FOUND))
+      assertEquals(NativeContactOperationResult.NotFound, missing.await())
+      val missingCreate = ContactCapture()
+      runtime.createDirect(session.contactUserId, generation, "missing", missingCreate)
+      assertEquals(NativeContactOperationResult.Unavailable, missingCreate.await())
+      val oversized = ContactCapture()
+      runtime.searchContact("alice", generation, "large", oversized)
+      val oversizedBody = ByteArray(NativeDirectHttpLimits.CONTACT_SEARCH_BYTES.toInt() + 1) { 1 }
+      transport.completeNext(NativeDirectHttpResult.Success(oversizedBody))
+      assertEquals(NativeContactOperationResult.Unavailable, oversized.await())
+      awaitRuntimeIdle(runtime)
+      assertEquals(0, session.contactSearchParseCount)
+      assertTrue(oversizedBody.all { it == 0.toByte() })
+      val mismatch = ContactCapture()
+      runtime.searchContact("bob", generation, "mismatch", mismatch)
+      transport.completeNext(NativeDirectHttpResult.Success("alice-not-bob".toByteArray()))
+      assertEquals(NativeContactOperationResult.Unavailable, mismatch.await())
+      awaitRuntimeIdle(runtime)
+      assertTrue(session.parsedContactKeys.all { key -> key.all { it == 0.toByte() } })
+      assertEquals(0, session.contactCreatePrepareCount)
+    } finally {
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun contactCreateRejectsSwappedKeysAndBackgroundRevokesRetainedSelection() {
+    val executor = daemonExecutor()
+    val session = FakeSession()
+    val transport = ControllableDirectTransport()
+    val runtime = runtime(executor, session, directTransport = transport)
+    try {
+      val generation = completeDirectReadyBootstrap(runtime, session, transport,
+        directConversation("10", "Other", "11", "other", true))
+      val found = ContactCapture()
+      runtime.searchContact("alice", generation, "contact-1", found)
+      transport.completeNext(NativeDirectHttpResult.Success("contact".toByteArray()))
+      found.await()
+      session.swapCreatedContactKeys = true
+      val created = ContactCapture()
+      runtime.createDirect(session.contactUserId, generation, "contact-1", created)
+      transport.completeNext(NativeDirectHttpResult.Success("swapped".toByteArray()))
+      assertEquals(NativeContactOperationResult.Unavailable, created.await())
+      assertEquals(0, session.contactInstallCount)
+      assertTrue(session.parsedContactKeys.all { key -> key.all { it == 0.toByte() } })
+      val second = ContactCapture()
+      runtime.searchContact("alice", generation, "contact-2", second)
+      transport.completeNext(NativeDirectHttpResult.Success("contact".toByteArray()))
+      second.await()
+      runtime.lockForBackground()
+      assertTrue(session.parsedContactKeys.all { key -> key.all { it == 0.toByte() } })
+      val stale = ContactCapture()
+      runtime.createDirect(session.contactUserId, generation, "contact-2", stale)
+      assertEquals(NativeContactOperationResult.Unavailable, stale.await())
+      assertEquals(1, session.contactCreatePrepareCount)
+    } finally {
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
+  private class ContactCapture : NativeContactOperationCallback {
+    private val completed = CountDownLatch(1)
+    private val result = AtomicReference<NativeContactOperationResult?>()
+    val completionCount = AtomicInteger(0)
+    override fun onComplete(result: NativeContactOperationResult) {
+      completionCount.incrementAndGet()
+      this.result.set(result)
+      completed.countDown()
+    }
+    fun await(): NativeContactOperationResult {
+      assertTrue("contact operation did not complete", completed.await(5, TimeUnit.SECONDS))
+      return checkNotNull(result.get())
+    }
+  }
+
   @Test
   fun identitySetupAuthorityDefersOutsideForegroundAndPublishesOnlyStableEpoch() {
     NativeIdentitySetupCoordinator.resetForTest()
@@ -1047,6 +1293,9 @@ class VeilMobileRuntimeTest {
         listOf(
           NativeDirectMessageView(
             messageId = "30000000-0000-4000-8000-000000000001",
+            stableUiId = "30000000-0000-4000-8000-000000000001",
+            clientMessageId = null,
+            serverMessageId = "30000000-0000-4000-8000-000000000001",
             text = oldPlaintext,
             timestampMs = 1_700_000_000_123,
             direction = NativeDirectMessageDirection.INCOMING,
@@ -1132,6 +1381,9 @@ class VeilMobileRuntimeTest {
         listOf(
           NativeDirectMessageView(
             messageId = "30000000-0000-4000-8000-000000000001",
+            stableUiId = "30000000-0000-4000-8000-000000000001",
+            clientMessageId = null,
+            serverMessageId = "30000000-0000-4000-8000-000000000001",
             text = plaintext,
             timestampMs = 1_700_000_000_123,
             direction = NativeDirectMessageDirection.INCOMING,
@@ -3351,6 +3603,70 @@ class VeilMobileRuntimeTest {
   }
 
   @Test
+  fun v2AcceptancePreservesOriginalIdsAcrossEveryDurableTransportOutcome() {
+    listOf(NativeDirectTextSendOutcome.ACCEPTED,
+      NativeDirectTextSendOutcome.ACCEPTED_FOR_REPLAY,
+      NativeDirectTextSendOutcome.ACCEPTED_SESSION_INVALID).forEach { outcome ->
+      val executor = CapturingScheduledExecutor()
+      val fakeSession = FakeSession().apply { directTextSendOutcomes.add(outcome) }
+      val transport = ControllableDirectTransport()
+      val runtime = runtime(executor, fakeSession, directTransport = transport)
+      val conversation = directConversation("10", "Alice", "11", "alice", needsPreKey = false)
+      try {
+        val generation = completeDirectReadyBootstrap(runtime, fakeSession, transport, conversation)
+        val completed = AtomicReference<NativeDirectTextSendResultV2?>()
+        val completions = AtomicInteger(0)
+        runtime.sendDirectTextV2(conversation.conversationId, generation, "single durable intent") {
+          completions.incrementAndGet()
+          completed.set(it)
+        }
+        val result = checkNotNull(completed.get())
+        assertEquals(NativeDirectTextSendResult.ACCEPTED, result.outcome)
+        assertEquals(fakeSession.directTextAcceptance, result.acceptance)
+        assertEquals(1, completions.get())
+        assertEquals(1, fakeSession.directTextSendCount)
+        assertTrue(fakeSession.directTextPlaintextReferences.single().all { it == 0.toByte() })
+        runtime.lockSession()
+        assertEquals(1, completions.get())
+        assertEquals(fakeSession.directTextAcceptance, result.acceptance)
+      } finally {
+        runtime.lockSession()
+        executor.shutdownNow()
+      }
+    }
+  }
+
+  @Test
+  fun malformedNativeAcceptedReceiptRevokesGenerationWithoutPublishingInventedIdentity() {
+    listOf(null, NativeDirectTextAcceptanceV2("40000000-0000-4000-8000-000000000001",
+      "40000000-0000-4000-8000-000000000002")).forEach { malformed ->
+      val executor = daemonExecutor()
+      val fakeSession = FakeSession().apply {
+        directTextSendOutcomes.add(NativeDirectTextSendOutcome.ACCEPTED)
+        directTextAcceptance = malformed
+      }
+      val transport = ControllableDirectTransport()
+      val runtime = runtime(executor, fakeSession, directTransport = transport)
+      val conversation = directConversation("10", "Alice", "11", "alice", needsPreKey = false)
+      try {
+        val generation = completeDirectReadyBootstrap(runtime, fakeSession, transport, conversation)
+        val completed = AtomicReference<NativeDirectTextSendResultV2?>()
+        runtime.sendDirectTextV2(conversation.conversationId, generation, "native invalid receipt") {
+          completed.set(it)
+        }
+        assertEquals(NativeDirectTextSendResult.UNAVAILABLE, checkNotNull(completed.get()).outcome)
+        assertNull(completed.get()?.acceptance)
+        assertNull(runtime.snapshot().directGeneration)
+        assertEquals(1, fakeSession.directTextSendCount)
+        assertTrue(fakeSession.directTextPlaintextReferences.single().all { it == 0.toByte() })
+      } finally {
+        runtime.lockSession()
+        executor.shutdownNow()
+      }
+    }
+  }
+
+  @Test
   fun acceptedSessionInvalidCompletesOnceAndRevokesWithoutRetryPermission() {
     val executor = daemonExecutor()
     val fakeSession = FakeSession().apply {
@@ -5091,6 +5407,9 @@ class VeilMobileRuntimeTest {
   fun generatedDirectMessageProjectionMapsOnlyTheMinimalUiContract() {
     val nativeView = NativeDirectMessageView(
       messageId = "30000000-0000-4000-8000-000000000001",
+      stableUiId = "30000000-0000-4000-8000-000000000001",
+      clientMessageId = null,
+      serverMessageId = "30000000-0000-4000-8000-000000000001",
       text = "authenticated preview",
       timestampMs = 1_700_000_000_123,
       direction = NativeDirectMessageDirection.INCOMING,
@@ -5103,14 +5422,15 @@ class VeilMobileRuntimeTest {
     assertFalse(nativeView.toString().contains("authenticated preview"))
     assertFalse(nativeProjection.toString().contains("authenticated preview"))
     assertEquals(
-      setOf("messageId", "text", "timestampMs", "direction", "delivery"),
+      setOf("messageId", "stableUiId", "clientMessageId", "serverMessageId",
+        "text", "timestampMs", "direction", "delivery"),
       NativeDirectMessageView::class.java.declaredFields.map { it.name }.toSet(),
     )
-    val generatedFields = MobileDirectMessageData::class.java.declaredFields.map { it.name }.toSet()
+    val generatedFields = MobileDirectMessageDataV2::class.java.declaredFields.map { it.name }.toSet()
     assertFalse(generatedFields.contains("messageId"))
     assertFalse(generatedFields.contains("text"))
 
-    val denied = MobileDirectMessageProjection(
+    val denied = MobileDirectMessageProjectionV2(
       availability = MobileDirectMessageProjectionAvailability.UNAVAILABLE,
       messages = emptyList(),
     ).toNativeDirectMessageProjection()
@@ -5145,9 +5465,46 @@ class VeilMobileRuntimeTest {
   }
 
   @Test
+  fun generatedV2AcceptanceMapsOriginalIdsWithoutInventingAliases() {
+    val clientId = "40000000-0000-4000-8000-000000000001"
+    val mapped = MobileDirectTextSendResultV2(MobileDirectTextSendOutcome.ACCEPTED_FOR_REPLAY,
+      MobileDirectTextSendAcceptanceV2(clientId, clientId)).toNativeDirectTextAttemptV2()
+    assertEquals(NativeDirectTextSendOutcome.ACCEPTED_FOR_REPLAY, mapped.outcome)
+    assertEquals(NativeDirectTextAcceptanceV2(clientId, clientId), mapped.acceptance)
+    assertFalse(mapped.toString().contains(clientId))
+    val noReceipt = MobileDirectTextSendResultV2(MobileDirectTextSendOutcome.NEEDS_PRE_KEY,
+      null).toNativeDirectTextAttemptV2()
+    assertNull(noReceipt.acceptance)
+  }
+
+  @Test
+  fun v2ProjectionRejectsCrossDirectionIdentityCollisionAndWrongReceiptAliases() {
+    val clientId = "40000000-0000-4000-8000-000000000001"
+    val serverId = "30000000-0000-4000-8000-000000000001"
+    val pending = NativeDirectMessageView(clientId, clientId, clientId, null, "same intent",
+      null, NativeDirectMessageDirection.OUTGOING, NativeDirectMessageDelivery.SENDING)
+    val ack = pending.copy(messageId = serverId, serverMessageId = serverId,
+      timestampMs = 1_700_000_000_123L, delivery = NativeDirectMessageDelivery.SENT)
+    fun projection(vararg rows: NativeDirectMessageView) = NativeDirectMessageProjection(
+      NativeDirectMessageProjectionAvailability.AVAILABLE, rows.toList())
+    assertTrue(projection(pending).isStructurallySafe())
+    assertTrue(projection(ack).isStructurallySafe())
+    assertEquals(pending.stableUiId, ack.stableUiId)
+    val incoming = NativeDirectMessageView(clientId, clientId, null, clientId, "incoming",
+      1_700_000_000_124L, NativeDirectMessageDirection.INCOMING, NativeDirectMessageDelivery.SENT)
+    assertFalse(projection(ack, incoming).isStructurallySafe())
+    assertFalse(projection(ack.copy(clientMessageId = null)).isStructurallySafe())
+    assertFalse(projection(ack.copy(serverMessageId = null)).isStructurallySafe())
+    assertFalse(projection(incoming.copy(clientMessageId = clientId)).isStructurallySafe())
+  }
+
+  @Test
   fun directProjectionStructuralGuardEnforcesUtf8RowAndAggregateBudgets() {
     fun message(index: Int, text: String) = NativeDirectMessageView(
       messageId = "30000000-0000-4000-8000-${index.toString(16).padStart(12, '0')}",
+      stableUiId = "30000000-0000-4000-8000-${index.toString(16).padStart(12, '0')}",
+      clientMessageId = null,
+      serverMessageId = "30000000-0000-4000-8000-${index.toString(16).padStart(12, '0')}",
       text = text,
       timestampMs = 1_700_000_000_000L + index,
       direction = NativeDirectMessageDirection.INCOMING,
@@ -5705,6 +6062,8 @@ class VeilMobileRuntimeTest {
     @Volatile var directSendReadiness = NativeDirectSendReadiness.NEEDS_PRE_KEY
     @Volatile var directTextSendCount = 0
     val directTextSendOutcomes = ArrayDeque<NativeDirectTextSendOutcome>()
+    var directTextAcceptance: NativeDirectTextAcceptanceV2? = NativeDirectTextAcceptanceV2(
+      "40000000-0000-4000-8000-000000000001", "40000000-0000-4000-8000-000000000001")
     val directTextPlaintextReferences = CopyOnWriteArrayList<ByteArray>()
     val directTextPlaintextCopies = CopyOnWriteArrayList<ByteArray>()
     var peerPreKeyRequestCount = 0
@@ -5742,6 +6101,12 @@ class VeilMobileRuntimeTest {
     var contactUserId = "550e8400-e29b-41d4-a716-446655440002"
     var contactUsername = "alice"
     var createdConversationId = "550e8400-e29b-41d4-a716-446655440003"
+    var contactSearchParseCount = 0
+    var contactCreatePrepareCount = 0
+    var contactInstallCount = 0
+    var swapCreatedContactKeys = false
+    var contactCreateParseBoundary: () -> Unit = {}
+    val parsedContactKeys = CopyOnWriteArrayList<ByteArray>()
 
     override fun mobileReconnectTarget(): NativeMobileReconnectTarget? {
       storedReconnectTargetLoadCount += 1
@@ -6016,16 +6381,23 @@ class VeilMobileRuntimeTest {
       leaseToken: String,
       conversationId: String,
       plaintextUtf8: ByteArray,
-    ): NativeDirectTextSendOutcome {
+    ): NativeDirectTextAttemptV2 {
       check(leaseToken == "test-direct-lease")
       directTextSendCount += 1
       directTextPlaintextReferences.add(plaintextUtf8)
       directTextPlaintextCopies.add(plaintextUtf8.copyOf())
-      return if (directTextSendOutcomes.isEmpty()) {
+      val outcome = if (directTextSendOutcomes.isEmpty()) {
         NativeDirectTextSendOutcome.UNAVAILABLE
       } else {
         directTextSendOutcomes.removeFirst()
       }
+      return NativeDirectTextAttemptV2(outcome, when (outcome) {
+        NativeDirectTextSendOutcome.ACCEPTED,
+        NativeDirectTextSendOutcome.ACCEPTED_FOR_REPLAY,
+        NativeDirectTextSendOutcome.ACCEPTED_SESSION_INVALID ->
+          directTextAcceptance
+        else -> null
+      })
     }
 
     override fun prepareDirectPreKeyRequest(
@@ -6087,7 +6459,12 @@ class VeilMobileRuntimeTest {
         username = contactUsername,
         identityKey = contactIdentityKey.copyOf(),
         signingKey = contactSigningKey.copyOf(),
-      ).also { response.fill(0) }
+      ).also {
+        contactSearchParseCount += 1
+        parsedContactKeys.add(it.identityKey)
+        parsedContactKeys.add(it.signingKey)
+        response.fill(0)
+      }
 
     override fun prepareCreateDirectRequest(peerUserId: String): NativeContactRequest =
       NativeContactRequest(
@@ -6095,14 +6472,18 @@ class VeilMobileRuntimeTest {
         requestTarget = "/v1/conversations/dm",
         body = "{\"peer_user_id\":\"$peerUserId\"}".toByteArray(),
         signature = testRestSignature(),
-      )
+      ).also { contactCreatePrepareCount += 1 }
 
     override fun parseCreateDirectResponse(response: ByteArray): NativeDirectCreatedConversation =
       NativeDirectCreatedConversation(
         conversationId = createdConversationId,
-        peerIdentityKey = contactIdentityKey.copyOf(),
+        peerIdentityKey = if (swapCreatedContactKeys) ByteArray(32) { 99 }
+          else contactIdentityKey.copyOf(),
         peerSigningKey = contactSigningKey.copyOf(),
-      ).also { response.fill(0) }
+      ).also {
+        contactCreateParseBoundary()
+        response.fill(0)
+      }
 
     override fun installDirectConversation(
       leaseToken: String,
@@ -6116,6 +6497,7 @@ class VeilMobileRuntimeTest {
       check(peerUserId == contactUserId)
       check(peerIdentityKey.contentEquals(contactIdentityKey))
       check(peerSigningKey.contentEquals(contactSigningKey))
+      contactInstallCount += 1
       peerIdentityKey.fill(0)
       peerSigningKey.fill(0)
       return NativeDirectConversationInstallOutcome.INSTALLED

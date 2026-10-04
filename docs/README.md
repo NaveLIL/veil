@@ -11,6 +11,18 @@ evidence для completion gates. Veil остаётся pre-release проект
 - [Русская entry page](../README.md) — состояние продукта, локальный запуск и
   release process.
 - [English entry page](../README.en.md) — compact project overview.
+- [Дорожная карта надёжности бэкенда и Android](roadmaps/backend-and-mobile-reliability-2026-10-04.md) —
+  план исправлений, зависимости и критерии готовности на основе кода и открытых
+  проектов; статус — предложение.
+- [Готовые основы мобильного frontend](reviews/mobile-frontend-candidates-2026-10-04.md) —
+  сравнение шаблонов и UI-компонентов, ограничения адаптации и первый spike.
+- [Адаптация интерфейса Rocket.Chat](reviews/rocket-chat-frontend-adaptation-2026-10-04.md) —
+  предпочтительное направление пользователя: компоненты, граница с native ядром,
+  этапы переноса и предварительная оценка трудоёмкости.
+- [Результаты реализации надёжности](reviews/reliability-implementation-2026-10-04.md) —
+  изменения, выполненные проверки и открытые gates.
+- [Первая ручная проверка ПК ↔ Android](reviews/pc-android-first-text-test-2026-10-04.md) —
+  настройка двух аккаунтов, импорт приглашения и последовательный обмен текстом.
 - [Участие в разработке](../CONTRIBUTING.md) — workflow, проверки и
   лицензионные условия вклада.
 - [Security Policy](../SECURITY.md) — приватное сообщение об уязвимостях.
@@ -22,6 +34,7 @@ evidence для completion gates. Veil остаётся pre-release проект
 - [ADR-0002: Origin-bound one-time Node Access Passes](adr/0002-origin-bound-node-access-passes.md)
 - [ADR-0003: Origin-bound transport authentication](adr/0003-origin-bound-transport-authentication.md)
 - [ADR-0004: Clean Slate v0.3 and open-source protocol preference](adr/0004-clean-slate-v0.3-and-open-source-crypto.md)
+- [ADR-0005: Immutable events, sync, retention and cutover — Proposed](adr/0005-immutable-events-sync-retention-and-cutover.md)
 - [ADR: Witnessed key transparency and authorized membership epochs](adr/0002-witnessed-key-transparency-and-membership-epochs.md)
 
 ADR фиксирует принятое решение и причины. Изменение такого решения должно

@@ -1366,7 +1366,8 @@ const App: Component = () => {
   });
 
   const handleSend = async () => {
-    const text = inputText().trim();
+    const draftText = inputText();
+    const text = draftText.trim();
     const conversation = conv();
     if (!text || !conversation || text.length > MAX_MSG_LEN || sendBusy()) return;
     if (transportMutationUnavailable()) {
@@ -1400,13 +1401,19 @@ const App: Component = () => {
     setSendNotice("");
     try {
       await appStore.sendMessage(text, reply?.id);
+      if (!isUiSessionEpochCurrent(sendSessionEpoch) || appStore.screen() !== "chat") return;
       setDeferredSendDrafts((previous) => {
-        if (!previous[conversationId]) return previous;
+        if (previous[conversationId]?.token !== sendToken) return previous;
         const next = { ...previous };
         delete next[conversationId];
         return next;
       });
-      if (appStore.activeConversationId() === conversationId) {
+      if (
+        appStore.activeConversationId() === conversationId
+        && composerContextEpoch === sendComposerContextEpoch
+        && inputText() === draftText
+        && replyingTo()?.id === reply?.id
+      ) {
         setInputText("");
         setReplyingTo(null);
         if (inputRef) inputRef.style.height = "21px";

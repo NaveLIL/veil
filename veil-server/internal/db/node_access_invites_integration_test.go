@@ -18,9 +18,7 @@ import (
 	"time"
 
 	"github.com/NaveLIL/veil/veil-server/internal/db"
-	"github.com/testcontainers/testcontainers-go"
-	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
-	"github.com/testcontainers/testcontainers-go/wait"
+	"github.com/NaveLIL/veil/veil-server/internal/testpostgres"
 	"golang.org/x/crypto/curve25519"
 )
 
@@ -184,25 +182,8 @@ func newInviteIntegrationDB(t *testing.T) *db.DB {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
-	container, err := tcpostgres.Run(ctx,
-		"postgres:16-alpine",
-		tcpostgres.WithDatabase("veil"),
-		tcpostgres.WithUsername("veil"),
-		tcpostgres.WithPassword("veil"),
-		testcontainers.WithWaitStrategy(
-			wait.ForLog("database system is ready to accept connections").
-				WithOccurrence(2).
-				WithStartupTimeout(60*time.Second),
-		),
-	)
-	if err != nil {
-		t.Fatalf("start PostgreSQL: %v", err)
-	}
-	t.Cleanup(func() { _ = container.Terminate(context.Background()) })
-	dsn, err := container.ConnectionString(ctx, "sslmode=disable")
-	if err != nil {
-		t.Fatal(err)
-	}
+	dsn := testpostgres.Provision(t, ctx)
+
 	database, err := db.Connect(ctx, dsn)
 	if err != nil {
 		t.Fatal(err)

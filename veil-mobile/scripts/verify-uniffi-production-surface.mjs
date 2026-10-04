@@ -41,6 +41,11 @@ const required = [
   "fun `confirmDirectIdentityVerification`",
   "fun `directIdentityVerification`",
   "fun `sendDirectText`",
+  "fun `sendDirectTextV2`",
+  "fun `projectDirectMessagesV2`",
+  "open class MobileDirectMessageDataV2",
+  "data class MobileDirectTextSendResultV2",
+  "fun `stableUiId`",
   "fun `startBackgroundEvents`",
 ];
 

@@ -3,6 +3,10 @@ import { NativeModules } from "react-native";
 
 const originalModule = NativeModules.VeilMobileRuntime;
 const conversationId = "20000000-0000-4000-8000-000000000001";
+const acceptance = {
+  clientMessageId: "40000000-0000-4000-8000-000000000001",
+  localMessageId: "40000000-0000-4000-8000-000000000001",
+};
 
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
@@ -21,7 +25,7 @@ function installRuntime(sendResult: Promise<unknown>) {
   Object.defineProperty(NativeModules, "VeilMobileRuntime", {
     configurable: true,
     value: {
-      sendDirectText,
+      sendDirectTextV2: sendDirectText,
       addListener: jest.fn(),
       removeListeners: jest.fn(),
     },
@@ -52,10 +56,10 @@ describe("Direct text native send boundary", () => {
     });
   });
 
-  it("forwards only the exact generation and plaintext and accepts only a payload-free result", async () => {
-    const { runtime, sendDirectText } = installRuntime(Promise.resolve(null));
+  it("forwards only exact generation and plaintext and returns original committed native IDs", async () => {
+    const { runtime, sendDirectText } = installRuntime(Promise.resolve(acceptance));
 
-    await expect(runtime.sendDirectText(conversationId, 42, "hello 👋")).resolves.toBeUndefined();
+    await expect(runtime.sendDirectText(conversationId, 42, "hello 👋")).resolves.toEqual(acceptance);
     expect(sendDirectText).toHaveBeenCalledWith(conversationId, 42, "hello 👋");
 
     const unexpected = installRuntime(Promise.resolve({ messageId: "must-not-cross" }));
@@ -111,6 +115,44 @@ describe("Direct text native send boundary", () => {
     }));
     await expect(matchingBoth.runtime.sendDirectText(conversationId, 1, "hello")).rejects
       .toMatchObject({ reason: "rejected", publicFailureCodeV1: "VEIL-DIRECT-001" });
+  });
+
+  it("rejects missing malformed mismatched or authority-bearing receipts", async () => {
+    for (const malformed of [null, undefined, {},
+      { ...acceptance, localMessageId: "40000000-0000-4000-8000-000000000002" },
+      { ...acceptance, clientMessageId: "00000000-0000-0000-0000-000000000000" },
+      { ...acceptance, ciphertext: "must-not-cross" },
+      { ...acceptance, serverMessageId: acceptance.clientMessageId }]) {
+      const installed = installRuntime(Promise.resolve(malformed));
+      await expect(installed.runtime.sendDirectText(conversationId, 1, "hello")).rejects
+        .toMatchObject({ reason: "unavailable", publicFailureCodeV1: "VEIL-RUNTIME-999" });
+    }
+  });
+
+  it("requires V2 native before enqueue and never invokes a legacy native send", async () => {
+    const installed = installRuntime(Promise.resolve(acceptance));
+    const legacySend = jest.fn<() => Promise<unknown>>().mockResolvedValue(null);
+    delete NativeModules.VeilMobileRuntime.sendDirectTextV2;
+    NativeModules.VeilMobileRuntime.sendDirectText = legacySend;
+    await expect(installed.runtime.sendDirectText(conversationId, 1, "hello")).rejects
+      .toMatchObject({ reason: "unavailable", publicFailureCodeV1: "VEIL-RUNTIME-999" });
+    expect(legacySend).not.toHaveBeenCalled();
+    expect(installed.sendDirectText).not.toHaveBeenCalled();
+  });
+
+  it("does not invoke native success getters and collapses malformed receipt exceptions", async () => {
+    let reads = 0;
+    const hostile = Object.create(null, {
+      clientMessageId: { enumerable: true, get: () => {
+        reads += 1;
+        throw new Error("native diagnostic must not cross");
+      } },
+      localMessageId: { enumerable: true, value: acceptance.localMessageId },
+    });
+    const installed = installRuntime(Promise.resolve(hostile));
+    await expect(installed.runtime.sendDirectText(conversationId, 1, "hello")).rejects
+      .toMatchObject({ reason: "unavailable", message: "Direct messaging is unavailable" });
+    expect(reads).toBe(0);
   });
 
   it("fails closed for missing, malformed, conflicting, or mismatched native gates", async () => {
