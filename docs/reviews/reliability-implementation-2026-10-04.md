@@ -304,3 +304,11 @@ guard исключался только для этих host-only fake-native JV
 ARM64 release `libveil_ffi.so` реально собрана (21,212,216 bytes). Вторая ABI,
 package verification и clean source record ещё ожидаются. Hash/size финальных
 выдаваемых файлов фиксируются отдельным artifact evidence после packaging.
+
+Обе release Android ABI затем собраны и скопированы самим cargo-ndk: ARM64
+21,212,216 bytes, x86_64 21,513,656 bytes. После генерации bindings source tree
+зафиксирован локально в `ce/reliability-mobile-20261004`. Перед APK packaging
+из Settings убрана статическая фраза о физически проверенном restart: новый
+tester не наследует physical qualification прежнего артефакта. Изменённая
+Settings suite прошла (3 tests). APK build использует clean commit, настоящий
+tester key и все native presence/signing/version/source guards.

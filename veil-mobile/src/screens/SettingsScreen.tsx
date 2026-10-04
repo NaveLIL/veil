@@ -258,7 +258,7 @@ function settingsDefinition(
             title: "This device",
             rows: [
               { label: "Android phone", value: connected ? "Active" : "Local only", tone: connected ? "positive" : "muted" },
-              { label: "Process restart", value: "Same-account restore", detail: "Physically verified without a new Access Pass.", tone: "positive" },
+              { label: "Process restart", value: "Reopen local account", detail: "Unlock this account again after restarting Veil.", tone: "muted" },
             ],
           },
           {
