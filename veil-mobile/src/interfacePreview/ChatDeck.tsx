@@ -1,4 +1,4 @@
-import React, { useEffect } from 'react';
+import React, { useCallback, useEffect } from 'react';
 import { Keyboard, StyleSheet, useWindowDimensions, View } from 'react-native';
 import { Gesture, GestureDetector } from 'react-native-gesture-handler';
 import Animated, { cancelAnimation, ReduceMotion, runOnJS, useAnimatedStyle, useSharedValue, withSpring } from 'react-native-reanimated';
@@ -13,6 +13,8 @@ export function ChatDeck({ navigation, conversation, navigationOpen, hasChat, en
   const progress = useSharedValue(navigationOpen ? 1 : 0);
   const start = useSharedValue(1);
   const target = useSharedValue(navigationOpen ? 1 : 0);
+  // Capture a JS function, never the native Keyboard object, in a UI worklet.
+  const dismissKeyboard = useCallback(() => { Keyboard.dismiss(); }, []);
   const spring = { stiffness: 260, damping: 30, mass: 1, overshootClamping: true,
     reduceMotion: reduceMotion ? ReduceMotion.Always : ReduceMotion.System };
   useEffect(() => {
@@ -26,7 +28,7 @@ export function ChatDeck({ navigation, conversation, navigationOpen, hasChat, en
   }, [navigationOpen, reduceMotion, progress, target]);
   const pan = Gesture.Pan().enabled(enabled && hasChat).maxPointers(1)
     .activeOffsetX([-14, 14]).failOffsetY([-10, 10])
-    .onStart(() => { cancelAnimation(progress); start.value = progress.value; runOnJS(Keyboard.dismiss)(); })
+    .onStart(() => { cancelAnimation(progress); start.value = progress.value; runOnJS(dismissKeyboard)(); })
     .onUpdate(event => { progress.value = Math.max(0, Math.min(1, start.value + event.translationX / width)); })
     .onEnd(event => {
       const open = swipeDestination(progress.value, event.velocityX, width);
