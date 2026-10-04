@@ -4,8 +4,9 @@
 
 Это отчёт о реально выполненных изменениях и проверках, а не отметка о завершении всей [дорожной карты](../roadmaps/backend-and-mobile-reliability-2026-10-04.md).
 
-Последнее host evidence находится в разделе «Финальные host gates перед tester
-packaging» ниже. Ранние разделы сохраняют исходные ограничения окружения и
+Финальные артефакты и их evidence находятся в разделе «Выданный первый набор
+ПК ↔ Android» ниже; host evidence — в «Финальные host gates перед tester
+packaging». Ранние разделы сохраняют исходные ограничения окружения и
 результаты отдельных этапов. R02 исправлен и проверен; R03/R04/R13 и M01–M03
 имеют выполненный первый объём. Full offline/history/multi-device/group/mobile
 release gates остаются открытыми. APK/physical success не выводится из host tests.
@@ -351,3 +352,64 @@ Corresponding adapter source, hashes и scope входят в выдаваемы
 полную независимую проверку. Build receipt связывает commit, одноразовый runId
 и SHA/размер именно результирующего APK; старый успешный log не подходит.
 Физическая проверка ПК ↔ телефон и production certificate остаются открытыми.
+
+### Выданный первый набор ПК ↔ Android
+
+Собранный source checkpoint:
+`775e3bf407f76b090d5fb23d6e6881b70e74f3b5`. Последующие изменения этого
+журнала не являются source revision уже скомпилированных файлов.
+
+- [Полный набор ZIP](../../target/Veil-Test-Kit-775e3bf407f7.zip), 61,214,005 bytes.
+- [Android APK](../../target/tester-20261004/775e3bf407f7/Veil-Android-0.1.0-tester.20261004.1.apk), 98,021,906 bytes.
+- [Windows EXE](../../target/tester-20261004/775e3bf407f7/Veil-Desktop-0.2.0.exe), 31,434,752 bytes.
+- [APK evidence](../../target/tester-20261004/775e3bf407f7/APK-EVIDENCE.json),
+  [build metadata](../../target/tester-20261004/775e3bf407f7/BUILD-METADATA.json),
+  [host build proof](../../target/tester-20261004/775e3bf407f7/HOST-BUILD-PROOF.json)
+  и [контрольные суммы](../../target/tester-20261004/775e3bf407f7/SHA256SUMS.txt).
+
+Финальный `assembleInternalTester`: **BUILD SUCCESSFUL, 5m 47s**, 500 tasks,
+60 executed / 440 up-to-date; native presence guard и оба CMake ABI выполнены.
+После переноса Gradle dependency/wrapper cache в короткий `D:/vgv26`
+обнаружились старые absolute paths в CMake/Ninja cache. Сгенерированные
+screens/app `.cxx` и `build/intermediates/cxx` сохранены отдельно вне repo и
+пересозданы. Исходный Gradle cache, SDK jars, системная policy и registry не
+изменены. Ровно одна pinned transformation receipt и pre-execution proof PASS
+связаны с этим commit/runId и точными SHA/size финального APK; прежние успешные
+или неуспешные logs не принимаются как его доказательство.
+
+Полный independent verifier прошёл на выдаваемом APK и записал sanitized
+bootstrap evidence: постоянный tester certificate совпадает, debug certificate
+исключён, APK v2 signature/единственный signer/non-debuggable/12 permissions/
+15 components/запрет cleartext/backup/transfer/branding/source/version/две ABI
+проверены. Production certificate ещё отсутствует; `releaseReady=false`,
+production separation и physical gates явно отложены.
+
+Дополнительно байты `assets/index.android.bundle` в APK совпали с настоящим
+AGP Hermes output. В его source map 3179 sources; все 36 project `/src/` contents
+совпали с текущими исходниками. Все 13 production путей присутствуют, SDK/
+WatermelonDB/design preview отсутствуют; полный Rocket.Chat MIT notice находится
+в самих Hermes bytes. Original cargo-ndk SO hashes совпадают с AGP merged input;
+APK libraries совпадают byte-for-byte с AGP output после удаления debug symbols.
+Исходные и packaged hashes разделены в metadata, размеры не смешиваются.
+
+Windows Tauri release повторно собран на том же clean checkpoint. Его
+Authenticode status — `NotSigned`; EXE использует существующий vault текущего
+Windows пользователя. GUI агентом не запускался. Ресурсы/notices находятся рядом
+с EXE в наборе; ZIP нужно распаковать полностью. Private signing inputs не
+включены; в наборе public certificate, 79 проверенных SHA-256 entries, соответствующий
+AGPL source archive и source/build-tool notices. ZIP содержит все ожидаемые
+payload entries; его отдельный SHA-256 также записан.
+
+| Артефакт | SHA-256 |
+|---|---|
+| APK | `994d6cdd3a8598efb4c6459612d70da41a140fd566587a670711c91556b34d47` |
+| EXE | `ff5cb334f4faffb7204463f84023c7af666a685bcfd19953bae809e034688ffb` |
+| Набор ZIP | `99eacfa4e7d5a2e90b5dc47c3e4b1d8cc06548a6e66158c07ba46c741e179af8` |
+
+Это первый tester для неизменяемого Direct-текста: два разных аккаунта,
+по одному устройству, первые сообщения sequential. Физическая проверка
+на телефоне ещё не выполнена; см. [ручную инструкцию](pc-android-first-text-test-2026-10-04.md).
+Crossed INITIAL и timestamp cursor commit inversion остаются подтверждёнными
+открытыми дефектами. Полный offline/history/background/push/multi-device/groups/
+media/calls/release scope не квалифицирован; R07/R10 ADR остаётся Proposed.
+Локальные server fixes не развёрнуты на `https://veil.erez.pro`.
