@@ -9,6 +9,10 @@ export const allowedSources = [
   'src/interfacePreview/model.ts', 'src/presentation/rocketChat/notice.ts',
   'src/interfacePreview/appearance.ts', 'src/interfacePreview/appearanceBridge.ts',
   'src/interfacePreview/ChatDeck.tsx', 'src/interfacePreview/UserProfile.tsx', 'src/interfacePreview/navigation.ts',
+  'src/interfacePreview/ConversationHistory.tsx', 'src/interfacePreview/Composer.tsx', 'src/interfacePreview/history.ts',
+  'src/interfacePreview/Primitives.tsx', 'src/interfacePreview/AppearanceSettings.tsx', 'src/interfacePreview/NavigationPanel.tsx',
+  'src/interfacePreview/ConversationScreen.tsx', 'src/interfacePreview/LockPreview.tsx', 'src/interfacePreview/PreviewSheet.tsx',
+  'src/interfacePreview/KeyboardFrame.tsx',
 ];
 export function verifyPreviewSource() {
   const visited = new Set();
