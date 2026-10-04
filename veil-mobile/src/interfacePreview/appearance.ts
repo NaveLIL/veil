@@ -1,3 +1,6 @@
+/** One rounded-rectangle standard across islands, panels and controls. */
+export const geometry = { radius: 20, borderWidth: 1 } as const;
+
 /** Presentation-only presets matching the desktop names; no account storage. */
 export const palettes = {
   Veil: { bg: '#2B2D31', surface: '#36373D', raised: '#383A40', line: '#45464C', text: '#EEEEEF', muted: '#C0C0C8', accent: '#7C6BF5', tint: '#39324B' },

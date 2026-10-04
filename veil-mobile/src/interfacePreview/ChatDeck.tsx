@@ -3,6 +3,7 @@ import { Keyboard, StyleSheet, useWindowDimensions, View } from 'react-native';
 import { Gesture, GestureDetector } from 'react-native-gesture-handler';
 import Animated, { cancelAnimation, ReduceMotion, runOnJS, useAnimatedStyle, useSharedValue, withSpring } from 'react-native-reanimated';
 import { swipeDestination } from './navigation';
+import { geometry } from './appearance';
 
 type Props = { navigation: React.ReactNode; profile: React.ReactNode; conversation: React.ReactNode; navigationOpen: boolean;
   surfaceColor: string; edgeColor: string;
@@ -58,6 +59,7 @@ export function ChatDeck({ navigation, profile, conversation, navigationOpen, su
 }
 const styles = StyleSheet.create({ root: { flex: 1, overflow: 'hidden' }, layer: { ...StyleSheet.absoluteFillObject },
   profile: { zIndex: 1 },
-  backdrop: { ...StyleSheet.absoluteFillObject, backgroundColor: '#000000', borderRadius: 20 },
-  chat: { zIndex: 2, borderRadius: 20, borderWidth: 1, shadowColor: '#000000', shadowOpacity: 0.55, shadowRadius: 18, shadowOffset: { width: -8, height: 0 }, elevation: 12 },
-  chatClip: { flex: 1, borderRadius: 19, overflow: 'hidden' } });
+  backdrop: { ...StyleSheet.absoluteFillObject, backgroundColor: '#000000', borderRadius: geometry.radius },
+  chat: { zIndex: 2, borderRadius: geometry.radius, borderWidth: geometry.borderWidth, shadowColor: '#000000', shadowOpacity: 0.55, shadowRadius: 18, shadowOffset: { width: -8, height: 0 }, elevation: 12 },
+  // The inset curve is concentric with the common outer radius.
+  chatClip: { flex: 1, borderRadius: geometry.radius - geometry.borderWidth, overflow: 'hidden' } });
