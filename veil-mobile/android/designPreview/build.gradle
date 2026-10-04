@@ -1,5 +1,9 @@
 apply plugin: 'com.android.application'
 apply plugin: 'org.jetbrains.kotlin.android'
+// RN 0.79's application plugin aligns toolchains across ALL projects. :app
+// has already aligned this module to JDK 17; a second alignment finalizes an
+// already finalized Kotlin languageVersion. Skip only that duplicate pass.
+ext.set('react.internal.disableJavaVersionAlignment', true)
 apply plugin: 'com.facebook.react'
 
 def projectRoot = rootDir.parentFile.absolutePath
