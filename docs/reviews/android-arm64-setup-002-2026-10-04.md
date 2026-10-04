@@ -76,3 +76,45 @@ tester-сертификат. Установка выполняется **обн�
 После независимой проверки APK требуется ручное подтверждение пользователя:
 исчезла ли ошибка холодного запуска и доступен ли экран регистрации. Проверка
 на физическом телефоне и реальный обмен ПК ↔ Android пока не подтверждены.
+
+## Фактически собранное обновление
+
+Исходники APK: `3170508d02ec3cb7a9c1d095fe61c821e3942588`, чистое дерево перед
+сборкой и упаковкой. Документ дополнен результатами после сборки; изменение
+документации не требует пересборки исполняемого приложения.
+
+`assembleInternalTester` и `compileDebugAndroidTestKotlin`: BUILD SUCCESSFUL,
+3m 23s. Connected/device tasks не запускались. Применён прежний локальный
+адаптер запуска Java Prefab для закреплённого AGP 8.8.2: один подтверждённый
+host-only receipt, те же executable/arguments/exit semantics, без изменения
+Windows policy, APK guards или runtime защиты. Это не штатная конфигурация AGP
+и не утверждение о воспроизводимости CI.
+
+APK: `target/android-update-20261004/3170508d02ec/Veil-Android-0.1.0-tester.20261004.2.apk`,
+98,021,906 bytes; SHA-256
+`62a5f5d4b17ffd189772e0119bcd41d485d5e907c143a67d87793e094d976a91`.
+Независимый verifier подтвердил сертификат, package ID, version/source metadata,
+два ABI, строгий manifest/component/permission contract и backup exclusions.
+Tester certificate SHA-256 остался
+`f5df868d3f517c0853225840e2c4f67f2d7b20d05b183bf1ab396e530fc3f250`.
+Production certificate не provisioned; `releaseReady=false`.
+
+В DEX фактического APK повторно проверены пять `Os.open` с runtime O_NOFOLLOW,
+закрытая directory mapping, lstat/fstat/fsync/close, ReactMethod bridge,
+FLAG_SECURE до регистрации и `ALLOW_READY_SCREEN_CAPTURE=false`. Независимое
+read-only ревью подтвердило те же свойства. Hermes bundle и оба упакованных
+stripped Rust SO совпадают с соответствующими выходами сборки; все 36 project
+sources в source map совпали с исходниками, полный Rocket.Chat MIT notice
+присутствует в Hermes. Реальный NDK clang отдельно подтвердил обе таблицы flags.
+
+Набор обновления: `target/Veil-Android-Update-3170508d02ec.zip`, 49,608,303 bytes,
+SHA-256 `ab0d27dda31f5543e96bbcc7adde0153935b4bec36a2d74b26ebc7a6e6f2eacb`.
+Содержит APK, точный AGPL source archive, public certificate, verifier evidence,
+build/DEX/ABI proof и исходники build helpers. После упаковки все **33 payload
+checksums** повторно проверены чтением ZIP. Private key/password/identity/Access
+Pass туда не включены.
+
+EXE не пересобирался и не изменялся; SHA-256 прежней выдачи повторно совпал:
+`ff5cb334f4faffb7204463f84023c7af666a685bcfd19953bae809e034688ffb`.
+Пользователь сообщил об успешной работе ПК. Повторный запуск нового APK на
+Galaxy и обмен между двумя клиентами остаются ручными непроведёнными проверками.
