@@ -20,6 +20,7 @@ class DesignApplication : Application(), ReactApplication {
   override val reactNativeHost: ReactNativeHost = object : DefaultReactNativeHost(this) {
     override fun getPackages(): List<ReactPackage> = listOf(
       MainReactPackage(), SafeAreaContextPackage(), SvgPackage(), EdgeToEdgePackage(),
+      DesignAppearancePackage(),
     )
     override fun getJSMainModuleName() = "design-preview-index"
     override fun getUseDeveloperSupport() = BuildConfig.DEBUG

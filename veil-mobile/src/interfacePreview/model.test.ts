@@ -31,7 +31,7 @@ test('search/unread/open and unknown IDs respect the fixture boundary', () => {
   const s = createDemoSession();
   expect(visibleChats(s, '  АННА ', false)).toHaveLength(1);
   expect(visibleChats(s, 'nikita.demo', false)[0].messages).toHaveLength(0);
-  expect(visibleChats(openChat(s, 'demo-anna'), '', true).map(c => c.id)).toEqual(['demo-sofia']);
+  expect(visibleChats(openChat(s, 'demo-anna'), '', true).map(c => c.id)).toEqual(['demo-sofia', 'demo-group']);
   expect(setDraft(s, 'real-account-id', 'x')).toBe(s);
   expect(sendDemo(setDraft(s, 'demo-new', '   '), 'demo-new', '15:00').nextId).toBe(1);
 });
