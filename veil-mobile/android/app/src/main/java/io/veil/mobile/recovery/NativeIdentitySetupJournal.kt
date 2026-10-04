@@ -692,7 +692,7 @@ internal class AndroidNativeIdentitySetupJournalFileOps(directory: File) :
         OsConstants.O_RDWR or
           OsConstants.O_CREAT or
           LINUX_O_CLOEXEC or
-          LINUX_O_NOFOLLOW,
+          OsConstants.O_NOFOLLOW,
         OWNER_READ_WRITE,
       )
     val stream = try {
@@ -728,7 +728,7 @@ internal class AndroidNativeIdentitySetupJournalFileOps(directory: File) :
           OsConstants.O_CREAT or
           OsConstants.O_EXCL or
           LINUX_O_CLOEXEC or
-          LINUX_O_NOFOLLOW,
+          OsConstants.O_NOFOLLOW,
         OWNER_READ_WRITE,
       )
     val output = try {
@@ -763,7 +763,7 @@ internal class AndroidNativeIdentitySetupJournalFileOps(directory: File) :
     val descriptor =
       Os.open(
         temp.absolutePath,
-        OsConstants.O_RDONLY or LINUX_O_CLOEXEC or LINUX_O_NOFOLLOW,
+        OsConstants.O_RDONLY or LINUX_O_CLOEXEC or OsConstants.O_NOFOLLOW,
         0,
       )
     var failure: Throwable? = null
@@ -813,8 +813,8 @@ internal class AndroidNativeIdentitySetupJournalFileOps(directory: File) :
         parent.absolutePath,
         OsConstants.O_RDONLY or
           LINUX_O_CLOEXEC or
-          LINUX_O_NOFOLLOW or
-          LINUX_O_DIRECTORY,
+          OsConstants.O_NOFOLLOW or
+          nativeIdentitySetupDirectoryFlag(OsConstants.O_NOFOLLOW),
         0,
       )
     var failure: Throwable? = null
@@ -840,7 +840,7 @@ internal class AndroidNativeIdentitySetupJournalFileOps(directory: File) :
     val descriptor =
       Os.open(
         path.absolutePath,
-        OsConstants.O_RDONLY or LINUX_O_CLOEXEC or LINUX_O_NOFOLLOW,
+        OsConstants.O_RDONLY or LINUX_O_CLOEXEC or OsConstants.O_NOFOLLOW,
         0,
       )
     return try {
@@ -908,8 +908,19 @@ private class AndroidNativeIdentitySetupJournalTempOutput(
   override fun close() = output.close()
 }
 
-// Linux UAPI flags are stable across every Android ABI supported by minSdk 24.
-// Some android.system.OsConstants Java fields are exposed only on newer APIs.
-private const val LINUX_O_DIRECTORY = 0x00010000
-private const val LINUX_O_NOFOLLOW = 0x00020000
+/**
+ * O_DIRECTORY has no public Android OsConstants field. Its Linux UAPI value
+ * differs between the two supported ABIs, as does O_NOFOLLOW (public since API 21).
+ * Use the running platform's O_NOFOLLOW, not Build.SUPPORTED_ABIS: the latter
+ * describes supported device ABIs rather than the ABI of this process.
+ * Keep the kernel directory guard; an unknown flag layout must fail closed.
+ */
+internal fun nativeIdentitySetupDirectoryFlag(platformNoFollow: Int): Int =
+  when (platformNoFollow) {
+    0x00008000 -> 0x00004000 // arm64-v8a: O_NOFOLLOW=0100000, O_DIRECTORY=040000.
+    0x00020000 -> 0x00010000 // x86_64: O_NOFOLLOW=0400000, O_DIRECTORY=0200000.
+    else -> throw NativeIdentitySetupJournalException("setup journal platform flags are unsupported")
+  }
+
+// O_CLOEXEC=02000000 is shared by both supported ABIs; its public field needs API 27.
 private const val LINUX_O_CLOEXEC = 0x00080000
