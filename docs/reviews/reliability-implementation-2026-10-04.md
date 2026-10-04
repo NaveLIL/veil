@@ -249,7 +249,7 @@ actions под native scope/cancellation guards. Production UI использу�
 адаптированные Rocket.Chat 4.77.0 компоненты; upstream SHA, исходники и MIT
 notice перечислены в mobile inventory. Все **30 Jest suites / 262 tests PASS**,
 TypeScript и scoped lint прошли. Actual Metro boundary проверил 3193 sources,
-включая 11 обязательных production путей и полный MIT notice.
+включая 13 обязательных production путей и полный MIT notice.
 
 Для tester добавлен явный импорт HTTPS invitation из clipboard: foreground
 native Activity проверяет bounded plain-text item и использует прежний parser.
@@ -312,3 +312,42 @@ package verification и clean source record ещё ожидаются. Hash/size
 tester не наследует physical qualification прежнего артефакта. Изменённая
 Settings suite прошла (3 tests). APK build использует clean commit, настоящий
 tester key и все native presence/signing/version/source guards.
+
+### Проверка первого реально упакованного APK
+
+Первый `assembleInternalTester` завершился `BUILD SUCCESSFUL` за 8m 1s.
+Независимый verifier отклонил этот APK: Expo Camera добавил ненужный
+`RECORD_AUDIO`, прежний contract не описывал реально используемые native
+events service/QR dependencies, а AGP resource shrinking переименовал XML
+файлы. Этот первый APK не выдаётся как проверенный.
+
+Tester overlay теперь удаляет только microphone permission. Камера сохраняет
+существующую сверку identity QR; foreground dataSync service остаётся native
+и non-exported. Contract перечисляет ровно 12 permissions и 15 components
+с индивидуальными security attributes. `ACCESS_NETWORK_STATE` происходит
+из Google DataTransport в camera dependency graph, не из WorkManager.
+Это не подтверждает физическую работу scanner или полную оценку SDK telemetry.
+
+Resource verifier связывает manifest resource ID с точным reviewed table name
+и единственным default XML file внутри APK. Разрешены исходный путь либо
+ограниченный плоский AAPT optimized path; aliases/traversal/duplicates/config
+overrides и отсутствие файла отвергаются. Backup XML читается по этой
+проверенной привязке; прежние запреты cloud/device transfer сохраняются.
+R8/resource shrinking, signing, native presence и source/version gates не
+отключались. Verifier unit tests: **63 PASS**. Read-only диагностика первого
+APK подтверждает остальные guards, но не выдаёт evidence для APK с microphone.
+
+На этом Windows host group policy запрещает batch wrapper для Prefab. Для
+сборки использован отдельный процессный adapter вне repo: pinned AGP 8.8.2
+Java agent меняет ровно один `useScript` flag в проверенном helper, сохраняя
+Java executable, classpath, arguments и exit propagation. Это внутренний,
+недокументированный AGP hook, а не поддерживаемая настройка или CI qualification.
+Policy/registry/SDK cache не изменены. Неверный class/method hash завершает
+JVM; перед tasks проверяются executable/arguments и `useScript=false`.
+Успешный запуск имеет ровно одну transformation receipt и pre-execution proof.
+Corresponding adapter source, hashes и scope входят в выдаваемый набор.
+
+Новая сборка обязана использовать следующий clean source checkpoint и пройти
+полную независимую проверку. Build receipt связывает commit, одноразовый runId
+и SHA/размер именно результирующего APK; старый успешный log не подходит.
+Физическая проверка ПК ↔ телефон и production certificate остаются открытыми.

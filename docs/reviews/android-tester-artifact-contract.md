@@ -5,6 +5,11 @@ this document alone does not establish physical-device testing.
 
 Date: 2026-07-20
 
+Manifest/component contract reviewed against the first assembled APK and its
+manifest-merger provenance on 2026-10-04. The reviewed replacement must be
+rebuilt from the new clean source checkpoint; the earlier APK requesting
+`RECORD_AUDIO` is rejected and must not be distributed as verified.
+
 Scope: isolated, release-like packaging and verification for the closed Android
 Direct Preview.
 
@@ -43,7 +48,8 @@ branding so evidence cannot silently confuse it with the regular client.
 
 The requested-permission allowlist is exactly `INTERNET`,
 `POST_NOTIFICATIONS`, `VIBRATE`, `HIDE_OVERLAY_WINDOWS`, `WAKE_LOCK`,
-`USE_BIOMETRIC`, `USE_FINGERPRINT`, and the package-scoped
+`USE_BIOMETRIC`, `USE_FINGERPRINT`, `FOREGROUND_SERVICE`,
+`FOREGROUND_SERVICE_DATA_SYNC`, `CAMERA`, `ACCESS_NETWORK_STATE`, and the package-scoped
 `io.veil.mobile.tester.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION`. The latter is
 also the sole declared permission and must have `signature` protection. Any
 additional, duplicate, renamed, or differently protected permission fails
@@ -54,6 +60,58 @@ the dependency-provided UnifiedPush `LinkActivity`, exported messaging receiver,
 and exported foreground service. The app-owned `VeilPushService` remains in the
 reviewed inventory only as a non-exported dormant boundary. The verifier rejects
 unknown, duplicate, aliased, or unexpectedly exported app components.
+
+The native `VeilEventsService` remains non-exported with only the `dataSync`
+foreground-service type (compiled manifest value `0x1`). Its existing React
+native entry point calls `ContextCompat.startForegroundService`; the service
+calls `startForeground` with `FOREGROUND_SERVICE_TYPE_DATA_SYNC` on Android 14+
+and the native runtime's `startBackgroundEvents`. The two foreground-service
+permissions describe that existing native service. This packaging contract
+does not establish background delivery or lifecycle reliability on a phone.
+
+`CAMERA` is retained for the existing reachable Direct identity verification
+sheet, which renders an account-v2 QR code and offers an optional camera scan.
+The scan submits the QR value to the scoped native identity-verification API;
+manual safety-number comparison remains available if camera access is denied.
+The production GUI has no voice/video recording action or microphone permission
+request. The tester overlay removes the transitive Expo Camera `RECORD_AUDIO`
+permission; the independent verifier rejects its presence.
+
+Expo Camera 16.1.11 already includes CameraX, ML Kit barcode scanning and Google
+code-scanner dependencies. The exact eight private dependency components below
+were present in the assembled APK; they are pinned individually rather than
+allowing arbitrary SDK components. `ACCESS_NETWORK_STATE` originates from
+Google DataTransport 2.3.3/2.2.6 in that dependency graph, not Veil sync or
+WorkManager. The assembled manifest has no WorkManager component, and the
+current Veil native source has no WorkManager scheduling path. Keeping these
+existing QR dependencies does not establish their complete data-collection
+behavior or physical scanner behavior; neither is inferred from host checks.
+
+| Exact dependency component | Required security attributes in compiled manifest |
+|---|---|
+| `androidx.camera.core.impl.MetadataHolderService` | service; `enabled=false`, `exported=false` |
+| `com.google.mlkit.vision.codescanner.internal.GmsBarcodeScanningDelegateActivity` | activity; `exported=false`, `screenOrientation=1` |
+| `com.google.mlkit.common.internal.MlKitComponentDiscoveryService` | service; `exported=false`, `directBootAware=true` |
+| `com.google.mlkit.common.internal.MlKitInitProvider` | provider; `exported=false`, package-scoped `io.veil.mobile.tester.mlkitinitprovider` authority, `initOrder=99` |
+| `com.google.android.gms.common.api.GoogleApiActivity` | activity; `exported=false` |
+| `com.google.android.datatransport.runtime.backends.TransportBackendDiscovery` | service; `exported=false` |
+| `com.google.android.datatransport.runtime.scheduling.jobscheduling.JobInfoSchedulerService` | service; `exported=false`, `permission=android.permission.BIND_JOB_SERVICE` |
+| `com.google.android.datatransport.runtime.scheduling.jobscheduling.AlarmManagerSchedulerBroadcastReceiver` | receiver; `exported=false` |
+
+Every other reviewed component-security attribute must remain absent unless
+already explicitly required by its individual inventory entry. In particular,
+the QR dependency components cannot acquire foreground-service types, broader
+exported state, alternate process/permission/authority/grant policies, or
+unreviewed enabled/direct-boot overrides. The complete inventory is exactly
+15 components: the original six, native `VeilEventsService`, and these eight.
+
+Evidence sources are the packaged manifest (`apkanalyzer manifest print` and
+`aapt2 dump xmltree`), its `manifest-merger-internalTester-report.txt`,
+`src/components/identity/IdentityIslandSheet.tsx`, the installed Expo Camera
+`android/build.gradle` and `android/src/main/AndroidManifest.xml`, and native
+`VeilMobileRuntimeModule.kt`/`VeilEventsService.kt`. No package upgrade, signing
+change, blanket component allowlist, or artifact verification bypass is part
+of this alignment.
 
 ## Required packaging inputs
 
@@ -201,6 +259,18 @@ requires all of the following before evidence is written:
 - exact `Veil Tester` launcher/recovery strings and the distinct
   `drawable/ic_veil_tester_launcher` icon binding;
 - exactly the reviewed `arm64-v8a` and `x86_64` `libveil_ffi.so` entries.
+
+Resource-file lookup follows the exact manifest resource ID to the unique
+reviewed `drawable/ic_veil_tester_launcher` or `xml/data_extraction_rules`
+resource-table name, then to one default XML file actually present in the APK.
+AAPT2 resource optimization may shorten `res/drawable/ic_veil_tester_launcher.xml`
+and `res/xml/data_extraction_rules.xml` to flat bounded `res/*.xml` filenames.
+The verifier resolves those mappings without disabling shrinking or hardcoding
+a particular optimized filename. Reassigned IDs/names, alternate resource
+types, multiple/configuration-specific mappings, unsafe paths, file aliases,
+or missing archive members fail closed. The bound backup XML still undergoes
+the same exact cloud/transfer exclusion checks. Resource-table identity and
+distinct tester branding are packaging checks, not a rendered pixel comparison.
 
 The JSON record contains the APK SHA-256 and only bounded artifact metadata. It
 must not contain passwords, keystore paths, enrollment bearers, account IDs,

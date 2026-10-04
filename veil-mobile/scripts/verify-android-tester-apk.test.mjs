@@ -10,6 +10,7 @@ import {
   parseArguments,
   parseManifestXml,
   parseSingleLineOutput,
+  resolveTesterResourceFiles,
   verifyArchiveFileList,
   verifyTesterDataExtractionRules,
   verifyTesterPermissions,
@@ -48,6 +49,10 @@ const DYNAMIC_RECEIVER_PERMISSION = (
   "io.veil.mobile.tester.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION"
 );
 const PERMISSIONS = Object.freeze([
+  "android.permission.ACCESS_NETWORK_STATE",
+  "android.permission.CAMERA",
+  "android.permission.FOREGROUND_SERVICE",
+  "android.permission.FOREGROUND_SERVICE_DATA_SYNC",
   "android.permission.HIDE_OVERLAY_WINDOWS",
   "android.permission.INTERNET",
   "android.permission.POST_NOTIFICATIONS",
@@ -67,7 +72,7 @@ const BACKUP_POLICY = Object.freeze({
     excludedDomains: BACKUP_EXCLUDED_DOMAINS,
   }),
 });
-const COMPONENTS = Object.freeze([
+const BASE_COMPONENTS = Object.freeze([
   Object.freeze({
     type: "activity",
     name: "io.veil.mobile.MainActivity",
@@ -89,6 +94,15 @@ const COMPONENTS = Object.freeze([
   Object.freeze({
     type: "service",
     name: "io.veil.mobile.push.VeilPushService",
+    enabled: true,
+    exported: false,
+    permission: null,
+    authorities: null,
+    grantUriPermissions: false,
+  }),
+  Object.freeze({
+    type: "service",
+    name: "io.veil.mobile.runtime.VeilEventsService",
     enabled: true,
     exported: false,
     permission: null,
@@ -122,6 +136,35 @@ const COMPONENTS = Object.freeze([
     authorities: null,
     grantUriPermissions: false,
   }),
+]);
+const CAMERA_COMPONENTS = Object.freeze([
+  ["service", "androidx.camera.core.impl.MetadataHolderService", false, null, null],
+  ["activity", "com.google.mlkit.vision.codescanner.internal.GmsBarcodeScanningDelegateActivity", true, null, null],
+  ["service", "com.google.mlkit.common.internal.MlKitComponentDiscoveryService", true, null, null],
+  ["provider", "com.google.mlkit.common.internal.MlKitInitProvider", true, null, "io.veil.mobile.tester.mlkitinitprovider"],
+  ["activity", "com.google.android.gms.common.api.GoogleApiActivity", true, null, null],
+  ["service", "com.google.android.datatransport.runtime.backends.TransportBackendDiscovery", true, null, null],
+  ["service", "com.google.android.datatransport.runtime.scheduling.jobscheduling.JobInfoSchedulerService", true, "android.permission.BIND_JOB_SERVICE", null],
+  ["receiver", "com.google.android.datatransport.runtime.scheduling.jobscheduling.AlarmManagerSchedulerBroadcastReceiver", true, null, null],
+].map(([type, name, enabled, permission, authorities]) => Object.freeze({
+  type,
+  name,
+  enabled,
+  exported: false,
+  permission,
+  authorities,
+  grantUriPermissions: false,
+})));
+const COMPONENTS = Object.freeze([...BASE_COMPONENTS, ...CAMERA_COMPONENTS]);
+const CAMERA_COMPONENT_XML = Object.freeze([
+  '    <service android:name="androidx.camera.core.impl.MetadataHolderService" android:enabled="false" android:exported="false" />',
+  '    <activity android:name="com.google.mlkit.vision.codescanner.internal.GmsBarcodeScanningDelegateActivity" android:exported="false" android:screenOrientation="1" />',
+  '    <service android:name="com.google.mlkit.common.internal.MlKitComponentDiscoveryService" android:directBootAware="true" android:exported="false" />',
+  '    <provider android:name="com.google.mlkit.common.internal.MlKitInitProvider" android:authorities="io.veil.mobile.tester.mlkitinitprovider" android:exported="false" android:initOrder="99" />',
+  '    <activity android:name="com.google.android.gms.common.api.GoogleApiActivity" android:exported="false" />',
+  '    <service android:name="com.google.android.datatransport.runtime.backends.TransportBackendDiscovery" android:exported="false" />',
+  '    <service android:name="com.google.android.datatransport.runtime.scheduling.jobscheduling.JobInfoSchedulerService" android:exported="false" android:permission="android.permission.BIND_JOB_SERVICE" />',
+  '    <receiver android:name="com.google.android.datatransport.runtime.scheduling.jobscheduling.AlarmManagerSchedulerBroadcastReceiver" android:exported="false" />',
 ]);
 const BACKUP_MANIFEST_POLICY = Object.freeze({
   hasBackupAgent: false,
@@ -267,9 +310,11 @@ ${extraMetadata}
     </activity>
     <activity android:name="io.veil.mobile.recovery.RecoveryActivity" android:excludeFromRecents="true" android:exported="false" android:label="${recoveryLabel}" android:noHistory="false" android:stateNotNeeded="true" />
     <service android:name="io.veil.mobile.push.VeilPushService" android:exported="false" />
+    <service android:name="io.veil.mobile.runtime.VeilEventsService" android:exported="false" android:foregroundServiceType="0x1" />
     <provider android:name="expo.modules.filesystem.FileSystemFileProvider" android:authorities="io.veil.mobile.tester.FileSystemFileProvider" android:exported="false" android:grantUriPermissions="true" />
     <provider android:name="androidx.startup.InitializationProvider" android:authorities="io.veil.mobile.tester.androidx-startup" android:exported="false" />
     <receiver android:name="androidx.profileinstaller.ProfileInstallReceiver" android:directBootAware="false" android:enabled="true" android:exported="true" android:permission="android.permission.DUMP" />
+${CAMERA_COMPONENT_XML.join("\n")}
 ${extraApplicationContent}
   </application>
 </manifest>
@@ -744,7 +789,7 @@ test("effective permission verifier accepts only the reviewed exact set", () => 
     "PERMISSIONS_MISMATCH",
   );
   expectCode(
-    () => verifyTesterPermissions(`${[...PERMISSIONS, "android.permission.CAMERA"].join("\n")}\n`),
+    () => verifyTesterPermissions(`${[...PERMISSIONS, "android.permission.RECORD_AUDIO"].join("\n")}\n`),
     "PERMISSIONS_MISMATCH",
   );
   expectCode(() => verifyTesterPermissions("android.permission.INTERNET\0\n"), "PERMISSIONS_OUTPUT_FORMAT");
@@ -1055,7 +1100,7 @@ test("manifest parser requires exact permissions and signature declaration", () 
   expectCode(
     () => assertTesterManifest(parseManifestXml(manifestXml().replace(
       internetPermission,
-      '  <uses-permission android:name="android.permission.CAMERA" />',
+      '  <uses-permission android:name="android.permission.RECORD_AUDIO" />',
     )), SOURCE_COMMIT),
     "MANIFEST_PERMISSIONS",
   );
@@ -1737,6 +1782,196 @@ test("bootstrap evidence cannot infer absent production cert or bypass signer an
   }
 });
 
+test("resource lookup resolves optimized XML paths through exact reviewed IDs and names", () => {
+  const parsed = parseManifestXml(manifestXml());
+  const resourceFiles = { iconFile: "res/H7.xml", dataExtractionRulesFile: "res/4j.xml" };
+  const optimizedDump = aapt2ResourceDump(resourceFiles);
+  assert.deepEqual(resolveTesterResourceFiles(parsed, optimizedDump), resourceFiles);
+  assert.deepEqual(verifyTesterResourceBindings(parsed, optimizedDump), RESOURCES);
+  assert.deepEqual(resolveTesterResourceFiles(parsed, aapt2ResourceDump()), {
+    iconFile: "res/drawable/ic_veil_tester_launcher.xml",
+    dataExtractionRulesFile: "res/xml/data_extraction_rules.xml",
+  });
+  verifyArchiveFileList(fileList(["/res/H7.xml", "/res/4j.xml"]), resourceFiles);
+  expectCode(
+    () => verifyArchiveFileList(fileList(["/res/H7.xml"]), resourceFiles),
+    "FILES_RESOURCE_MISSING",
+  );
+  expectCode(
+    () => verifyArchiveFileList(fileList(["/res/H7.xml", "/res/4j.xml/"]), resourceFiles),
+    "FILES_RESOURCE_MISSING",
+  );
+});
+
+test("resource lookup rejects unsafe, ambiguous, aliased or non-XML packaged paths", () => {
+  const parsed = parseManifestXml(manifestXml());
+  for (const invalidPath of [
+    "/res/H7.xml",
+    "res/../H7.xml",
+    "res/./H7.xml",
+    "res//H7.xml",
+    "res\\H7.xml",
+    "res/H7.png",
+    "res/H7.xml/",
+    "res/drawable/unreviewed.xml",
+    "res/xml/unreviewed.xml",
+    "res/a b.xml",
+    `res/${"A".repeat(65)}.xml`,
+  ]) {
+    for (const [field, code] of [
+      ["iconFile", "AAPT2_TESTER_ICON_FILE"],
+      ["dataExtractionRulesFile", "AAPT2_DATA_EXTRACTION_RULES_FILE"],
+    ]) {
+      expectCode(
+        () => resolveTesterResourceFiles(parsed, aapt2ResourceDump({ [field]: invalidPath })),
+        code,
+      );
+    }
+  }
+  expectCode(
+    () => resolveTesterResourceFiles(parsed, aapt2ResourceDump({ iconFile: "res/A.xml", dataExtractionRulesFile: "res/A.xml" })),
+    "AAPT2_RESOURCE_FILE_ALIAS",
+  );
+  for (const [file, code] of [
+    ["res/drawable/ic_veil_tester_launcher.xml", "AAPT2_TESTER_ICON_FILE"],
+    ["res/xml/data_extraction_rules.xml", "AAPT2_DATA_EXTRACTION_RULES_FILE"],
+  ]) {
+    const fileLine = `      () (file) ${file} type=XML`;
+    for (const replacement of [
+      fileLine.replace("type=XML", "type=PNG"),
+      `${fileLine}\n${fileLine}`,
+      `${fileLine}\n${fileLine.replace("()", "(v35)")}`,
+    ]) {
+      expectCode(
+        () => resolveTesterResourceFiles(parsed, aapt2ResourceDump().replace(fileLine, replacement)),
+        code,
+      );
+    }
+  }
+});
+
+test("archive resource bindings reject malformed authority and missing actual files", () => {
+  for (const resourceFiles of [
+    [],
+    {},
+    { iconFile: "res/A.xml", dataExtractionRulesFile: "res/A.xml" },
+    { iconFile: "res/A.xml", dataExtractionRulesFile: "res/B.xml", unexpected: "res/C.xml" },
+    { iconFile: "res/../A.xml", dataExtractionRulesFile: "res/B.xml" },
+    { iconFile: 1, dataExtractionRulesFile: "res/B.xml" },
+  ]) {
+    expectCode(() => verifyArchiveFileList(fileList(), resourceFiles), "FILES_RESOURCE_BINDINGS");
+  }
+  expectCode(
+    () => verifyArchiveFileList(fileList(), { iconFile: "res/A.xml", dataExtractionRulesFile: "res/B.xml" }),
+    "FILES_RESOURCE_MISSING",
+  );
+});
+
+test("permission verifier rejects recording and unrelated foreground service permissions", () => {
+  for (const unexpectedPermission of [
+    "android.permission.RECORD_AUDIO",
+    "android.permission.FOREGROUND_SERVICE_CAMERA",
+    "android.permission.FOREGROUND_SERVICE_MICROPHONE",
+    "android.permission.FOREGROUND_SERVICE_LOCATION",
+  ]) {
+    expectCode(
+      () => verifyTesterPermissions(`${[...PERMISSIONS, unexpectedPermission].join("\n")}\n`),
+      "PERMISSIONS_MISMATCH",
+    );
+    expectCode(
+      () => assertTesterManifest(parseManifestXml(manifestXml().replace(
+        "  <application",
+        `  <uses-permission android:name="${unexpectedPermission}" />\n  <application`,
+      )), SOURCE_COMMIT),
+      "MANIFEST_PERMISSIONS",
+    );
+  }
+  for (const requiredPermission of [
+    "android.permission.CAMERA",
+    "android.permission.ACCESS_NETWORK_STATE",
+    "android.permission.FOREGROUND_SERVICE",
+    "android.permission.FOREGROUND_SERVICE_DATA_SYNC",
+  ]) {
+    expectCode(
+      () => verifyTesterPermissions(`${PERMISSIONS.filter((name) => name !== requiredPermission).join("\n")}\n`),
+      "PERMISSIONS_MISMATCH",
+    );
+  }
+});
+
+test("native events service requires one non-exported dataSync-only component", () => {
+  const eventsService = '    <service android:name="io.veil.mobile.runtime.VeilEventsService" android:exported="false" android:foregroundServiceType="0x1" />';
+  for (const replacement of [
+    "",
+    eventsService.replace("io.veil.mobile.runtime.VeilEventsService", "io.veil.mobile.runtime.OtherEventsService"),
+  ]) {
+    expectCode(
+      () => assertTesterManifest(parseManifestXml(manifestXml().replace(eventsService, replacement)), SOURCE_COMMIT),
+      "MANIFEST_COMPONENT_INVENTORY",
+    );
+  }
+  expectCode(
+    () => assertTesterManifest(parseManifestXml(manifestXml().replace(eventsService, `${eventsService}\n${eventsService}`)), SOURCE_COMMIT),
+    "MANIFEST_COMPONENT_DUPLICATE",
+  );
+  for (const replacement of [
+    eventsService.replace('android:exported="false"', 'android:exported="true"'),
+    eventsService.replace(' android:foregroundServiceType="0x1"', ""),
+    eventsService.replace('android:foregroundServiceType="0x1"', 'android:foregroundServiceType="0x0"'),
+    eventsService.replace('android:foregroundServiceType="0x1"', 'android:foregroundServiceType="0x41"'),
+    eventsService.replace('android:foregroundServiceType="0x1"', 'android:foregroundServiceType="dataSync"'),
+    ...[
+      'android:directBootAware="true"',
+      'android:enabled="false"',
+      'android:isolatedProcess="true"',
+      'android:process=":events"',
+      'android:permission="android.permission.INTERNET"',
+    ].map((attribute) => eventsService.replace(" />", ` ${attribute} />`)),
+  ]) {
+    expectCode(
+      () => assertTesterManifest(parseManifestXml(manifestXml().replace(eventsService, replacement)), SOURCE_COMMIT),
+      "MANIFEST_COMPONENT_SECURITY",
+    );
+  }
+});
+
+test("identity QR dependency components retain every exact private security boundary", () => {
+  for (const component of CAMERA_COMPONENT_XML) {
+    for (const replacement of [
+      component.replace('android:exported="false"', 'android:exported="true"'),
+      component.includes('android:permission="android.permission.BIND_JOB_SERVICE"')
+        ? component.replace('android:permission="android.permission.BIND_JOB_SERVICE"', 'android:permission="android.permission.INTERNET"')
+        : component.replace(" />", ' android:permission="android.permission.INTERNET" />'),
+      component.replace(" />", ' android:foregroundServiceType="0x1" />'),
+    ]) {
+      expectCode(
+        () => assertTesterManifest(parseManifestXml(manifestXml().replace(component, replacement)), SOURCE_COMMIT),
+        "MANIFEST_COMPONENT_SECURITY",
+      );
+    }
+    expectCode(
+      () => assertTesterManifest(parseManifestXml(manifestXml().replace(component, "")), SOURCE_COMMIT),
+      "MANIFEST_COMPONENT_INVENTORY",
+    );
+    expectCode(
+      () => assertTesterManifest(parseManifestXml(manifestXml().replace(component, `${component}\n${component}`)), SOURCE_COMMIT),
+      "MANIFEST_COMPONENT_DUPLICATE",
+    );
+  }
+  for (const [from, to] of [
+    ['android:name="androidx.camera.core.impl.MetadataHolderService" android:enabled="false"', 'android:name="androidx.camera.core.impl.MetadataHolderService" android:enabled="true"'],
+    ['android:authorities="io.veil.mobile.tester.mlkitinitprovider"', 'android:authorities="io.veil.mobile.mlkitinitprovider"'],
+    ['android:initOrder="99"', 'android:initOrder="100"'],
+    ['android:initOrder="99"', 'android:grantUriPermissions="true" android:initOrder="99"'],
+    ['android:name="com.google.mlkit.common.internal.MlKitComponentDiscoveryService" android:directBootAware="true"', 'android:name="com.google.mlkit.common.internal.MlKitComponentDiscoveryService" android:directBootAware="false"'],
+  ]) {
+    expectCode(
+      () => assertTesterManifest(parseManifestXml(manifestXml().replace(from, to)), SOURCE_COMMIT),
+      "MANIFEST_COMPONENT_SECURITY",
+    );
+  }
+});
+
 test("evidence builder rejects malformed hashes, sizes, commits, and timestamps", () => {
   const valid = {
     apkSha256: "ef".repeat(32),
@@ -1811,7 +2046,7 @@ test("evidence builder rejects malformed hashes, sizes, commits, and timestamps"
   expectCode(
     () => buildEvidence({
       ...valid,
-      permissions: [...PERMISSIONS, "android.permission.CAMERA"],
+      permissions: [...PERMISSIONS, "android.permission.RECORD_AUDIO"],
     }),
     "EVIDENCE_PERMISSIONS",
   );

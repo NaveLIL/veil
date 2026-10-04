@@ -32,6 +32,7 @@ const EXPECTED_TARGET_SDK_VERSION = 35;
 const MAIN_ACTIVITY_CLASS = "io.veil.mobile.MainActivity";
 const RECOVERY_ACTIVITY_CLASS = "io.veil.mobile.recovery.RecoveryActivity";
 const PUSH_SERVICE_CLASS = "io.veil.mobile.push.VeilPushService";
+const EVENTS_SERVICE_CLASS = "io.veil.mobile.runtime.VeilEventsService";
 const FILE_SYSTEM_PROVIDER_CLASS = "expo.modules.filesystem.FileSystemFileProvider";
 const INITIALIZATION_PROVIDER_CLASS = "androidx.startup.InitializationProvider";
 const PROFILE_INSTALL_RECEIVER_CLASS = "androidx.profileinstaller.ProfileInstallReceiver";
@@ -75,6 +76,10 @@ const DYNAMIC_RECEIVER_PERMISSION = (
   `${EXPECTED_APPLICATION_ID}.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION`
 );
 const EXPECTED_PERMISSIONS = Object.freeze([
+  "android.permission.ACCESS_NETWORK_STATE",
+  "android.permission.CAMERA",
+  "android.permission.FOREGROUND_SERVICE",
+  "android.permission.FOREGROUND_SERVICE_DATA_SYNC",
   "android.permission.HIDE_OVERLAY_WINDOWS",
   "android.permission.INTERNET",
   "android.permission.POST_NOTIFICATIONS",
@@ -117,6 +122,7 @@ const COMPONENT_SECURITY_ATTRIBUTES = Object.freeze([
   "android:grantUriPermissions",
   "android:immersive",
   "android:inheritShowWhenLocked",
+  "android:initOrder",
   "android:isolatedProcess",
   "android:launchMode",
   "android:lockTaskMode",
@@ -169,6 +175,14 @@ const EXPECTED_COMPONENTS = Object.freeze([
     securityAttributes: Object.freeze({ "android:exported": "false" }),
   }),
   Object.freeze({
+    type: "service",
+    name: EVENTS_SERVICE_CLASS,
+    securityAttributes: Object.freeze({
+      "android:exported": "false",
+      "android:foregroundServiceType": "0x1",
+    }),
+  }),
+  Object.freeze({
     type: "provider",
     name: FILE_SYSTEM_PROVIDER_CLASS,
     securityAttributes: Object.freeze({
@@ -196,7 +210,69 @@ const EXPECTED_COMPONENTS = Object.freeze([
     }),
   }),
 ]);
-const EXPECTED_COMPONENT_EVIDENCE = Object.freeze(EXPECTED_COMPONENTS.map(
+const EXPECTED_CAMERA_COMPONENTS = Object.freeze([
+  Object.freeze({
+    type: "service",
+    name: "androidx.camera.core.impl.MetadataHolderService",
+    securityAttributes: Object.freeze({
+      "android:enabled": "false",
+      "android:exported": "false",
+    }),
+  }),
+  Object.freeze({
+    type: "activity",
+    name: "com.google.mlkit.vision.codescanner.internal.GmsBarcodeScanningDelegateActivity",
+    securityAttributes: Object.freeze({
+      "android:exported": "false",
+      "android:screenOrientation": "1",
+    }),
+  }),
+  Object.freeze({
+    type: "service",
+    name: "com.google.mlkit.common.internal.MlKitComponentDiscoveryService",
+    securityAttributes: Object.freeze({
+      "android:directBootAware": "true",
+      "android:exported": "false",
+    }),
+  }),
+  Object.freeze({
+    type: "provider",
+    name: "com.google.mlkit.common.internal.MlKitInitProvider",
+    securityAttributes: Object.freeze({
+      "android:authorities": `${EXPECTED_APPLICATION_ID}.mlkitinitprovider`,
+      "android:exported": "false",
+      "android:initOrder": "99",
+    }),
+  }),
+  Object.freeze({
+    type: "activity",
+    name: "com.google.android.gms.common.api.GoogleApiActivity",
+    securityAttributes: Object.freeze({ "android:exported": "false" }),
+  }),
+  Object.freeze({
+    type: "service",
+    name: "com.google.android.datatransport.runtime.backends.TransportBackendDiscovery",
+    securityAttributes: Object.freeze({ "android:exported": "false" }),
+  }),
+  Object.freeze({
+    type: "service",
+    name: "com.google.android.datatransport.runtime.scheduling.jobscheduling.JobInfoSchedulerService",
+    securityAttributes: Object.freeze({
+      "android:exported": "false",
+      "android:permission": "android.permission.BIND_JOB_SERVICE",
+    }),
+  }),
+  Object.freeze({
+    type: "receiver",
+    name: "com.google.android.datatransport.runtime.scheduling.jobscheduling.AlarmManagerSchedulerBroadcastReceiver",
+    securityAttributes: Object.freeze({ "android:exported": "false" }),
+  }),
+]);
+const EXPECTED_ALL_COMPONENTS = Object.freeze([
+  ...EXPECTED_COMPONENTS,
+  ...EXPECTED_CAMERA_COMPONENTS,
+]);
+const EXPECTED_COMPONENT_EVIDENCE = Object.freeze(EXPECTED_ALL_COMPONENTS.map(
   (component) => Object.freeze({
     type: component.type,
     name: component.name,
@@ -779,11 +855,11 @@ function assertTesterComponentManifest(parsed) {
     actualByKey.set(key, component);
     names.add(component.name);
   }
-  if (actualByKey.size !== EXPECTED_COMPONENTS.length) {
+  if (actualByKey.size !== EXPECTED_ALL_COMPONENTS.length) {
     fail("MANIFEST_COMPONENT_INVENTORY");
   }
 
-  for (const expected of EXPECTED_COMPONENTS) {
+  for (const expected of EXPECTED_ALL_COMPONENTS) {
     const component = actualByKey.get(`${expected.type}\0${expected.name}`);
     if (!component) fail("MANIFEST_COMPONENT_INVENTORY");
     for (const attributeName of COMPONENT_SECURITY_ATTRIBUTES) {
@@ -1074,7 +1150,7 @@ export function assertTesterManifest(
   });
 }
 
-export function verifyTesterResourceBindings(parsed, output) {
+export function resolveTesterResourceFiles(parsed, output) {
   const iconReference = parsed?.applicationAttributes?.get?.("android:icon");
   const roundIconReference = parsed?.applicationAttributes?.get?.("android:roundIcon");
   const applicationLabelReference = parsed?.applicationAttributes?.get?.("android:label");
@@ -1190,22 +1266,30 @@ export function verifyTesterResourceBindings(parsed, output) {
       dataExtractionRulesMapping = nameMappings[0];
     }
   }
-  const expectedIconFileLine = `      () (file) ${EXPECTED_TESTER_ICON_FILE} type=XML`;
-  if (
-    iconMapping.fileLines.length !== 1
-    || iconMapping.fileLines[0] !== expectedIconFileLine
-  ) {
-    fail("AAPT2_TESTER_ICON_FILE");
-  }
-  const expectedDataExtractionRulesFileLine = (
-    `      () (file) ${EXPECTED_DATA_EXTRACTION_RULES_FILE} type=XML`
+  const resolveXmlFile = (mapping, canonicalPath, errorCode) => {
+    if (mapping.fileLines.length !== 1) fail(errorCode);
+    const match = /^      \(\) \(file\) (\S+) type=XML$/.exec(mapping.fileLines[0]);
+    const file = match?.[1];
+    // AAPT2 resource optimization shortens packaged filenames but retains the
+    // reviewed resource ID/name binding. Accept only that single default XML
+    // mapping, either its original path or a bounded flat optimized res path.
+    if (file !== canonicalPath && !/^res\/[A-Za-z0-9_-]{1,64}\.xml$/.test(file ?? "")) {
+      fail(errorCode);
+    }
+    return file;
+  };
+  const iconFile = resolveXmlFile(iconMapping, EXPECTED_TESTER_ICON_FILE, "AAPT2_TESTER_ICON_FILE");
+  const dataExtractionRulesFile = resolveXmlFile(
+    dataExtractionRulesMapping,
+    EXPECTED_DATA_EXTRACTION_RULES_FILE,
+    "AAPT2_DATA_EXTRACTION_RULES_FILE",
   );
-  if (
-    dataExtractionRulesMapping.fileLines.length !== 1
-    || dataExtractionRulesMapping.fileLines[0] !== expectedDataExtractionRulesFileLine
-  ) {
-    fail("AAPT2_DATA_EXTRACTION_RULES_FILE");
-  }
+  if (iconFile === dataExtractionRulesFile) fail("AAPT2_RESOURCE_FILE_ALIAS");
+  return Object.freeze({ iconFile, dataExtractionRulesFile });
+}
+
+export function verifyTesterResourceBindings(parsed, output) {
+  resolveTesterResourceFiles(parsed, output);
 
   return Object.freeze({
     iconResource: EXPECTED_TESTER_ICON_RESOURCE,
@@ -1261,7 +1345,7 @@ export function verifyTesterDataExtractionRules(output) {
   });
 }
 
-export function verifyArchiveFileList(output) {
+export function verifyArchiveFileList(output, resourceFiles = null) {
   assertBoundedOutputString(output, MAX_FILE_LIST_OUTPUT_BYTES, "FILES_OUTPUT_SIZE");
   const text = validateDecodedToolText(output, "FILES_OUTPUT_FORMAT");
   const lines = text.split("\n");
@@ -1295,6 +1379,29 @@ export function verifyArchiveFileList(output) {
     if (!directory) files.add(normalized);
   }
 
+  if (resourceFiles !== null) {
+    if (
+      typeof resourceFiles !== "object"
+      || Array.isArray(resourceFiles)
+      || !exactStringSet(Object.keys(resourceFiles), ["iconFile", "dataExtractionRulesFile"])
+      || resourceFiles.iconFile === resourceFiles.dataExtractionRulesFile
+    ) {
+      fail("FILES_RESOURCE_BINDINGS");
+    }
+    for (const [name, canonicalPath] of [
+      ["iconFile", EXPECTED_TESTER_ICON_FILE],
+      ["dataExtractionRulesFile", EXPECTED_DATA_EXTRACTION_RULES_FILE],
+    ]) {
+      const file = resourceFiles[name];
+      if (
+        typeof file !== "string"
+        || (file !== canonicalPath && !/^res\/[A-Za-z0-9_-]{1,64}\.xml$/.test(file))
+      ) {
+        fail("FILES_RESOURCE_BINDINGS");
+      }
+      if (!files.has(file)) fail("FILES_RESOURCE_MISSING");
+    }
+  }
   if (!files.has(REQUIRED_ASSET)) fail("FILES_BUNDLE_MISSING");
   const veilFfiAbis = [];
   for (const entry of files) {
@@ -2038,15 +2145,18 @@ export async function verifyAndroidTesterApk(configuration, options = {}) {
       configuration.versionCode,
       configuration.versionName,
     );
-    const verifiedResources = verifyTesterResourceBindings(
-      parsedManifest,
-      await boundedToolRun(
-        invocations.aapt2.executable,
-        invocations.aapt2.prefixArgs,
-        ["dump", "resources", snapshotPath],
-        MAX_RESOURCE_TABLE_OUTPUT_BYTES,
-        childEnvironment,
-      ),
+    const resourceTable = await boundedToolRun(
+      invocations.aapt2.executable,
+      invocations.aapt2.prefixArgs,
+      ["dump", "resources", snapshotPath],
+      MAX_RESOURCE_TABLE_OUTPUT_BYTES,
+      childEnvironment,
+    );
+    const verifiedResources = verifyTesterResourceBindings(parsedManifest, resourceTable);
+    const resourceFiles = resolveTesterResourceFiles(parsedManifest, resourceTable);
+    verifyArchiveFileList(
+      await analyze(["files", "list"], MAX_FILE_LIST_OUTPUT_BYTES),
+      resourceFiles,
     );
     const verifiedBackupPolicy = verifyTesterDataExtractionRules(
       await boundedToolRun(
@@ -2056,7 +2166,7 @@ export async function verifyAndroidTesterApk(configuration, options = {}) {
           "dump",
           "xmltree",
           "--file",
-          EXPECTED_DATA_EXTRACTION_RULES_FILE,
+          resourceFiles.dataExtractionRulesFile,
           snapshotPath,
         ],
         MAX_DATA_EXTRACTION_RULES_OUTPUT_BYTES,
@@ -2080,7 +2190,6 @@ export async function verifyAndroidTesterApk(configuration, options = {}) {
       );
     }
     const verifiedBranding = assertTesterBranding(branding);
-    verifyArchiveFileList(await analyze(["files", "list"], MAX_FILE_LIST_OUTPUT_BYTES));
 
     const finalSourceInfo = await requireRegularFile(
       configuration.apkPath,
