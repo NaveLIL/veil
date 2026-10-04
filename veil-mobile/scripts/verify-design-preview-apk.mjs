@@ -41,8 +41,8 @@ if (!nativeHost.includes('MainReactPackage') || !nativeHost.includes('SafeAreaCo
 const map = JSON.parse(fs.readFileSync(sourceMap, 'utf8'));
 const found = new Map();
 map.sources.forEach((source, i) => {
-  const normalized = source.replaceAll('\\', '/').replace(/^.*?veil-mobile\//, '').replace(/^(\.\.\/)+/, '');
-  if (!source.includes('node_modules') && /(?:^|\/)(?:src\/|App\.tsx|index\.ts|design-preview-index\.ts)/.test(normalized)) {
+  const normalized = source.replaceAll('\\', '/').replace(/^.*?veil-mobile\//, '').replace(/^(\.\.\/)+/, '').replace(/^\/+/, '');
+  if (!source.includes('node_modules') && !['\u0000polyfill:external-require', '\u0000polyfill:assets-registry'].includes(source)) {
     if (!allowedSources.includes(normalized)) throw Error(`Unexpected application source in bundle: ${source}`);
     if (found.has(normalized)) throw Error('Duplicate application source in map');
     const content = map.sourcesContent?.[i];

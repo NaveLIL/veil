@@ -22,7 +22,7 @@ class DesignApplication : Application(), ReactApplication {
       MainReactPackage(), SafeAreaContextPackage(), SvgPackage(), EdgeToEdgePackage(),
     )
     override fun getJSMainModuleName() = "design-preview-index"
-    override fun getUseDeveloperSupport() = false
+    override fun getUseDeveloperSupport() = BuildConfig.DEBUG
     override val isNewArchEnabled = BuildConfig.IS_NEW_ARCHITECTURE_ENABLED
     override val isHermesEnabled = BuildConfig.IS_HERMES_ENABLED
   }

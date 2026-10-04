@@ -57,7 +57,7 @@ android {
         targetSdkVersion rootProject.ext.targetSdkVersion
         versionCode 2026100401
         versionName '0.1.0-design.20261004.1'
-        manifestPlaceholders = [veilDesignSource: sourceCommit]
+        manifestPlaceholders = [veilDesignSource: sourceCommit, veilDesignLabel: 'Veil Design']
     }
     signingConfigs {
         if (signingReady) {
@@ -70,6 +70,13 @@ android {
         }
     }
     buildTypes {
+        debug {
+            applicationIdSuffix '.live'
+            versionNameSuffix '-live'
+            debuggable true
+            manifestPlaceholders = [veilDesignLabel: 'Veil Design Live']
+            if (signingReady) signingConfig signingConfigs.preview
+        }
         release {
             debuggable false
             minifyEnabled false
@@ -89,7 +96,7 @@ gradle.taskGraph.whenReady { graph ->
     if (tasks.any { it.name ==~ /(?i)^(install|uninstall|connected).*/ }) {
         throw new GradleException('Preview build is host-only. Use assembleRelease and install the reviewed APK manually; never erase an account app.')
     }
-    if (tasks.any { it.name.toLowerCase().contains('release') } && (!signingReady || !(sourceCommit ==~ /^[0-9a-f]{40}$/))) {
+    if (tasks.any { it.name.toLowerCase().contains('release') || it.name.toLowerCase().contains('debug') } && (!signingReady || !(sourceCommit ==~ /^[0-9a-f]{40}$/))) {
         throw new GradleException('Design APK requires complete independent tester signing and a source commit. No unsigned/debug fallback.')
     }
 }

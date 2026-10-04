@@ -1,0 +1,5 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" xmlns:tools="http://schemas.android.com/tools">
+  <!-- Only Live previews can fetch public JS fixtures from local Metro over USB. -->
+  <uses-permission android:name="android.permission.INTERNET" tools:node="replace" />
+  <application android:networkSecurityConfig="@xml/design_live_network_security" />
+</manifest>
