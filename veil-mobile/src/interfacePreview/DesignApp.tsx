@@ -54,7 +54,6 @@ function Workbench() {
   });
   const [query, setQuery] = useState('');
   const [searchVisible, setSearchVisible] = useState(false);
-  const [unreadOnly, setUnreadOnly] = useState(false);
   const [newChat, setNewChat] = useState(false);
   const [sheet, setSheet] = useState<Sheet>(null);
   const interactions = useMessageInteractions(session, setSession, chatId);
@@ -363,8 +362,6 @@ function Workbench() {
                   setQuery={setQuery}
                   searchVisible={searchVisible}
                   setSearchVisible={setSearchVisible}
-                  unreadOnly={unreadOnly}
-                  setUnreadOnly={setUnreadOnly}
                   newChat={newChat}
                   setNewChat={setNewChat}
                   enterChat={enterChat}

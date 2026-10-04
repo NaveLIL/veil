@@ -31,8 +31,6 @@ type Props = {
   setQuery: Setter<string>;
   searchVisible: boolean;
   setSearchVisible: Setter<boolean>;
-  unreadOnly: boolean;
-  setUnreadOnly: Setter<boolean>;
   newChat: boolean;
   setNewChat: Setter<boolean>;
   enterChat: (id: string) => void;
@@ -49,8 +47,6 @@ export function NavigationPanel({
   setQuery,
   searchVisible,
   setSearchVisible,
-  unreadOnly,
-  setUnreadOnly,
   newChat,
   setNewChat,
   enterChat,
@@ -61,11 +57,9 @@ export function NavigationPanel({
   const listOffset = useRef(0);
   const searchRef = useRef<TextInput>(null);
   const space = demoSpaces.find((item) => item.id === destination);
-  const searchResults = visibleChats(
-    session,
-    query,
-    newChat ? false : unreadOnly,
-  ).filter((item) => !newChat || !item.kind || item.kind === 'direct');
+  const searchResults = visibleChats(session, query, false).filter(
+    (item) => !newChat || !item.kind || item.kind === 'direct',
+  );
   return (
     <View style={styles.navigationSurface}>
       <View style={styles.home}>
@@ -176,41 +170,6 @@ export function NavigationPanel({
                       onPress={() => setQuery('')}
                     />
                   )}
-                </View>
-              )}
-              {!newChat && (
-                <View style={styles.filters}>
-                  {[
-                    { name: 'Все', unread: false },
-                    { name: 'Непрочитанные', unread: true },
-                  ].map((filter) => (
-                    <Pressable
-                      key={filter.name}
-                      accessibilityRole="button"
-                      accessibilityState={{
-                        selected: unreadOnly === filter.unread,
-                      }}
-                      onPress={() => setUnreadOnly(filter.unread)}
-                      style={[
-                        styles.filter,
-                        {
-                          borderBottomColor:
-                            unreadOnly === filter.unread
-                              ? c.accent
-                              : 'transparent',
-                        },
-                      ]}
-                    >
-                      <Label
-                        color={
-                          unreadOnly === filter.unread ? c.accent : c.muted
-                        }
-                        style={styles.buttonText}
-                      >
-                        {filter.name}
-                      </Label>
-                    </Pressable>
-                  ))}
                 </View>
               )}
               <FlatList
@@ -478,14 +437,6 @@ const styles = StyleSheet.create({
     paddingHorizontal: 12,
     paddingVertical: 10,
   },
-  filters: { flexDirection: 'row', gap: 16, paddingHorizontal: 14 },
-  filter: {
-    minHeight: geometry.touchTarget,
-    minWidth: geometry.touchTarget,
-    justifyContent: 'center',
-    borderBottomWidth: 2,
-  },
-  buttonText: { ...typography.button, fontWeight: '600' },
   chatList: { paddingHorizontal: 10, paddingBottom: 96 },
   empty: { alignItems: 'center', paddingVertical: 28, gap: 12 },
   chatRow: {
