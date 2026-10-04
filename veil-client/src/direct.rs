@@ -430,13 +430,43 @@ pub fn install_authenticated_direct_conversation_v1(
         client.ensure_peer_signing_key_compatible(member.identity_key, member.signing_key)?;
     }
 
-    // 2. Prepare snapshots for SQLCipher
+    // The create-DM response establishes keys, not profile presentation. An
+    // absent username is None; Some("") is an invalid directory observation.
+    // Keep an already pinned exact account snapshot intact: an unversioned
+    // observation without presentation must not erase its known profile.
+    let db = client.db().ok_or("database not initialized")?;
     let observed_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-    let snapshots = direct_page_account_snapshots(
-        &[Box::new(conversation.clone())],
-        canonical_server_origin,
-        &observed_at,
-    );
+    let snapshots = conversation
+        .members
+        .iter()
+        .map(|member| {
+            if let Some(existing) =
+                db.resolve_account_by_origin_user(canonical_server_origin, &member.user_id)?
+            {
+                if existing.locator.identity_key == member.identity_key
+                    && existing.signing_key == member.signing_key
+                {
+                    return Ok(existing);
+                }
+            }
+            // A conflicting baseline is deliberately not reused: the store must
+            // still classify and quarantine the new identity/signing candidate.
+            Ok(AccountSnapshot {
+                locator: ProfileLocator {
+                    canonical_server_origin: canonical_server_origin.to_string(),
+                    user_id: member.user_id.clone(),
+                    identity_key: member.identity_key,
+                },
+                signing_key: member.signing_key,
+                username: None,
+                display_name: None,
+                profile_version: None,
+                profile_origin: canonical_server_origin.to_string(),
+                source: AccountSnapshotSource::AuthenticatedConversationDirectory,
+                observed_at: observed_at.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
 
     let stored_conversation = AuthenticatedDirectDirectoryEntry {
         conversation_id: conversation.id.clone(),
@@ -447,7 +477,6 @@ pub fn install_authenticated_direct_conversation_v1(
     };
 
     // 3. Durable write to SQLCipher
-    let db = client.db().ok_or("database not initialized")?;
     db.upsert_identity_directory(&snapshots)?;
     db.upsert_directory_directs(canonical_server_origin, &[stored_conversation])?;
 
@@ -1410,6 +1439,179 @@ mod tests {
         );
         install_authenticated_direct_directory_page(client, ORIGIN, SELF_USER, None, &response)
             .unwrap();
+    }
+
+    #[test]
+    fn new_direct_install_persists_missing_presentation_without_empty_usernames() {
+        let (mut client, path) = initialized_client();
+        let peer = veil_crypto::IdentityKeyPair::generate();
+        // Match mobile bootstrap: an authenticated, initially empty directory.
+        install_authenticated_direct_directory_page(
+            &mut client,
+            ORIGIN,
+            SELF_USER,
+            None,
+            &page(vec![], None),
+        )
+        .unwrap();
+
+        install_authenticated_direct_conversation_v1(
+            &mut client,
+            ORIGIN,
+            SELF_USER,
+            CONVERSATION,
+            PEER_USER,
+            peer.x25519_public_bytes(),
+            peer.ed25519_public_bytes(),
+        )
+        .expect("a created Direct must be installed without invented presentation metadata");
+
+        let db = client.db().unwrap();
+        let self_account = db
+            .resolve_account_by_origin_user(ORIGIN, SELF_USER)
+            .unwrap()
+            .unwrap();
+        let peer_account = db
+            .resolve_account_by_origin_user(ORIGIN, PEER_USER)
+            .unwrap()
+            .unwrap();
+        assert_eq!(self_account.username, None);
+        assert_eq!(peer_account.username, None);
+        assert_eq!(peer_account.signing_key, peer.ed25519_public_bytes());
+        assert_eq!(
+            client.known_user_identity(PEER_USER),
+            Some(peer.x25519_public_bytes())
+        );
+        assert!(client
+            .peer_signing_key_is_pinned(&peer.x25519_public_bytes(), &peer.ed25519_public_bytes()));
+        let stored = db.get_conversations().unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].id, CONVERSATION);
+        assert_eq!(stored[0].server_origin.as_deref(), Some(ORIGIN));
+        assert_eq!(stored[0].peer_user_id.as_deref(), Some(PEER_USER));
+        drop(client);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn new_direct_install_preserves_existing_unversioned_and_versioned_profiles() {
+        for version in [None, Some(7)] {
+            let (mut client, path) = initialized_client();
+            let peer = veil_crypto::IdentityKeyPair::generate();
+            install_authenticated_direct_directory_page(
+                &mut client,
+                ORIGIN,
+                SELF_USER,
+                None,
+                &page(vec![], None),
+            )
+            .unwrap();
+            let known = AccountSnapshot {
+                locator: ProfileLocator {
+                    canonical_server_origin: ORIGIN.to_string(),
+                    user_id: PEER_USER.to_string(),
+                    identity_key: peer.x25519_public_bytes(),
+                },
+                signing_key: peer.ed25519_public_bytes(),
+                username: Some("peer".to_string()),
+                display_name: Some("Known peer".to_string()),
+                profile_version: version,
+                profile_origin: ORIGIN.to_string(),
+                source: AccountSnapshotSource::AuthenticatedConversationDirectory,
+                observed_at: "2026-10-04T00:00:00Z".to_string(),
+            };
+            client
+                .db()
+                .unwrap()
+                .upsert_identity_directory(&[known.clone()])
+                .unwrap();
+
+            install_authenticated_direct_conversation_v1(
+                &mut client,
+                ORIGIN,
+                SELF_USER,
+                CONVERSATION,
+                PEER_USER,
+                peer.x25519_public_bytes(),
+                peer.ed25519_public_bytes(),
+            )
+            .unwrap();
+            assert_eq!(
+                client
+                    .db()
+                    .unwrap()
+                    .resolve_account_by_origin_user(ORIGIN, PEER_USER,)
+                    .unwrap()
+                    .unwrap(),
+                known
+            );
+            // Reopening the same Direct is idempotent and cannot clear metadata.
+            install_authenticated_direct_conversation_v1(
+                &mut client,
+                ORIGIN,
+                SELF_USER,
+                CONVERSATION,
+                PEER_USER,
+                peer.x25519_public_bytes(),
+                peer.ed25519_public_bytes(),
+            )
+            .unwrap();
+            assert_eq!(
+                client
+                    .db()
+                    .unwrap()
+                    .resolve_account_by_origin_user(ORIGIN, PEER_USER,)
+                    .unwrap()
+                    .unwrap(),
+                known
+            );
+            drop(client);
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn new_direct_install_still_rejects_a_changed_peer_identity() {
+        let (mut client, path) = initialized_client();
+        let peer = veil_crypto::IdentityKeyPair::generate();
+        let replacement = veil_crypto::IdentityKeyPair::generate();
+        install_peer_directory(
+            &mut client,
+            peer.x25519_public_bytes(),
+            peer.ed25519_public_bytes(),
+        );
+        let before = client
+            .db()
+            .unwrap()
+            .resolve_account_by_origin_user(ORIGIN, PEER_USER)
+            .unwrap()
+            .unwrap();
+        assert!(install_authenticated_direct_conversation_v1(
+            &mut client,
+            ORIGIN,
+            SELF_USER,
+            CONVERSATION_TWO,
+            PEER_USER,
+            replacement.x25519_public_bytes(),
+            replacement.ed25519_public_bytes(),
+        )
+        .is_err());
+        assert_eq!(
+            client
+                .db()
+                .unwrap()
+                .resolve_account_by_origin_user(ORIGIN, PEER_USER)
+                .unwrap()
+                .unwrap(),
+            before
+        );
+        assert_eq!(
+            client.known_user_identity(PEER_USER),
+            Some(peer.x25519_public_bytes())
+        );
+        assert_eq!(client.db().unwrap().get_conversations().unwrap().len(), 1);
+        drop(client);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
