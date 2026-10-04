@@ -158,7 +158,7 @@ function MessageBubble({ item, c, onLongPress, onRetry }: { item: DemoMessage; c
         <Label color={c.text} style={styles.messageText}>{item.text}</Label>
         <View style={styles.messageMeta}>
           <Label color={item.delivery === 'failed' ? c.danger : c.muted} style={styles.messageTime}>{item.time}{item.delivery && item.delivery !== 'accepted' ? ` · ${status}` : ''}</Label>
-          {item.delivery === 'accepted' ? <Check size={14} color={c.muted} /> : item.delivery === 'queued' ? <Clock3 size={13} color={c.muted} /> : item.delivery === 'failed' || item.delivery === 'unknown' ? <CircleAlert size={13} color={c.danger} /> : null}
+          {item.delivery === 'accepted' ? <Check size={14} color={c.muted} /> : item.delivery === 'queued' ? <Clock3 size={13} color={c.muted} /> : item.delivery === 'failed' ? <CircleAlert size={13} color={c.danger} /> : item.delivery === 'unknown' ? <Info size={13} color={c.muted} /> : null}
         </View>
       </Pressable>
       {item.delivery === 'failed' && <Pressable onPress={onRetry} accessibilityRole="button" accessibilityLabel="Повторить демо-отправку этого сообщения" style={styles.retryButton}><Label color={c.danger} style={styles.chipText}>Повторить</Label></Pressable>}

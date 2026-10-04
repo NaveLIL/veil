@@ -15,7 +15,31 @@ react {
     hermesCommand = reactNativeDir.get().asFile.absolutePath + '/sdks/hermesc/%OS-BIN%/hermesc'
     cliFile = new File(['node', '--print', "require.resolve('@expo/cli', { paths: [require.resolve('expo/package.json')] })"].execute(null, rootDir).text.trim())
     bundleCommand = 'export:embed'
-    autolinkLibrariesWithApp()
+    // Deliberately do not autolink the account application's full dependency
+    // set: Expo would pull camera, secure-store, scanners and other modules.
+}
+def previewLinkFile = layout.buildDirectory.file('generated/preview-autolinking/autolinking.json')
+def rootLinkFile = rootProject.layout.buildDirectory.file('generated/autolinking/autolinking.json')
+def previewLibraries = ['react-native-safe-area-context', 'react-native-svg', 'react-native-edge-to-edge']
+def preparePreviewAutolinking = tasks.register('preparePreviewAutolinking') {
+    inputs.file(rootLinkFile)
+    outputs.file(previewLinkFile)
+    doLast {
+        def config = new groovy.json.JsonSlurper().parse(rootLinkFile.get().asFile)
+        config.dependencies = config.dependencies.findAll { name, value -> previewLibraries.contains(name) }
+        if (config.dependencies.keySet() != previewLibraries.toSet()) {
+            throw new GradleException('Preview native UI dependency inventory changed')
+        }
+        def output = previewLinkFile.get().asFile
+        output.parentFile.mkdirs()
+        output.setText(groovy.json.JsonOutput.toJson(config), 'UTF-8')
+    }
+}
+['generateAutolinkingPackageList', 'generateAutolinkingNewArchitectureFiles'].each { name ->
+    tasks.named(name) {
+        dependsOn(preparePreviewAutolinking)
+        autolinkInputFile.set(previewLinkFile)
+    }
 }
 def signingNames = ['VEIL_ANDROID_TESTER_KEYSTORE', 'VEIL_ANDROID_TESTER_KEYSTORE_PASSWORD', 'VEIL_ANDROID_TESTER_KEY_ALIAS', 'VEIL_ANDROID_TESTER_KEY_PASSWORD']
 def signing = signingNames.collect { System.getenv(it) }
@@ -58,6 +82,7 @@ dependencies {
     coreLibraryDesugaring('com.android.tools:desugar_jdk_libs:2.1.5')
     implementation('com.facebook.react:react-android')
     implementation('com.facebook.react:hermes-android')
+    previewLibraries.each { implementation project(":${it}") }
 }
 gradle.taskGraph.whenReady { graph ->
     def tasks = graph.allTasks.findAll { it.project == project }

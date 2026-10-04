@@ -13,6 +13,7 @@ const java = path.join(javaHome, 'bin/java.exe');
 const analyze = (...args) => execFileSync(java, ['-Dfile.encoding=UTF-8', `-Dcom.android.sdklib.toolsdir=${sdk}/cmdline-tools/19.0`, '-classpath', `${sdk}/cmdline-tools/19.0/lib/apkanalyzer-classpath.jar`, 'com.android.tools.apk.analyzer.ApkAnalyzerCli', ...args, apk], { encoding: 'utf8', windowsHide: true, maxBuffer: 40 * 1024 * 1024 });
 const sha = bytes => createHash('sha256').update(bytes).digest('hex');
 const manifest = analyze('manifest', 'print');
+if (analyze('manifest', 'min-sdk').trim() !== '24' || analyze('manifest', 'target-sdk').trim() !== '35') throw Error('Preview SDK mismatch');
 const parsed = parseManifestXml(manifest);
 const a = parsed.applicationAttributes;
 const m = parsed.manifestAttributes;
@@ -31,7 +32,8 @@ if (parsed.applicationComponents.some(c => /io\.veil\.mobile\.(?!designpreview)/
 const signer = execFileSync(java, ['-jar', `${sdk}/build-tools/35.0.0/lib/apksigner.jar`, 'verify', '--verbose', '--print-certs', apk], { encoding: 'utf8', windowsHide: true });
 if (!signer.includes('Verifies') || !signer.includes('Number of signers: 1') || !signer.includes(`Signer #1 certificate SHA-256 digest: ${certificate}`) || !/Verified using v2 scheme.*: true/.test(signer) || /Verified using v(?:1|3|3\.1|4) scheme.*: true/.test(signer) || /WARNING:|ERROR:/.test(signer)) throw Error('Preview signing mismatch');
 const dex = analyze('dex', 'packages', '--defined-only');
-if (/io\.veil\.mobile\.(?:runtime|recovery|crypto)|uniffi\.veil|veil_ffi|net\.sqlcipher/.test(dex)) throw Error('Account code packaged in preview DEX');
+const veilNames = [...dex.matchAll(/io\.veil(?:\.[A-Za-z0-9_$]+)+/g)].map(match => match[0]);
+if (!veilNames.some(name => name === 'io.veil.mobile.designpreview.DesignActivity') || veilNames.some(name => name !== 'io.veil.mobile' && name !== 'io.veil.mobile.designpreview' && !name.startsWith('io.veil.mobile.designpreview.')) || /uniffi\.veil|veil_ffi|net\.sqlcipher|expo\.modules\.(?:camera|securestore)/.test(dex)) throw Error('Account/device-capability code packaged in preview DEX');
 const activity = analyze('dex', 'code', '--class', 'io.veil.mobile.designpreview.DesignActivity');
 if (!activity.includes('VeilDesign') || /Window;->(?:addFlags|setFlags|clearFlags)|setRecentsScreenshotEnabled|consumeEnrollment/.test(activity)) throw Error('Preview activity capture/entry drift');
 const nativeHost = analyze('dex', 'code', '--class', 'io.veil.mobile.designpreview.DesignApplication$reactNativeHost$1');

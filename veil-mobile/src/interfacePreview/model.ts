@@ -21,9 +21,9 @@ export function createDemoSession(): DemoSession {
       { id: 'demo-sofia', name: 'София', initials: 'С', color: '#AB745D', username: 'sofia.demo', unread: 1,
         messages: [{ id: 'fixture-s1', own: false, text: 'Нашла очень красивое место для прогулки.', time: '12:05' }] },
       { id: 'demo-daniel', name: 'Даниил', initials: 'Д', color: '#59749B', username: 'daniel.demo', unread: 0,
-        messages: [{ id: 'fixture-d1', own: true, text: 'Спасибо, посмотрю вечером.', time: 'Вчера', delivery: 'accepted' }] },
+        messages: [{ id: 'fixture-d1', own: true, text: 'Спасибо, посмотрю вечером.', time: '11:48', delivery: 'accepted' }] },
       { id: 'demo-lena', name: 'Елена', initials: 'Е', color: '#94708D', username: 'lena.demo', unread: 0,
-        messages: [{ id: 'fixture-e1', own: false, text: 'Хороших выходных!', time: 'Вчера' }] },
+        messages: [{ id: 'fixture-e1', own: false, text: 'Хороших выходных!', time: '10:15' }] },
       { id: 'demo-new', name: 'Никита', initials: 'Н', color: '#657B5D', username: 'nikita.demo', unread: 0, messages: [] },
     ],
   };
