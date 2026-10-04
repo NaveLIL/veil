@@ -1,0 +1,25 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" xmlns:tools="http://schemas.android.com/tools">
+  <!-- Deliberately offline, even if a shared RN/Expo dependency requests access. -->
+  <uses-permission android:name="android.permission.INTERNET" tools:node="remove" />
+  <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" tools:node="remove" />
+  <uses-permission android:name="android.permission.CAMERA" tools:node="remove" />
+  <uses-permission android:name="android.permission.RECORD_AUDIO" tools:node="remove" />
+  <uses-permission android:name="android.permission.POST_NOTIFICATIONS" tools:node="remove" />
+  <uses-permission android:name="android.permission.VIBRATE" tools:node="remove" />
+  <uses-permission android:name="android.permission.WAKE_LOCK" tools:node="remove" />
+  <uses-permission android:name="android.permission.FOREGROUND_SERVICE" tools:node="remove" />
+  <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" tools:node="remove" />
+  <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" tools:node="remove" />
+  <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" tools:node="remove" />
+  <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" tools:node="remove" />
+  <uses-permission android:name="android.permission.USE_BIOMETRIC" tools:node="remove" />
+  <uses-permission android:name="android.permission.USE_FINGERPRINT" tools:node="remove" />
+  <application android:name=".DesignApplication" android:label="Veil Design" android:icon="@drawable/ic_design_launcher" android:allowBackup="false" android:fullBackupContent="false" android:theme="@style/DesignTheme" android:usesCleartextTraffic="false" tools:replace="android:allowBackup">
+    <meta-data android:name="io.veil.design.OFFLINE_FIXTURES_ONLY" android:value="true" />
+    <meta-data android:name="io.veil.design.SOURCE_COMMIT" android:value="${veilDesignSource}" />
+    <meta-data android:name="expo.modules.updates.ENABLED" android:value="false" />
+    <activity android:name=".DesignActivity" android:exported="true" android:launchMode="singleTask" android:windowSoftInputMode="adjustResize" android:configChanges="keyboard|keyboardHidden|orientation|screenSize|screenLayout|uiMode">
+      <intent-filter><action android:name="android.intent.action.MAIN" /><category android:name="android.intent.category.LAUNCHER" /></intent-filter>
+    </activity>
+  </application>
+</manifest>

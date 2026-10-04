@@ -36,4 +36,8 @@ rootProject.name = 'Veil'
 expoAutolinking.useExpoVersionCatalog()
 
 include ':app'
+// An explicit opt-in keeps the normal client's module graph unchanged.
+if (providers.gradleProperty('veilDesignPreview').orNull == 'true') {
+  include ':designPreview'
+}
 includeBuild(expoAutolinking.reactNativeGradlePlugin)

@@ -1,0 +1,66 @@
+apply plugin: 'com.android.application'
+apply plugin: 'org.jetbrains.kotlin.android'
+apply plugin: 'com.facebook.react'
+
+def projectRoot = rootDir.parentFile.absolutePath
+react {
+    root = file('../..')
+    entryFile = file('../../design-preview-index.ts')
+    reactNativeDir = new File(['node', '--print', "require.resolve('react-native/package.json')"].execute(null, rootDir).text.trim()).parentFile
+    codegenDir = new File(['node', '--print', "require.resolve('@react-native/codegen/package.json', { paths: [require.resolve('react-native/package.json')] })"].execute(null, rootDir).text.trim()).parentFile
+    hermesCommand = reactNativeDir.absolutePath + '/sdks/hermesc/%OS-BIN%/hermesc'
+    cliFile = new File(['node', '--print', "require.resolve('@expo/cli', { paths: [require.resolve('expo/package.json')] })"].execute(null, rootDir).text.trim())
+    bundleCommand = 'export:embed'
+    autolinkLibrariesWithApp()
+}
+def signingNames = ['VEIL_ANDROID_TESTER_KEYSTORE', 'VEIL_ANDROID_TESTER_KEYSTORE_PASSWORD', 'VEIL_ANDROID_TESTER_KEY_ALIAS', 'VEIL_ANDROID_TESTER_KEY_PASSWORD']
+def signing = signingNames.collect { System.getenv(it) }
+def signingReady = signing.every { it != null && !it.trim().empty }
+def sourceCommit = System.getenv('VEIL_SOURCE_COMMIT') ?: 'unconfigured'
+
+android {
+    namespace 'io.veil.mobile.designpreview'
+    compileSdk rootProject.ext.compileSdkVersion
+    buildToolsVersion rootProject.ext.buildToolsVersion
+    ndkVersion rootProject.ext.ndkVersion
+    defaultConfig {
+        applicationId 'io.veil.mobile.designpreview'
+        minSdkVersion rootProject.ext.minSdkVersion
+        targetSdkVersion rootProject.ext.targetSdkVersion
+        versionCode 2026100401
+        versionName '0.1.0-design.20261004.1'
+        manifestPlaceholders = [veilDesignSource: sourceCommit]
+    }
+    signingConfigs {
+        if (signingReady) {
+            preview {
+                storeFile file(signing[0]); storePassword signing[1]
+                keyAlias signing[2]; keyPassword signing[3]
+                enableV1Signing = false; enableV2Signing = true
+                enableV3Signing = false; enableV4Signing = false
+            }
+        }
+    }
+    buildTypes {
+        release {
+            debuggable false
+            minifyEnabled false
+            if (signingReady) signingConfig signingConfigs.preview
+        }
+    }
+    compileOptions { coreLibraryDesugaringEnabled true }
+}
+dependencies {
+    coreLibraryDesugaring('com.android.tools:desugar_jdk_libs:2.1.5')
+    implementation('com.facebook.react:react-android')
+    implementation('com.facebook.react:hermes-android')
+}
+gradle.taskGraph.whenReady { graph ->
+    def tasks = graph.allTasks.findAll { it.project == project }
+    if (tasks.any { it.name ==~ /(?i)^(install|uninstall|connected).*/ }) {
+        throw new GradleException('Preview build is host-only. Use assembleRelease and install the reviewed APK manually; never erase an account app.')
+    }
+    if (tasks.any { it.name.toLowerCase().contains('release') } && (!signingReady || !(sourceCommit ==~ /^[0-9a-f]{40}$/))) {
+        throw new GradleException('Design APK requires complete independent tester signing and a source commit. No unsigned/debug fallback.')
+    }
+}
