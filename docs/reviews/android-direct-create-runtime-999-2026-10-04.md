@@ -63,3 +63,49 @@ empty username. Успешный физический обмен пока не �
 
 Этот документ не утверждает готовность production release или выполнение
 остальной backend/mobile дорожной карты.
+
+## Выданное обновление
+
+APK source commit: `ff6e2222be343f6c17dfc3002b9d5f5accc608e0`, чистое дерево
+перед native build, APK build и packaging. Этот раздел добавлен документационным
+изменением после упаковки; исходники самого APK остаются на указанном commit.
+
+Дополнительный прогон `cargo test -p veil-ffi --lib --release --locked mobile_direct_`:
+**49 PASS**, 0 failed/ignored. Итого 67 Rust test cases для shared Direct и
+mobile Direct FFI. Focused JS tests ContactSearchScreen/runtimeContacts:
+19 PASS, обе suites; они проверяют UI/DTO/correlation, а Rust install в них
+mocked. Production UniFFI surface verifier подтвердил прежнюю high-level
+secret-safe границу; интерфейсы не изменялись, регенерация Kotlin не требовалась.
+
+Реальный cargo-ndk release build завершён для обеих ABIs с одинаковым чистым
+source commit до/после сборки. SHA-256 исходных Rust SO:
+
+| ABI | SHA-256 |
+| --- | --- |
+| arm64-v8a | `6e75215808bf0584ce14f0647b4f7071ae06894188feaa4867fdf9e301f73f9b` |
+| x86_64 | `76f982c5a826d50fe9da0b8a789043d448a2aabe3f87fa51593b38210acedfb0` |
+
+`assembleInternalTester` и `compileDebugAndroidTestKotlin`: BUILD SUCCESSFUL,
+2m 23s, с прежним узким локальным AGP host adapter, без пропуска APK guards.
+Instrumentation не запускалась на телефоне или эмуляторе.
+
+APK: `target/android-update-20261004/ff6e2222be34/Veil-Android-0.1.0-tester.20261004.3.apk`,
+98,038,286 bytes; SHA-256
+`cd15d91bc270c1fbf7eefd23bd46e9a5f0850fdc8782634e1c64546cc5a61501`.
+Независимый verifier подтвердил постоянный tester certificate, source/version,
+package/ABI, строгий manifest/privacy/backup contract. `releaseReady=false`;
+production certificate по-прежнему не provisioned. DEX inspection подтвердил
+сохранение прежнего ARM64 journal fix, ReactMethod и FLAG_SECURE.
+
+Обе новые Rust SO отличаются от предыдущей выдачи; merged native input совпал
+с actual cargo-ndk output, packaged stripped SO — с AGP stripped output.
+Проверено содержимое ZIP/APK, а не только промежуточные файлы. Hermes bundle
+совпал с generated bundle; 36 project sources в source map совпали с исходниками,
+полный Rocket.Chat MIT notice сохранён.
+
+Набор: `target/Veil-Android-Update-ff6e2222be34.zip`; SHA-256
+`8d0a126aee74a3fdd9209b922207c7d9ddf9a526fe9709f0fd72803c905b7fd1`.
+Включает точный AGPL source, public tester certificate, APK evidence,
+Rust build/source/output receipts, ожидаемое baseline failure и успешные
+test logs. Приватные ключи, пароли, recovery phrase, Access Pass и сообщения
+не включены. Успешный обмен телефона с ПК остаётся ручной проверкой пользователя.
