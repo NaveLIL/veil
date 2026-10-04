@@ -49,3 +49,21 @@ test('quotes distinguish unavailable and deleted originals without showing delet
   );
   expect(ui.getByText('Сообщение удалено')).toBeTruthy();
 });
+test('quote cancellation and original navigation are independent touch actions', () => {
+  const onPress = jest.fn(),
+    onDismiss = jest.fn();
+  const ui = render(
+    <MessageQuote
+      chat={createDemoSession().chats[0]}
+      id="fixture-a1"
+      c={palettes.OLED}
+      onPress={onPress}
+      onDismiss={onDismiss}
+    />,
+  );
+  fireEvent.press(ui.getByLabelText('Отменить ответ'));
+  expect(onDismiss).toHaveBeenCalledTimes(1);
+  expect(onPress).not.toHaveBeenCalled();
+  fireEvent.press(ui.getByLabelText(/Перейти к оригиналу:/));
+  expect(onPress).toHaveBeenCalledTimes(1);
+});

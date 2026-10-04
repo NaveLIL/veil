@@ -147,31 +147,32 @@ export function ConversationScreen({
             {notice}
           </Label>
         )}
-        {(editing || replyId) && (
+        {editing ? (
           <View style={[styles.context, { backgroundColor: c.raised }]}>
             <View style={styles.flex}>
-              {editing ? (
-                <View style={styles.editLabel}>
-                  <Pencil size={16} color={c.accent} />
-                  <Label color={c.text}>Редактирование сообщения</Label>
-                </View>
-              ) : (
-                <MessageQuote
-                  chat={chat}
-                  id={replyId!}
-                  c={c}
-                  onPress={() => onQuote?.(replyId!)}
-                />
-              )}
+              <View style={styles.editLabel}>
+                <Pencil size={16} color={c.accent} />
+                <Label color={c.text}>Редактирование сообщения</Label>
+              </View>
             </View>
             <IconButton
               icon={X}
-              label={editing ? 'Отменить редактирование' : 'Отменить ответ'}
+              label="Отменить редактирование"
               color={c.muted}
               onPress={() => onCancelComposition?.()}
             />
           </View>
-        )}
+        ) : replyId ? (
+          <View style={styles.compositionQuote}>
+            <MessageQuote
+              chat={chat}
+              id={replyId}
+              c={c}
+              onPress={() => onQuote?.(replyId)}
+              onDismiss={() => onCancelComposition?.()}
+            />
+          </View>
+        ) : null}
         <Composer
           key={chat.id}
           value={draft}
@@ -189,6 +190,7 @@ export function ConversationScreen({
 const styles = StyleSheet.create({
   conversation: { flex: 1 },
   notice: { ...typography.caption, paddingHorizontal: 14, paddingVertical: 8 },
+  compositionQuote: { marginHorizontal: 10, marginTop: 8 },
   context: {
     flexDirection: 'row',
     alignItems: 'center',

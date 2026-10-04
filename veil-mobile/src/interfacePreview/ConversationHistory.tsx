@@ -227,7 +227,7 @@ const HistoryPage = memo(function HistoryPage({
         onScroll={onScroll}
         onScrollToIndexFailed={quoteNavigation.onFailed}
         onViewableItemsChanged={quoteNavigation.onViewableItemsChanged}
-        viewabilityConfig={{ itemVisiblePercentThreshold: 15 }}
+        viewabilityConfig={{ viewAreaCoveragePercentThreshold: 10 }}
         extraData={`${quoteNavigation.highlight}:${selectedMessageId}`}
         onScrollBeginDrag={() => {
           quoteNavigation.clear();
