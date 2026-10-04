@@ -4,10 +4,11 @@ import { Gesture, GestureDetector } from 'react-native-gesture-handler';
 import Animated, { cancelAnimation, ReduceMotion, runOnJS, useAnimatedStyle, useSharedValue, withSpring } from 'react-native-reanimated';
 import { swipeDestination } from './navigation';
 
-type Props = { navigation: React.ReactNode; conversation: React.ReactNode; navigationOpen: boolean;
+type Props = { navigation: React.ReactNode; profile: React.ReactNode; conversation: React.ReactNode; navigationOpen: boolean;
+  surfaceColor: string; edgeColor: string;
   hasChat: boolean; enabled: boolean; reduceMotion: boolean; onNavigationChange: (open: boolean) => void };
 /** Both layers retain their native views and scroll positions between swipes. */
-export function ChatDeck({ navigation, conversation, navigationOpen, hasChat, enabled, reduceMotion, onNavigationChange }: Props) {
+export function ChatDeck({ navigation, profile, conversation, navigationOpen, surfaceColor, edgeColor, hasChat, enabled, reduceMotion, onNavigationChange }: Props) {
   const { width: screenWidth } = useWindowDimensions();
   const width = Math.max(1, screenWidth - 12);
   const progress = useSharedValue(navigationOpen ? 1 : 0);
@@ -40,13 +41,23 @@ export function ChatDeck({ navigation, conversation, navigationOpen, hasChat, en
       if (!success) progress.value = reduceMotion ? target.value : withSpring(target.value, spring);
     });
   const chatStyle = useAnimatedStyle(() => ({ transform: [{ translateX: progress.value * width }] }));
-  const navigationStyle = useAnimatedStyle(() => ({ transform: [{ translateX: hasChat ? (progress.value - 1) * 12 : 0 }] }));
+  // Dim opaque islands; fading their surfaces would leak wallpaper through text.
+  const backdropStyle = useAnimatedStyle(() => ({ opacity: hasChat ? (1 - progress.value) * 0.48 : 0 }));
   return <GestureDetector gesture={pan}><View style={styles.root} collapsable={false}>
-    <Animated.View testID="navigation-layer" pointerEvents={navigationOpen ? 'auto' : 'none'}
-      accessibilityElementsHidden={!navigationOpen} importantForAccessibility={navigationOpen ? 'auto' : 'no-hide-descendants'} style={[styles.layer, navigationStyle]}>{navigation}</Animated.View>
+    <View testID="navigation-layer" pointerEvents={navigationOpen ? 'auto' : 'none'}
+      accessibilityElementsHidden={!navigationOpen} importantForAccessibility={navigationOpen ? 'auto' : 'no-hide-descendants'} style={styles.layer}>
+      {navigation}<Animated.View pointerEvents="none" accessible={false} style={[styles.backdrop, backdropStyle]} />
+    </View>
+    <View testID="profile-layer" pointerEvents={navigationOpen ? 'box-none' : 'none'}
+      accessibilityElementsHidden={!navigationOpen} importantForAccessibility={navigationOpen ? 'auto' : 'no-hide-descendants'} style={[styles.layer, styles.profile]}>{profile}</View>
     {hasChat && <Animated.View testID="chat-layer" pointerEvents={navigationOpen ? 'none' : 'auto'}
-      accessibilityElementsHidden={navigationOpen} importantForAccessibility={navigationOpen ? 'no-hide-descendants' : 'auto'} style={[styles.layer, styles.chat, chatStyle]}>{conversation}</Animated.View>}
+      accessibilityElementsHidden={navigationOpen} importantForAccessibility={navigationOpen ? 'no-hide-descendants' : 'auto'} style={[styles.layer, styles.chat, { backgroundColor: surfaceColor, borderColor: edgeColor }, chatStyle]}>
+      <View style={styles.chatClip}>{conversation}</View>
+    </Animated.View>}
   </View></GestureDetector>;
 }
 const styles = StyleSheet.create({ root: { flex: 1, overflow: 'hidden' }, layer: { ...StyleSheet.absoluteFillObject },
-  chat: { shadowColor: '#000000', shadowOpacity: 0.4, shadowRadius: 20, shadowOffset: { width: -6, height: 0 }, elevation: 12 } });
+  profile: { zIndex: 1 },
+  backdrop: { ...StyleSheet.absoluteFillObject, backgroundColor: '#000000', borderRadius: 20 },
+  chat: { zIndex: 2, borderRadius: 20, borderWidth: 1, shadowColor: '#000000', shadowOpacity: 0.55, shadowRadius: 18, shadowOffset: { width: -8, height: 0 }, elevation: 12 },
+  chatClip: { flex: 1, borderRadius: 19, overflow: 'hidden' } });

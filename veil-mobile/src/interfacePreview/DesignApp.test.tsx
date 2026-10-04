@@ -89,9 +89,11 @@ test('desktop theme presets survive navigation and the lock preview needs no cre
 });
 test('revealing navigation and browsing a space retains the active chat, draft and hidden profile', async () => {
   const ui = await mount();
+  const floatingProfile = ui.getByTestId('floating-profile');
   fireEvent.press(ui.getByRole('button', { name: /Анна Морозова, непрочитанных/ }));
   fireEvent.changeText(ui.getByLabelText('Текст демо-сообщения'), 'остаться в этом чате');
   expect(ui.queryByLabelText('Раскрыть свой профиль')).toBeNull();
+  expect(ui.getByTestId('floating-profile', { includeHiddenElements: true })).toBe(floatingProfile);
   fireEvent.press(ui.getByLabelText('Назад к списку'));
   fireEvent.press(ui.getByLabelText('Пространство Студия'));
   expect(ui.getByLabelText('Раскрыть свой профиль')).toBeTruthy();
