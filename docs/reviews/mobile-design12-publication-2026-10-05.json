@@ -1,0 +1,52 @@
+{
+  "schema": "veil.mobile-publication.v1",
+  "published": true,
+  "recordedAtUtc": "2026-10-05T06:27:13.070Z",
+  "repository": "NaveLIL/veil",
+  "branch": "ce/mobile-design12-20261005",
+  "commit": "bf90280c8f21a3af119d4ef5bf41d137e1424953",
+  "tag": "mobile-test-20261005-12",
+  "htmlUrl": "https://github.com/NaveLIL/veil/releases/tag/mobile-test-20261005-12",
+  "prerelease": true,
+  "sourceSnapshot": "76c9d20f095c76448fccaf08f4c6bdc8ae9d7a24bb1ab1208b7d16a46eb47063",
+  "embeddedBuildBaseCommit": "81da3e12539cdc503119ca61088d14a8ecdb041f",
+  "priorDirectExchange": "user-verified",
+  "postMigrationDirectE2eVerified": false,
+  "publicDownloadsVerified": [
+    "Veil-Design-12.apk",
+    "Veil-Account-Tester-12.apk",
+    "source-snapshot.zip"
+  ],
+  "assets": [
+    {
+      "name": "build-manifest.json",
+      "size": 2823,
+      "digest": "sha256:061b0ed62fb76d34463f23686a8f430e63d070a44eda2bc492171fd0792e1c87",
+      "url": "https://github.com/NaveLIL/veil/releases/download/mobile-test-20261005-12/build-manifest.json"
+    },
+    {
+      "name": "SHA256SUMS.txt",
+      "size": 350,
+      "digest": "sha256:0f85975f1cf8d79602cb1c11eed843d18eb5372b7754521214ebad22f96cf871",
+      "url": "https://github.com/NaveLIL/veil/releases/download/mobile-test-20261005-12/SHA256SUMS.txt"
+    },
+    {
+      "name": "source-snapshot.zip",
+      "size": 1152329,
+      "digest": "sha256:1f80a2c05750394ca2bea01c8e44bd6a5859090db6a309dc181528643623fde0",
+      "url": "https://github.com/NaveLIL/veil/releases/download/mobile-test-20261005-12/source-snapshot.zip"
+    },
+    {
+      "name": "Veil-Account-Tester-12.apk",
+      "size": 98147594,
+      "digest": "sha256:ebc40a8c9ea3508b2c5e93fac026711ecba7a77a4e6bb00ab33a58e8cc84ee15",
+      "url": "https://github.com/NaveLIL/veil/releases/download/mobile-test-20261005-12/Veil-Account-Tester-12.apk"
+    },
+    {
+      "name": "Veil-Design-12.apk",
+      "size": 39506998,
+      "digest": "sha256:d918718a57a6d79d0cf3aca9189dc3ab40a025351ad0d07d5c34b7026e1dc7af",
+      "url": "https://github.com/NaveLIL/veil/releases/download/mobile-test-20261005-12/Veil-Design-12.apk"
+    }
+  ]
+}

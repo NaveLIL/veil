@@ -1,6 +1,6 @@
 # Mobile Design 12 distribution handoff
 
-The owner authorized a separate GitHub test prerelease for installation on another phone. The release is [mobile-test-20261005-12](https://github.com/NaveLIL/veil/releases/tag/mobile-test-20261005-12); the source branch is [ce/mobile-design12-20261005](https://github.com/NaveLIL/veil/tree/ce/mobile-design12-20261005). These are the designated distribution locations; successful public-download readback is recorded in the publication receipt after upload.
+The owner authorized a separate GitHub test prerelease for installation on another phone. The release is [mobile-test-20261005-12](https://github.com/NaveLIL/veil/releases/tag/mobile-test-20261005-12); the source branch is [ce/mobile-design12-20261005](https://github.com/NaveLIL/veil/tree/ce/mobile-design12-20261005). Both APKs and the source ZIP were downloaded without authentication after publication; bytes and SHA-256 matched the immutable candidate. Release target, asset digests and public-download checks are recorded in the [publication receipt](mobile-design12-publication-2026-10-05.json). The release tag points to source commit `bf90280c8f21a3af119d4ef5bf41d137e1424953`; subsequent documentation commits do not replace its APKs.
 
 | APK | Purpose | Download |
 |---|---|---|
