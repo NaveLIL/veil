@@ -1,7 +1,7 @@
 import React, { useImperativeHandle } from 'react';
 import { Animated, Modal, Pressable, StyleSheet, View, ViewStyle, useWindowDimensions } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { geometry, Palette } from './appearance';
+import { geometry, motion, Palette } from './appearance';
 import { LiveBlur, useModalBackdrop } from './LiveBlur';
 import { useSheetMotion } from './useSheetMotion';
 
@@ -14,7 +14,7 @@ export function VeilSheet({ visible = true, c, reduceMotion, onClose, onShow, on
   const { height } = useWindowDimensions();
   const sheet = useSheetMotion(visible, reduceMotion, height, onClose);
   useImperativeHandle(dismissRef, () => ({ dismiss: sheet.dismiss }), [sheet.dismiss]);
-  const underlayBlur = useModalBackdrop(sheet.presented);
+  const underlayBlur = useModalBackdrop(sheet.presented, sheet.backdropActive, reduceMotion);
   return <Modal visible={sheet.presented} transparent animationType="none" statusBarTranslucent
     navigationBarTranslucent onRequestClose={() => sheet.back(onBack)} onShow={() => { sheet.onShow(); onShow?.(); }}>
     <SafeAreaView edges={['top']} style={styles.root}>
@@ -22,7 +22,8 @@ export function VeilSheet({ visible = true, c, reduceMotion, onClose, onShow, on
         style={StyleSheet.absoluteFillObject} />
       <Animated.View accessibilityViewIsModal style={[styles.panel, { backgroundColor: c.bg,
         borderColor: c.line }, style, { transform: [{ translateY: sheet.translate }] }]}>
-        <LiveBlur blurRadius={underlayBlur} style={style?.height ? styles.flex : undefined}>
+        <LiveBlur blurRadius={underlayBlur} blurTransitionMs={reduceMotion ? 0 : motion.transitionDuration}
+          style={style?.height ? styles.flex : undefined}>
         <View {...sheet.panHandlers}>
         <Pressable accessibilityRole="button" accessibilityLabel={closeLabel}
           accessibilityHint="Смахните панель вниз или активируйте, чтобы закрыть"

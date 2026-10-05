@@ -1,6 +1,6 @@
 import React, { useRef } from 'react';
 import { Pressable, Text, View } from 'react-native';
-import { ChevronDown, MessageCircle } from 'lucide-react-native';
+import { ChevronDown } from 'lucide-react-native';
 import { styles } from './profileStyles';
 import { Palette } from './appearance';
 import { useAccessibilityFocus } from './AccessibilityFocusBoundary';
@@ -8,8 +8,6 @@ export function FloatingProfile({
   c,
   profile,
   onOpen,
-  hasChat,
-  onResume,
   caption = "Ваш профиль · демо",
   avatar,
 }: {
@@ -18,8 +16,6 @@ export function FloatingProfile({
   caption?: string;
   avatar?: React.ReactNode;
   onOpen: (handle?: number) => void;
-  hasChat: boolean;
-  onResume: () => void;
 }) {
   const trigger = useRef<View>(null);
   const focus = useAccessibilityFocus();
@@ -52,16 +48,6 @@ export function FloatingProfile({
         </View>
         <ChevronDown size={18} color={c.muted} />
       </Pressable>
-      {hasChat && (
-        <Pressable
-          accessibilityRole="button"
-          accessibilityLabel="Вернуться в последний чат"
-          onPress={onResume}
-          style={styles.icon}
-        >
-          <MessageCircle size={22} color={c.accent} />
-        </Pressable>
-      )}
     </View>
   );
 }

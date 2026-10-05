@@ -188,8 +188,6 @@ function Workbench() {
                     profileReturnFocus.current = handle;
                     setOwnProfileOpen(true);
                   }}
-                  hasChat={!!chat}
-                  onResume={() => dispatchDeck({ type: 'resume' })}
                 />
               }
               conversation={

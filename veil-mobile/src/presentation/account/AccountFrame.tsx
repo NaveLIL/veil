@@ -33,7 +33,7 @@ export function AccountFrame({ conversation, navigationOpen = true, onNavigation
         enabled={!modalOpen && !profileOpen} reduceMotion={reduceMotion} onNavigationChange={onNavigationChange}
         navigation={() => <AccountDirectory onOpen={onOpen} onContacts={onContacts} />}
         profile={<FloatingProfile c={c} profile={{ name: binding?.userId.slice(0, 8) ?? 'Аккаунт' }}
-          caption="Ваш аккаунт" hasChat={!!conversation} onResume={() => onNavigationChange(false)}
+          caption="Ваш аккаунт"
           avatar={binding && <UserAvatar canonicalServerOrigin={binding.canonicalServerOrigin}
             userId={binding.userId} technicalUsername={binding.userId} size={44} />}
           onOpen={handle => { returnFocus.current = handle; setProfileOpen(true); }} />}

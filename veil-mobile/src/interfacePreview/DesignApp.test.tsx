@@ -5,6 +5,7 @@ import { FlatList } from 'react-native';
 import { DesignApp } from './DesignApp';
 import { canGroup, createDemoSession, visibleChats } from './model';
 import { ConversationHistory } from './ConversationHistory';
+import { ChatDeck } from './ChatDeck';
 import { copyDemoText } from './clipboardBridge';
 jest.mock('./preferencesBridge', () => {
   const actual = jest.requireActual<typeof import('./preferencesBridge')>(
@@ -197,7 +198,9 @@ test('revealing navigation and browsing a space retains the active chat, draft a
   fireEvent.press(ui.getByLabelText('Назад к списку'));
   fireEvent.press(ui.getByLabelText('Пространство Студия'));
   expect(ui.getByLabelText('Раскрыть свой профиль')).toBeTruthy();
-  fireEvent.press(ui.getByLabelText('Вернуться в последний чат'));
+  expect(ui.queryByLabelText('Вернуться в последний чат')).toBeNull();
+  // Swiping the existing deck closed resumes the retained conversation.
+  act(() => ui.UNSAFE_getByType(ChatDeck).props.onNavigationChange(false));
   expect(ui.getByText('Личный чат · демо')).toBeTruthy();
   expect(ui.getByLabelText('Текст демо-сообщения').props.value).toBe(
     'остаться в этом чате',

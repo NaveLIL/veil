@@ -1,11 +1,47 @@
 import React from 'react';
 import { act, fireEvent, render } from '@testing-library/react-native';
-import { Animated, Modal, PanResponder, PanResponderCallbacks, Text } from 'react-native';
+import { Animated, Modal, PanResponder, PanResponderCallbacks, StyleSheet, Text, useWindowDimensions } from 'react-native';
 import { afterEach, expect, jest, test } from '@jest/globals';
 import { VeilSheet } from './VeilSheet';
 import { palettes } from './appearance';
+import { ModalBlurBoundary } from './LiveBlur';
 
 afterEach(() => { jest.restoreAllMocks(); });
+test('the first modal frame is offscreen and repeated native onShow does not restart entry', () => {
+  const timing = jest.spyOn(Animated, 'timing').mockReturnValue({start:jest.fn(),stop:jest.fn(),reset:jest.fn()});
+  let height = 0;
+  function Content() { height = useWindowDimensions().height; return <Text>Content</Text>; }
+  const ui = render(<VeilSheet c={palettes.OLED} reduceMotion={false} onClose={jest.fn()}><Content /></VeilSheet>);
+  const panel = ui.UNSAFE_getByType(Animated.View);
+  const translate = StyleSheet.flatten(panel.props.style).transform[0].translateY;
+  expect(translate.__getValue()).toBe(height);
+  expect(timing).not.toHaveBeenCalled();
+  act(() => ui.UNSAFE_getByType(Modal).props.onShow());
+  act(() => ui.UNSAFE_getByType(Modal).props.onShow());
+  expect(timing).toHaveBeenCalledTimes(1);
+  expect(timing.mock.calls[0][1]).toMatchObject({toValue:0,useNativeDriver:true});
+});
+test('an initially hidden sheet does not start an invisible exit animation', () => {
+  const timing = jest.spyOn(Animated, 'timing');
+  const ui = render(<VeilSheet visible={false} c={palettes.OLED} reduceMotion={false} onClose={jest.fn()}><Text>Content</Text></VeilSheet>);
+  expect(ui.UNSAFE_getByType(Modal).props.visible).toBe(false);
+  expect(timing).not.toHaveBeenCalled();
+});
+test('underlay blur starts clearing during exit, and reopening rejects the old exit', () => {
+  const completions: ((r:{finished:boolean})=>void)[]=[];
+  jest.spyOn(Animated,'timing').mockReturnValue({start:jest.fn((cb?: (r:{finished:boolean})=>void)=>{if(cb)completions.push(cb);}),stop:jest.fn(),reset:jest.fn()});
+  const close=jest.fn(),tree=(visible:boolean)=><ModalBlurBoundary><VeilSheet visible={visible} c={palettes.OLED} reduceMotion={false} onClose={close}><Text>Content</Text></VeilSheet></ModalBlurBoundary>;
+  const ui=render(tree(true));
+  expect(ui.getByTestId('modal-blur-background', {includeHiddenElements:true}).props.blurRadius).toBe(12);
+  ui.rerender(tree(false));
+  expect(ui.UNSAFE_getByType(Modal).props.visible).toBe(true);
+  expect(ui.getByTestId('modal-blur-background', {includeHiddenElements:true}).props.blurRadius).toBe(0);
+  ui.rerender(tree(true));
+  act(()=>completions[0]({finished:true}));
+  expect(ui.UNSAFE_getByType(Modal).props.visible).toBe(true);
+  expect(ui.getByTestId('modal-blur-background', {includeHiddenElements:true}).props.blurRadius).toBe(12);
+  expect(close).not.toHaveBeenCalled();
+});
 test('the dismiss grip is accessible, contains no cross, and Back cannot dismiss twice', () => {
   const close = jest.fn();
   const ui = render(<VeilSheet c={palettes.OLED} reduceMotion onClose={close}><Text>Content</Text></VeilSheet>);
