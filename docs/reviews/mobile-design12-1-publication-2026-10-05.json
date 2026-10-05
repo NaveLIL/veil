@@ -1,0 +1,49 @@
+{
+  "repository": "NaveLIL/veil",
+  "branch": "ce/mobile-design12-20261005",
+  "commit": "cfa7495b811e57612cf4f7449d6745e586bda6c1",
+  "tag": "mobile-test-20261005-12-1",
+  "htmlUrl": "https://github.com/NaveLIL/veil/releases/tag/mobile-test-20261005-12-1",
+  "prerelease": true,
+  "sourceSnapshot": "227b1a57e11e6846b4b074e6d3b2a7f15fd93606888aeea715a81ffcbb254cc2",
+  "embeddedBuildBaseCommit": "855c1d18b3942a3be82c7c0845b6860498eae043",
+  "priorDirectExchange": "user-verified",
+  "postMigrationDirectE2eVerified": false,
+  "publicDownloadsVerified": [
+    "Veil-Design-12.1.apk",
+    "Veil-Account-Tester-12.1.apk",
+    "source-snapshot.zip"
+  ],
+  "assets": [
+    {
+      "name": "build-manifest.json",
+      "size": 2830,
+      "digest": "sha256:0c80b4a6e8cb2e6bf7034091ab1babcc34e123f557c540dc128fd8c1e281e3aa",
+      "url": "https://github.com/NaveLIL/veil/releases/download/mobile-test-20261005-12-1/build-manifest.json"
+    },
+    {
+      "name": "SHA256SUMS.txt",
+      "size": 354,
+      "digest": "sha256:e2f2d10f5df077c828daa79865fa36841fc17f11778ef2a72edb6d603919c94c",
+      "url": "https://github.com/NaveLIL/veil/releases/download/mobile-test-20261005-12-1/SHA256SUMS.txt"
+    },
+    {
+      "name": "source-snapshot.zip",
+      "size": 1154643,
+      "digest": "sha256:9b684b5cd5e2ac5b9b045802408ffc09c3bc3645f656a11770d4171a21b450a6",
+      "url": "https://github.com/NaveLIL/veil/releases/download/mobile-test-20261005-12-1/source-snapshot.zip"
+    },
+    {
+      "name": "Veil-Account-Tester-12.1.apk",
+      "size": 98148342,
+      "digest": "sha256:01116714f0d25ab12ae3e8a9a7345a29356867e4cc43c15f42983409a553a146",
+      "url": "https://github.com/NaveLIL/veil/releases/download/mobile-test-20261005-12-1/Veil-Account-Tester-12.1.apk"
+    },
+    {
+      "name": "Veil-Design-12.1.apk",
+      "size": 39508270,
+      "digest": "sha256:b89369b246684a973550aa84c27fb2344f2d5e19bccfa5e62a78c0f40385a2e0",
+      "url": "https://github.com/NaveLIL/veil/releases/download/mobile-test-20261005-12-1/Veil-Design-12.1.apk"
+    }
+  ]
+}
