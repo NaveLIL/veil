@@ -5,6 +5,7 @@ import com.facebook.react.ReactApplication
 import com.facebook.react.ReactHost
 import com.facebook.react.ReactNativeHost
 import com.facebook.react.ReactPackage
+import io.veil.mobile.presentation.VeilPresentationPackage
 import com.facebook.react.defaults.DefaultNewArchitectureEntryPoint.load
 import com.facebook.react.defaults.DefaultReactHost.getDefaultReactHost
 import com.facebook.react.defaults.DefaultReactNativeHost
@@ -21,8 +22,8 @@ import com.swmansion.reanimated.ReanimatedPackage
 class DesignApplication : Application(), ReactApplication {
   override val reactNativeHost: ReactNativeHost = object : DefaultReactNativeHost(this) {
     override fun getPackages(): List<ReactPackage> = listOf(
-      MainReactPackage(), SafeAreaContextPackage(), SvgPackage(), EdgeToEdgePackage(),
-      DesignAppearancePackage(), DesignClipboardPackage(),
+      MainReactPackage(), SafeAreaContextPackage(), SvgPackage(), EdgeToEdgePackage(), VeilPresentationPackage(false),
+      DesignAppearancePackage(), DesignClipboardPackage(), DesignPreferencesPackage(),
       RNGestureHandlerPackage(), ReanimatedPackage(),
     )
     override fun getJSMainModuleName() = "design-preview-index"

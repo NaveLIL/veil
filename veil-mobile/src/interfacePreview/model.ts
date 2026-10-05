@@ -1,5 +1,12 @@
 /** Offline, in-memory presentation fixtures. These IDs are never Veil account IDs. */
-export type Delivery = 'accepted' | 'queued' | 'failed' | 'unknown';
+import type { Attachment } from './attachmentContract';
+import type {
+  Delivery,
+  TimelineMessage,
+  TimelineConversation,
+} from './conversationContract';
+import { olderHistory } from './historyFixtures';
+export type { Delivery } from './conversationContract';
 export type Scenario =
   | 'normal'
   | 'offline'
@@ -7,37 +14,15 @@ export type Scenario =
   | 'unknown'
   | 'identityChanged';
 export const demoToday = '2026-10-04';
-export type DemoMessage = {
-  id: string;
-  text: string;
-  own: boolean;
-  time: string;
-  day?: string;
-  delivery?: Delivery;
-  author?: string;
-  replyTo?: string;
-  edited?: boolean;
-  deleted?: boolean;
-};
-export type DemoChat = {
-  id: string;
-  name: string;
-  initials: string;
-  color: string;
-  username: string;
-  unread: number;
-  pinned?: boolean;
-  kind?: 'direct' | 'group' | 'channel';
-  space?: string;
-  category?: string;
-  messages: DemoMessage[];
-};
+export type DemoMessage = TimelineMessage;
+export type DemoChat = TimelineConversation;
 export type DemoSession = {
   chats: DemoChat[];
   drafts: Record<string, string>;
   scenario: Scenario;
   nextId: number;
   replies?: Record<string, string | undefined>;
+  attachments?: Record<string, Attachment | undefined>;
   edits?: Record<string, { messageId: string; text: string } | undefined>;
 };
 export const demoSpaces = [
@@ -56,54 +41,8 @@ export const demoSpaces = [
     description: 'Свои люди · 12 участников',
   },
 ];
-export function canGroup(
-  previous: DemoMessage | undefined,
-  current: DemoMessage,
-) {
-  if (
-    !previous ||
-    previous.own !== current.own ||
-    previous.author !== current.author ||
-    (previous.day ?? demoToday) !== (current.day ?? demoToday)
-  )
-    return false;
-  const minutes = (time: string) =>
-    /^([01]\d|2[0-3]):[0-5]\d$/.test(time)
-      ? Number(time.slice(0, 2)) * 60 + Number(time.slice(3))
-      : null;
-  const a = minutes(previous.time),
-    b = minutes(current.time);
-  return a !== null && b !== null && b >= a && b - a <= 5;
-}
+export { canGroup } from './messageGrouping';
 
-/** Varied deterministic history; its demonstration links are never opened. */
-function olderHistory(chatId: string, count: number): DemoMessage[] {
-  const texts = [
-    'Доброе утро! Как продвигается наш проект?',
-    'Сегодня хочу спокойно разобрать детали и ничего не потерять по дороге.',
-    'Да, записал. Вернёмся к этому после обеда.',
-    'Небольшой список:\n• проверить основные сценарии\n• сравнить варианты\n• оставить время на исправления',
-    'Ссылка для обсуждения: https://example.invalid/veil/design/long-conversation?view=mobile&section=history\nЭто демонстрационный адрес.',
-    'Отлично 🙂 Приятно, когда всё складывается. 👨‍👩‍👧‍👦 ✨',
-    'Длинное сообщение тоже должно оставаться удобным для чтения. '.repeat(7) +
-      '\n\nВторой абзац: открываем другой чат, возвращаемся обратно и продолжаем с того же места.',
-    'Договорились. Спасибо!',
-    'Проверка длинного слова: ' + 'оченьдлиннаястрокабезпробелов'.repeat(8),
-    'Ещё одна мысль — сначала доведём личную переписку до удобного состояния.',
-  ];
-  return Array.from({ length: count }, (_, index) => ({
-    id: `fixture-history-${chatId}-${index}`,
-    own: Math.floor(index / 3) % 2 === 1,
-    day: new Date(Date.UTC(2026, 8, 27 + Math.floor(index / 45)))
-      .toISOString()
-      .slice(0, 10),
-    time: `${String(9 + Math.floor((index % 45) / 30)).padStart(2, '0')}:${String(index % 30).padStart(2, '0')}`,
-    text: texts[index % texts.length],
-    ...(Math.floor(index / 3) % 2 === 1
-      ? { delivery: 'accepted' as const }
-      : {}),
-  }));
-}
 export function createDemoSession(): DemoSession {
   return {
     scenario: 'normal',
@@ -119,7 +58,7 @@ export function createDemoSession(): DemoSession {
         unread: 2,
         pinned: true,
         messages: [
-          ...olderHistory('anna', 316),
+          ...olderHistory('anna', 716),
           {
             id: 'fixture-a1',
             own: false,
@@ -203,6 +142,18 @@ export function createDemoSession(): DemoSession {
             time: '11:48',
             delivery: 'accepted',
           },
+          ...[
+            'Идея понравилась.',
+            'Сохраним острова.',
+            'И немного воздуха.',
+            'Договорились 🙂',
+          ].map((text, i) => ({
+            id: `fixture-d-burst-${i}`,
+            own: true,
+            text,
+            time: `11:${49 + i}`,
+            delivery: 'accepted' as const,
+          })),
         ],
       },
       {

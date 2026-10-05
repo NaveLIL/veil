@@ -1,12 +1,9 @@
-import { DemoMessage, DemoSession, sendDemo } from './model';
+import { DemoSession, sendDemo } from './model';
+import { sendAttachment } from './attachments';
 
-export type MessageAction = 'reply' | 'copy' | 'edit' | 'delete';
-export function availableActions(message: DemoMessage): MessageAction[] {
-  if (message.deleted) return [];
-  return message.own && message.delivery !== 'unknown'
-    ? ['reply', 'copy', 'edit', 'delete']
-    : ['reply', 'copy'];
-}
+import { availableActions } from './messageActionCapabilities';
+export { availableActions } from './messageActionCapabilities';
+export type { MessageAction } from './messageActionCapabilities';
 export function findMessage(session: DemoSession, chatId: string, id: string) {
   return session.chats
     .find((chat) => chat.id === chatId)
@@ -74,7 +71,10 @@ export function submitComposition(
   time: string,
 ): DemoSession {
   const edit = session.edits?.[chatId];
-  if (!edit) return sendDemo(session, chatId, time);
+  if (!edit)
+    return session.attachments?.[chatId]
+      ? sendAttachment(session, chatId, time)
+      : sendDemo(session, chatId, time);
   const message = findMessage(session, chatId, edit.messageId);
   if (
     !message ||
@@ -124,7 +124,14 @@ export function deleteMessage(
             ...c,
             messages: c.messages.map((m) =>
               m.id === id
-                ? { ...m, text: '', deleted: true, replyTo: undefined }
+                ? {
+                    ...m,
+                    text: '',
+                    deleted: true,
+                    replyTo: undefined,
+                    attachment: undefined,
+                    transfer: undefined,
+                  }
                 : m,
             ),
           }

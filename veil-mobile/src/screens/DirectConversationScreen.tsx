@@ -1,11 +1,11 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
-import { AccessibilityInfo, StyleSheet, Text, View } from "react-native";
+import { AccessibilityInfo, BackHandler, Keyboard, StyleSheet, Text, View } from "react-native";
 import type { NativeStackScreenProps } from "@react-navigation/native-stack";
-import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { IdentityIslandSheet } from "../components/identity/IdentityIslandSheet";
 import { ChatIsland } from "../components/layout/ChatIsland";
-import { MobileHeader } from "../components/navigation/MobileHeader";
+import { AccountFrame } from '../presentation/account/AccountFrame';
+import { useAccountNavigation } from '../presentation/account/useAccountNavigation';
 import { colors, spacing } from "../lib/theme";
 import { type Member, useChatStore } from "../stores/chat";
 import type { AuthenticatedStackParamList } from "./ChatListScreen";
@@ -13,13 +13,22 @@ import type { AuthenticatedStackParamList } from "./ChatListScreen";
 type Props = NativeStackScreenProps<AuthenticatedStackParamList, "Direct">;
 
 export default function DirectConversationScreen({ navigation, route }: Props) {
-  const insets = useSafeAreaInsets();
+  const [navigationOpen, setNavigationOpen] = useState(false);
+  const selected = useCallback((conversationId: string) => {
+    navigation.setParams({ conversationId }); setNavigationOpen(false);
+  }, [navigation]);
+  const onOpen = useAccountNavigation(selected);
+  useEffect(() => {
+    const subscription = BackHandler.addEventListener('hardwareBackPress', () => {
+      if (navigation.isFocused && !navigation.isFocused()) return false;
+      if (navigationOpen) return false;
+      Keyboard.dismiss(); setNavigationOpen(true); return true;
+    });
+    return () => subscription.remove();
+  }, [navigation, navigationOpen]);
   const conversationId = route.params.conversationId;
   const conversation = useChatStore((state) =>
     state.dms.find((candidate) => candidate.id === conversationId),
-  );
-  const peer = useChatStore(
-    (state) => state.directMembersByConversation[conversationId]?.peer ?? null,
   );
   const selectedDmId = useChatStore((state) => state.selectedDmId);
   const directGeneration = useChatStore((state) => state.directGeneration);
@@ -28,6 +37,7 @@ export default function DirectConversationScreen({ navigation, route }: Props) {
     profile: Member;
   } | null>(null);
   const identityReturnFocusHandle = useRef<number | null>(null);
+  const focusFrame = useRef<number | null>(null);
   const routeReady = Boolean(conversation && selectedDmId === conversationId);
   const identityProfile = routeReady
     && identitySelection?.conversationId === conversationId
@@ -39,10 +49,12 @@ export default function DirectConversationScreen({ navigation, route }: Props) {
   }, [navigation, routeReady]);
 
   useEffect(() => {
-    if (routeReady) return;
     setIdentitySelection(null);
     identityReturnFocusHandle.current = null;
-  }, [routeReady]);
+    if (focusFrame.current !== null) cancelAnimationFrame(focusFrame.current);
+    focusFrame.current = null;
+    return () => { if (focusFrame.current !== null) cancelAnimationFrame(focusFrame.current); };
+  }, [routeReady, conversationId, directGeneration]);
 
   const openIdentity = useCallback((profile: Member, triggerHandle: string | number) => {
     const handle = Number(triggerHandle);
@@ -57,36 +69,29 @@ export default function DirectConversationScreen({ navigation, route }: Props) {
     const handle = identityReturnFocusHandle.current;
     identityReturnFocusHandle.current = null;
     if (handle) {
-      requestAnimationFrame(() => AccessibilityInfo.setAccessibilityFocus(handle));
+      focusFrame.current = requestAnimationFrame(() => {
+        focusFrame.current = null;
+        AccessibilityInfo.setAccessibilityFocus(handle);
+      });
     }
   }, []);
 
   return (
     <View testID="direct-screen" style={styles.root}>
-      <View
+      <AccountFrame onOpen={onOpen} onContacts={() => navigation.navigate('Contacts')}
+        onSettings={() => navigation.navigate('Settings')} navigationOpen={navigationOpen}
+        onNavigationChange={setNavigationOpen} modalOpen={!!identityProfile}
+        conversation={<View
         style={styles.content}
         importantForAccessibility={identityProfile ? "no-hide-descendants" : "auto"}
         pointerEvents={identityProfile ? "none" : "auto"}
       >
-        <MobileHeader
-          title={routeReady ? conversation?.name ?? "Direct" : "Direct"}
-          subtitle={routeReady ? "End-to-end encrypted" : "Selection unavailable"}
-          backAction={{
-            label: "Home",
-            onPress: () => navigation.goBack(),
-          }}
-          action={routeReady && peer ? {
-            label: "Details",
-            onPress: (event) => openIdentity(peer, event.nativeEvent.target),
-          } : undefined}
-        />
         {routeReady ? (
           <ChatIsland
-            bottomInset={insets.bottom}
-            leftInset={insets.left}
-            rightInset={insets.right}
+            embedded
+            onBack={() => { Keyboard.dismiss(); setNavigationOpen(true); }}
             onOpenIdentity={openIdentity}
-            showHeader={false}
+            showHeader
           />
         ) : (
           <View
@@ -100,7 +105,7 @@ export default function DirectConversationScreen({ navigation, route }: Props) {
             </Text>
           </View>
         )}
-      </View>
+      </View>} />
       <IdentityIslandSheet
         profile={identityProfile}
         contextLabel="Direct conversation"

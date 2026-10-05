@@ -1,11 +1,13 @@
 import React from 'react';
-import { Modal, Pressable, ScrollView, StyleSheet, View } from 'react-native';
+import { VeilSheet } from './VeilSheet';
+import { Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { Check, Shield, X } from 'lucide-react-native';
+import { Check, Shield } from 'lucide-react-native';
 import { geometry, Palette, typography } from './appearance';
 import { DemoChat, Scenario } from './model';
 import { ROCKET_CHAT_MIT_NOTICE } from '../presentation/rocketChat/notice';
-import { Avatar, Button, IconButton, Label } from './Primitives';
+import { Avatar, Button, Label } from './Primitives';
+import { useModalAccessibility } from './useModalAccessibility';
 export type Sheet = 'profile' | 'scenarios' | 'about' | null;
 type Props = {
   sheet: Sheet;
@@ -16,6 +18,7 @@ type Props = {
   onClose: () => void;
   onScenario: (scenario: Scenario) => void;
   addIncoming: (count: number) => void;
+  returnFocus?: number;
 };
 const scenarioNames: Record<Scenario, string> = {
   normal: 'Обычный чат',
@@ -33,40 +36,24 @@ export function PreviewSheet({
   onClose,
   onScenario,
   addIncoming,
+  returnFocus,
 }: Props) {
+  const focus = useModalAccessibility(sheet !== null, returnFocus);
   return (
-    <Modal
-      visible={sheet !== null}
-      transparent
-      animationType={reduceMotion ? 'none' : 'slide'}
-      onRequestClose={onClose}
-      statusBarTranslucent
-    >
-      <View style={styles.modalRoot}>
-        <Pressable
-          accessibilityRole="button"
-          accessibilityLabel="Закрыть панель"
-          onPress={onClose}
-          style={styles.scrim}
-        />
+    <VeilSheet visible={sheet !== null} c={c} reduceMotion={reduceMotion} onClose={onClose}
+      onShow={focus.onShow} closeLabel="Закрыть" style={{ maxHeight: '88%' }}>
         <SafeAreaView
           edges={['bottom']}
           style={[styles.sheet, { backgroundColor: c.surface }]}
         >
           <View style={styles.sheetHeading}>
-            <Label color={c.text} style={[styles.cardTitle, styles.flex]}>
+            <Text ref={focus.heading} accessible accessibilityRole="header" style={[styles.cardTitle, styles.flex, {color:c.text}]}>
               {sheet === 'profile'
                 ? 'О разговоре'
                 : sheet === 'scenarios'
                   ? 'Сценарии сообщений'
                   : 'Veil Design'}
-            </Label>
-            <IconButton
-              icon={X}
-              label="Закрыть"
-              color={c.muted}
-              onPress={onClose}
-            />
+            </Text>
           </View>
           <ScrollView contentContainerStyle={styles.sheetContent}>
             {sheet === 'scenarios' ? (
@@ -135,8 +122,8 @@ export function PreviewSheet({
                   Скриншоты разрешены.
                 </Label>
                 <Label color={c.muted} style={styles.body}>
-                  Демо-сообщения и настройки живут в памяти до перезапуска.
-                  Выбранная картинка обрабатывается локально.
+                  Демо-сообщения живут в памяти до перезапуска. Оформление и
+                  обработанная картинка сохраняются локально на этом устройстве.
                 </Label>
                 <Label color={c.muted} style={styles.body}>
                   Veil © NaveLIL · AGPL-3.0-or-later. Composer pattern adapted
@@ -149,8 +136,7 @@ export function PreviewSheet({
             )}
           </ScrollView>
         </SafeAreaView>
-      </View>
-    </Modal>
+    </VeilSheet>
   );
 }
 function ScenarioPicker({
@@ -188,14 +174,10 @@ function ScenarioPicker({
 
 const styles = StyleSheet.create({
   modalRoot: { flex: 1, justifyContent: 'flex-end' },
-  scrim: {
-    ...StyleSheet.absoluteFillObject,
-    backgroundColor: 'rgba(0,0,0,0.65)',
-  },
   sheet: {
     borderTopLeftRadius: geometry.radius,
     borderTopRightRadius: geometry.radius,
-    maxHeight: '88%',
+    flexShrink: 1,
   },
   sheetHeading: {
     flexDirection: 'row',

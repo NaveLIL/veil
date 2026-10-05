@@ -4,7 +4,6 @@ import {
   FlatList,
   Pressable,
   ScrollView,
-  StyleSheet,
   TextInput,
   View,
 } from 'react-native';
@@ -14,11 +13,12 @@ import {
   MessageCircle,
   Plus,
   Search,
-  Users,
   X,
 } from 'lucide-react-native';
-import Reanimated from 'react-native-reanimated';
-import { geometry, Palette, typography } from './appearance';
+import { DockItem } from './DockItem';
+import { DirectoryRow } from './DirectoryRow';
+import { styles } from './navigationStyles';
+import { Palette } from './appearance';
 import { DemoChat, DemoSession, demoSpaces, visibleChats } from './model';
 import { Avatar, IconButton, Label } from './Primitives';
 type Setter<T> = React.Dispatch<React.SetStateAction<T>>;
@@ -35,9 +35,7 @@ type Props = {
   setNewChat: Setter<boolean>;
   enterChat: (id: string) => void;
   animatedStyle: React.ComponentProps<typeof Animated.View>['style'];
-  dimStyle: React.ComponentProps<typeof Reanimated.View>['style'];
 };
-type IconComponent = typeof Search;
 export function NavigationPanel({
   c,
   session,
@@ -51,7 +49,6 @@ export function NavigationPanel({
   setNewChat,
   enterChat,
   animatedStyle,
-  dimStyle,
 }: Props) {
   const chatsRef = useRef<FlatList<DemoChat>>(null);
   const listOffset = useRef(0);
@@ -93,13 +90,6 @@ export function NavigationPanel({
               />
             ))}
           </ScrollView>
-
-          <Reanimated.View
-            testID="dock-dimmer"
-            pointerEvents="none"
-            accessible={false}
-            style={[styles.islandDimmer, dimStyle]}
-          />
         </View>
         <Animated.View
           style={[
@@ -199,59 +189,12 @@ export function NavigationPanel({
                   const latest = item.messages[item.messages.length - 1];
                   const draft = session.drafts[item.id];
                   return (
-                    <Pressable
-                      onPress={() => enterChat(item.id)}
-                      accessibilityRole="button"
-                      accessibilityLabel={`${item.name}${item.unread ? `, непрочитанных: ${item.unread}` : ''}${draft ? ', есть черновик' : ''}`}
-                      style={({ pressed }) => [
-                        styles.chatRow,
-                        pressed && { backgroundColor: c.surface },
-                      ]}
-                    >
-                      <Avatar chat={item} />
-                      <View style={styles.chatRowBody}>
-                        <View style={styles.rowTitle}>
-                          {item.kind === 'group' && (
-                            <Users size={13} color={c.muted} />
-                          )}
-                          <Label
-                            color={c.text}
-                            numberOfLines={1}
-                            style={styles.chatName}
-                          >
-                            {item.name}
-                          </Label>
-                          <Label color={c.muted} style={styles.time}>
-                            {latest?.time}
-                          </Label>
-                        </View>
-                        <View style={styles.rowTitle}>
-                          <Label
-                            color={draft ? c.accent : c.muted}
-                            numberOfLines={1}
-                            style={styles.previewText}
-                          >
-                            {draft
-                              ? `Черновик: ${draft}`
-                              : latest
-                                ? `${latest.own ? 'Вы: ' : latest.author ? `${latest.author}: ` : ''}${latest.deleted ? 'Сообщение удалено' : latest.text}`
-                                : 'Начать разговор'}
-                          </Label>
-                          {item.unread > 0 && (
-                            <View
-                              style={[
-                                styles.unreadBadge,
-                                { backgroundColor: c.accent },
-                              ]}
-                            >
-                              <Label color="#101015" style={styles.unreadText}>
-                                {item.unread}
-                              </Label>
-                            </View>
-                          )}
-                        </View>
-                      </View>
-                    </Pressable>
+                    <DirectoryRow c={c} id={item.id} name={item.name} time={latest?.time}
+                      unread={item.unread} hasDraft={!!draft} group={item.kind === 'group'}
+                      avatar={<Avatar chat={item} />} onOpen={enterChat}
+                      preview={draft ? `Черновик: ${draft}` : latest
+                        ? `${latest.own ? 'Вы: ' : latest.author ? `${latest.author}: ` : ''}${latest.deleted ? 'Сообщение удалено' : latest.text || latest.attachment?.name || 'Сообщение'}`
+                        : 'Начать разговор'} />
                   );
                 }}
                 ListFooterComponent={
@@ -318,193 +261,8 @@ export function NavigationPanel({
               </ScrollView>
             </>
           ) : null}
-          <Reanimated.View
-            testID="list-dimmer"
-            pointerEvents="none"
-            accessible={false}
-            style={[styles.islandDimmer, dimStyle]}
-          />
         </Animated.View>
       </View>
     </View>
   );
 }
-function DockItem({
-  label,
-  icon: Icon,
-  initials,
-  selected,
-  onPress,
-  c,
-}: {
-  label: string;
-  icon?: IconComponent;
-  initials?: string;
-  selected: boolean;
-  onPress: () => void;
-  c: Palette;
-}) {
-  return (
-    <View style={styles.dockItem}>
-      <View
-        style={[
-          styles.activePill,
-          { backgroundColor: selected ? c.accent : 'transparent' },
-        ]}
-      />
-      <Pressable
-        accessibilityRole="tab"
-        accessibilityLabel={label}
-        accessibilityState={{ selected }}
-        onPress={onPress}
-        style={({ pressed }) => [
-          styles.dockButton,
-          {
-            backgroundColor: selected ? c.accent : c.surface,
-            borderRadius: geometry.radius,
-          },
-          pressed && styles.pressed,
-        ]}
-      >
-        {Icon ? (
-          <Icon
-            size={23}
-            color={selected ? '#101015' : c.muted}
-            strokeWidth={1.8}
-          />
-        ) : (
-          <Label
-            color={selected ? '#101015' : c.accent}
-            style={styles.dockInitial}
-          >
-            {initials}
-          </Label>
-        )}
-      </Pressable>
-    </View>
-  );
-}
-
-const styles = StyleSheet.create({
-  navigationSurface: { flex: 1 },
-  home: { flex: 1, flexDirection: 'row', gap: 6 },
-  dock: {
-    width: 60,
-    overflow: 'hidden',
-    borderRadius: geometry.radius,
-    borderWidth: geometry.borderWidth,
-    paddingTop: 10,
-    paddingBottom: 88,
-    gap: 6,
-  },
-  dockDivider: { height: 1, marginHorizontal: 14, marginVertical: 3 },
-  dockSpaces: { gap: 8, paddingBottom: 8 },
-  islandDimmer: {
-    ...StyleSheet.absoluteFillObject,
-    zIndex: 1,
-    backgroundColor: '#000000',
-    borderRadius: geometry.radius - geometry.borderWidth,
-  },
-  island: {
-    flex: 1,
-    borderRadius: geometry.radius,
-    borderWidth: geometry.borderWidth,
-    overflow: 'hidden',
-  },
-  header: {
-    minHeight: 60,
-    paddingLeft: 14,
-    paddingRight: 4,
-    flexDirection: 'row',
-    alignItems: 'center',
-  },
-  heading: {
-    ...typography.heading,
-    fontWeight: '600',
-    letterSpacing: -0.4,
-  },
-  flex: { flex: 1, minWidth: 0 },
-  searchBox: {
-    marginHorizontal: 12,
-    borderRadius: geometry.radius,
-    flexDirection: 'row',
-    alignItems: 'center',
-  },
-  searchInput: {
-    flex: 1,
-    fontSize: 14,
-    minHeight: geometry.touchTarget,
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-  },
-  chatList: { paddingHorizontal: 10, paddingBottom: 96 },
-  empty: { alignItems: 'center', paddingVertical: 28, gap: 12 },
-  chatRow: {
-    minHeight: 76,
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingHorizontal: 4,
-    paddingVertical: 12,
-    gap: 10,
-    borderRadius: geometry.radius,
-  },
-  chatRowBody: { flex: 1, gap: 5, minWidth: 0 },
-  rowTitle: { flexDirection: 'row', alignItems: 'center', gap: 5 },
-  chatName: { flex: 1, ...typography.name, fontWeight: '600' },
-  time: { ...typography.micro },
-  previewText: { flex: 1, ...typography.caption },
-  unreadBadge: {
-    minWidth: 18,
-    height: 18,
-    borderRadius: 9,
-    alignItems: 'center',
-    justifyContent: 'center',
-    paddingHorizontal: 4,
-  },
-  unreadText: { fontSize: 10, lineHeight: 14, fontWeight: '700' },
-  footer: {
-    ...typography.micro,
-    textAlign: 'center',
-    paddingVertical: 20,
-  },
-  spaceHeader: {
-    paddingHorizontal: 16,
-    paddingTop: 20,
-    paddingBottom: 16,
-    gap: 4,
-  },
-  caption: { ...typography.caption },
-  sectionLabel: {
-    ...typography.micro,
-    fontWeight: '600',
-    letterSpacing: 1.2,
-    marginTop: 24,
-    marginBottom: 12,
-  },
-  channelRow: {
-    minHeight: 52,
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 10,
-    paddingHorizontal: 10,
-    borderRadius: geometry.radius,
-  },
-  unreadDot: { width: 6, height: 6, borderRadius: 3 },
-  dockItem: { height: 52, alignItems: 'center', justifyContent: 'center' },
-  activePill: {
-    position: 'absolute',
-    left: 0,
-    width: 3,
-    height: 28,
-    borderTopRightRadius: 3,
-    borderBottomRightRadius: 3,
-  },
-  dockButton: {
-    width: geometry.touchTarget,
-    height: geometry.touchTarget,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  pressed: { opacity: 0.7 },
-  dockInitial: { fontSize: 18, fontWeight: '600' },
-});

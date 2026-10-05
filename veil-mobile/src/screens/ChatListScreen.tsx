@@ -1,4 +1,4 @@
-import React, { useEffect } from "react";
+import React, { useEffect, useMemo } from "react";
 import { DarkTheme, NavigationContainer } from "@react-navigation/native";
 import { createNativeStackNavigator } from "@react-navigation/native-stack";
 
@@ -9,6 +9,7 @@ import DirectConversationScreen from "./DirectConversationScreen";
 import HomeScreen from "./HomeScreen";
 import ContactSearchScreen from "./ContactSearchScreen";
 import SettingsScreen, { SettingsDetailScreen } from "./SettingsScreen";
+import { usePresentation } from '../interfacePreview/PresentationContext';
 
 export type SettingsSectionKey =
   | "account"
@@ -51,6 +52,9 @@ const VEIL_NAVIGATION_THEME = {
  * reset whenever the authenticated origin/account/generation changes.
  */
 export default function ChatListScreen() {
+  const { c } = usePresentation();
+  const theme = useMemo(() => ({...VEIL_NAVIGATION_THEME, colors:{...VEIL_NAVIGATION_THEME.colors,
+    primary:c.accent, background:c.bg, card:c.bg, text:c.text, border:c.line, notification:c.accent}}), [c]);
   const reducedMotion = useReducedMotionPreference();
   const runtimeBinding = useChatStore((state) => state.runtimeBinding);
   const directGeneration = useChatStore((state) => state.directGeneration);
@@ -65,12 +69,12 @@ export default function ChatListScreen() {
   }, []);
 
   return (
-    <NavigationContainer key={navigationScope} theme={VEIL_NAVIGATION_THEME}>
+    <NavigationContainer key={navigationScope} theme={theme}>
       <Stack.Navigator
         initialRouteName="Home"
         screenOptions={{
           animation: reducedMotion ? "none" : "slide_from_right",
-          contentStyle: { backgroundColor: colors.background },
+          contentStyle: { backgroundColor: c.bg },
           headerShown: false,
         }}
       >

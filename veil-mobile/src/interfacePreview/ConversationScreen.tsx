@@ -1,20 +1,15 @@
-import React from 'react';
-import { Pressable, StyleSheet, View } from 'react-native';
-import {
-  ArrowLeft,
-  CircleAlert,
-  MoreHorizontal,
-  X,
-  Pencil,
-  WifiOff,
-} from 'lucide-react-native';
+import React, { useState } from 'react';
+import { StyleSheet, View } from 'react-native';
+import { CircleAlert, X, Pencil, WifiOff } from 'lucide-react-native';
 import { geometry, Palette, typography } from './appearance';
 import { DemoChat, DemoMessage, demoSpaces, Scenario } from './model';
-import { Avatar, IconButton, Label } from './Primitives';
+import { IconButton, Label } from './Primitives';
 import { ConversationHistory } from './ConversationHistory';
 import { MessageQuote } from './MessageQuote';
 import { QuoteJump } from './useMessageInteractions';
-import { Composer } from './Composer';
+import { ConversationSurface } from './ConversationSurface';
+import { Attachment } from './attachments';
+import { AttachmentCard } from './AttachmentCard';
 type Props = {
   chat: DemoChat;
   chats: DemoChat[];
@@ -37,8 +32,13 @@ type Props = {
   onRetry: (chatId: string, messageId: string) => void;
   onRead: (chatId: string) => void;
   onBack: () => void;
-  onProfile: () => void;
-  onScenarios: () => void;
+  onProfile: (handle?: number) => void;
+  onScenarios: (handle?: number) => void;
+  attachment?: Attachment;
+  onAttach?: (handle?: number) => void;
+  onRemoveAttachment?: () => void;
+  onAttachment?: (asset: Attachment, handle?: number) => void;
+  onCancelTransfer?: (chatId: string, id: string) => void;
 };
 export function ConversationScreen({
   chat,
@@ -64,49 +64,61 @@ export function ConversationScreen({
   onBack,
   onProfile,
   onScenarios,
+  attachment,
+  onAttach,
+  onRemoveAttachment,
+  onAttachment,
+  onCancelTransfer,
 }: Props) {
+  const [compactViewport, setCompactViewport] = useState(false);
+  const combinedContext =
+    compactViewport && !!replyId && !!attachment && !editing;
   return (
-    <View
-      testID="conversation-island"
-      style={[styles.conversation, { backgroundColor: c.bg }]}
-    >
-      <View style={[styles.chatHeader, { borderBottomColor: c.line }]}>
-        <IconButton
-          icon={ArrowLeft}
-          label="Назад к списку"
-          onPress={onBack}
-          color={c.text}
+    <ConversationSurface
+      chat={chat}
+      c={c}
+      visible={visible}
+      draft={draft}
+      editing={editing}
+      blocked={scenario === 'identityChanged'}
+      onDraft={onDraft}
+      onSend={onSend}
+      hasAttachment={!!attachment && !editing}
+      onAttach={onAttach}
+      onBack={onBack}
+      onProfile={onProfile}
+      onMenu={onScenarios}
+      notice={notice}
+      subtitle={
+        (chat.kind === 'channel'
+          ? demoSpaces.find((s) => s.id === chat.space)?.name
+          : chat.kind === 'group'
+            ? 'Групповой чат'
+            : 'Личный чат') + ' · демо'
+      }
+      onLayout={(event) =>
+        setCompactViewport(event.nativeEvent.layout.height < 500)
+      }
+      history={
+        <ConversationHistory
+          chats={chats}
+          chatId={chat.id}
+          visible={visible}
+          c={c}
+          reduceMotion={reduceMotion}
+          onMessage={onMessage}
+          selectedMessageId={selectedMessageId}
+          jump={jump}
+          onQuote={onQuote}
+          onNotice={onNotice}
+          onRetry={onRetry}
+          onRead={onRead}
+          onAttachment={onAttachment}
+          onCancelTransfer={onCancelTransfer}
         />
-        <Pressable
-          accessibilityRole="button"
-          accessibilityLabel={`Профиль: ${chat.name}`}
-          onPress={onProfile}
-          style={styles.peerHeader}
-        >
-          <Avatar chat={chat} size={36} />
-          <View style={styles.flex}>
-            <Label color={c.text} style={styles.peerName} numberOfLines={1}>
-              {chat.kind === 'channel' ? `# ${chat.name}` : chat.name}
-            </Label>
-            <Label color={c.muted} style={styles.caption}>
-              {chat.kind === 'channel'
-                ? demoSpaces.find((s) => s.id === chat.space)?.name
-                : chat.kind === 'group'
-                  ? 'Групповой чат'
-                  : 'Личный чат'}{' '}
-              · демо
-            </Label>
-          </View>
-        </Pressable>
-        <IconButton
-          icon={MoreHorizontal}
-          label="Состояния и настройки макета"
-          onPress={onScenarios}
-          color={c.muted}
-        />
-      </View>
-      <View style={styles.flex}>
-        {scenario !== 'normal' && (
+      }
+      banner={
+        scenario !== 'normal' && (
           <View style={[styles.stateBanner, { backgroundColor: c.tint }]}>
             {scenario === 'offline' ? (
               <WifiOff size={18} color={c.accent} />
@@ -123,72 +135,86 @@ export function ConversationScreen({
                     : 'Демо: следующая отправка завершится ошибкой'}
             </Label>
           </View>
-        )}
-        <ConversationHistory
-          chats={chats}
-          chatId={chat.id}
-          visible={visible}
-          c={c}
-          reduceMotion={reduceMotion}
-          onMessage={onMessage}
-          selectedMessageId={selectedMessageId}
-          jump={jump}
-          onQuote={onQuote}
-          onNotice={onNotice}
-          onRetry={onRetry}
-          onRead={onRead}
-        />
-        {!!notice && (
-          <Label
-            color={c.accent}
-            style={styles.notice}
-            accessibilityLiveRegion="polite"
-          >
-            {notice}
-          </Label>
-        )}
-        {editing ? (
-          <View style={[styles.context, { backgroundColor: c.raised }]}>
-            <View style={styles.flex}>
-              <View style={styles.editLabel}>
-                <Pencil size={16} color={c.accent} />
-                <Label color={c.text}>Редактирование сообщения</Label>
+        )
+      }
+      context={
+        <>
+          {' '}
+          {editing ? (
+            <View style={[styles.context, { backgroundColor: c.raised }]}>
+              <View style={styles.flex}>
+                <View style={styles.editLabel}>
+                  <Pencil size={16} color={c.accent} />
+                  <Label color={c.text}>Редактирование сообщения</Label>
+                </View>
+              </View>
+              <IconButton
+                icon={X}
+                label="Отменить редактирование"
+                color={c.muted}
+                onPress={() => onCancelComposition?.()}
+              />
+            </View>
+          ) : combinedContext && replyId && attachment ? (
+            <View
+              testID="compact-composition-context"
+              style={styles.previewRail}
+            >
+              <View style={styles.flex}>
+                <MessageQuote
+                  chat={chat}
+                  id={replyId}
+                  c={c}
+                  compact
+                  onPress={() => onQuote?.(replyId)}
+                  onDismiss={() => onCancelComposition?.()}
+                />
+              </View>
+              <View style={styles.flex}>
+                <AttachmentCard
+                  asset={attachment}
+                  compact
+                  dense
+                  c={c}
+                  onRemove={onRemoveAttachment}
+                />
               </View>
             </View>
-            <IconButton
-              icon={X}
-              label="Отменить редактирование"
-              color={c.muted}
-              onPress={() => onCancelComposition?.()}
-            />
-          </View>
-        ) : replyId ? (
-          <View style={styles.compositionQuote}>
-            <MessageQuote
-              chat={chat}
-              id={replyId}
-              c={c}
-              onPress={() => onQuote?.(replyId)}
-              onDismiss={() => onCancelComposition?.()}
-            />
-          </View>
-        ) : null}
-        <Composer
-          key={chat.id}
-          value={draft}
-          editing={editing}
-          onChange={onDraft}
-          onSend={onSend}
-          blocked={scenario === 'identityChanged'}
-          placeholder={`Написать ${chat.kind === 'channel' ? '#' : '@'}${chat.name}`}
-          c={c}
-        />
-      </View>
-    </View>
+          ) : replyId ? (
+            <View style={styles.compositionQuote}>
+              <MessageQuote
+                chat={chat}
+                id={replyId}
+                c={c}
+                onPress={() => onQuote?.(replyId)}
+                onDismiss={() => onCancelComposition?.()}
+              />
+            </View>
+          ) : null}
+          {attachment && !editing && !combinedContext && (
+            <View style={styles.compositionQuote}>
+              <AttachmentCard
+                asset={attachment}
+                compact
+                c={c}
+                onRemove={onRemoveAttachment}
+              />
+            </View>
+          )}{' '}
+        </>
+      }
+    />
   );
 }
 const styles = StyleSheet.create({
   conversation: { flex: 1 },
+  previewRail: {
+    flexDirection: 'row',
+    alignItems: 'flex-end',
+    gap: 6,
+    marginHorizontal: 10,
+    marginTop: 8,
+  },
   notice: { ...typography.caption, paddingHorizontal: 14, paddingVertical: 8 },
   compositionQuote: { marginHorizontal: 10, marginTop: 8 },
   context: {

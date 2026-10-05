@@ -1,18 +1,19 @@
-import React, { useState } from 'react';
+import React, { useRef, useState } from 'react';
+import { VeilSheet } from './VeilSheet';
 import {
-  Modal,
   Pressable,
   ScrollView,
   StyleSheet,
   Text,
   View,
+  AccessibilityInfo,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Copy, Pencil, Reply, Trash2, X } from 'lucide-react-native';
 import { geometry, Palette, typography } from './appearance';
-import { DemoMessage } from './model';
-import { availableActions, MessageAction } from './messageActions';
-import { IconButton } from './Primitives';
+import { TimelineMessage, ConversationCapabilities, designCapabilities } from './conversationContract';
+import { availableActions, MessageAction } from './messageActionCapabilities';
+import { useAccessibilityFocus } from './AccessibilityFocusBoundary';
 
 const labels: Record<MessageAction, string> = {
   reply: 'Ответить',
@@ -27,29 +28,22 @@ export function MessageActionsPanel({
   reduceMotion,
   onClose,
   onAction,
+  capabilities = designCapabilities,
 }: {
-  message: DemoMessage;
+  message: TimelineMessage;
+  capabilities?: ConversationCapabilities;
   c: Palette;
   reduceMotion: boolean;
   onClose: () => void;
   onAction: (action: MessageAction) => void;
 }) {
   const [confirming, setConfirming] = useState(false);
+  const heading = useRef<Text>(null);
+  const focus = useAccessibilityFocus();
   return (
-    <Modal
-      visible
-      transparent
-      animationType={reduceMotion ? 'none' : 'fade'}
-      onRequestClose={confirming ? () => setConfirming(false) : onClose}
-      statusBarTranslucent
-    >
-      <View style={styles.root}>
-        <Pressable
-          accessibilityRole="button"
-          accessibilityLabel="Закрыть действия сообщения"
-          style={StyleSheet.absoluteFillObject}
-          onPress={onClose}
-        />
+    <VeilSheet c={c} reduceMotion={reduceMotion} onClose={onClose}
+      closeLabel="Закрыть действия сообщения" style={{ maxHeight: '75%', margin: geometry.inset }}
+      onShow={() => { focus.cancel(); if (heading.current) AccessibilityInfo.sendAccessibilityEvent(heading.current, 'focus'); }}>
         <SafeAreaView
           edges={['bottom']}
           style={[
@@ -59,24 +53,20 @@ export function MessageActionsPanel({
         >
           <View style={styles.heading}>
             <Text
+              ref={heading}
+              accessible
               accessibilityRole="header"
               style={[styles.title, { color: c.text }]}
             >
               {confirming ? 'Удалить сообщение?' : 'Сообщение'}
             </Text>
-            <IconButton
-              icon={X}
-              label="Закрыть действия сообщения"
-              color={c.muted}
-              onPress={onClose}
-            />
           </View>
           <ScrollView contentContainerStyle={styles.content}>
             <Text
               numberOfLines={3}
               style={[styles.preview, { color: c.muted }]}
             >
-              {message.text}
+              {message.text || message.attachment?.name}
             </Text>
             {confirming ? (
               <>
@@ -86,6 +76,7 @@ export function MessageActionsPanel({
                 </Text>
                 <Action
                   label="Подтвердить удаление"
+                  destructive
                   icon={Trash2}
                   c={c}
                   onPress={() => onAction('delete')}
@@ -98,10 +89,11 @@ export function MessageActionsPanel({
                 />
               </>
             ) : (
-              availableActions(message).map((action) => (
+              availableActions(message, capabilities).map((action) => (
                 <Action
                   key={action}
                   label={labels[action]}
+                  destructive={action === 'delete'}
                   icon={icons[action]}
                   c={c}
                   onPress={() =>
@@ -112,8 +104,7 @@ export function MessageActionsPanel({
             )}
           </ScrollView>
         </SafeAreaView>
-      </View>
-    </Modal>
+    </VeilSheet>
   );
 }
 function Action({
@@ -121,10 +112,12 @@ function Action({
   icon: Icon,
   c,
   onPress,
+  destructive = false,
 }: {
   label: string;
   icon: typeof Copy;
   c: Palette;
+  destructive?: boolean;
   onPress: () => void;
 }) {
   return (
@@ -136,8 +129,12 @@ function Action({
         { backgroundColor: pressed ? c.tint : c.raised },
       ]}
     >
-      <Icon size={20} color={c.accent} />
-      <Text style={[styles.actionText, { color: c.text }]}>{label}</Text>
+      <Icon size={20} color={destructive ? c.danger : c.accent} />
+      <Text
+        style={[styles.actionText, { color: destructive ? c.danger : c.text }]}
+      >
+        {label}
+      </Text>
     </Pressable>
   );
 }
@@ -145,13 +142,10 @@ const styles = StyleSheet.create({
   root: {
     flex: 1,
     justifyContent: 'flex-end',
-    backgroundColor: 'rgba(0,0,0,0.5)',
+
   },
   panel: {
-    borderRadius: geometry.radius,
-    borderWidth: geometry.borderWidth,
-    margin: geometry.inset,
-    maxHeight: '75%',
+    flexShrink: 1,
     overflow: 'hidden',
   },
   heading: {
@@ -171,5 +165,5 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     gap: 12,
   },
-  actionText: { ...typography.body },
+  actionText: { ...typography.body, flex: 1 },
 });

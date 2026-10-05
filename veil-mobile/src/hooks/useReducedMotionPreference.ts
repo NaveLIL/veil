@@ -1,7 +1,8 @@
 import { useEffect, useState } from "react";
 import { AccessibilityInfo } from "react-native";
+import { useMobileSettingsStore } from '../stores/settings';
 
-export function useReducedMotionPreference(): boolean {
+export function useSystemReducedMotion(): boolean {
   const [reducedMotion, setReducedMotion] = useState(false);
 
   useEffect(() => {
@@ -22,4 +23,9 @@ export function useReducedMotionPreference(): boolean {
   }, []);
 
   return reducedMotion;
+}
+
+export function useReducedMotionPreference(): boolean {
+  const local = useMobileSettingsStore((s) => s.reduceMotion);
+  return useSystemReducedMotion() || local;
 }

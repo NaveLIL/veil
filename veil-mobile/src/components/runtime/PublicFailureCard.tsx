@@ -6,6 +6,8 @@ import {
   type PublicFailureCodeV1,
 } from "../../contracts/publicFailureCodesV1";
 import { colors, radii, spacing } from "../../lib/theme";
+import { geometry } from '../../interfacePreview/appearance';
+import { usePresentation } from '../../interfacePreview/PresentationContext';
 
 export function PublicFailureCard({
   code,
@@ -17,22 +19,23 @@ export function PublicFailureCard({
   announce?: boolean;
 }) {
   const failure = publicFailurePresentationV1(code);
+  const { c } = usePresentation();
   return (
     <View
       testID="public-failure-card-v1"
       accessibilityRole={announce ? "alert" : undefined}
       accessibilityLiveRegion={announce ? "assertive" : "none"}
-      style={[styles.card, compact && styles.compact]}
+      style={[styles.card, compact && styles.compact, {borderRadius:geometry.radius, borderColor:c.danger, backgroundColor:c.surface}]}
     >
-      <Text accessibilityRole="header" style={styles.title}>{failure.title}</Text>
-      <Text style={styles.description}>{failure.description}</Text>
-      <Text style={styles.actionLabel}>NEXT ACTION</Text>
-      <Text style={styles.action}>{failure.nextAction}</Text>
+      <Text accessibilityRole="header" style={[styles.title, {color:c.text}]}>{failure.title}</Text>
+      <Text style={[styles.description, {color:c.muted}]}>{failure.description}</Text>
+      <Text style={[styles.actionLabel, {color:c.muted}]}>NEXT ACTION</Text>
+      <Text style={[styles.action, {color:c.text}]}>{failure.nextAction}</Text>
       <Text
         testID="public-failure-code-v1"
         accessibilityLabel={`Public failure code ${failure.code}`}
         selectable
-        style={styles.code}
+        style={[styles.code, {color:c.danger}]}
       >
         {failure.code}
       </Text>

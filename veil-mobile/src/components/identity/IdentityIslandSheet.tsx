@@ -1,9 +1,13 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { AccessibilityInfo, Animated, AppState, BackHandler, findNodeHandle, Linking, Modal, Pressable, ScrollView, StyleSheet, Text, useWindowDimensions, View } from "react-native";
+import { AccessibilityInfo, AppState, BackHandler, findNodeHandle, Linking, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import { CameraView, useCameraPermissions, type BarcodeScanningResult } from "expo-camera";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
-import { Check, ChevronLeft, ScanLine, X } from "lucide-react-native";
+import { Check, ChevronLeft, ScanLine } from "lucide-react-native";
 import QRCode from "react-native-qrcode-svg";
+import { VeilSheet } from '../../interfacePreview/VeilSheet';
+import { geometry } from '../../interfacePreview/appearance';
+import { usePresentation } from '../../interfacePreview/PresentationContext';
+import { useReducedMotionPreference } from '../../hooks/useReducedMotionPreference';
 import type { Member } from "../../stores/chat";
 import { colors, radii, spacing } from "../../lib/theme";
 import VeilRuntime, { type DirectIdentityVerification } from "../../native/runtime";
@@ -23,17 +27,12 @@ interface Props {
 }
 
 export const IdentityIslandSheet: React.FC<Props> = ({ profile, contextLabel, returnLabel = "Members", directVerification, onClose, onMessage }) => {
-  const progress = useRef(new Animated.Value(0)).current;
-  const closeButtonRef = useRef<View>(null);
-  const reduceMotionRef = useRef(true);
-  const motionPreferenceResolvedRef = useRef(false);
-  const closingRef = useRef(false);
+  const { c } = usePresentation();
+  const localMotion = useReducedMotionPreference();
+  const closeButtonRef = useRef<Text>(null);
   const closeDeliveredRef = useRef(false);
   const mountedRef = useRef(true);
-  const profileRef = useRef(profile);
-  profileRef.current = profile;
   const insets = useSafeAreaInsets();
-  const { height: windowHeight } = useWindowDimensions();
   const [motionPreferenceResolved, setMotionPreferenceResolved] = useState(false);
   const [verification, setVerification] = useState<DirectIdentityVerification | null>(null);
   const [verificationLoading, setVerificationLoading] = useState(false);
@@ -47,30 +46,11 @@ export const IdentityIslandSheet: React.FC<Props> = ({ profile, contextLabel, re
   const scannerConsumedRef = useRef(false);
   const verificationRequestRef = useRef(0);
 
-  const startEntryAnimation = useCallback(() => {
-    progress.setValue(0);
-    Animated.spring(progress, {
-      toValue: 1,
-      damping: 22,
-      stiffness: 230,
-      mass: 0.9,
-      useNativeDriver: true,
-    }).start();
-  }, [progress]);
-
-  const finishClose = useCallback(() => {
-    if (!mountedRef.current || !closingRef.current || closeDeliveredRef.current) return;
-    closingRef.current = false;
-    closeDeliveredRef.current = true;
-    onClose();
-  }, [onClose]);
-
   useEffect(() => () => {
     mountedRef.current = false;
-    closingRef.current = false;
     scannerConsumedRef.current = true;
-    progress.stopAnimation();
-  }, [progress]);
+    verificationRequestRef.current += 1;
+  }, []);
 
   const dismissScanner = useCallback(() => {
     scannerConsumedRef.current = true;
@@ -80,71 +60,21 @@ export const IdentityIslandSheet: React.FC<Props> = ({ profile, contextLabel, re
   }, []);
 
   useEffect(() => {
-    let mounted = true;
-    void AccessibilityInfo.isReduceMotionEnabled().then((enabled) => {
-      if (!mounted || motionPreferenceResolvedRef.current) return;
-      reduceMotionRef.current = enabled;
-      motionPreferenceResolvedRef.current = true;
-      setMotionPreferenceResolved(true);
-    }).catch(() => {
-      // Fail safe: keep motion disabled when the platform capability cannot be read.
-      if (!mounted || motionPreferenceResolvedRef.current) return;
-      reduceMotionRef.current = true;
-      motionPreferenceResolvedRef.current = true;
-      setMotionPreferenceResolved(true);
-    });
-    const subscription = AccessibilityInfo.addEventListener("reduceMotionChanged", (enabled) => {
-      const firstResolution = !motionPreferenceResolvedRef.current;
-      reduceMotionRef.current = enabled;
-      motionPreferenceResolvedRef.current = true;
-      if (firstResolution) {
-        setMotionPreferenceResolved(true);
-        return;
-      }
-      if (enabled) {
-        progress.stopAnimation();
-        if (closingRef.current) finishClose();
-        else if (profileRef.current) progress.setValue(1);
-      }
-    });
-    return () => {
-      mounted = false;
-      subscription.remove();
-    };
-  }, [finishClose, progress]);
-
+    let active = true;
+    void AccessibilityInfo.isReduceMotionEnabled().then(enabled => {
+      if (active) setMotionPreferenceResolved(true);
+    }).catch(() => { if (active) setMotionPreferenceResolved(true); });
+    return () => { active = false; };
+  }, []);
   const requestClose = useCallback(() => {
-    if (scannerOpen) {
-      dismissScanner();
-      return;
-    }
-    if (closingRef.current || closeDeliveredRef.current) return;
-    closingRef.current = true;
-    progress.stopAnimation();
-    if (reduceMotionRef.current) {
-      finishClose();
-      return;
-    }
-    Animated.timing(progress, { toValue: 0, duration: 170, useNativeDriver: true }).start(() => {
-      // A platform interruption must not strand an inaccessible modal.
-      finishClose();
-    });
-  }, [dismissScanner, finishClose, progress, scannerOpen]);
-
+    if (scannerOpen) { dismissScanner(); return; }
+    if (closeDeliveredRef.current) return;
+    closeDeliveredRef.current = true;
+    onClose();
+  }, [dismissScanner, onClose, scannerOpen]);
   useEffect(() => {
-    if (!profile) {
-      dismissScanner();
-      setScannerError(null);
-      closeDeliveredRef.current = false;
-      closingRef.current = false;
-      progress.stopAnimation();
-      progress.setValue(0);
-      return;
-    }
-    if (!motionPreferenceResolved || closingRef.current || closeDeliveredRef.current) return;
-    if (reduceMotionRef.current) progress.setValue(1);
-    else startEntryAnimation();
-  }, [dismissScanner, motionPreferenceResolved, profile, progress, startEntryAnimation]);
+    if (!profile) { dismissScanner(); setScannerError(null); closeDeliveredRef.current = false; }
+  }, [dismissScanner, profile]);
 
   useEffect(() => {
     if (!profile) return;
@@ -324,26 +254,12 @@ export const IdentityIslandSheet: React.FC<Props> = ({ profile, contextLabel, re
   if (!profile || !motionPreferenceResolved) return null;
   const shortKey = locator ? `${locator.identityKey.slice(0, 12)}…${locator.identityKey.slice(-8)}` : null;
   return (
-    <Modal
-      visible
-      transparent
-      animationType="none"
-      onRequestClose={requestClose}
-      onShow={() => {
+    <VeilSheet c={c} reduceMotion={localMotion} closeLabel="Close identity"
+      onClose={requestClose} onShow={() => {
         const handle = findNodeHandle(closeButtonRef.current);
         if (handle) AccessibilityInfo.setAccessibilityFocus(handle);
-      }}
-      statusBarTranslucent
-    >
-      <View style={styles.modal} accessibilityViewIsModal>
-        <Pressable accessibilityRole="button" accessibilityLabel="Close identity" style={StyleSheet.absoluteFill} onPress={requestClose}>
-          <Animated.View style={[StyleSheet.absoluteFill, styles.scrim, { opacity: progress }]} />
-        </Pressable>
-        <Animated.View
-          testID="identity-sheet-surface"
-          style={[styles.sheet, { paddingBottom: insets.bottom + spacing.md, transform: [{ translateY: progress.interpolate({ inputRange: [0, 1], outputRange: [Math.max(windowHeight, 1), 0] }) }] }]}
-        >
-          <View style={styles.handle} />
+      }} style={{maxHeight:'88%'}}>
+      <View testID="identity-sheet-surface" style={[styles.sheet, {backgroundColor:c.bg, borderColor:c.line, paddingBottom:insets.bottom + spacing.md}]}>
           <View
             testID="identity-sheet-header"
             style={[
@@ -364,18 +280,8 @@ export const IdentityIslandSheet: React.FC<Props> = ({ profile, contextLabel, re
               <ChevronLeft size={17} strokeWidth={2.2} color={colors.primaryHi} />
               <Text numberOfLines={1} style={styles.back}>{returnLabel}</Text>
             </Pressable>
-            <Text accessibilityRole="header" style={styles.headerTitle}>Identity</Text>
-            <Pressable
-              ref={closeButtonRef}
-              focusable
-              accessibilityRole="button"
-              accessibilityLabel="Close"
-              onPress={requestClose}
-              hitSlop={8}
-              style={[styles.headerSide, styles.headerSideEnd]}
-            >
-              <X size={21} strokeWidth={2} color={colors.textMd} />
-            </Pressable>
+            <Text ref={closeButtonRef} accessible accessibilityRole="header" style={[styles.headerTitle,{color:c.text}]}>Identity</Text>
+
           </View>
           <ScrollView
             testID="identity-sheet-content"
@@ -526,15 +432,11 @@ export const IdentityIslandSheet: React.FC<Props> = ({ profile, contextLabel, re
             </View>
             {onMessage && locator ? <Pressable style={styles.message} accessibilityRole="button" onPress={() => onMessage(profile)}><Text style={styles.messageText}>Message</Text></Pressable> : null}
           </ScrollView>
-        </Animated.View>
+      </View>
         {scannerOpen && cameraPermission?.granted ? (
-          <Modal
-            visible
-            animationType="fade"
-            onRequestClose={dismissScanner}
-            statusBarTranslucent
-          >
-            <View style={styles.scannerModal} accessibilityViewIsModal>
+          <VeilSheet c={c} reduceMotion={localMotion} onClose={dismissScanner}
+            closeLabel="Close QR scanner" style={{height:'100%'}}>
+            <View style={styles.scannerModal}>
               <CameraView
                 testID="identity-qr-camera"
                 style={StyleSheet.absoluteFill}
@@ -559,24 +461,15 @@ export const IdentityIslandSheet: React.FC<Props> = ({ profile, contextLabel, re
                 ]}
               >
                 <Text accessibilityRole="header" style={styles.scannerTitle}>Scan identity QR</Text>
-                <Pressable
-                  accessibilityRole="button"
-                  accessibilityLabel="Close QR scanner"
-                  onPress={dismissScanner}
-                  hitSlop={8}
-                  style={styles.scannerClose}
-                >
-                  <X size={24} strokeWidth={2.2} color="white" />
-                </Pressable>
+
               </View>
               <View pointerEvents="none" style={[styles.scannerInstructions, { paddingBottom: insets.bottom + spacing.lg }]}>
                 <Text style={styles.scannerInstructionsText}>{"Center the QR code shown on the other person's Veil device. The camera closes after one scan."}</Text>
               </View>
             </View>
-          </Modal>
+          </VeilSheet>
         ) : null}
-      </View>
-    </Modal>
+    </VeilSheet>
   );
 };
 
@@ -584,7 +477,7 @@ const Detail = ({ label, value, mono = false }: { label: string; value: string; 
 
 const styles = StyleSheet.create({
   modal: { flex: 1, justifyContent: "flex-end" }, scrim: { backgroundColor: "rgba(4,7,12,0.72)" },
-  sheet: { maxHeight: "88%", backgroundColor: "#192735", borderTopLeftRadius: 26, borderTopRightRadius: 26, borderWidth: StyleSheet.hairlineWidth, borderColor: "rgba(124,107,245,0.3)", overflow: "hidden" },
+  sheet: { maxHeight: "88%", backgroundColor: "#192735", borderTopLeftRadius: geometry.radius, borderTopRightRadius: geometry.radius, borderWidth: StyleSheet.hairlineWidth, borderColor: "rgba(124,107,245,0.3)", overflow: "hidden" },
   handle: { width: 42, height: 4, borderRadius: 2, backgroundColor: colors.textXLo, alignSelf: "center", marginTop: 8 },
   header: { height: 52, paddingHorizontal: spacing.lg, flexDirection: "row", alignItems: "center", justifyContent: "space-between", borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: colors.border },
   headerSide: { width: 92, minHeight: 44, flexDirection: "row", alignItems: "center", gap: 2 },
@@ -610,7 +503,7 @@ const styles = StyleSheet.create({
   settingsButtonText: { color: colors.primaryHi, fontSize: 12, fontWeight: "700" },
   scannerModal: { flex: 1, backgroundColor: "#02060a" },
   scannerShade: { ...StyleSheet.absoluteFillObject, backgroundColor: "rgba(0,0,0,0.18)" },
-  scannerFrame: { position: "absolute", width: 264, height: 264, borderRadius: 26, borderWidth: 3, borderColor: "white", alignSelf: "center", top: "31%" },
+  scannerFrame: { position: "absolute", width: 264, height: 264, borderRadius: geometry.radius, borderWidth: 3, borderColor: "white", alignSelf: "center", top: "31%" },
   scannerHeader: { position: "absolute", left: 0, right: 0, flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
   scannerTitle: { color: "white", fontSize: 17, fontWeight: "800", textShadowColor: "rgba(0,0,0,0.8)", textShadowRadius: 5 },
   scannerClose: { width: 46, height: 46, borderRadius: 23, alignItems: "center", justifyContent: "center", backgroundColor: "rgba(0,0,0,0.55)" },

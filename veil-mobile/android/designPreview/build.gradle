@@ -45,8 +45,10 @@ def signingNames = ['VEIL_ANDROID_TESTER_KEYSTORE', 'VEIL_ANDROID_TESTER_KEYSTOR
 def signing = signingNames.collect { System.getenv(it) }
 def signingReady = signing.every { it != null && !it.trim().empty }
 def sourceCommit = System.getenv('VEIL_SOURCE_COMMIT') ?: 'unconfigured'
+def sourcePatch = System.getenv('VEIL_DESIGN_SOURCE_PATCH_SHA256') ?: 'clean'
 
 android {
+    sourceSets { main.java.srcDirs += file('../presentation/src/main/java') }
     namespace 'io.veil.mobile.designpreview'
     compileSdk rootProject.ext.compileSdkVersion
     buildToolsVersion rootProject.ext.buildToolsVersion
@@ -55,9 +57,9 @@ android {
         applicationId 'io.veil.mobile.designpreview'
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 2026100408
-        versionName '0.1.0-design.20261004.8'
-        manifestPlaceholders = [veilDesignSource: sourceCommit, veilDesignLabel: 'Veil Design']
+        versionCode 2026100511
+        versionName '0.1.0-design.20261005.11'
+        manifestPlaceholders = [veilDesignSource: sourceCommit, veilDesignPatch: sourcePatch, veilDesignLabel: 'Veil Design']
     }
     signingConfigs {
         if (signingReady) {
@@ -99,4 +101,5 @@ gradle.taskGraph.whenReady { graph ->
     if (tasks.any { it.name.toLowerCase().contains('release') || it.name.toLowerCase().contains('debug') } && (!signingReady || !(sourceCommit ==~ /^[0-9a-f]{40}$/))) {
         throw new GradleException('Design APK requires complete independent tester signing and a source commit. No unsigned/debug fallback.')
     }
+    if (!(sourcePatch == 'clean' || sourcePatch ==~ /^[0-9a-f]{64}$/)) throw new GradleException('Invalid design source patch hash')
 }

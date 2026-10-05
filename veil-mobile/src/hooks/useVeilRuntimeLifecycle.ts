@@ -120,6 +120,9 @@ export function useVeilRuntimeLifecycle(): VeilRuntimeController {
       let handshaking = true;
       let bufferedSnapshot: VeilMobileRuntimeSnapshot | null = null;
       subscription = VeilRuntime.subscribe((snapshot) => {
+        // A queued native callback may survive unsubscribe. It must not
+        // reconcile (and clear) a newer foreground/account epoch's UI.
+        if (!epochIsCurrent(epoch)) return;
         if (handshaking) {
           // Keep the latest event that arrives after subscription but before
           // the confirming read is committed. Dropping it could publish a

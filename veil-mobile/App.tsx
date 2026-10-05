@@ -1,6 +1,5 @@
-import React, { useEffect } from "react";
+import React, { useEffect, useState } from "react";
 import {
-  ActivityIndicator,
   Pressable,
   ScrollView,
   StyleSheet,
@@ -33,8 +32,19 @@ import {
   useRuntimeGateStore,
 } from "./src/stores/runtime";
 import { useMobileSettingsStore } from "./src/stores/settings";
+import { AccountAppearanceProvider } from './src/presentation/appearance/AccountAppearance';
+import { ModalBlurBoundary } from './src/interfacePreview/LiveBlur';
+import { VeilState } from './src/interfacePreview/VeilState';
+import { usePresentation } from './src/interfacePreview/PresentationContext';
+import { AccessibilityFocusBoundary } from './src/interfacePreview/AccessibilityFocusBoundary';
+import { accountStartupState } from './src/presenters/accountStartup';
 
 export default function App() {
+  return <AccountAppearanceProvider><AccessibilityFocusBoundary><ModalBlurBoundary>
+    <RuntimeApplication />
+  </ModalBlurBoundary></AccessibilityFocusBoundary></AccountAppearanceProvider>;
+}
+function RuntimeApplication() {
   const runtime = useVeilRuntimeLifecycle();
   const verifyIdentityPresence = runtime.verifyIdentityPresence;
   const retryIdentityBootstrap = runtime.retryBootstrap;
@@ -121,7 +131,7 @@ export default function App() {
 
   let content: React.ReactNode;
   if (identityReconciliation === "checking") {
-    content = <RuntimeBootstrap reducedMotion={reducedMotion} />;
+    content = <RuntimeBootstrap onRetry={() => void runtime.retryBootstrap()} />;
   } else if (identityReconciliation === "blocked") {
     content = (
       <RuntimeError
@@ -133,7 +143,7 @@ export default function App() {
       />
     );
   } else if (phase === "bootstrapping" || phase === "privacy") {
-    content = <RuntimeBootstrap reducedMotion={reducedMotion} />;
+    content = <RuntimeBootstrap onRetry={() => void runtime.retryBootstrap()} />;
   } else if (phase === "error" || !snapshot) {
     content = (
       <RuntimeError
@@ -186,6 +196,7 @@ export default function App() {
       <SafeAreaProvider>
         <StatusBar style="light" translucent />
         <View
+          testID={`account-state-${accountStartupState(phase, snapshot, requiresExplicitReopen, publicFailureCode)}`}
           style={styles.flex}
           pointerEvents={curtainVisible ? "none" : "auto"}
           importantForAccessibility={curtainVisible ? "no-hide-descendants" : "auto"}
@@ -217,18 +228,15 @@ export function canStartNativeIdentitySetup(
     && publicFailureCode === null;
 }
 
-function RuntimeBootstrap({ reducedMotion }: { reducedMotion: boolean }) {
-  return (
-    <View
-      testID="runtime-bootstrap"
-      accessibilityRole="progressbar"
-      accessibilityLabel="Verifying secure mobile runtime"
-      style={styles.centered}
-    >
-      {reducedMotion ? null : <ActivityIndicator color={colors.primaryHi} />}
-      <Text style={styles.bootstrapText}>Verifying native session...</Text>
-    </View>
-  );
+function RuntimeBootstrap({ onRetry }: { onRetry: () => void }) {
+  const { c } = usePresentation();
+  const [slow, setSlow] = useState(false);
+  useEffect(() => { const timer = setTimeout(() => setSlow(true), 10000); return () => clearTimeout(timer); }, []);
+  return <View testID="runtime-bootstrap" accessibilityLabel="Verifying secure mobile runtime" style={styles.flex}>
+    <VeilState c={c} kind={slow ? 'unavailable' : 'loading'} title="Проверка защищённой сессии"
+      detail={slow ? 'Проверка занимает больше времени. Аккаунт пока не открыт.' : 'Ожидаем состояние native runtime. Переписка ещё недоступна.'}
+      action={slow ? {label:'Try secure verification again', onPress:onRetry} : undefined} />
+  </View>;
 }
 
 function RuntimeError({

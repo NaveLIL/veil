@@ -4,6 +4,7 @@ import { dirname, join, resolve } from "node:path";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
+import { allowedProductionPresentation } from './verify-conversation-boundaries.mjs';
 
 const require = createRequire(import.meta.url);
 const projectDirectory = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -36,10 +37,15 @@ const requiredSourcePaths = [
   "/src/hooks/useVeilRuntimeLifecycle.ts",
   "/src/presenters/directTimeline.ts",
   "/src/presenters/contacts.ts",
-  "/src/presentation/rocketChat/RoomItem.tsx",
+  "/src/presentation/account/AccountDirectory.tsx",
+  "/src/presentation/account/AccountFrame.tsx",
+  "/src/presentation/account/AccountProfile.tsx",
   "/src/presentation/rocketChat/ContactItem.tsx",
-  "/src/presentation/rocketChat/Message.tsx",
-  "/src/presentation/rocketChat/Composer.tsx",
+  "/src/components/layout/NativeDesignTimeline.tsx",
+  "/src/presenters/directDesignAdapter.ts",
+  "/src/interfacePreview/ConversationSurface.tsx",
+  "/src/interfacePreview/MessageRow.tsx",
+  "/src/interfacePreview/Composer.tsx",
   "/src/presentation/rocketChat/theme.ts",
   "/src/presentation/rocketChat/notice.ts",
 ];
@@ -91,7 +97,8 @@ try {
 
   const literalMatches = forbiddenLiterals.filter((literal) => bundle.includes(literal));
   const sourceMatches = normalizedSources.filter((source) =>
-    forbiddenSourceFragments.some((fragment) => source.includes(fragment)),
+    forbiddenSourceFragments.some((fragment) => source.includes(fragment)) ||
+    (source.includes('/src/interfacePreview/') && !allowedProductionPresentation.some(allowed => source.endsWith('/'+allowed))),
   );
   const missingSources = requiredSourcePaths.filter((required) =>
     !normalizedSources.some((source) => source.endsWith(required)),

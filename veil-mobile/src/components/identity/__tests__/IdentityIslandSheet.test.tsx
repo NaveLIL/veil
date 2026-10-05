@@ -59,6 +59,7 @@ jest.mock("react-native", () => {
 });
 
 jest.mock("react-native-safe-area-context", () => ({
+  SafeAreaView: jest.requireActual<typeof import("react-native")>("react-native").View,
   useSafeAreaInsets: () => ({ top: 0, right: 20, bottom: 18, left: 44 }),
 }));
 
@@ -350,47 +351,14 @@ describe("IdentityIslandSheet interaction and accessibility boundary", () => {
     expect(timing).not.toHaveBeenCalled();
   });
 
-  it("uses a spring for non-reduced entry and completes close only after the bounded exit timing", async () => {
+  it("uses the shared native-driver entry and makes accessible Back idempotent", async () => {
     reduceMotion.mockResolvedValue(false);
-    const springStart = jest.fn();
-    const spring = jest.spyOn(Animated, "spring").mockReturnValue({
-      start: springStart,
-      stop: jest.fn(),
-      reset: jest.fn(),
-    });
-    let finishExit: ((result: { finished: boolean }) => void) | undefined;
-    const timingStart = jest.fn((callback?: (result: { finished: boolean }) => void) => {
-      finishExit = callback;
-    });
-    const timing = jest.spyOn(Animated, "timing").mockReturnValue({
-      start: timingStart,
-      stop: jest.fn(),
-      reset: jest.fn(),
-    });
-    const { onClose, root } = await renderSheet();
-
-    expect(spring).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
-      toValue: 1,
-      damping: 22,
-      stiffness: 230,
-      mass: 0.9,
-      useNativeDriver: true,
-    }));
-    expect(springStart).toHaveBeenCalled();
-
+    const timing = jest.spyOn(Animated, 'timing').mockReturnValue({start:jest.fn(), stop:jest.fn(), reset:jest.fn()});
+    const {onClose, root} = await renderSheet();
+    act(() => root.findByType(Modal).props.onShow());
+    expect(timing).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({toValue:0, duration:220, useNativeDriver:true}));
     act(() => root.findByType(Modal).props.onRequestClose());
     act(() => root.findByType(Modal).props.onRequestClose());
-    expect(timing).toHaveBeenCalledWith(expect.anything(), {
-      toValue: 0,
-      duration: 170,
-      useNativeDriver: true,
-    });
-    expect(onClose).not.toHaveBeenCalled();
-
-    expect(timing).toHaveBeenCalledTimes(1);
-    act(() => finishExit?.({ finished: false }));
-    expect(onClose).toHaveBeenCalledTimes(1);
-    act(() => finishExit?.({ finished: true }));
     expect(onClose).toHaveBeenCalledTimes(1);
   });
 
@@ -410,26 +378,15 @@ describe("IdentityIslandSheet interaction and accessibility boundary", () => {
       await Promise.resolve();
     });
     expect(root.findAllByType(Modal)).toHaveLength(1);
-    expect(spring).toHaveBeenCalledTimes(1);
+    expect(spring).not.toHaveBeenCalled();
   });
 
-  it("finishes an in-flight close once when reduced motion is enabled", async () => {
+  it("does not reopen or redeliver dismissal when Reduce Motion changes after Back", async () => {
     reduceMotion.mockResolvedValue(false);
-    let finishExit: ((result: { finished: boolean }) => void) | undefined;
-    jest.spyOn(Animated, "timing").mockReturnValue({
-      start: jest.fn((callback?: (result: { finished: boolean }) => void) => {
-        finishExit = callback;
-      }),
-      stop: jest.fn(),
-      reset: jest.fn(),
-    });
-    const { onClose, root } = await renderSheet();
-
+    const {onClose, root} = await renderSheet();
     act(() => root.findByType(Modal).props.onRequestClose());
-    expect(onClose).not.toHaveBeenCalled();
     act(() => reduceMotionHandler?.(true));
-    expect(onClose).toHaveBeenCalledTimes(1);
-    act(() => finishExit?.({ finished: false }));
+    act(() => root.findByType(Modal).props.onRequestClose());
     expect(onClose).toHaveBeenCalledTimes(1);
   });
 });

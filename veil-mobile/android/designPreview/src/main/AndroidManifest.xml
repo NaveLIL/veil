@@ -17,6 +17,7 @@
   <application android:name=".DesignApplication" android:label="${veilDesignLabel}" android:icon="@drawable/ic_design_launcher" android:allowBackup="false" android:fullBackupContent="false" android:theme="@style/DesignTheme" android:usesCleartextTraffic="false" tools:replace="android:allowBackup">
     <meta-data android:name="io.veil.design.OFFLINE_FIXTURES_ONLY" android:value="true" />
     <meta-data android:name="io.veil.design.SOURCE_COMMIT" android:value="${veilDesignSource}" />
+    <meta-data android:name="io.veil.design.SOURCE_PATCH_SHA256" android:value="${veilDesignPatch}" />
     <meta-data android:name="expo.modules.updates.ENABLED" android:value="false" />
     <activity android:name=".DesignActivity" android:exported="true" android:launchMode="singleTask" android:windowSoftInputMode="adjustResize" android:configChanges="keyboard|keyboardHidden|orientation|screenSize|screenLayout|uiMode">
       <intent-filter><action android:name="android.intent.action.MAIN" /><category android:name="android.intent.category.LAUNCHER" /></intent-filter>

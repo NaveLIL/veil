@@ -1,11 +1,9 @@
 import React, { useCallback, useEffect } from 'react';
 import {
   Keyboard,
-  StyleProp,
   StyleSheet,
   useWindowDimensions,
   View,
-  ViewStyle,
 } from 'react-native';
 import { Gesture, GestureDetector } from 'react-native-gesture-handler';
 import Animated, {
@@ -13,14 +11,17 @@ import Animated, {
   ReduceMotion,
   runOnJS,
   useAnimatedStyle,
+  useAnimatedProps,
   useSharedValue,
   withSpring,
 } from 'react-native-reanimated';
 import { swipeDestination } from './navigation';
 import { geometry, motion } from './appearance';
+import { useAccessibilityFocus } from './AccessibilityFocusBoundary';
+import { LiveBlur } from './LiveBlur';
 
 type Props = {
-  navigation: (dimStyle: StyleProp<ViewStyle>) => React.ReactNode;
+  navigation: () => React.ReactNode;
   profile: React.ReactNode;
   conversation: React.ReactNode;
   navigationOpen: boolean;
@@ -45,6 +46,8 @@ export function ChatDeck({
   onNavigationChange,
 }: Props) {
   const { width: screenWidth } = useWindowDimensions();
+  const focus = useAccessibilityFocus();
+  useEffect(() => focus.cancel(), [navigationOpen, hasChat, focus]);
   // Travel through the physical viewport, not the inset navigation frame.
   const width = Math.max(1, screenWidth);
   const progress = useSharedValue(navigationOpen ? 1 : 0);
@@ -103,13 +106,13 @@ export function ChatDeck({
   const chatStyle = useAnimatedStyle(() => ({
     transform: [{ translateX: progress.value * width }],
   }));
-  // Dim opaque islands; fading their surfaces would leak wallpaper through text.
-  const backdropStyle = useAnimatedStyle(() => ({
-    opacity: hasChat ? (1 - progress.value) * 0.48 : 0,
+  const blurProps = useAnimatedProps(() => ({
+    blurRadius: hasChat ? (1 - progress.value) * 10 : 0,
   }));
   return (
     <GestureDetector gesture={pan}>
       <View style={styles.root} collapsable={false}>
+        <LiveBlur animatedProps={blurProps} style={StyleSheet.absoluteFillObject}>
         <View
           testID="navigation-layer"
           pointerEvents={navigationOpen ? 'auto' : 'none'}
@@ -119,7 +122,7 @@ export function ChatDeck({
           }
           style={styles.layer}
         >
-          {navigation(backdropStyle)}
+          {navigation()}
         </View>
         <View
           testID="profile-layer"
@@ -132,6 +135,7 @@ export function ChatDeck({
         >
           {profile}
         </View>
+        </LiveBlur>
         {hasChat && (
           <Animated.View
             testID="chat-layer"

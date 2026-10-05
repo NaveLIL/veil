@@ -145,6 +145,7 @@ android {
         coreLibraryDesugaringEnabled true
     }
     sourceSets {
+        main.java.srcDirs += file('../presentation/src/main/java')
         main.java.srcDirs += file('../../src/native/generated/uniffi')
     }
     signingConfigs {

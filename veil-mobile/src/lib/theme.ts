@@ -1,3 +1,5 @@
+import { geometry } from '../interfacePreview/appearance';
+
 /**
  * Shared design tokens — mirrors veil-desktop/src/app.css palette.
  * Mobile uses StyleSheet (no Tailwind yet); keep this file as the
@@ -41,11 +43,12 @@ export const colors = {
   successBorder: "rgba(52,211,153,0.2)",
 };
 
+/** Legacy security-form aliases use the same approved island/control radius. */
 export const radii = {
-  sm: 6,
-  md: 10,
-  lg: 14,
-  xl: 20,
+  sm: geometry.radius,
+  md: geometry.radius,
+  lg: geometry.radius,
+  xl: geometry.radius,
   pill: 999,
 };
 

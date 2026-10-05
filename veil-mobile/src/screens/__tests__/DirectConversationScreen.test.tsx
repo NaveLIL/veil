@@ -40,36 +40,16 @@ const mockPeer: Member = {
   color: "#ec4899",
 };
 
-jest.mock("../../components/navigation/MobileHeader", () => {
-  const ReactModule = jest.requireActual<typeof import("react")>("react");
-  const { Pressable: NativePressable, View: NativeView } =
-    jest.requireActual<typeof import("react-native")>("react-native");
-  return {
-    MobileHeader: ({
-      title,
-      subtitle,
-      action,
-    }: {
-      title: string;
-      subtitle?: string;
-      action?: { onPress: (event: { nativeEvent: { target: number } }) => void };
-    }) => ReactModule.createElement(
-      NativeView,
-      { testID: "direct-header", accessibilityLabel: title, accessibilityHint: subtitle },
-      action ? ReactModule.createElement(NativePressable, {
-            testID: "open-direct-details",
-            onPress: () => action.onPress({ nativeEvent: { target: 733 } }),
-          }) : null,
-    ),
-  };
-});
+jest.mock('../../presentation/account/AccountFrame', () => ({
+  AccountFrame: ({conversation}: {conversation: import('react').ReactNode}) => conversation,
+}));
 
 jest.mock("../../components/layout/ChatIsland", () => {
   const ReactModule = jest.requireActual<typeof import("react")>("react");
   const { Pressable: NativePressable } = jest.requireActual<typeof import("react-native")>("react-native");
   return {
     ChatIsland: ({
-      bottomInset,
+      showHeader,
       onOpenIdentity,
     }: {
       bottomInset?: number;
@@ -77,7 +57,7 @@ jest.mock("../../components/layout/ChatIsland", () => {
       showHeader?: boolean;
     }) =>
       ReactModule.createElement(NativePressable, {
-        accessibilityValue: { text: String(bottomInset ?? 0) },
+        accessibilityValue: { text: String(showHeader) },
         testID: "open-chat-identity",
         onPress: () => onOpenIdentity?.(mockPeer, 411),
       }),
@@ -171,12 +151,14 @@ describe("DirectConversationScreen identity boundary", () => {
   it("isolates the background for an identity opened from a message", () => {
     expect(
       renderer.root.findByProps({ testID: "open-chat-identity" }).props.accessibilityValue,
-    ).toEqual({ text: "34" });
+    ).toEqual({ text: "true" });
     verifyOpenAndClose("open-chat-identity", 411);
   });
 
   it("uses the same modal boundary for the explicit Direct details action", () => {
-    verifyOpenAndClose("open-direct-details", 733);
+    const island = renderer.root.findByProps({ testID: 'open-chat-identity' });
+    expect(island.props.accessibilityValue.text).toBe('true');
+    verifyOpenAndClose('open-chat-identity', 411);
   });
 
   it("fails closed until the route and native-selected Direct agree", () => {
@@ -197,10 +179,6 @@ describe("DirectConversationScreen identity boundary", () => {
 
     expect(goBack).toHaveBeenCalled();
     expect(useChatStore.getState().selectedDmId).toBe(staleConversationId);
-    expect(renderer.root.findByProps({ testID: "direct-header" }).props).toMatchObject({
-      accessibilityLabel: "Direct",
-      accessibilityHint: "Selection unavailable",
-    });
     expect(renderer.root.findByProps({ testID: "direct-route-pending" })).toBeTruthy();
     expect(renderer.root.findAllByProps({ testID: "open-chat-identity" })).toHaveLength(0);
     expect(renderer.root.findAllByProps({ testID: "open-direct-details" })).toHaveLength(0);

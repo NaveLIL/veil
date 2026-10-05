@@ -6,6 +6,18 @@ import { DesignApp } from './DesignApp';
 import { canGroup, createDemoSession, visibleChats } from './model';
 import { ConversationHistory } from './ConversationHistory';
 import { copyDemoText } from './clipboardBridge';
+jest.mock('./preferencesBridge', () => {
+  const actual = jest.requireActual<typeof import('./preferencesBridge')>(
+    './preferencesBridge',
+  );
+  return {
+    ...actual,
+    loadPreferences: jest
+      .fn<() => Promise<typeof actual.defaultPreferences>>()
+      .mockResolvedValue(actual.defaultPreferences),
+    savePreferences: jest.fn<() => Promise<null>>().mockResolvedValue(null),
+  };
+});
 jest.mock('./clipboardBridge', () => ({
   copyDemoText: jest.fn<() => Promise<void>>().mockResolvedValue(undefined),
 }));
@@ -265,4 +277,85 @@ test('message actions retain per-chat reply/draft state and edit cancellation re
   fireEvent.press(ui.getByRole('button', { name: 'Копировать' }));
   await act(async () => {});
   expect(ui.getByText('Не удалось скопировать текст')).toBeTruthy();
+});
+test('attachment cancellation retains caption; viewer and retry keep the same native history/message', async () => {
+  const ui = await mount();
+  fireEvent.press(ui.getByRole('button', { name: /^Анна Морозова, / }));
+  fireEvent.changeText(ui.getByLabelText('Текст демо-сообщения'), 'подпись');
+  fireEvent.press(ui.getByLabelText('Добавить вложение'));
+  fireEvent.press(ui.getByRole('button', { name: 'Демо-изображение' }));
+  fireEvent.press(ui.getByLabelText('Убрать вложение'));
+  expect(ui.getByLabelText('Текст демо-сообщения').props.value).toBe('подпись');
+  fireEvent.press(ui.getByLabelText('Состояния и настройки макета'));
+  fireEvent.press(ui.getByRole('radio', { name: 'Ошибка отправки' }));
+  fireEvent.press(ui.getByLabelText('Закрыть'));
+  fireEvent.press(ui.getByLabelText('Добавить вложение'));
+  fireEvent.press(ui.getByRole('button', { name: 'Демо-изображение' }));
+  fireEvent.press(ui.getByLabelText('Отправить демо-сообщение'));
+  for (let i = 0; i < 2; i++)
+    await act(async () => {
+      jest.advanceTimersByTime(650);
+    });
+  const list = ui.getByTestId('history-list-demo-anna');
+  const data = () =>
+    ui
+      .UNSAFE_getAllByType(FlatList)
+      .find((v) => v.props.testID === 'history-list-demo-anna')!.props.data;
+  const count = data().length;
+  expect(data()[count - 1].transfer.phase).toBe('failed');
+  act(() =>
+    ui
+      .UNSAFE_getByType(ConversationHistory)
+      .props.onAttachment(data()[count - 1].attachment),
+  );
+  fireEvent.press(ui.getByLabelText('Закрыть изображение'));
+  expect(ui.getByTestId('history-list-demo-anna')).toBe(list);
+  fireEvent.press(ui.getByLabelText('Состояния и настройки макета'));
+  fireEvent.press(ui.getByRole('radio', { name: 'Обычный чат' }));
+  fireEvent.press(ui.getByLabelText('Закрыть'));
+  act(() =>
+    ui
+      .UNSAFE_getByType(ConversationHistory)
+      .props.onRetry('demo-anna', data()[count - 1].id),
+  );
+  for (let i = 0; i < 4; i++)
+    await act(async () => {
+      jest.advanceTimersByTime(650);
+    });
+  expect(data()).toHaveLength(count);
+  expect(data()[count - 1].transfer.phase).toBe('complete');
+  expect(data()[count - 1].text).toBe('подпись');
+});
+
+test('short viewport combines reply and attachment without losing either cancel action or the draft', async () => {
+  const ui = await mount();
+  fireEvent.press(ui.getByRole('button', { name: /^Анна Морозова, / }));
+  act(() =>
+    ui
+      .UNSAFE_getByType(ConversationHistory)
+      .props.onMessage(
+        createDemoSession().chats[0].messages.find(
+          (m) => m.id === 'fixture-a2',
+        ),
+      ),
+  );
+  fireEvent.press(ui.getByRole('button', { name: 'Ответить' }));
+  fireEvent.changeText(ui.getByLabelText('Текст демо-сообщения'), 'подпись');
+  fireEvent.press(ui.getByLabelText('Добавить вложение'));
+  fireEvent.press(ui.getByRole('button', { name: 'Демо-изображение' }));
+  fireEvent(ui.getByTestId('conversation-island'), 'layout', {
+    nativeEvent: { layout: { width: 390, height: 340 } },
+  });
+  expect(ui.getByTestId('compact-composition-context')).toBeTruthy();
+  expect(ui.getByLabelText('Отменить ответ')).toBeTruthy();
+  expect(ui.getByLabelText('Убрать вложение')).toBeTruthy();
+  fireEvent(ui.getByTestId('conversation-island'), 'layout', {
+    nativeEvent: { layout: { width: 390, height: 740 } },
+  });
+  expect(ui.queryByTestId('compact-composition-context')).toBeNull();
+  fireEvent.press(ui.getByLabelText('Убрать вложение'));
+  expect(ui.getByLabelText('Отменить ответ')).toBeTruthy();
+  expect(ui.getByLabelText('Текст демо-сообщения').props.value).toBe('подпись');
+  fireEvent.press(ui.getByLabelText('Отменить ответ'));
+  expect(ui.getByLabelText('Текст демо-сообщения').props.value).toBe('подпись');
 });

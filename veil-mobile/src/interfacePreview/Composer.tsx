@@ -7,7 +7,8 @@ import {
   useWindowDimensions,
   View,
 } from 'react-native';
-import { ArrowUp } from 'lucide-react-native';
+import { ArrowUp, Plus } from 'lucide-react-native';
+import { IconButton } from './Primitives';
 import { geometry, Palette, typography } from './appearance';
 
 export function Composer({
@@ -18,6 +19,10 @@ export function Composer({
   blocked,
   placeholder,
   c,
+  hasAttachment = false,
+  onAttach,
+  mode = 'demo',
+  pending = false,
 }: {
   value: string;
   editing?: boolean;
@@ -26,29 +31,59 @@ export function Composer({
   blocked: boolean;
   placeholder: string;
   c: Palette;
+  hasAttachment?: boolean;
+  onAttach?: (handle?: number) => void;
+  mode?: 'demo' | 'native';
+  pending?: boolean;
 }) {
-  const { fontScale } = useWindowDimensions();
+  const { fontScale, height: viewportHeight } = useWindowDimensions();
   const [contentHeight, setContentHeight] = useState(48);
   const minHeight = Math.max(48, Math.ceil(22 * fontScale + 24));
-  const maxHeight = Math.max(minHeight, Math.ceil(22 * fontScale * 5 + 24));
+  const maxHeight = Math.max(
+    minHeight,
+    Math.min(
+      Math.ceil(22 * fontScale * 5 + 24),
+      Math.floor(viewportHeight * 0.22),
+    ),
+  );
   const height = Math.min(
     maxHeight,
     Math.max(minHeight, value ? contentHeight : minHeight),
   );
-  const disabled = blocked || !value.trim();
+  const disabled = blocked || pending || (!value.trim() && !hasAttachment);
+  // The chat name is already in the header. Keep the empty field readable
+  // when system text scaling leaves less width between its two actions.
+  const fieldPlaceholder = blocked
+    ? fontScale >= 1.3
+      ? 'Остановлено'
+      : 'Отправка остановлена'
+    : fontScale >= 1.3
+      ? 'Сообщение'
+      : placeholder;
   return (
     <View style={styles.area}>
       <View style={[styles.composer, { backgroundColor: c.raised }]}>
+        {onAttach && !blocked && !editing && (
+          <IconButton
+            icon={Plus}
+            label="Добавить вложение"
+            color={c.muted}
+            onPress={onAttach}
+          />
+        )}
         <TextInput
-          testID="preview-composer"
-          accessibilityLabel="Текст демо-сообщения"
+          testID={mode === 'native' ? 'direct-composer' : 'preview-composer'}
+          accessibilityLabel={
+            mode === 'demo' ? 'Текст демо-сообщения' : 'Текст сообщения'
+          }
           value={value}
           onChangeText={onChange}
-          placeholder={blocked ? 'Отправка остановлена' : placeholder}
+          placeholder={fieldPlaceholder}
           placeholderTextColor={c.muted}
           editable={!blocked}
+          accessibilityState={{ disabled: blocked }}
           multiline
-          maxLength={4000}
+          maxLength={mode === 'demo' ? 4000 : 16384}
           submitBehavior="newline"
           textAlignVertical="top"
           scrollEnabled={contentHeight > maxHeight}
@@ -60,13 +95,18 @@ export function Composer({
           keyboardAppearance="dark"
         />
         <Pressable
+          testID={mode === 'native' ? 'direct-send-button' : undefined}
           onPress={onSend}
           disabled={disabled}
           accessibilityRole="button"
           accessibilityLabel={
-            editing ? 'Сохранить изменения' : 'Отправить демо-сообщение'
+            editing
+              ? 'Сохранить изменения'
+              : mode === 'demo'
+                ? 'Отправить демо-сообщение'
+                : 'Отправить сообщение'
           }
-          accessibilityState={{ disabled }}
+          accessibilityState={{ disabled, busy: pending }}
           style={({ pressed }) => [
             styles.send,
             {
@@ -79,7 +119,9 @@ export function Composer({
         </Pressable>
       </View>
       <Text style={[styles.note, { color: c.muted }]}>
-        Демо · сообщения остаются на этом устройстве
+        {mode === 'demo'
+          ? 'Демо · сообщения остаются на этом устройстве'
+          : 'Личные сообщения · Veil'}
       </Text>
     </View>
   );
@@ -100,6 +142,8 @@ const styles = StyleSheet.create({
     ...typography.body,
   },
   send: {
+    minWidth: geometry.touchTarget,
+    minHeight: geometry.touchTarget,
     width: geometry.touchTarget,
     height: geometry.touchTarget,
     borderRadius: geometry.radius,

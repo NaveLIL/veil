@@ -21,6 +21,7 @@ import {
   hasExactAuthenticatedBinding,
   type RuntimeOperation,
 } from "../../stores/runtime";
+import { usePresentation } from '../../interfacePreview/PresentationContext';
 
 interface SecureRuntimeGateProps {
   snapshot: VeilMobileRuntimeSnapshot;
@@ -51,6 +52,7 @@ export function SecureRuntimeGate({
   onDiscardPendingAccessPass,
   onRefresh,
 }: SecureRuntimeGateProps) {
+  const { c } = usePresentation();
   const pending = snapshot.pendingAccessPass;
   const suggestedOrigin = pending?.canonicalOrigin
     ?? snapshot.binding?.canonicalServerOrigin
@@ -139,7 +141,7 @@ export function SecureRuntimeGate({
     && (snapshot.connectionState === "disconnected" || snapshot.connectionState === "error");
 
   return (
-    <SafeAreaView testID="secure-runtime-gate" style={styles.root} edges={["top", "bottom"]}>
+    <SafeAreaView testID="secure-runtime-gate" style={[styles.root, {backgroundColor:c.bg}]} edges={["top", "bottom"]}>
       <KeyboardAvoidingView
         style={styles.flex}
         behavior={Platform.OS === "ios" ? "padding" : undefined}

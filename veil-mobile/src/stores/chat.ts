@@ -58,6 +58,7 @@ export interface DmConversation {
   isGroup: false;
   lastMessage?: string;
   lastAt?: string;
+  lastDirection?: DirectMessageDirection;
   color: string;
   peerUserId: string;
   peerUsername: string;
@@ -120,6 +121,12 @@ interface RuntimeDirectory {
 }
 
 interface ChatState {
+  /** Transient drafts are scoped to the current authenticated authority, never persisted. */
+  directDrafts: Record<string, string>;
+  directViewports: Record<string, { anchorId: string | null; following: boolean }>;
+  setDirectViewport: (scope: string, anchorId: string | null, following: boolean) => void;
+  setDirectDraft: (scope: string, text: string) => void;
+  consumeDirectDraft: (scope: string, submitted: string) => void;
   servers: Server[];
   channels: Channel[];
   dms: DmConversation[];
@@ -135,6 +142,7 @@ interface ChatState {
   directoryRevision: number;
   projectionRequestRevision: number;
   directSendPending: boolean;
+  directSendScope: string | null;
   directSendError: DirectTextSendErrorState | null;
   directSendRequestRevision: number;
   hydrateRuntimeDirectory: (snapshot: VeilMobileRuntimeSnapshot) => void;
@@ -386,6 +394,8 @@ function toRenderableMessages(
 }
 
 const initialChatState = {
+  directDrafts: {} as Record<string, string>,
+  directViewports: {} as ChatState['directViewports'],
   servers: [DIRECT_SERVER],
   channels: [] as Channel[],
   dms: [] as DmConversation[],
@@ -401,12 +411,29 @@ const initialChatState = {
   directoryRevision: 0,
   projectionRequestRevision: 0,
   directSendPending: false,
+  directSendScope: null,
   directSendError: null as DirectTextSendErrorState | null,
   directSendRequestRevision: 0,
 };
 
 export const useChatStore = create<ChatState>((set, get) => ({
   ...initialChatState,
+  setDirectViewport: (scope, anchorId, following) => {
+    if (directDraftScope(get()) !== scope || (anchorId !== null && !isCanonicalUuid(anchorId))) return;
+    set(state => ({ directViewports: { ...state.directViewports, [scope]: { anchorId, following } } }));
+  },
+  setDirectDraft: (scope, text) => {
+    if (directDraftScope(get()) !== scope || text.length > 16_384) return;
+    set((state) => ({ directDrafts: { ...state.directDrafts, [scope]: text } }));
+  },
+  consumeDirectDraft: (scope, submitted) => {
+    const state = get();
+    const binding = state.runtimeBinding;
+    if (!binding || state.directGeneration === null || state.directDrafts[scope] !== submitted) return;
+    const prefix = `${binding.canonicalServerOrigin}\u0000${binding.userId}\u0000${state.directGeneration}\u0000`;
+    if (!scope.startsWith(prefix) || !state.dms.some(dm => scope === prefix + dm.id)) return;
+    const drafts = { ...state.directDrafts }; delete drafts[scope]; set({ directDrafts: drafts });
+  },
 
   hydrateRuntimeDirectory: (snapshot) => {
     const directory = normalizeDirectory(snapshot);
@@ -450,6 +477,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
     const projected = projectDirectory(directory);
     set({
       dms: projected.dms,
+      directDrafts: {},
+      directViewports: {},
       selectedServerId: DM_HOME_ID,
       selectedChannelId: null,
       // Directory metadata may preload, plaintext may not. A fresh runtime
@@ -464,6 +493,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       directoryRevision: state.directoryRevision + 1,
       projectionRequestRevision: state.projectionRequestRevision + 1,
       directSendPending: false,
+      directSendScope: null,
       directSendError: null,
       directSendRequestRevision: state.directSendRequestRevision + 1,
     });
@@ -491,7 +521,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       // plaintext rows or last-message preview.
       messagesByChannel: {},
       projectionStateByConversation: {},
-      dms: state.dms.map(({ lastMessage: _lastMessage, lastAt: _lastAt, ...dm }) => dm),
+      dms: state.dms.map(({ lastMessage: _lastMessage, lastAt: _lastAt, lastDirection: _lastDirection, ...dm }) => dm),
       projectionRequestRevision: state.projectionRequestRevision + 1,
       directSendError: null,
     });
@@ -515,7 +545,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       // synchronously before crossing the async native boundary so a blocked
       // conversation cannot remain visible behind a stalled Promise.
       messagesByChannel: {},
-      dms: state.dms.map(({ lastMessage: _lastMessage, lastAt: _lastAt, ...dm }) => dm),
+      dms: state.dms.map(({ lastMessage: _lastMessage, lastAt: _lastAt, lastDirection: _lastDirection, ...dm }) => dm),
       projectionStateByConversation: { [conversationId]: "loading" },
     });
 
@@ -581,6 +611,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
             ...dm,
             lastMessage: last?.text,
             lastAt: last?.ts,
+            lastDirection: last?.direction,
           }
         : dm),
     });
@@ -607,6 +638,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     const requestRevision = state.directSendRequestRevision + 1;
     set({
       directSendPending: true,
+      directSendScope: directDraftScope(state),
       directSendError: null,
       directSendRequestRevision: requestRevision,
     });
@@ -623,6 +655,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
           && current.directMembersByConversation[conversationId] === members;
         set({
           directSendPending: false,
+          directSendScope: null,
           directSendError: stillSelectedAuthority ? failure : null,
         });
       }
@@ -635,7 +668,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         && sameBinding(current.runtimeBinding, binding)
         && current.directGeneration === directGeneration
         && current.directMembersByConversation[conversationId] === members;
-      set({ directSendPending: false, directSendError: null });
+      set({ directSendPending: false, directSendScope: null, directSendError: null });
       if (stillSelectedAuthority) {
         // Only the post-commit native projection may create the visible row.
         // Never synthesize an ID, sequence, timestamp, or optimistic plaintext.
@@ -658,4 +691,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
 export function resetChatStoreForTests(): void {
   useChatStore.setState(initialChatState);
+}
+
+export function directDraftScope(state: Pick<ChatState, 'runtimeBinding' | 'directGeneration' | 'selectedDmId'>): string | null {
+  return state.runtimeBinding && state.directGeneration !== null && state.selectedDmId
+    ? `${state.runtimeBinding.canonicalServerOrigin}\u0000${state.runtimeBinding.userId}\u0000${state.directGeneration}\u0000${state.selectedDmId}`
+    : null;
 }

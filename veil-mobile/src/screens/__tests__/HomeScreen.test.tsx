@@ -12,6 +12,10 @@ jest.mock("../../components/identity/UserAvatar", () => {
   const { View } = jest.requireActual<typeof import("react-native")>("react-native");
   return { UserAvatar: () => ReactModule.createElement(View) };
 });
+jest.mock('../../presentation/appearance/AccountAppearance', () => ({
+  useAccountAppearance: () => ({ready:true, theme:'OLED', wallpaper:null, showWallpaper:true, dim:20, blur:4}),
+  AccountAppearanceSettings: () => null,
+}));
 const metrics = { frame: { x: 0, y: 0, width: 390, height: 844 }, insets: { top: 47, right: 20, bottom: 34, left: 44 } };
 const conversationId = "30000000-0000-4000-8000-000000000001";
 const snapshot: VeilMobileRuntimeSnapshot = {
@@ -29,18 +33,20 @@ describe("HomeScreen native Direct GUI", () => {
   beforeEach(() => { resetChatStoreForTests(); useChatStore.getState().hydrateRuntimeDirectory(snapshot); });
   it("selects an authoritative Direct before navigating and exposes Contacts/Settings", () => {
     const { view, navigate } = home();
-    fireEvent.press(view.getByLabelText("Open Direct with Anya"));
+    fireEvent.press(view.getByLabelText("Anya"));
     expect(useChatStore.getState().selectedDmId).toBe(conversationId);
     expect(navigate).toHaveBeenCalledWith("Direct", { conversationId });
     fireEvent.press(view.getByLabelText("Find contacts"));
     expect(navigate).toHaveBeenCalledWith("Contacts");
-    fireEvent.press(view.getByLabelText("Open Settings"));
+    fireEvent.press(view.getByLabelText('Раскрыть свой профиль'));
+    fireEvent.press(view.getByRole('tab', {name:'Настройки'}));
+    fireEvent.press(view.getByLabelText('Аккаунт и безопасность'));
     expect(navigate).toHaveBeenCalledWith("Settings");
   });
   it("can start contact discovery from a truly empty native Home", () => {
     useChatStore.getState().hydrateRuntimeDirectory({ ...snapshot, directConversations: [] });
     const { view, navigate } = home();
-    expect(view.getByText("No Direct conversations yet")).toBeTruthy();
+    expect(view.getByText("Пока нет личных чатов")).toBeTruthy();
     fireEvent.press(view.getByLabelText("Find contacts"));
     expect(navigate).toHaveBeenCalledWith("Contacts");
     expect(view.queryByLabelText("Spaces")).toBeNull();

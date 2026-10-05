@@ -22,14 +22,18 @@ test('drafts survive navigation, are isolated by chat, and clear only on local a
   expect(s.chats[0].messages[s.chats[0].messages.length - 1]?.text).toBe(
     '  Привет  ',
   );
-  expect(createDemoSession().chats[0].messages).toHaveLength(320);
+  expect(createDemoSession().chats[0].messages.length).toBeGreaterThanOrEqual(
+    500,
+  );
 });
 
 test('long histories have stable unique IDs and grouping stops at a date boundary', () => {
   const session = createDemoSession();
   const anna = session.chats[0].messages;
   expect(session.chats[1].messages).toHaveLength(160);
-  expect(new Set(anna.map((message) => message.id)).size).toBe(320);
+  expect(anna.length).toBeGreaterThanOrEqual(500);
+  expect(anna.length).toBeLessThanOrEqual(1000);
+  expect(new Set(anna.map((message) => message.id)).size).toBe(anna.length);
   expect(new Set(anna.map((message) => message.day)).size).toBeGreaterThan(6);
   const first = {
     id: 'a',
@@ -50,9 +54,9 @@ test('incoming fixture bursts append stable messages without changing the draft 
     'Многострочный\nчерновик',
   );
   const after = receiveDemo(before, 'demo-anna', 3, '15:00');
-  expect(after.chats[0].messages.slice(0, 320)).toEqual(
-    before.chats[0].messages,
-  );
+  expect(
+    after.chats[0].messages.slice(0, before.chats[0].messages.length),
+  ).toEqual(before.chats[0].messages);
   expect(
     after.chats[0].messages
       .slice(-3)

@@ -1,38 +1,70 @@
-import React, { memo } from 'react';
-import { Platform, Pressable, StyleSheet, Text, View } from 'react-native';
+import React, { memo, useRef, useEffect } from 'react';
+import {
+  findNodeHandle,
+  Platform,
+  Pressable,
+  StyleSheet,
+  Text,
+  View,
+} from 'react-native';
 import { Check, CircleAlert, Clock3 } from 'lucide-react-native';
 import { geometry, Palette, typography } from './appearance';
-import { DemoMessage, DemoChat } from './model';
+import type {
+  TimelineMessage,
+  TimelineConversation,
+} from './conversationContract';
 import { MessageQuote } from './MessageQuote';
+import { AttachmentCard } from './AttachmentCard';
+import type { Attachment } from './attachmentContract';
+import { deliveryLabel } from './deliveryPresentation';
+import { useAccessibilityFocus } from './AccessibilityFocusBoundary';
 export const MessageRow = memo(function MessageRow({
   item,
   chat,
   grouped,
+  showStatus = true,
   c,
   onMessage,
   onRetry,
   onQuote,
   highlighted,
+  selected = false,
+  onAttachment,
+  onCancelTransfer,
+  retryEnabled = true,
+  avatar,
+  onAuthor,
+  deliveryDetail,
 }: {
-  item: DemoMessage;
-  chat: DemoChat;
+  item: TimelineMessage;
+  chat: TimelineConversation;
   grouped: boolean;
+  showStatus?: boolean;
   c: Palette;
   onQuote?: (id: string) => void;
   highlighted?: boolean;
-  onMessage: (message: DemoMessage) => void;
+  selected?: boolean;
+  onAttachment?: (asset: Attachment, handle?: number) => void;
+  onCancelTransfer?: (chatId: string, id: string) => void;
+  onMessage?: (message: TimelineMessage) => void;
   onRetry: (chatId: string, messageId: string) => void;
+  retryEnabled?: boolean;
+  avatar?: React.ReactNode;
+  onAuthor?: (handle: number) => void;
+  deliveryDetail?: React.ReactNode;
 }) {
-  const status =
-    item.delivery === 'queued'
-      ? 'В очереди'
-      : item.delivery === 'failed'
-        ? 'Не отправлено'
-        : item.delivery === 'unknown'
-          ? 'Подтверждение неизвестно'
-          : item.delivery === 'accepted'
-            ? 'Отправлено'
-            : '';
+  const authorTrigger = useRef<View>(null);
+  const messageButton = useRef<View>(null);
+  const wasSelected = useRef(selected);
+  const focus = useAccessibilityFocus();
+  useEffect(() => {
+    if (wasSelected.current && !selected) {
+      const handle = focus.remember(messageButton);
+      if (handle) focus.restore(handle);
+    }
+    wasSelected.current = selected;
+  }, [selected, focus]);
+  const status = item.own && !item.deleted ? deliveryLabel(item.delivery) : '';
   const StatusIcon =
     item.delivery === 'queued'
       ? Clock3
@@ -58,18 +90,38 @@ export const MessageRow = memo(function MessageRow({
       ]}
     >
       <View style={styles.gutter}>
-        {!grouped && (
-          <View
-            accessible={false}
-            style={[styles.avatar, { backgroundColor: chat.color }]}
-          >
-            <Text style={styles.initials}>{initials}</Text>
-          </View>
-        )}
+        {!grouped &&
+          (avatar || (
+            <View
+              accessible={false}
+              importantForAccessibility="no-hide-descendants"
+              accessibilityElementsHidden
+              style={[styles.avatar, { backgroundColor: chat.color }]}
+            >
+              <Text style={styles.initials} numberOfLines={1} adjustsFontSizeToFit>{initials}</Text>
+            </View>
+          ))}
       </View>
       <View style={styles.flex}>
         {!grouped && (
-          <View style={styles.author}>
+          <Pressable
+            ref={authorTrigger}
+            style={styles.author}
+            accessible={!!onAuthor}
+            importantForAccessibility={onAuthor ? 'auto' : 'no-hide-descendants'}
+            accessibilityRole={onAuthor ? 'button' : undefined}
+            accessibilityLabel={
+              onAuthor ? `Сведения об отправителе: ${name}` : undefined
+            }
+            onPress={
+              onAuthor
+                ? () => {
+                    const handle = findNodeHandle(authorTrigger.current);
+                    if (handle) onAuthor(handle);
+                  }
+                : undefined
+            }
+          >
             <Text
               style={[styles.name, { color: item.own ? c.accent : c.text }]}
             >
@@ -78,7 +130,7 @@ export const MessageRow = memo(function MessageRow({
             <Text style={[styles.caption, { color: c.muted }]}>
               {item.time}
             </Text>
-          </View>
+          </Pressable>
         )}
         {!!item.replyTo && (
           <MessageQuote
@@ -88,37 +140,91 @@ export const MessageRow = memo(function MessageRow({
             onPress={() => onQuote?.(item.replyTo!)}
           />
         )}
-        <Pressable
-          disabled={item.deleted}
-          accessibilityRole="button"
-          accessibilityLabel={`${name}: ${item.deleted ? 'Сообщение удалено' : item.text}. ${item.time}. ${status}`}
-          onPress={() => onMessage(item)}
-          onLongPress={() => onMessage(item)}
-          style={styles.messageTap}
-        >
-          <Text style={[styles.messageText, { color: c.text }]}>
-            {item.deleted ? 'Сообщение удалено' : item.text}
-          </Text>
-        </Pressable>
+        {(!item.attachment || !!item.text || item.deleted) && (
+          <Pressable
+            ref={messageButton}
+            disabled={item.deleted}
+            accessibilityRole={onMessage ? 'button' : 'text'}
+            accessibilityHint={
+              onMessage ? 'Открыть действия сообщения' : undefined
+            }
+            accessibilityState={{ disabled: !!item.deleted }}
+            accessibilityActions={
+              item.deleted || !onMessage
+                ? []
+                : [{ name: 'longpress', label: 'Действия сообщения' }]
+            }
+            onAccessibilityAction={(event) => {
+              if (!item.deleted && event.nativeEvent.actionName === 'longpress')
+                onMessage?.(item);
+            }}
+            accessibilityLabel={`${name}: ${item.deleted ? 'Сообщение удалено' : item.text}. ${item.time}. ${status}`}
+            onPress={onMessage ? () => onMessage(item) : undefined}
+            onLongPress={onMessage ? () => onMessage(item) : undefined}
+            style={styles.messageTap}
+          >
+            <Text style={[styles.messageText, { color: c.text }]}>
+              {item.deleted ? 'Сообщение удалено' : item.text}
+            </Text>
+          </Pressable>
+        )}
+        {item.attachment && !item.deleted && (
+          <>
+            <AttachmentCard
+              asset={item.attachment}
+              transfer={item.transfer}
+              c={c}
+              onOpen={(handle) => onAttachment?.(item.attachment!, handle)}
+              onRetry={() => onRetry(chat.id, item.id)}
+              onCancel={() => onCancelTransfer?.(chat.id, item.id)}
+            />
+            {!item.text && (
+              <Pressable
+                ref={messageButton}
+                accessibilityRole="button"
+                accessibilityLabel={`Действия с вложением: ${item.attachment.name}. ${item.time}. ${status}`}
+                onPress={() => onMessage?.(item)}
+                style={styles.retry}
+              >
+                <Text style={[styles.caption, { color: c.muted }]}>
+                  Действия
+                </Text>
+              </Pressable>
+            )}
+          </>
+        )}
         {item.edited && !item.deleted && (
           <Text style={[styles.caption, { color: c.muted }]}>изменено</Text>
         )}
-        {!!status && !item.deleted && (
-          <View style={styles.status}>
-            <StatusIcon size={13} color={c.muted} />
-            <Text style={[styles.caption, { color: c.muted }]}>{status}</Text>
-          </View>
-        )}
-        {item.delivery === 'failed' && !item.deleted && (
-          <Pressable
-            accessibilityRole="button"
-            accessibilityLabel="Повторить демо-сообщение"
-            onPress={() => onRetry(chat.id, item.id)}
-            style={styles.retry}
-          >
-            <Text style={[styles.caption, { color: c.accent }]}>Повторить</Text>
-          </Pressable>
-        )}
+        {!!status &&
+          showStatus &&
+          !item.deleted &&
+          (!item.transfer || item.transfer.phase === 'complete') && (
+            <View
+              testID={`delivery-${item.id}`}
+              accessible={false}
+              style={styles.status}
+            >
+              <StatusIcon size={13} color={c.muted} />
+              <Text style={[styles.caption, { color: c.muted }]}>{status}</Text>
+            </View>
+          )}
+        {deliveryDetail}
+        {retryEnabled &&
+          item.delivery === 'failed' &&
+          !item.deleted &&
+          !item.attachment && (
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel="Повторить демо-сообщение"
+              onPress={() => onRetry(chat.id, item.id)}
+              style={styles.retry}
+            >
+              <Text style={[styles.caption, { color: c.accent }]}>
+                Повторить
+              </Text>
+            </Pressable>
+          )}
       </View>
     </View>
   );

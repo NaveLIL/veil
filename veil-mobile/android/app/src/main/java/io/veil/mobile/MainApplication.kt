@@ -25,6 +25,7 @@ import io.veil.mobile.recovery.RecoveryActivity
 import io.veil.mobile.recovery.VeilIdentitySetupPackage
 import io.veil.mobile.runtime.VeilMobileRuntime
 import io.veil.mobile.runtime.VeilMobileRuntimePackage
+import io.veil.mobile.presentation.VeilPresentationPackage
 
 class MainApplication : Application(), ReactApplication, Application.ActivityLifecycleCallbacks {
   private val mainHandler = Handler(Looper.getMainLooper())
@@ -56,6 +57,7 @@ class MainApplication : Application(), ReactApplication, Application.ActivityLif
         object : DefaultReactNativeHost(this) {
           override fun getPackages(): List<ReactPackage> {
             val packages = PackageList(this).packages
+            packages.add(VeilPresentationPackage())
             packages.add(VeilCryptoPackage())
             packages.add(
               VeilIdentitySetupPackage(

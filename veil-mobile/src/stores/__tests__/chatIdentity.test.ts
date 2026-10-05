@@ -682,3 +682,37 @@ describe("production Direct chat store", () => {
     expect(runtime.sendDirectText).not.toHaveBeenCalled();
   });
 });
+
+test('pending send ownership remains A while B is selected; late result never injects A rows into B', async () => {
+  resetChatStoreForTests(); jest.clearAllMocks();
+  useChatStore.getState().hydrateRuntimeDirectory(snapshot());
+  runtime.getDirectMessages.mockResolvedValue(available('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa','fixture'));
+  useChatStore.getState().selectDm(anya.conversationId);
+  await useChatStore.getState().loadSelectedDirectMessages();
+  const completion=deferred<void>(); runtime.sendDirectText.mockReturnValue(completion.promise);
+  const send=useChatStore.getState().sendSelectedDirectText('test intent');
+  const owner=useChatStore.getState().directSendScope;
+  expect(owner).toContain(anya.conversationId);
+  useChatStore.getState().selectDm(mark.conversationId);
+  await useChatStore.getState().loadSelectedDirectMessages();
+  expect(useChatStore.getState().directSendScope).toBe(owner);
+  expect(await useChatStore.getState().sendSelectedDirectText('second intent')).toBe('unavailable');
+  expect(runtime.sendDirectText).toHaveBeenCalledTimes(1);
+  completion.resolve(); await send;
+  expect(useChatStore.getState().directSendScope).toBeNull();
+  expect(useChatStore.getState().selectedDmId).toBe(mark.conversationId);
+  expect(useChatStore.getState().messagesByChannel[anya.conversationId]).toBeUndefined();
+});
+
+test('account replacement clears pending ownership and ignores an old send error', async () => {
+  resetChatStoreForTests(); jest.clearAllMocks();
+  useChatStore.getState().hydrateRuntimeDirectory(snapshot());
+  runtime.getDirectMessages.mockResolvedValue(available('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa','fixture'));
+  useChatStore.getState().selectDm(anya.conversationId);
+  await useChatStore.getState().loadSelectedDirectMessages();
+  const completion=deferred<void>(); runtime.sendDirectText.mockReturnValue(completion.promise);
+  const send=useChatStore.getState().sendSelectedDirectText('test intent');
+  useChatStore.getState().hydrateRuntimeDirectory(snapshot([anya],bindingB,2));
+  completion.reject(new Error('private native detail must not be shown')); await send;
+  expect(useChatStore.getState()).toMatchObject({directSendPending:false,directSendScope:null,directSendError:null,selectedDmId:null,messagesByChannel:{}});
+});

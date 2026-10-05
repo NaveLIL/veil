@@ -29,7 +29,9 @@ type Props = {
   pickerError: string;
   chooseWallpaper: () => Promise<void>;
   onLock: () => void;
-  onScenarios: () => void;
+  onScenarios?: () => void;
+  ownershipLabel?: string;
+  lockLabel?: string;
   onAbout: () => void;
 };
 export function AppearanceSettings({
@@ -53,6 +55,8 @@ export function AppearanceSettings({
   onLock,
   onScenarios,
   onAbout,
+  ownershipLabel = 'Настройки этого макета',
+  lockLabel = 'Посмотреть экран блокировки',
 }: Props) {
   return (
     <ScrollView contentContainerStyle={styles.settingsContent}>
@@ -60,7 +64,7 @@ export function AppearanceSettings({
         Внешний вид
       </Label>
       <Label color={c.muted} style={styles.caption}>
-        Настройки этого макета
+        {ownershipLabel}
       </Label>
       <Label color={c.muted} style={styles.sectionLabel}>
         ЦВЕТОВАЯ СХЕМА
@@ -166,7 +170,8 @@ export function AppearanceSettings({
       />
       <Label color={c.muted} style={styles.caption}>
         Картинка выбирается на устройстве. Острова сохраняют контраст при любом
-        фоне. Настройки пока живут в памяти макета.
+        фоне. Оформление сохраняется локально; сообщения и черновики — только в
+        памяти.
       </Label>
       <Label color={c.muted} style={styles.sectionLabel}>
         ДВИЖЕНИЕ
@@ -182,9 +187,9 @@ export function AppearanceSettings({
           Анимации уже уменьшены настройкой Android.
         </Label>
       )}
-      <Button label="Посмотреть экран блокировки" onPress={onLock} c={c} />
-      <Button label="Сценарии сообщений" onPress={onScenarios} c={c} />
-      <Button label="О дизайн-макете" onPress={onAbout} c={c} />
+      <Button label={lockLabel} onPress={onLock} c={c} />
+      {onScenarios && <Button label="Сценарии сообщений" onPress={onScenarios} c={c} />}
+      <Button label={onScenarios ? 'О дизайн-макете' : 'О Veil'} onPress={onAbout} c={c} />
     </ScrollView>
   );
 }

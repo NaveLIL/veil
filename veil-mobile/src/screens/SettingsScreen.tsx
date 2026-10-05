@@ -30,6 +30,7 @@ import { colors, radii, spacing } from "../lib/theme";
 import { useRuntimeGateStore } from "../stores/runtime";
 import { useMobileSettingsStore } from "../stores/settings";
 import { ROCKET_CHAT_MIT_NOTICE } from "../presentation/rocketChat/notice";
+import { AccountAppearanceSettings } from '../presentation/appearance/AccountAppearance';
 import type {
   AuthenticatedStackParamList,
   SettingsSectionKey,
@@ -173,7 +174,9 @@ export function SettingsDetailScreen({ navigation, route }: DetailProps) {
         ]}
         showsVerticalScrollIndicator={false}
       >
-        {definition.groups.map((group) => (
+        {route.params.section === 'appearance' ? <AccountAppearanceSettings
+          onLock={() => navigation.navigate('SettingsDetail', {section:'privacy'})}
+          onAbout={() => navigation.navigate('SettingsDetail', {section:'about'})} /> : definition.groups.map((group) => (
           <Island key={group.title} variant="solid" glow={false} padding={spacing.md}>
             <Text accessibilityRole="header" style={styles.groupTitle}>{group.title}</Text>
             {group.rows.map((row, index) => (

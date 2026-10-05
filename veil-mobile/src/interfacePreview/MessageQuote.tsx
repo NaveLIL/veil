@@ -2,7 +2,7 @@ import React from 'react';
 import { Pressable, StyleSheet, Text, View } from 'react-native';
 import { Reply, X } from 'lucide-react-native';
 import { geometry, Palette, typography } from './appearance';
-import { DemoChat } from './model';
+import type { TimelineConversation } from './conversationContract';
 import { IconButton } from './Primitives';
 
 export function MessageQuote({
@@ -11,12 +11,14 @@ export function MessageQuote({
   c,
   onPress,
   onDismiss,
+  compact = false,
 }: {
-  chat: DemoChat;
+  chat: TimelineConversation;
   id: string;
   c: Palette;
   onPress: () => void;
   onDismiss?: () => void;
+  compact?: boolean;
 }) {
   const original = chat.messages.find((m) => m.id === id);
   const name = original?.own ? 'Вы' : (original?.author ?? chat.name);
@@ -24,7 +26,7 @@ export function MessageQuote({
     ? 'Оригинал недоступен'
     : original.deleted
       ? 'Сообщение удалено'
-      : original.text;
+      : original.text || original.attachment?.name || 'Вложение';
   return (
     <View
       style={[
@@ -40,14 +42,17 @@ export function MessageQuote({
         accessibilityRole="button"
         accessibilityLabel={`Перейти к оригиналу: ${name}. ${text}`}
         onPress={onPress}
-        style={styles.link}
+        style={[styles.link, compact && styles.compactLink]}
       >
-        <Reply size={16} color={c.accent} />
+        {!compact && <Reply size={16} color={c.accent} />}
         <View style={styles.flex}>
           <Text numberOfLines={1} style={[styles.name, { color: c.accent }]}>
             {name}
           </Text>
-          <Text numberOfLines={2} style={[styles.text, { color: c.muted }]}>
+          <Text
+            numberOfLines={compact ? 1 : 2}
+            style={[styles.text, { color: c.muted }]}
+          >
             {text}
           </Text>
         </View>
@@ -82,5 +87,6 @@ const styles = StyleSheet.create({
     gap: 8,
   },
   name: { ...typography.name, fontWeight: '600' },
+  compactLink: { padding: 4 },
   text: { ...typography.caption },
 });

@@ -18,6 +18,8 @@ import {
 import { ArrowDown } from 'lucide-react-native';
 import { geometry, Palette, typography } from './appearance';
 import { MessageRow } from './MessageRow';
+import { showDelivery } from './deliveryPresentation';
+import { Attachment } from './attachments';
 import { useQuoteNavigation } from './useQuoteNavigation';
 import { QuoteJump } from './useMessageInteractions';
 import { canGroup, DemoChat, DemoMessage, demoToday } from './model';
@@ -40,6 +42,8 @@ type Props = {
   onNotice?: (text: string) => void;
   onMessage: (message: DemoMessage) => void;
   onRetry: (chatId: string, messageId: string) => void;
+  onAttachment?: (asset: Attachment, handle?: number) => void;
+  onCancelTransfer?: (chatId: string, id: string) => void;
   onRead: (chatId: string) => void;
 };
 /** Retain only visited fixture lists: switching chats never guesses a variable-height offset. */
@@ -91,8 +95,15 @@ const HistoryPage = memo(function HistoryPage({
   onQuote,
   selectedMessageId,
   onNotice,
+  onAttachment,
+  onCancelTransfer,
 }: PageProps) {
   const list = useRef<FlatList<DemoMessage>>(null);
+  const unreadStart = useRef(
+    chat.unread > 0
+      ? chat.messages.filter((m) => !m.own).slice(-chat.unread)[0]?.id
+      : undefined,
+  );
   const [firstLoadedId, setFirstLoadedId] = useState(
     () =>
       chat.messages[Math.max(0, chat.messages.length - historyPageSize)]?.id,
@@ -216,7 +227,7 @@ const HistoryPage = memo(function HistoryPage({
         keyExtractor={(message) => message.id}
         style={styles.flex}
         contentContainerStyle={styles.content}
-        initialNumToRender={12}
+        initialNumToRender={historyPageSize}
         maxToRenderPerBatch={10}
         windowSize={7}
         removeClippedSubviews={false}
@@ -298,14 +309,30 @@ const HistoryPage = memo(function HistoryPage({
                   <View style={[styles.line, { backgroundColor: c.line }]} />
                 </View>
               )}
+              {item.id === unreadStart.current && (
+                <View style={styles.date}>
+                  <View style={[styles.line, { backgroundColor: c.accent }]} />
+                  <Text style={[styles.caption, { color: c.accent }]}>
+                    Новые сообщения · демо
+                  </Text>
+                  <View style={[styles.line, { backgroundColor: c.accent }]} />
+                </View>
+              )}
               <MessageRow
                 item={item}
+                selected={item.id === selectedMessageId}
                 chat={chat}
                 grouped={canGroup(previous, item)}
+                showStatus={showDelivery(
+                  item,
+                  chat.messages[offset + index + 1],
+                )}
                 c={c}
                 onMessage={onMessage}
                 onRetry={onRetry}
                 onQuote={onQuote}
+                onAttachment={onAttachment}
+                onCancelTransfer={onCancelTransfer}
                 highlighted={
                   item.id === quoteNavigation.highlight ||
                   item.id === selectedMessageId

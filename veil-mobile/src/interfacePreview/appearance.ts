@@ -34,6 +34,7 @@ export const palettes = {
     muted: '#C0C0C8',
     accent: '#7C6BF5',
     tint: '#39324B',
+    danger: '#E6A0A8',
   },
   Midnight: {
     bg: '#191E2C',
@@ -44,6 +45,7 @@ export const palettes = {
     muted: '#C0C0C8',
     accent: '#8B7CFF',
     tint: '#302B49',
+    danger: '#E6A0A8',
   },
   Ocean: {
     bg: '#142536',
@@ -54,6 +56,7 @@ export const palettes = {
     muted: '#C0C0C8',
     accent: '#4AA8FF',
     tint: '#204461',
+    danger: '#E6A0A8',
   },
   Forest: {
     bg: '#172720',
@@ -64,6 +67,7 @@ export const palettes = {
     muted: '#C0C0C8',
     accent: '#4FD1A1',
     tint: '#264B3D',
+    danger: '#E6A0A8',
   },
   OLED: {
     bg: '#101010',
@@ -74,6 +78,7 @@ export const palettes = {
     muted: '#C0C0C8',
     accent: '#A78BFA',
     tint: '#2B223A',
+    danger: '#E6A0A8',
   },
 };
 export type ThemeName = keyof typeof palettes;

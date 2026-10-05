@@ -8,7 +8,8 @@ import {
   View,
 } from 'react-native';
 import { Search } from 'lucide-react-native';
-import { DemoChat } from './model';
+import type { TimelineConversation } from './conversationContract';
+import { useAccessibilityFocus } from './AccessibilityFocusBoundary';
 import { geometry, Palette, typography } from './appearance';
 type IconComponent = typeof Search;
 export function Label({
@@ -26,17 +27,20 @@ export function IconButton({
 }: {
   icon: IconComponent;
   label: string;
-  onPress: () => void;
+  onPress: (handle?: number) => void;
   color: string;
 }) {
+  const trigger = React.useRef<View>(null);
+  const focus = useAccessibilityFocus();
   return (
     <Pressable
-      onPress={onPress}
+      ref={trigger}
+      onPress={() => onPress(focus.remember(trigger))}
       accessibilityRole="button"
       accessibilityLabel={label}
       style={({ pressed }) => [styles.iconButton, pressed && styles.pressed]}
     >
-      <Icon size={22} color={color} strokeWidth={1.8} />
+      <Icon accessible={false} size={22} color={color} strokeWidth={1.8} />
     </Pressable>
   );
 }
@@ -44,12 +48,14 @@ export function Avatar({
   chat,
   size = 42,
 }: {
-  chat: Pick<DemoChat, 'initials' | 'color'>;
+  chat: Pick<TimelineConversation, 'initials' | 'color'>;
   size?: number;
 }) {
   return (
     <View
       accessible={false}
+      importantForAccessibility="no-hide-descendants"
+      accessibilityElementsHidden
       style={[
         styles.avatar,
         {
@@ -60,7 +66,7 @@ export function Avatar({
         },
       ]}
     >
-      <Label color="#FFFFFF" style={styles.avatarText}>
+      <Label color="#FFFFFF" style={styles.avatarText} allowFontScaling={false}>
         {chat.initials}
       </Label>
     </View>
@@ -68,17 +74,24 @@ export function Avatar({
 }
 export function Button({
   label,
+  accessibilityLabel = label,
   onPress,
   c,
+  disabled = false,
 }: {
   label: string;
+  accessibilityLabel?: string;
   onPress: () => void;
   c: Palette;
+  disabled?: boolean;
 }) {
   return (
     <Pressable
       accessibilityRole="button"
+      disabled={disabled}
+      accessibilityState={{ disabled }}
       onPress={onPress}
+      accessibilityLabel={accessibilityLabel}
       style={({ pressed }) => [
         styles.button,
         { backgroundColor: c.raised },
@@ -140,8 +153,18 @@ export function Stepper({
           {value}
         </Label>
       </View>
-      <Button label="−" onPress={onMinus} c={c} />
-      <Button label="+" onPress={onPlus} c={c} />
+      <Button
+        label="−"
+        accessibilityLabel={`Уменьшить: ${label}, сейчас ${value}`}
+        onPress={onMinus}
+        c={c}
+      />
+      <Button
+        label="+"
+        accessibilityLabel={`Увеличить: ${label}, сейчас ${value}`}
+        onPress={onPlus}
+        c={c}
+      />
     </View>
   );
 }
