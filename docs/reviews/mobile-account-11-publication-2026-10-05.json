@@ -1,0 +1,71 @@
+{
+  "repository": "NaveLIL/veil",
+  "branch": "ce/mobile-account-11-20261005",
+  "commit": "02dea964ebc1de44d5c91d47d0e944d47d064a59",
+  "tag": "mobile-test-20261005-11",
+  "htmlUrl": "https://github.com/NaveLIL/veil/releases/tag/mobile-test-20261005-11",
+  "prerelease": true,
+  "assets": [
+    {
+      "name": "manifest.json",
+      "size": 786,
+      "digest": "sha256:2627d0e7d1900b3dfdc59ee009d40d0d26aed05c882f8e4e58839acd66b0a182",
+      "url": "https://github.com/NaveLIL/veil/releases/download/mobile-test-20261005-11/manifest.json"
+    },
+    {
+      "name": "SHA256SUMS.txt",
+      "size": 335,
+      "digest": "sha256:3fa5272b37ecd49e4689366ed314a0811c0df42870ceb33432daf5bb657e676b",
+      "url": "https://github.com/NaveLIL/veil/releases/download/mobile-test-20261005-11/SHA256SUMS.txt"
+    },
+    {
+      "name": "source.zip",
+      "size": 7008470,
+      "digest": "sha256:8f3e630ddeaeb010981b9a00d908a14725ec5bae46787a4b27ceba7360fc15d4",
+      "url": "https://github.com/NaveLIL/veil/releases/download/mobile-test-20261005-11/source.zip"
+    },
+    {
+      "name": "Veil-Account-Tester-11.apk",
+      "size": 98128706,
+      "digest": "sha256:9763aeed4d4d24750231cd52d23d24138a93253ccb1136b3b6e629ce7175e19b",
+      "url": "https://github.com/NaveLIL/veil/releases/download/mobile-test-20261005-11/Veil-Account-Tester-11.apk"
+    },
+    {
+      "name": "Veil-Design-11.apk",
+      "size": 39504574,
+      "digest": "sha256:45976d0ed6be6f23028fbf31c595829dda815b4007579ee38fb898e533c64a7c",
+      "url": "https://github.com/NaveLIL/veil/releases/download/mobile-test-20261005-11/Veil-Design-11.apk"
+    }
+  ],
+  "embeddedBuildBaseCommit": "8bbdf3ff154d9b7182be6a1ce295550be9c93b53",
+  "sourceSnapshot": "03884ecdf168945815f66ff5b1793e27b5629f8c61a53b291e33fe19c9a6b6d5",
+  "authenticatedE2E": false,
+  "finalBuildDeviceVerified": false,
+  "publicDownloadVerification": [
+    {
+      "name": "Veil-Design-11.apk",
+      "url": "https://github.com/NaveLIL/veil/releases/download/mobile-test-20261005-11/Veil-Design-11.apk",
+      "httpStatus": 200,
+      "bytes": 39504574,
+      "digest": "sha256:45976d0ed6be6f23028fbf31c595829dda815b4007579ee38fb898e533c64a7c",
+      "withoutAuthentication": true
+    },
+    {
+      "name": "Veil-Account-Tester-11.apk",
+      "url": "https://github.com/NaveLIL/veil/releases/download/mobile-test-20261005-11/Veil-Account-Tester-11.apk",
+      "httpStatus": 200,
+      "bytes": 98128706,
+      "digest": "sha256:9763aeed4d4d24750231cd52d23d24138a93253ccb1136b3b6e629ce7175e19b",
+      "withoutAuthentication": true
+    }
+  ],
+  "defaultBranchDependencyWarning": {
+    "source": "GitHub git-push server message",
+    "branch": "master",
+    "total": 45,
+    "high": 29,
+    "moderate": 13,
+    "low": 3,
+    "independentValidation": false
+  }
+}

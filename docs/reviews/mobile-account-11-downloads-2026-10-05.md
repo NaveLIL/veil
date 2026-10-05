@@ -13,9 +13,14 @@ APKs are release assets, rather than large binaries stored in Git history.
 - [Frozen corresponding source companion](https://github.com/NaveLIL/veil/releases/download/mobile-test-20261005-11/source.zip).
 - [SHA256SUMS](https://github.com/NaveLIL/veil/releases/download/mobile-test-20261005-11/SHA256SUMS.txt).
 
-These URLs become downloadable once all assets pass checksum verification and
-the draft is published as a prerelease. Publication verification is recorded
-separately; this document does not establish device or authenticated E2E results.
+The prerelease is published. Both public APK URLs returned HTTP 200 without
+authentication; their complete downloaded bytes matched the sizes and SHA-256
+digests of the verified local APKs. All five uploaded assets also matched
+GitHub's reported checksums. See the [publication receipt](mobile-account-11-publication-2026-10-05.json).
+This establishes distribution, not device or authenticated E2E results.
+The release tag targets code/distribution commit
+`02dea964ebc1de44d5c91d47d0e944d47d064a59`; a later documentation-only commit on
+the same branch records the successful publication.
 
 | APK | Package | SHA-256 |
 |---|---|---|
@@ -49,6 +54,14 @@ Keep existing account data when installing. The first phone's older account
 tester has a different signing identity and cannot accept this APK as an
 in-place update; do not erase it to force installation. The second phone's
 tester certificate matched and permits a normal data-preserving update.
+
+## Hosting observations
+
+During the branch push, GitHub reported 45 dependency alerts on the existing
+default `master` branch: 29 high, 13 moderate and 3 low. These are the hosting
+service's reported counts, not independently validated exploit findings.
+They were not introduced or remediated by the APK publication. No broad
+dependency upgrade was performed in this frontend/distribution session.
 
 See the [full verification report](mobile-account-11-verification-2026-10-05.md),
 [complete-scope audit](mobile-account-11-completion-audit-2026-10-05.md),
