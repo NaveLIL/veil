@@ -8,6 +8,7 @@ const edges = new Map();
 function dependencies(relative) {
   if (edges.has(relative)) return edges.get(relative);
   const text = fs.readFileSync(path.join(root, relative), 'utf8');
+  if (relative.endsWith('.json')) { JSON.parse(text); edges.set(relative, []); return []; }
   const emitted = ts.transpileModule(text, { compilerOptions: { module: ts.ModuleKind.ESNext, jsx: ts.JsxEmit.Preserve } }).outputText;
   const ast = ts.createSourceFile(relative, emitted, ts.ScriptTarget.Latest, true);
   const dependencies = [];
@@ -16,7 +17,7 @@ function dependencies(relative) {
     const name = node.moduleSpecifier?.text;
     if (!name?.startsWith('.')) continue;
     const base = path.resolve(root, path.dirname(relative), name);
-    const file = ['.ts', '.tsx'].map(ext => base + ext).find(file => fs.existsSync(file));
+    const file = ['.ts', '.tsx', ''].map(ext => base + ext).find(file => fs.existsSync(file) && fs.statSync(file).isFile());
     if (!file) throw Error(`Unresolved source ${relative}: ${name}`);
     dependencies.push(path.relative(root, file).replaceAll('\\', '/'));
   }
@@ -36,12 +37,18 @@ function closure(entry, forbid = () => false) {
   return [...visited];
 }
 verifyPreviewSource();
-const presentation = ['KeyboardFrame.tsx', 'ConversationSurface.tsx', 'MessageRow.tsx', 'MessageActionsPanel.tsx', 'ChatDeck.tsx', 'DockItem.tsx', 'DirectoryRow.tsx', 'ProfileEntry.tsx', 'ProfilePanelFrame.tsx', 'WallpaperSurface.tsx', 'AppearanceSettings.tsx', 'PresentationContext.tsx', 'VeilState.tsx', 'useAppearanceState.ts'].flatMap(file => closure(`src/interfacePreview/${file}`, file =>
+const presentation = ['useVeilStyles.ts', 'RouteSurface.tsx', 'KeyboardFrame.tsx', 'ConversationSurface.tsx', 'MessageRow.tsx', 'MessageActionsPanel.tsx', 'ChatDeck.tsx', 'DockItem.tsx', 'DirectoryRow.tsx', 'ProfileEntry.tsx', 'ProfilePanelFrame.tsx', 'WallpaperSurface.tsx', 'AppearanceSettings.tsx', 'PresentationContext.tsx', 'VeilState.tsx', 'useAppearanceState.ts'].flatMap(file => closure(`src/interfacePreview/${file}`, file =>
   /\/(native|stores|presenters)\//.test(file) || /\/(model|attachments|useAttachmentTransfers|DesignConversation|.*Bridge|useAppearancePreferences)\.tsx?$/.test(file)));
 const demo = closure('design-preview-index.ts');
 const native = closure('src/components/layout/NativeDesignTimeline.tsx', file =>
   /\/interfacePreview\/(model|historyFixtures|attachments|DesignApp|DesignConversation|NavigationPanel|useAttachmentTransfers|.*Bridge)\.tsx?$/.test(file));
 closure('src/screens/HomeScreen.tsx', file => /\/interfacePreview\/(model|historyFixtures|DesignApp|DesignConversation|NavigationPanel|UserProfile|.*Bridge)\.tsx?$/.test(file));
+// User routes share Veil presentation; legal attribution is deliberately allowed.
+for (const route of ['HomeScreen', 'ContactSearchScreen', 'DirectConversationScreen', 'SettingsScreen', 'OnboardingScreen']) {
+  closure(`src/screens/${route}.tsx`, file =>
+    /\/presentation\/rocketChat\/(?!notice\.)/.test(file) || /\/components\/layout\/MobileHeader\.tsx?$/.test(file)
+    || /\/interfacePreview\/(model|historyFixtures|DesignApp|DesignConversation|NavigationPanel|UserProfile|.*Bridge)\.tsx?$/.test(file));
+}
 const coordinator = fs.readFileSync(path.join(root, 'src/interfacePreview/DesignApp.tsx'), 'utf8');
 if (/from ['"].*\/(ConversationHistory|MessageRow|useMessageInteractions|attachments|useAttachmentTransfers|preferencesBridge|appearanceBridge)['"]/.test(coordinator)) throw Error('DesignApp owns feature implementation details again');
 // The canonical contract also exports the real capability flags used by the native adapter.

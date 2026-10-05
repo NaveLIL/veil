@@ -1,80 +1,88 @@
 /**
  * Source adaptation: Rocket.Chat.ReactNative 4.77.0 / 0a7df3d82a2e9d20e37f9ec5651fd3c74b98ab36.
- * app/views/NewMessageView/index.tsx, HeaderNewMessage.tsx, containers/SearchBox/index.tsx.
  * Copyright (c) 2015-2018 Rocket.Chat Technologies Corp. MIT.
- * Changes: exact-username native controller, Veil runtime gate/header, explicit search;
- * remove local DB/spotlight, Rocket create/navigation/VoIP and renderer HTTP.
+ * Exact native search retained; presentation migrated to shared Veil.
  * See third-party/rocket-chat-reactnative/SOURCE_INVENTORY.md.
  */
-import React from "react";
-import { ActivityIndicator, FlatList, KeyboardAvoidingView, Platform, Pressable, StyleSheet, Text, TextInput, View } from "react-native";
-import type { NativeStackScreenProps } from "@react-navigation/native-stack";
-import { Search } from "lucide-react-native";
-import { useSafeAreaInsets } from "react-native-safe-area-context";
-import { MobileHeader } from "../components/navigation/MobileHeader";
-import { UserAvatar } from "../components/identity/UserAvatar";
-import { PublicFailureCard } from "../components/runtime/PublicFailureCard";
-import { ContactItem } from "../presentation/rocketChat/ContactItem";
-import { rocketColors } from "../presentation/rocketChat/theme";
-import { useContactsPresenter } from "../presenters/contacts";
-import type { AuthenticatedStackParamList } from "./ChatListScreen";
+import React, { useCallback, useEffect, useRef } from 'react';
+import { FlatList, Keyboard, Pressable, StyleSheet, Text, TextInput, View } from 'react-native';
+import type { NativeStackScreenProps } from '@react-navigation/native-stack';
+import { Search, ChevronRight } from 'lucide-react-native';
+import { AccountRouteSurface } from '../presentation/account/AccountRouteSurface';
+import { KeyboardFrame } from '../interfacePreview/KeyboardFrame';
+import { usePresentation } from '../interfacePreview/PresentationContext';
+import { geometry, typography } from '../interfacePreview/appearance';
+import { VeilState } from '../interfacePreview/VeilState';
+import { UserAvatar } from '../components/identity/UserAvatar';
+import { contactsCopy as copy } from '../presentation/copy/contacts';
+import { useContactsPresenter } from '../presenters/contacts';
+import { useAccountNavigation } from '../presentation/account/useAccountNavigation';
+import { useChatStore } from '../stores/chat';
+import type { AuthenticatedStackParamList } from '../presentation/account/routes';
 
-type Props = NativeStackScreenProps<AuthenticatedStackParamList, "Contacts">;
-
-export default function ContactSearchScreen({ navigation }: Props) {
-  const insets = useSafeAreaInsets();
-  const p = useContactsPresenter((conversationId) => navigation.replace("Direct", { conversationId }));
-  const busy = p.status === "searching" || p.status === "creating";
-  return (
-    <KeyboardAvoidingView testID="contact-search-screen" style={styles.root} behavior={Platform.OS === "ios" ? "padding" : undefined}>
-      <MobileHeader title="New Direct" subtitle="Find someone by username"
-        backAction={{ label: "Home", onPress: () => navigation.goBack() }} />
-      <View style={[styles.content, { paddingLeft: insets.left, paddingRight: insets.right }]}>
-        <View style={styles.inputContainer}>
-          <TextInput testID="contact-username" style={styles.input} value={p.query} onChangeText={p.setQuery}
-            accessibilityLabel="Exact username" placeholder="Exact username" placeholderTextColor={rocketColors.fontAnnotation}
-            autoCapitalize="none" autoCorrect={false} returnKeyType="search" underlineColorAndroid="transparent"
-            editable={p.available} onSubmitEditing={() => void p.search()} />
-          <Pressable testID="contact-search-submit" accessibilityRole="button" accessibilityLabel="Search username"
-            accessibilityState={{ disabled: !p.available || !p.query.trim() || busy, busy }}
-            disabled={!p.available || !p.query.trim() || busy} onPress={() => void p.search()} style={styles.searchButton}>
-            <Search size={22} color={rocketColors.strokeHighlight} />
-          </Pressable>
-        </View>
-        <Text style={styles.hint}>Use the exact username on this Node.</Text>
-        <FlatList
-          data={p.result ? [p.result] : []}
-          testID="contact-results-list"
-          keyExtractor={(contact) => contact.userId}
-          contentContainerStyle={{ flexGrow: 1, paddingBottom: insets.bottom + 12 }}
-          keyboardShouldPersistTaps="always"
-          renderItem={({ item: contact }) => <ContactItem name={contact.username} disabled={busy}
-            onPress={() => void p.create()} avatar={<UserAvatar canonicalServerOrigin={p.binding?.canonicalServerOrigin ?? ""}
-              userId={contact.userId} technicalUsername={contact.username} size={30} />} />}
-          ListFooterComponent={busy ? <View testID="contact-operation-pending" style={styles.status}>
-            <ActivityIndicator color={rocketColors.strokeHighlight} /><Text style={styles.statusText}>
-              {p.status === "creating" ? "Opening Direct..." : "Searching..."}</Text>
-          </View> : null}
-          ListEmptyComponent={!busy ? <View style={styles.status}>
-            {p.status === "error" ? <View testID="contact-public-error"><PublicFailureCard code="VEIL-RUNTIME-999" compact /></View>
-              : <Text testID={p.status === "not_found" ? "contact-not-found" : "contact-search-empty"} style={styles.statusText}>
-                {p.status === "not_found" ? "No user found with that exact username." : "Enter a username to find someone."}
-              </Text>}
-          </View> : null}
-        />
+export default function ContactSearchScreen({ navigation }: NativeStackScreenProps<AuthenticatedStackParamList, 'Contacts'>) {
+  const { c } = usePresentation();
+  const opened = useRef<{ id: string; peer: string; origin: string; userId: string; generation: number } | null>(null);
+  const opening = useRef(false);
+  useEffect(() => navigation.addListener?.('focus', () => { opening.current = false; }), [navigation]);
+  const navigateToDirect = useCallback((id: string) => {
+    if (opening.current || (navigation.isFocused && !navigation.isFocused())) return;
+    opening.current = true;
+    Keyboard.dismiss(); navigation.push('Direct', { conversationId: id });
+  }, [navigation]);
+  const select = useAccountNavigation(navigateToDirect);
+  const p = useContactsPresenter(id => {
+    const s = useChatStore.getState(), dm = s.dms.find(item => item.id === id);
+    if (s.runtimeBinding && s.directGeneration !== null && dm) opened.current = { id, peer: dm.avatarIdentity.userId,
+      origin: s.runtimeBinding.canonicalServerOrigin, userId: s.runtimeBinding.userId, generation: s.directGeneration };
+    navigateToDirect(id);
+  });
+  const busy = p.status === 'searching' || p.status === 'creating';
+  const openResult = () => {
+    if (opening.current || busy || (navigation.isFocused && !navigation.isFocused())) return;
+    const s = useChatStore.getState(), last = opened.current;
+    if (last && last.peer === p.result?.userId && last.origin === s.runtimeBinding?.canonicalServerOrigin
+      && last.userId === s.runtimeBinding?.userId && last.generation === s.directGeneration
+      && s.dms.some(dm => dm.id === last.id && dm.avatarIdentity.userId === last.peer)) select(last.id);
+    else void p.create();
+  };
+  return <KeyboardFrame><AccountRouteSurface testID="contact-search-screen" title={copy.title} subtitle={copy.subtitle} onBack={() => navigation.goBack()}>
+    <View style={styles.content}>
+      <View style={[styles.search, { backgroundColor: c.surface, borderColor: c.line }]}>
+        <TextInput testID="contact-username" value={p.query} onChangeText={p.setQuery} accessibilityLabel={copy.username}
+          placeholder={copy.username} placeholderTextColor={c.muted} autoCapitalize="none" autoCorrect={false}
+          returnKeyType="search" editable={p.available} onSubmitEditing={() => void p.search()}
+          style={[styles.input, { color: c.text }]} />
+        <Pressable testID="contact-search-submit" accessibilityRole="button" accessibilityLabel={copy.submit}
+          accessibilityState={{ disabled: !p.available || !p.query.trim() || busy, busy }}
+          disabled={!p.available || !p.query.trim() || busy} onPress={() => void p.search()} style={styles.submit}>
+          <Search accessible={false} size={22} color={c.accent} />
+        </Pressable>
       </View>
-    </KeyboardAvoidingView>
-  );
+      <Text style={[styles.hint, { color: c.muted }]}>{copy.hint}</Text>
+      <FlatList testID="contact-results-list" data={p.result && !busy && p.available ? [p.result] : []}
+        keyExtractor={contact => contact.userId} keyboardShouldPersistTaps="handled" keyboardDismissMode="on-drag"
+        contentContainerStyle={styles.results} renderItem={({ item }) => <Pressable accessibilityRole="button"
+          accessibilityLabel={copy.open(item.username)} disabled={busy} accessibilityState={{ disabled: busy }}
+          onPress={openResult} style={({ pressed }) => [styles.result, { backgroundColor: c.surface }, pressed && { opacity: 0.7 }]}>
+          {p.binding && <UserAvatar canonicalServerOrigin={p.binding.canonicalServerOrigin} userId={item.userId} technicalUsername={item.username} size={44} />}
+          <View style={styles.meta}><Text style={[styles.name, { color: c.text }]}>{item.username}</Text>
+            <Text style={[styles.hint, { color: c.muted }]}>Личный чат · проверка личности отдельно</Text></View>
+          <ChevronRight accessible={false} color={c.muted} size={20} />
+        </Pressable>}
+        ListEmptyComponent={<VeilState c={c} kind={!p.available ? 'unavailable' : busy ? 'loading' : p.status === 'error' ? 'error' : 'empty'}
+          testID={!p.available ? 'contact-unavailable' : busy ? 'contact-operation-pending' : p.status === 'error' ? 'contact-public-error' : p.status === 'not_found' ? 'contact-not-found' : 'contact-search-empty'}
+          title={!p.available ? copy.unavailable : p.status === 'creating' ? copy.creating : busy ? copy.loading : p.status === 'error' ? copy.error : p.status === 'not_found' ? copy.missing : copy.empty}
+          detail={!p.available ? copy.unavailableDetail : p.status === 'creating' ? copy.creatingDetail : busy ? copy.loadingDetail : p.status === 'error' ? copy.errorDetail : p.status === 'not_found' ? copy.missingDetail : copy.emptyDetail}
+          action={p.available && p.status === 'error' && p.query.trim() ? { label: copy.retry, onPress: () => void p.search() } : undefined} />} />
+    </View>
+  </AccountRouteSurface></KeyboardFrame>;
 }
-
 const styles = StyleSheet.create({
-  root: { flex: 1, backgroundColor: rocketColors.surfaceRoom },
-  content: { flex: 1 },
-  inputContainer: { marginHorizontal: 12, marginTop: 16, marginBottom: 16, flexDirection: "row",
-    alignItems: "center", borderWidth: 1, borderColor: rocketColors.strokeLight, borderRadius: 4 },
-  input: { flex: 1, minHeight: 48, paddingHorizontal: 12, color: rocketColors.fontDefault, fontSize: 16 },
-  searchButton: { minWidth: 48, minHeight: 48, justifyContent: "center", alignItems: "center" },
-  hint: { color: rocketColors.fontSecondaryInfo, fontSize: 13, marginHorizontal: 12, marginBottom: 16 },
-  status: { padding: 24, alignItems: "center", gap: 12 },
-  statusText: { color: rocketColors.fontSecondaryInfo, fontSize: 16, lineHeight: 22, textAlign: "center" },
+  content: { flex: 1, padding: 12, gap: 12 }, search: { flexDirection: 'row', alignItems: 'center', borderRadius: geometry.radius, borderWidth: geometry.borderWidth },
+  input: { ...typography.body, flex: 1, minWidth: 0, minHeight: geometry.touchTarget, padding: 12 },
+  submit: { minWidth: geometry.touchTarget, minHeight: geometry.touchTarget, alignItems: 'center', justifyContent: 'center' },
+  hint: { ...typography.caption }, results: { flexGrow: 1, paddingBottom: 24 },
+  result: { minHeight: geometry.touchTarget, padding: 12, borderRadius: geometry.radius, flexDirection: 'row', gap: 12, alignItems: 'center' },
+  meta: { flex: 1, minWidth: 0 }, name: { ...typography.body, fontWeight: '600' },
 });

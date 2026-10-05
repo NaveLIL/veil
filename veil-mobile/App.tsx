@@ -1,9 +1,7 @@
 import React, { useEffect, useState } from "react";
 import {
-  Pressable,
   ScrollView,
   StyleSheet,
-  Text,
   View,
 } from "react-native";
 import { GestureHandlerRootView } from "react-native-gesture-handler";
@@ -37,6 +35,7 @@ import { ModalBlurBoundary } from './src/interfacePreview/LiveBlur';
 import { VeilState } from './src/interfacePreview/VeilState';
 import { usePresentation } from './src/interfacePreview/PresentationContext';
 import { AccessibilityFocusBoundary } from './src/interfacePreview/AccessibilityFocusBoundary';
+import { Button } from './src/interfacePreview/Primitives';
 import { accountStartupState } from './src/presenters/accountStartup';
 
 export default function App() {
@@ -232,10 +231,10 @@ function RuntimeBootstrap({ onRetry }: { onRetry: () => void }) {
   const { c } = usePresentation();
   const [slow, setSlow] = useState(false);
   useEffect(() => { const timer = setTimeout(() => setSlow(true), 10000); return () => clearTimeout(timer); }, []);
-  return <View testID="runtime-bootstrap" accessibilityLabel="Verifying secure mobile runtime" style={styles.flex}>
+  return <View testID="runtime-bootstrap" accessibilityLabel="Проверяем защищённую сессию Veil" style={[styles.flex, {backgroundColor:c.bg}]}>
     <VeilState c={c} kind={slow ? 'unavailable' : 'loading'} title="Проверка защищённой сессии"
       detail={slow ? 'Проверка занимает больше времени. Аккаунт пока не открыт.' : 'Ожидаем состояние native runtime. Переписка ещё недоступна.'}
-      action={slow ? {label:'Try secure verification again', onPress:onRetry} : undefined} />
+      action={slow ? {label:'Повторить защищённую проверку', onPress:onRetry} : undefined} />
   </View>;
 }
 
@@ -246,8 +245,9 @@ function RuntimeError({
   code: PublicFailureCodeV1;
   onRetry: () => void;
 }) {
+  const { c } = usePresentation();
   return (
-    <SafeAreaView testID="runtime-error" style={styles.runtimeErrorRoot} edges={["top", "bottom"]}>
+    <SafeAreaView testID="runtime-error" style={[styles.runtimeErrorRoot, {backgroundColor:c.bg}]} edges={["top", "bottom", "left", "right"]}>
       <ScrollView
         testID="runtime-error-scroll"
         contentContainerStyle={styles.runtimeErrorContent}
@@ -255,14 +255,7 @@ function RuntimeError({
       >
         <View style={styles.errorCard}>
           <PublicFailureCard code={code} />
-          <Pressable
-            accessibilityRole="button"
-            accessibilityLabel="Try secure verification again"
-            onPress={onRetry}
-            style={({ pressed }) => [styles.retryButton, pressed && styles.retryPressed]}
-          >
-            <Text style={styles.retryText}>Try secure verification again</Text>
-          </Pressable>
+          <Button label="Повторить защищённую проверку" onPress={onRetry} c={c} />
         </View>
       </ScrollView>
     </SafeAreaView>

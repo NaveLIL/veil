@@ -20,7 +20,11 @@ import {
 
 import { PhaseShiftMark } from "../components/brand/PhaseShiftMark";
 import { PublicFailureCard } from "../components/runtime/PublicFailureCard";
-import { colors, radii, spacing } from "../lib/theme";
+import { spacing } from "../lib/theme";
+import { geometry, motion, type Palette } from "../interfacePreview/appearance";
+import { useVeilStyles } from "../interfacePreview/useVeilStyles";
+import { usePresentation } from "../interfacePreview/PresentationContext";
+import { welcomeCopy as copy } from '../presentation/copy/welcome';
 import {
   beginIdentitySetup,
   useIdentitySetupStore,
@@ -33,6 +37,7 @@ interface OnboardingScreenProps {
 export default function OnboardingScreen({
   reducedMotion,
 }: OnboardingScreenProps) {
+  const styles = useVeilStyles(createStyles);
   const activeMode = useIdentitySetupStore((state) => state.activeMode);
   const publicFailureCode = useIdentitySetupStore((state) => state.publicFailureCode);
   const recoveryNotice = useIdentitySetupStore((state) => state.recoveryNotice);
@@ -47,7 +52,7 @@ export default function OnboardingScreen({
 
     const animation = Animated.timing(entrance, {
       toValue: 1,
-      duration: 320,
+      duration: motion.transitionDuration,
       easing: Easing.out(Easing.cubic),
       useNativeDriver: true,
     });
@@ -84,7 +89,7 @@ export default function OnboardingScreen({
       />
       <View pointerEvents="none" style={styles.ambientOrb} />
 
-      <SafeAreaView style={styles.safeArea} edges={["top", "bottom"]}>
+      <SafeAreaView style={styles.safeArea} edges={["top", "bottom", "left", "right"]}>
         <ScrollView
           contentContainerStyle={styles.scrollContent}
           showsVerticalScrollIndicator={false}
@@ -105,30 +110,28 @@ export default function OnboardingScreen({
               <Text accessibilityRole="header" style={styles.brandName}>
                 VEIL
               </Text>
-              <Text style={styles.eyebrow}>PRIVATE MOBILE PREVIEW</Text>
+              <Text style={styles.eyebrow}>{copy.eyebrow}</Text>
             </View>
 
             <View style={styles.heroCopy}>
               <Text accessibilityRole="header" style={styles.title}>
-                Your identity stays native.
+                {copy.title}
               </Text>
               <Text style={styles.subtitle}>
-                Create or restore inside a protected system screen. Recovery material never enters
-                the React Native interface.
+                {copy.description}
               </Text>
             </View>
 
             <View style={styles.assuranceRow} accessibilityRole="summary">
-              <AssuranceItem label="Native-only setup" />
-              <AssuranceItem label="Encrypted local vault" />
-              <AssuranceItem label="No cloud recovery" />
+              <AssuranceItem label={copy.native} />
+              <AssuranceItem label={copy.vault} />
+              <AssuranceItem label={copy.recovery} />
             </View>
 
             <View style={styles.actionPanel}>
-              <Text style={styles.panelTitle}>Set up this device</Text>
+              <Text style={styles.panelTitle}>{copy.panel}</Text>
               <Text style={styles.panelBody}>
-                Nothing is saved until you confirm in the protected native flow. You can cancel at
-                any time.
+                {copy.confirmation}
               </Text>
 
               {publicFailureCode || recoveryNotice ? (
@@ -146,7 +149,7 @@ export default function OnboardingScreen({
                       testID="identity-recovery-notice"
                       style={styles.recoveryBox}
                     >
-                      <Text style={styles.recoveryLabel}>RECOVERY MATERIAL STATUS</Text>
+                      <Text style={styles.recoveryLabel}>{copy.recoveryStatus}</Text>
                       <Text style={styles.recoveryText}>{recoveryNotice}</Text>
                     </View>
                   ) : null}
@@ -156,8 +159,8 @@ export default function OnboardingScreen({
               <View style={styles.actions}>
                 <SetupButton
                   testID="identity-setup-create"
-                  title="Create identity"
-                  description="Start with a new device-local identity"
+                  title={copy.create}
+                  description={copy.createDescription}
                   icon={Plus}
                   variant="primary"
                   loading={activeMode === "create"}
@@ -166,8 +169,8 @@ export default function OnboardingScreen({
                 />
                 <SetupButton
                   testID="identity-setup-restore"
-                  title="Restore identity"
-                  description="Recover an identity you already control"
+                  title={copy.restore}
+                  description={copy.restoreDescription}
                   icon={RotateCcw}
                   variant="secondary"
                   loading={activeMode === "restore"}
@@ -182,13 +185,13 @@ export default function OnboardingScreen({
                   accessibilityLiveRegion="polite"
                   style={styles.loadingText}
                 >
-                  Protected setup is open…
+                  {copy.busy}
                 </Text>
               ) : null}
             </View>
 
             <Text style={styles.footer}>
-              Development preview · Some mobile features are not available yet.
+              {copy.footer}
             </Text>
           </Animated.View>
         </ScrollView>
@@ -198,6 +201,7 @@ export default function OnboardingScreen({
 }
 
 function AssuranceItem({ label }: { label: string }) {
+  const styles = useVeilStyles(createStyles);
   return (
     <View style={styles.assuranceItem}>
       <View style={styles.assuranceDot} />
@@ -227,6 +231,8 @@ function SetupButton({
   disabled,
   onPress,
 }: SetupButtonProps) {
+  const { c } = usePresentation();
+  const styles = useVeilStyles(createStyles);
   const primary = variant === "primary";
   return (
     <Pressable
@@ -246,9 +252,9 @@ function SetupButton({
     >
       <View style={[styles.buttonMarker, primary && styles.buttonMarkerPrimary]}>
         {loading ? (
-          <ActivityIndicator size="small" color={primary ? "#ffffff" : colors.primaryHi} />
+          <ActivityIndicator size="small" color={primary ? "#ffffff" : c.accent} />
         ) : (
-          <Icon size={22} strokeWidth={2.1} color={primary ? "#ffffff" : colors.primaryHi} />
+          <Icon size={22} strokeWidth={2.1} color={primary ? "#ffffff" : c.accent} />
         )}
       </View>
       <View style={styles.buttonCopy}>
@@ -260,16 +266,16 @@ function SetupButton({
       <ChevronRight
         size={22}
         strokeWidth={2}
-        color={primary ? "rgba(255,255,255,0.72)" : colors.textLo}
+        color={primary ? "rgba(255,255,255,0.72)" : c.muted}
       />
     </Pressable>
   );
 }
 
-const styles = StyleSheet.create({
+const createStyles = (c: Palette) => StyleSheet.create({
   root: {
     flex: 1,
-    backgroundColor: colors.background,
+    backgroundColor: c.bg,
   },
   safeArea: { flex: 1 },
   ambientTop: {
@@ -305,20 +311,20 @@ const styles = StyleSheet.create({
   markFrame: {
     width: 76,
     height: 76,
-    borderRadius: radii.xl,
+    borderRadius: geometry.radius,
     alignItems: "center",
     justifyContent: "center",
-    backgroundColor: "rgba(13,14,20,0.78)",
+    backgroundColor: c.surface,
     borderWidth: StyleSheet.hairlineWidth,
-    borderColor: "rgba(167,139,250,0.24)",
-    shadowColor: colors.primary,
+    borderColor: c.line,
+    shadowColor: c.accent,
     shadowOpacity: 0.28,
     shadowRadius: 24,
     shadowOffset: { width: 0, height: 10 },
     elevation: 8,
   },
   brandName: {
-    color: colors.textHi,
+    color: c.text,
     fontSize: 18,
     fontWeight: "800",
     letterSpacing: 7,
@@ -326,7 +332,7 @@ const styles = StyleSheet.create({
     marginLeft: 7,
   },
   eyebrow: {
-    color: colors.primaryHi,
+    color: c.accent,
     fontSize: 11,
     fontWeight: "700",
     letterSpacing: 1.5,
@@ -337,7 +343,7 @@ const styles = StyleSheet.create({
     marginTop: spacing.xxl,
   },
   title: {
-    color: colors.textHi,
+    color: c.text,
     fontSize: 30,
     lineHeight: 36,
     fontWeight: "800",
@@ -345,7 +351,7 @@ const styles = StyleSheet.create({
     letterSpacing: -0.5,
   },
   subtitle: {
-    color: colors.textMd,
+    color: c.muted,
     fontSize: 16,
     lineHeight: 24,
     textAlign: "center",
@@ -364,10 +370,10 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     alignItems: "center",
     gap: spacing.sm,
-    borderRadius: radii.pill,
+    borderRadius: 999,
     borderWidth: StyleSheet.hairlineWidth,
-    borderColor: colors.border,
-    backgroundColor: colors.surfaceLow,
+    borderColor: c.line,
+    backgroundColor: c.raised,
     paddingHorizontal: spacing.md,
     paddingVertical: spacing.sm,
   },
@@ -375,18 +381,18 @@ const styles = StyleSheet.create({
     width: 6,
     height: 6,
     borderRadius: 3,
-    backgroundColor: colors.success,
+    backgroundColor: c.accent,
   },
   assuranceText: {
-    color: colors.textMd,
+    color: c.muted,
     fontSize: 12,
     fontWeight: "600",
   },
   actionPanel: {
-    borderRadius: radii.xl,
+    borderRadius: geometry.radius,
     borderWidth: StyleSheet.hairlineWidth,
-    borderColor: colors.border,
-    backgroundColor: colors.surfaceSolid,
+    borderColor: c.line,
+    backgroundColor: c.surface,
     padding: spacing.xl,
     marginTop: spacing.xxl,
     shadowColor: "#000000",
@@ -396,13 +402,13 @@ const styles = StyleSheet.create({
     elevation: 10,
   },
   panelTitle: {
-    color: colors.textHi,
+    color: c.text,
     fontSize: 18,
     lineHeight: 24,
     fontWeight: "800",
   },
   panelBody: {
-    color: colors.textMd,
+    color: c.muted,
     fontSize: 14,
     lineHeight: 21,
     marginTop: spacing.xs,
@@ -413,7 +419,7 @@ const styles = StyleSheet.create({
   },
   setupButton: {
     minHeight: 72,
-    borderRadius: radii.lg,
+    borderRadius: geometry.radius,
     borderWidth: StyleSheet.hairlineWidth,
     flexDirection: "row",
     alignItems: "center",
@@ -421,12 +427,12 @@ const styles = StyleSheet.create({
     paddingVertical: spacing.md,
   },
   setupButtonPrimary: {
-    backgroundColor: colors.primaryDeep,
+    backgroundColor: c.accent,
     borderColor: "rgba(255,255,255,0.16)",
   },
   setupButtonSecondary: {
-    backgroundColor: colors.surfaceLow,
-    borderColor: colors.border,
+    backgroundColor: c.raised,
+    borderColor: c.line,
   },
   setupButtonPressed: {
     opacity: 0.82,
@@ -436,10 +442,10 @@ const styles = StyleSheet.create({
   buttonMarker: {
     width: 44,
     height: 44,
-    borderRadius: 14,
+    borderRadius: geometry.radius,
     alignItems: "center",
     justifyContent: "center",
-    backgroundColor: "rgba(167,139,250,0.10)",
+    backgroundColor: c.tint,
     borderWidth: StyleSheet.hairlineWidth,
     borderColor: "rgba(167,139,250,0.24)",
   },
@@ -452,14 +458,14 @@ const styles = StyleSheet.create({
     marginLeft: spacing.md,
   },
   buttonTitle: {
-    color: colors.textHi,
+    color: c.text,
     fontSize: 15,
     lineHeight: 20,
     fontWeight: "800",
   },
   buttonTitlePrimary: { color: "#ffffff" },
   buttonDescription: {
-    color: colors.textMd,
+    color: c.muted,
     fontSize: 12,
     lineHeight: 17,
     marginTop: 2,
@@ -472,34 +478,34 @@ const styles = StyleSheet.create({
   recoveryBox: {
     minHeight: 48,
     justifyContent: "center",
-    borderRadius: radii.md,
+    borderRadius: geometry.radius,
     borderWidth: StyleSheet.hairlineWidth,
-    borderColor: colors.destructiveBorder,
-    backgroundColor: colors.destructiveBg,
+    borderColor: c.danger,
+    backgroundColor: c.tint,
     paddingHorizontal: spacing.md,
     paddingVertical: spacing.sm,
   },
   recoveryLabel: {
-    color: colors.textLo,
+    color: c.muted,
     fontSize: 9,
     fontWeight: "900",
     letterSpacing: 1.2,
     marginBottom: 4,
   },
   recoveryText: {
-    color: colors.destructive,
+    color: c.danger,
     fontSize: 13,
     lineHeight: 19,
   },
   loadingText: {
-    color: colors.textLo,
+    color: c.muted,
     fontSize: 12,
     lineHeight: 18,
     textAlign: "center",
     marginTop: spacing.md,
   },
   footer: {
-    color: colors.textLo,
+    color: c.muted,
     fontSize: 11,
     lineHeight: 17,
     textAlign: "center",

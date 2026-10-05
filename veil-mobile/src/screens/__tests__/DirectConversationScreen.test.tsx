@@ -183,4 +183,24 @@ describe("DirectConversationScreen identity boundary", () => {
     expect(renderer.root.findAllByProps({ testID: "open-chat-identity" })).toHaveLength(0);
     expect(renderer.root.findAllByProps({ testID: "open-direct-details" })).toHaveLength(0);
   });
+  it('restores a known conversation on focus without popping an offscreen route', () => {
+    act(() => renderer.unmount());
+    const secondId='30000000-0000-4000-8000-000000000002';
+    const goBack=jest.fn(), unsubscribe=jest.fn();
+    let focused=false, restore: (()=>void) | undefined;
+    act(() => {
+      useChatStore.setState({dms:[...useChatStore.getState().dms,
+        {...useChatStore.getState().dms[0],id:secondId}], selectedDmId:secondId});
+      renderer=TestRenderer.create(<DirectConversationScreen route={{params:{conversationId}} as never}
+        navigation={{goBack,isFocused:()=>focused,addListener:(_event:string,callback:()=>void)=>{restore=callback;return unsubscribe;}} as never} />);
+    });
+    expect(goBack).not.toHaveBeenCalled();
+    expect(useChatStore.getState().selectedDmId).toBe(secondId);
+    focused=true;
+    act(()=>restore?.());
+    expect(useChatStore.getState().selectedDmId).toBe(conversationId);
+    expect(goBack).not.toHaveBeenCalled();
+    act(()=>renderer.unmount());
+    expect(unsubscribe).toHaveBeenCalledTimes(1);
+  });
 });

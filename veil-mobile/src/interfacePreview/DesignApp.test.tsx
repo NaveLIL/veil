@@ -76,6 +76,9 @@ async function mount() {
   await act(async () => {});
   return ui;
 }
+async function finishSheetTransition() {
+  await act(async () => { jest.advanceTimersByTime(240); });
+}
 test('messages and spaces keep the dock, every conversation opens full screen and returns to its source', async () => {
   const ui = await mount();
   expect(ui.getByTestId('navigation-dock')).toBeTruthy();
@@ -146,6 +149,7 @@ test('identity change blocks composer while retaining the draft', async () => {
   fireEvent.press(ui.getByLabelText('Состояния и настройки макета'));
   fireEvent.press(ui.getByRole('radio', { name: 'Ключ изменился' }));
   fireEvent.press(ui.getByLabelText('Закрыть'));
+  await finishSheetTransition();
   expect(ui.getByLabelText('Текст демо-сообщения').props.editable).toBe(false);
   expect(ui.getByLabelText('Текст демо-сообщения').props.value).toBe(
     'сохранить',
@@ -164,6 +168,7 @@ test('desktop theme presets survive navigation and the lock preview needs no cre
     expect(ui.getByLabelText(`Тема ${theme}`)).toBeTruthy();
   fireEvent.press(ui.getByLabelText('Тема Ocean'));
   fireEvent.press(ui.getByLabelText('Закрыть свой профиль'));
+  await finishSheetTransition();
   fireEvent.press(ui.getByLabelText('Раскрыть свой профиль'));
   expect(ui.getByLabelText('Тема Ocean').props.accessibilityState.checked).toBe(
     true,
@@ -210,6 +215,7 @@ test('floating profile editing updates its card and exposes settings inside the 
   fireEvent.changeText(ui.getByLabelText('Имя демо-профиля'), 'Мой Veil');
   fireEvent.press(ui.getByLabelText('Готово'));
   fireEvent.press(ui.getByLabelText('Закрыть свой профиль'));
+  await finishSheetTransition();
   expect(ui.getByText('Мой Veil')).toBeTruthy();
   fireEvent.press(ui.getByLabelText('Раскрыть свой профиль'));
   fireEvent.press(ui.getByRole('tab', { name: 'Настройки' }));
@@ -289,6 +295,7 @@ test('attachment cancellation retains caption; viewer and retry keep the same na
   fireEvent.press(ui.getByLabelText('Состояния и настройки макета'));
   fireEvent.press(ui.getByRole('radio', { name: 'Ошибка отправки' }));
   fireEvent.press(ui.getByLabelText('Закрыть'));
+  await finishSheetTransition();
   fireEvent.press(ui.getByLabelText('Добавить вложение'));
   fireEvent.press(ui.getByRole('button', { name: 'Демо-изображение' }));
   fireEvent.press(ui.getByLabelText('Отправить демо-сообщение'));
@@ -309,10 +316,12 @@ test('attachment cancellation retains caption; viewer and retry keep the same na
       .props.onAttachment(data()[count - 1].attachment),
   );
   fireEvent.press(ui.getByLabelText('Закрыть изображение'));
+  await finishSheetTransition();
   expect(ui.getByTestId('history-list-demo-anna')).toBe(list);
   fireEvent.press(ui.getByLabelText('Состояния и настройки макета'));
   fireEvent.press(ui.getByRole('radio', { name: 'Обычный чат' }));
   fireEvent.press(ui.getByLabelText('Закрыть'));
+  await finishSheetTransition();
   act(() =>
     ui
       .UNSAFE_getByType(ConversationHistory)

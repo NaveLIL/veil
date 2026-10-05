@@ -30,6 +30,7 @@ export const allowedSources = [
   'src/interfacePreview/historyFixtures.ts',
   'src/interfacePreview/AttachmentVisual.tsx', 'src/interfacePreview/AttachmentCard.tsx', 'src/interfacePreview/AttachmentPanels.tsx',
   'src/interfacePreview/LiveBlur.tsx', 'src/interfacePreview/VeilSheet.tsx',
+  'src/interfacePreview/useSheetMotion.ts',
   'src/interfacePreview/appearancePreferences.ts', 'src/interfacePreview/useAppearanceState.ts',
   'src/interfacePreview/navigationStyles.ts', 'src/interfacePreview/DockItem.tsx', 'src/interfacePreview/DirectoryRow.tsx',
   'src/interfacePreview/profileStyles.ts', 'src/interfacePreview/ProfileEntry.tsx', 'src/interfacePreview/ProfilePanelFrame.tsx',

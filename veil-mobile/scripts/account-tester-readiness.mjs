@@ -26,5 +26,6 @@ if (process.argv.includes('--device')) {
   if (result.status!==0) {console.log('DEVICE CHECK UNAVAILABLE'); failed=true;}
   else console.log(result.stdout.trim());
 }
-console.log('Authenticated Direct E2E: BLOCKED BY TEST CREDENTIALS until an administrator provides an official test Access Pass and trust inputs. This script does not authenticate.');
+console.log('Authenticated Direct E2E: NOT RUN by this read-only readiness check. Credential availability and prior exchange results are not assessed.');
+console.log('A new authenticated test requires a usable official test Access Pass, test identities and the existing trust flow. This script does not authenticate.');
 process.exitCode=failed?1:0;

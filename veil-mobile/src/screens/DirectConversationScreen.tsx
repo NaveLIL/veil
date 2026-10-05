@@ -1,18 +1,20 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
-import { AccessibilityInfo, BackHandler, Keyboard, StyleSheet, Text, View } from "react-native";
+import { AccessibilityInfo, BackHandler, Keyboard, StyleSheet, View } from "react-native";
 import type { NativeStackScreenProps } from "@react-navigation/native-stack";
 
 import { IdentityIslandSheet } from "../components/identity/IdentityIslandSheet";
 import { ChatIsland } from "../components/layout/ChatIsland";
 import { AccountFrame } from '../presentation/account/AccountFrame';
 import { useAccountNavigation } from '../presentation/account/useAccountNavigation';
-import { colors, spacing } from "../lib/theme";
+import { usePresentation } from '../interfacePreview/PresentationContext';
+import { VeilState } from '../interfacePreview/VeilState';
 import { type Member, useChatStore } from "../stores/chat";
-import type { AuthenticatedStackParamList } from "./ChatListScreen";
+import type { AuthenticatedStackParamList } from "../presentation/account/routes";
 
 type Props = NativeStackScreenProps<AuthenticatedStackParamList, "Direct">;
 
 export default function DirectConversationScreen({ navigation, route }: Props) {
+  const { c } = usePresentation();
   const [navigationOpen, setNavigationOpen] = useState(false);
   const selected = useCallback((conversationId: string) => {
     navigation.setParams({ conversationId }); setNavigationOpen(false);
@@ -45,8 +47,19 @@ export default function DirectConversationScreen({ navigation, route }: Props) {
     : null;
 
   useEffect(() => {
-    if (!routeReady) navigation.goBack();
-  }, [navigation, routeReady]);
+    const restoreRoute = () => {
+      if (navigation.isFocused && !navigation.isFocused()) return;
+      const state = useChatStore.getState();
+      if (!state.dms.some(dm => dm.id === conversationId)) { navigation.goBack(); return; }
+      if (state.selectedDmId !== conversationId) {
+        if (!state.dms.some(dm => dm.id === state.selectedDmId)) { navigation.goBack(); return; }
+        state.selectDm(conversationId);
+      }
+    };
+    restoreRoute();
+    const unsubscribe = navigation.addListener?.('focus', restoreRoute);
+    return unsubscribe;
+  }, [navigation, conversationId, directGeneration]);
 
   useEffect(() => {
     setIdentitySelection(null);
@@ -77,9 +90,9 @@ export default function DirectConversationScreen({ navigation, route }: Props) {
   }, []);
 
   return (
-    <View testID="direct-screen" style={styles.root}>
+    <View testID="direct-screen" style={[styles.root, {backgroundColor:c.bg}]}>
       <AccountFrame onOpen={onOpen} onContacts={() => navigation.navigate('Contacts')}
-        onSettings={() => navigation.navigate('Settings')} navigationOpen={navigationOpen}
+        navigationOpen={navigationOpen}
         onNavigationChange={setNavigationOpen} modalOpen={!!identityProfile}
         conversation={<View
         style={styles.content}
@@ -94,16 +107,8 @@ export default function DirectConversationScreen({ navigation, route }: Props) {
             showHeader
           />
         ) : (
-          <View
-            testID="direct-route-pending"
-            accessibilityRole="alert"
-            accessibilityLabel="Direct conversation unavailable"
-            style={styles.routePending}
-          >
-            <Text style={styles.routePendingText}>
-              This Direct conversation is unavailable.
-            </Text>
-          </View>
+          <VeilState testID="direct-route-pending" c={c} kind="unavailable"
+            title="Личный чат недоступен" detail="Диалог не подтверждён в текущей сессии аккаунта." />
         )}
       </View>} />
       <IdentityIslandSheet
@@ -121,8 +126,6 @@ export default function DirectConversationScreen({ navigation, route }: Props) {
 }
 
 const styles = StyleSheet.create({
-  root: { flex: 1, backgroundColor: colors.background },
+  root: { flex: 1 },
   content: { flex: 1 },
-  routePending: { flex: 1, alignItems: "center", justifyContent: "center", padding: spacing.xxl },
-  routePendingText: { color: colors.textMd, fontSize: 13, marginTop: spacing.md, textAlign: "center" },
 });

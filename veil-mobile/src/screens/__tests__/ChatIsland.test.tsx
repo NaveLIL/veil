@@ -4,7 +4,7 @@ import { act, fireEvent, render, waitFor, within } from "@testing-library/react-
 import { StyleSheet } from "react-native";
 
 import { ChatIsland } from "../../components/layout/ChatIsland";
-import { publicFailurePresentationV1 } from "../../contracts/publicFailureCodesV1";
+import { publicFailureCopy as publicFailurePresentationV1 } from "../../presentation/copy/publicFailures";
 import type {
   DirectMessageProjection,
   VeilMobileRuntimeSnapshot,
@@ -91,7 +91,7 @@ describe("ChatIsland native Direct projection", () => {
     });
     expect(StyleSheet.flatten(view.getByTestId("direct-send-button").props.style))
       .toMatchObject({ minWidth: 48, minHeight: 48 });
-    await waitFor(() => expect(view.getByText("No messages yet")).toBeTruthy());
+    await waitFor(() => expect(view.getByText("Пока нет сообщений")).toBeTruthy());
   });
 
   it("does not project plaintext from an offscreen mount before explicit selection", () => {
@@ -105,7 +105,7 @@ describe("ChatIsland native Direct projection", () => {
 
     const view = render(<ChatIsland />);
 
-    expect(view.getByText("Choose a Direct conversation")).toBeTruthy();
+    expect(view.getByText("Выберите личный чат")).toBeTruthy();
     expect(runtime.getDirectMessages).not.toHaveBeenCalled();
     expect(useChatStore.getState().messagesByChannel).toEqual({});
   });
@@ -167,7 +167,7 @@ describe("ChatIsland native Direct projection", () => {
     const view = render(<ChatIsland />);
     const failedPresentation = publicFailurePresentationV1("VEIL-DIRECT-001");
     const unknownPresentation = publicFailurePresentationV1("VEIL-DIRECT-002");
-    expect(unknownPresentation.description).toMatch(/may .*have .*reached the peer/i);
+    expect(unknownPresentation.description).toMatch(/могло уже попасть собеседнику/i);
 
     for (const [messageId, presentation] of [
       [failedMessageId, failedPresentation],
@@ -195,7 +195,7 @@ describe("ChatIsland native Direct projection", () => {
 
     const view = render(<ChatIsland />);
     await waitFor(() => expect(view.getByTestId("direct-history-unavailable")).toBeTruthy());
-    expect(view.getByText("Messages are unavailable")).toBeTruthy();
+    expect(view.getByText("Сообщения недоступны")).toBeTruthy();
     expect(useChatStore.getState().messagesByChannel).toEqual({});
   });
 
@@ -254,7 +254,7 @@ describe("ChatIsland native Direct projection", () => {
     }));
 
     const view = render(<ChatIsland />);
-    await waitFor(() => expect(view.getByText("No messages yet")).toBeTruthy());
+    await waitFor(() => expect(view.getByText("Пока нет сообщений")).toBeTruthy());
     fireEvent.changeText(view.getByTestId("direct-composer"), "native accepted text");
     fireEvent.press(view.getByTestId("direct-send-button"));
 
@@ -282,7 +282,7 @@ describe("ChatIsland native Direct projection", () => {
     });
 
     const view = render(<ChatIsland />);
-    await waitFor(() => expect(view.getByText("No messages yet")).toBeTruthy());
+    await waitFor(() => expect(view.getByText("Пока нет сообщений")).toBeTruthy());
     fireEvent.changeText(view.getByTestId("direct-composer"), "keep this draft");
     fireEvent.press(view.getByTestId("direct-send-button"));
 
@@ -310,7 +310,7 @@ describe("ChatIsland native Direct projection", () => {
     }));
 
     const view = render(<ChatIsland />);
-    await waitFor(() => expect(view.getByText("No messages yet")).toBeTruthy());
+    await waitFor(() => expect(view.getByText("Пока нет сообщений")).toBeTruthy());
     fireEvent.changeText(view.getByTestId("direct-composer"), "same draft");
     fireEvent.press(view.getByTestId("direct-send-button"));
 

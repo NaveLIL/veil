@@ -1,71 +1,33 @@
-import React, { useEffect, useRef } from 'react';
-import { Animated, Modal, PanResponder, Pressable, StyleSheet, View, ViewStyle, useWindowDimensions } from 'react-native';
+import React, { useImperativeHandle } from 'react';
+import { Animated, Modal, Pressable, StyleSheet, View, ViewStyle, useWindowDimensions } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { geometry, motion, Palette } from './appearance';
+import { geometry, Palette } from './appearance';
 import { LiveBlur, useModalBackdrop } from './LiveBlur';
+import { useSheetMotion } from './useSheetMotion';
 
 /** Fixed modal window; only the sheet moves. A grip exposes dismiss without a cross. */
-export function VeilSheet({ visible = true, c, reduceMotion, onClose, onShow,
+export type VeilSheetControls = { dismiss: () => void };
+export function VeilSheet({ visible = true, c, reduceMotion, onClose, onShow, onBack, dismissRef,
   closeLabel = 'Закрыть панель', style, children,
 }: { visible?: boolean; c: Palette; reduceMotion: boolean; onClose: () => void;
-  onShow?: () => void; closeLabel?: string; style?: ViewStyle; children: React.ReactNode }) {
-  const underlayBlur = useModalBackdrop(visible);
+  onShow?: () => void; onBack?: () => void; dismissRef?: React.Ref<VeilSheetControls>; closeLabel?: string; style?: ViewStyle; children: React.ReactNode }) {
   const { height } = useWindowDimensions();
-  const translate = useRef(new Animated.Value(0)).current;
-  const closing = useRef(false);
-  const delivered = useRef(false);
-  const alive = useRef(true), visibleRef = useRef(visible); visibleRef.current = visible;
-  const latest = useRef(onClose); latest.current = onClose;
-  useEffect(() => { closing.current = false; delivered.current = false; translate.setValue(0); }, [visible, translate]);
-  useEffect(() => { alive.current = true; return () => { alive.current = false; translate.stopAnimation(); }; }, [translate]);
-  const complete = () => { if (alive.current && visibleRef.current && !delivered.current) { delivered.current = true; latest.current(); } };
-  useEffect(() => {
-    if (!reduceMotion) return;
-    translate.stopAnimation();
-    if (closing.current) complete();
-    else translate.setValue(0);
-    // onClose is read through its current ref; a scope change does not replay dismissal.
-  }, [reduceMotion, translate]);
-  function dismiss() {
-    if (closing.current) return;
-    closing.current = true;
-    if (reduceMotion) { complete(); return; }
-    Animated.timing(translate, { toValue: height, duration: motion.transitionDuration,
-      useNativeDriver: true }).start(() => complete());
-  }
-  function closeImmediately() {
-    if (closing.current) return;
-    closing.current = true;
-    translate.stopAnimation();
-    complete();
-  }
-  const pan = PanResponder.create({
-    onMoveShouldSetPanResponder: (_, g) => g.dy > 10 && Math.abs(g.dy) > Math.abs(g.dx),
-    onPanResponderMove: (_, g) => translate.setValue(Math.max(0, g.dy)),
-    onPanResponderRelease: (_, g) => {
-      if (g.dy > 70 || g.vy > 0.6) dismiss();
-      else Animated.spring(translate, { toValue: 0, ...motion.spring, useNativeDriver: true }).start();
-    },
-    onPanResponderTerminate: () => translate.setValue(0),
-  });
-  return <Modal visible={visible} transparent animationType="none" statusBarTranslucent
-    navigationBarTranslucent onRequestClose={closeImmediately} onShow={() => {
-      translate.setValue(reduceMotion ? 0 : height);
-      if (!reduceMotion) Animated.timing(translate, { toValue: 0,
-        duration: motion.transitionDuration, useNativeDriver: true }).start();
-      onShow?.();
-    }}>
+  const sheet = useSheetMotion(visible, reduceMotion, height, onClose);
+  useImperativeHandle(dismissRef, () => ({ dismiss: sheet.dismiss }), [sheet.dismiss]);
+  const underlayBlur = useModalBackdrop(sheet.presented);
+  return <Modal visible={sheet.presented} transparent animationType="none" statusBarTranslucent
+    navigationBarTranslucent onRequestClose={() => sheet.back(onBack)} onShow={() => { sheet.onShow(); onShow?.(); }}>
     <SafeAreaView edges={['top']} style={styles.root}>
-      <Pressable accessible={false} importantForAccessibility="no" onPress={closeImmediately}
+      <Pressable testID="veil-sheet-outside" accessible={false} importantForAccessibility="no" onPress={sheet.dismiss}
         style={StyleSheet.absoluteFillObject} />
       <Animated.View accessibilityViewIsModal style={[styles.panel, { backgroundColor: c.bg,
-        borderColor: c.line }, style, { transform: [{ translateY: translate }] }]}>
+        borderColor: c.line }, style, { transform: [{ translateY: sheet.translate }] }]}>
         <LiveBlur blurRadius={underlayBlur} style={style?.height ? styles.flex : undefined}>
-        <View {...pan.panHandlers}>
+        <View {...sheet.panHandlers}>
         <Pressable accessibilityRole="button" accessibilityLabel={closeLabel}
           accessibilityHint="Смахните панель вниз или активируйте, чтобы закрыть"
           accessibilityActions={[{ name: 'dismiss', label: closeLabel }]}
-          onAccessibilityAction={closeImmediately} onPress={closeImmediately} style={styles.handleTouch}>
+          onAccessibilityAction={sheet.dismiss} onPress={sheet.dismiss} style={styles.handleTouch}>
           <View importantForAccessibility="no-hide-descendants" style={[styles.handle, { backgroundColor: c.muted }]} />
         </Pressable>
         </View>

@@ -121,6 +121,7 @@ export function NavigationPanel({
                   label="Поиск чатов"
                   color={c.muted}
                   onPress={() => {
+                    if (searchVisible) setQuery('');
                     setSearchVisible((v) => !v);
                     requestAnimationFrame(() => searchRef.current?.focus());
                   }}

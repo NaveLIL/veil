@@ -27,6 +27,7 @@ import { useDirectViewportOwner } from '../../presenters/useDirectViewportOwner'
 import { UserAvatar } from '../identity/UserAvatar';
 import { PublicFailureCard } from '../runtime/PublicFailureCard';
 import { usePresentation } from '../../interfacePreview/PresentationContext';
+import { directCopy } from '../../presentation/copy/direct';
 
 /** Existing native/store authority -> approved presentation. Never imports demo models. */
 export function NativeDesignTimeline({
@@ -135,30 +136,10 @@ export function NativeDesignTimeline({
     }
     );
   }, [ownsViewport, p.scope]);
-  const empty = !p.conversationId
-    ? [
-        'Choose a Direct conversation',
-        'Encrypted history opens only after selection.',
-      ]
-    : p.projectionState === 'unavailable'
-      ? [
-          'Messages are unavailable',
-          'Veil withheld the entire projection because it could not be verified.',
-        ]
-      : p.historyWaitExpired
-        ? [
-            'История пока не получена',
-            'Проверка занимает больше времени, чем обычно. Можно проверить снова или вернуться к списку чатов.',
-          ]
-      : p.projectionState === 'available'
-        ? [
-            'No messages yet',
-            'This immutable Direct history is securely synchronized.',
-          ]
-        : [
-            'Opening encrypted history...',
-            'Verifying this conversation with the native runtime.',
-          ];
+  const empty = !p.conversationId ? directCopy.choose
+    : p.projectionState === 'unavailable' ? directCopy.unavailable
+    : p.historyWaitExpired ? directCopy.delayed
+    : p.projectionState === 'available' ? directCopy.empty : directCopy.loading;
   return (
     <View
       testID="chat-island-wrap"

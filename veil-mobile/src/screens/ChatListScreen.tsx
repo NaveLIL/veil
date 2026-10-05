@@ -3,7 +3,6 @@ import { DarkTheme, NavigationContainer } from "@react-navigation/native";
 import { createNativeStackNavigator } from "@react-navigation/native-stack";
 
 import { useReducedMotionPreference } from "../hooks/useReducedMotionPreference";
-import { colors } from "../lib/theme";
 import { useChatStore } from "../stores/chat";
 import DirectConversationScreen from "./DirectConversationScreen";
 import HomeScreen from "./HomeScreen";
@@ -11,38 +10,10 @@ import ContactSearchScreen from "./ContactSearchScreen";
 import SettingsScreen, { SettingsDetailScreen } from "./SettingsScreen";
 import { usePresentation } from '../interfacePreview/PresentationContext';
 
-export type SettingsSectionKey =
-  | "account"
-  | "devices"
-  | "privacy"
-  | "notifications"
-  | "appearance"
-  | "node"
-  | "storage"
-  | "about";
-
-export type AuthenticatedStackParamList = {
-  Home: undefined;
-  Contacts: undefined;
-  Direct: { conversationId: string };
-  Settings: undefined;
-  SettingsDetail: { section: SettingsSectionKey };
-};
+import type { AuthenticatedStackParamList } from '../presentation/account/routes';
+export type { AuthenticatedStackParamList, SettingsSectionKey } from '../presentation/account/routes';
 
 const Stack = createNativeStackNavigator<AuthenticatedStackParamList>();
-
-const VEIL_NAVIGATION_THEME = {
-  ...DarkTheme,
-  colors: {
-    ...DarkTheme.colors,
-    primary: colors.primary,
-    background: colors.background,
-    card: colors.surfaceSolid,
-    text: colors.textHi,
-    border: colors.border,
-    notification: colors.primaryHi,
-  },
-};
 
 /**
  * Authenticated mobile shell.
@@ -53,7 +24,7 @@ const VEIL_NAVIGATION_THEME = {
  */
 export default function ChatListScreen() {
   const { c } = usePresentation();
-  const theme = useMemo(() => ({...VEIL_NAVIGATION_THEME, colors:{...VEIL_NAVIGATION_THEME.colors,
+  const theme = useMemo(() => ({...DarkTheme, colors:{...DarkTheme.colors,
     primary:c.accent, background:c.bg, card:c.bg, text:c.text, border:c.line, notification:c.accent}}), [c]);
   const reducedMotion = useReducedMotionPreference();
   const runtimeBinding = useChatStore((state) => state.runtimeBinding);

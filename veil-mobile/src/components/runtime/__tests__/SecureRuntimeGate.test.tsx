@@ -71,7 +71,7 @@ describe("SecureRuntimeGate", () => {
       getByTestId("runtime-brand-phase-shift-mark", { includeHiddenElements: true }),
     ).toBeTruthy();
     expect(() => getByText("V")).toThrow();
-    expect(getByText("Local account locked")).toBeTruthy();
+    expect(getByText("Локальный аккаунт заблокирован")).toBeTruthy();
     fireEvent.press(getByTestId("unlock-account"));
     expect(onUnlock).toHaveBeenCalledTimes(1);
   });
@@ -132,7 +132,7 @@ describe("SecureRuntimeGate", () => {
     const view = renderGate(lockedSnapshot, { publicFailureCode: "VEIL-LOCAL-002" });
 
     expect(view.getByTestId("runtime-public-error")).toBeTruthy();
-    expect(view.getByText("Encrypted local account is unavailable")).toBeTruthy();
+    expect(view.getByText("Зашифрованный аккаунт недоступен")).toBeTruthy();
     expect(view.getByTestId("public-failure-code-v1").props).toMatchObject({
       children: "VEIL-LOCAL-002",
       selectable: true,
@@ -141,10 +141,10 @@ describe("SecureRuntimeGate", () => {
   });
 
   it.each(([
-    ["publishing_keys", "Publishing device keys"],
-    ["syncing_directory", "Verifying conversations"],
-    ["syncing_history", "Restoring encrypted history"],
-    ["history_synchronized", "Reconciling live messages"],
+    ["publishing_keys", "Публикуем ключи устройства"],
+    ["syncing_directory", "Проверяем диалоги"],
+    ["syncing_history", "Восстанавливаем зашифрованную историю"],
+    ["history_synchronized", "Согласуем новые сообщения"],
   ] as [VeilMobileRuntimeSnapshot["secureSyncState"], string][]))(
     "shows truthful coarse progress for %s",
     (secureSyncState, title) => {

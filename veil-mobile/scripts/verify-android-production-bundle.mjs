@@ -24,6 +24,8 @@ const forbiddenSourceFragments = [
   "/src/designPreview/",
   "/src/components/navigation/RootDock.tsx",
   "/src/screens/DesignPreviewScreens.tsx",
+  "/src/presentation/rocketChat/ContactItem.tsx",
+  "/src/presentation/rocketChat/theme.ts",
   "/node_modules/@rocket.chat/",
   "/node_modules/rocketchat-sdk/",
   "/node_modules/@nozbe/watermelondb/",
@@ -40,13 +42,14 @@ const requiredSourcePaths = [
   "/src/presentation/account/AccountDirectory.tsx",
   "/src/presentation/account/AccountFrame.tsx",
   "/src/presentation/account/AccountProfile.tsx",
-  "/src/presentation/rocketChat/ContactItem.tsx",
+  "/src/presentation/settings/SettingsContent.tsx",
+  "/src/presentation/settings/definitions.ts",
+  "/src/presentation/account/AccountRouteSurface.tsx",
   "/src/components/layout/NativeDesignTimeline.tsx",
   "/src/presenters/directDesignAdapter.ts",
   "/src/interfacePreview/ConversationSurface.tsx",
   "/src/interfacePreview/MessageRow.tsx",
   "/src/interfacePreview/Composer.tsx",
-  "/src/presentation/rocketChat/theme.ts",
   "/src/presentation/rocketChat/notice.ts",
 ];
 
@@ -122,7 +125,7 @@ try {
       for (const source of sourceMatches) console.error(`- ${source}`);
     }
     if (missingSources.length > 0) {
-      console.error("Required Veil/Rocket.Chat presentation modules absent from production source map:");
+      console.error("Required shared Veil routes absent from production source map:");
       for (const source of missingSources) console.error(`- ${source}`);
     }
     if (!hasShippedNotice) console.error("Full Rocket.Chat MIT notice is absent from the exported production JS.");

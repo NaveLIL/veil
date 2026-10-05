@@ -1,3 +1,4 @@
+import { runtimeCopy } from '../../presentation/copy/runtime';
 import React, { useEffect, useMemo, useState } from "react";
 import {
   ActivityIndicator,
@@ -15,7 +16,9 @@ import { SafeAreaView } from "react-native-safe-area-context";
 import { PhaseShiftMark } from "../brand/PhaseShiftMark";
 import { PublicFailureCard } from "./PublicFailureCard";
 import type { PublicFailureCodeV1 } from "../../contracts/publicFailureCodesV1";
-import { colors, radii, spacing, typography } from "../../lib/theme";
+import { spacing } from "../../lib/theme";
+import { geometry, type Palette } from "../../interfacePreview/appearance";
+import { useVeilStyles } from "../../interfacePreview/useVeilStyles";
 import type { VeilMobileRuntimeSnapshot } from "../../native/runtime";
 import {
   hasExactAuthenticatedBinding,
@@ -53,6 +56,7 @@ export function SecureRuntimeGate({
   onRefresh,
 }: SecureRuntimeGateProps) {
   const { c } = usePresentation();
+  const styles = useVeilStyles(createStyles);
   const pending = snapshot.pendingAccessPass;
   const suggestedOrigin = pending?.canonicalOrigin
     ?? snapshot.binding?.canonicalServerOrigin
@@ -67,60 +71,60 @@ export function SecureRuntimeGate({
   const status = useMemo(() => {
     if (requiresExplicitReopen) {
       return {
-        title: "Unlock required",
-        body: "Veil locked this account when the app left the foreground. Reopen it explicitly to continue.",
+        title: runtimeCopy("Unlock required"),
+        body: runtimeCopy("Veil locked this account when the app left the foreground. Reopen it explicitly to continue."),
       };
     }
     if (snapshot.sessionState === "locked" || snapshot.sessionState === "error") {
       return {
-        title: "Local account locked",
-        body: "Your recovery material remains inside the encrypted native vault.",
+        title: runtimeCopy("Local account locked"),
+        body: runtimeCopy("Your recovery material remains inside the encrypted native vault."),
       };
     }
     if (snapshot.sessionState === "opening" || snapshot.sessionState === "closing") {
       return {
-        title: "Securing local account",
-        body: "Waiting for the native encrypted session to settle.",
+        title: runtimeCopy("Securing local account"),
+        body: runtimeCopy("Waiting for the native encrypted session to settle."),
       };
     }
     if (snapshot.connectionState === "connecting") {
       return {
-        title: "Authenticating Veil Node",
-        body: "Establishing the native encrypted transport and account binding.",
+        title: runtimeCopy("Authenticating Veil Node"),
+        body: runtimeCopy("Establishing the native encrypted transport and account binding."),
       };
     }
     if (snapshot.connectionState === "connected" && !snapshot.directoryReady) {
       switch (snapshot.secureSyncState) {
         case "publishing_keys":
           return {
-            title: "Publishing device keys",
-            body: "Preparing this device for authenticated encrypted conversations.",
+            title: runtimeCopy("Publishing device keys"),
+            body: runtimeCopy("Preparing this device for authenticated encrypted conversations."),
           };
         case "syncing_directory":
           return {
-            title: "Verifying conversations",
-            body: "Loading the authenticated conversation directory into encrypted local storage.",
+            title: runtimeCopy("Verifying conversations"),
+            body: runtimeCopy("Loading the authenticated conversation directory into encrypted local storage."),
           };
         case "syncing_history":
           return {
-            title: "Restoring encrypted history",
-            body: "Validating and storing supported Direct messages before live chat can open.",
+            title: runtimeCopy("Restoring encrypted history"),
+            body: runtimeCopy("Validating and storing supported Direct messages before live chat can open."),
           };
         case "history_synchronized":
           return {
-            title: "Reconciling live messages",
-            body: "History is synchronized. Veil is still waiting for safe live-message reconciliation.",
+            title: runtimeCopy("Reconciling live messages"),
+            body: runtimeCopy("History is synchronized. Veil is still waiting for safe live-message reconciliation."),
           };
         default:
           return {
-            title: "Secure sync is not ready",
-            body: "The account is authenticated, but native secure synchronization is still incomplete.",
+            title: runtimeCopy("Secure sync is not ready"),
+            body: runtimeCopy("The account is authenticated, but native secure synchronization is still incomplete."),
           };
       }
     }
     return {
-      title: "Connect to your Veil Node",
-      body: "Only the canonical server origin crosses this UI boundary. Authentication remains native.",
+      title: runtimeCopy("Connect to your Veil Node"),
+      body: runtimeCopy("Only the canonical server origin crosses this UI boundary. Authentication remains native."),
     };
   }, [
     requiresExplicitReopen,
@@ -141,7 +145,7 @@ export function SecureRuntimeGate({
     && (snapshot.connectionState === "disconnected" || snapshot.connectionState === "error");
 
   return (
-    <SafeAreaView testID="secure-runtime-gate" style={[styles.root, {backgroundColor:c.bg}]} edges={["top", "bottom"]}>
+    <SafeAreaView testID="secure-runtime-gate" style={[styles.root, {backgroundColor:c.bg}]} edges={["top", "bottom", "left", "right"]}>
       <KeyboardAvoidingView
         style={styles.flex}
         behavior={Platform.OS === "ios" ? "padding" : undefined}
@@ -154,33 +158,31 @@ export function SecureRuntimeGate({
           <View style={styles.brandBlock} accessible accessibilityRole="header">
             <PhaseShiftMark size={56} testID="runtime-brand-phase-shift-mark" />
             <Text style={styles.brand}>VEIL</Text>
-            <Text style={styles.brandSub}>Native secure session</Text>
+            <Text style={styles.brandSub}>{runtimeCopy("Native secure session")}</Text>
           </View>
 
           {pending ? (
             <View testID="access-pass-review" style={[styles.card, styles.passCard]}>
               <View style={styles.cardHeader}>
                 <View style={styles.statusDot} />
-                <Text style={styles.eyebrow}>NODE ACCESS PASS</Text>
+                <Text style={styles.eyebrow}>{runtimeCopy("NODE ACCESS PASS")}</Text>
               </View>
-              <Text style={styles.cardTitle}>Review invitation</Text>
-              <Text style={styles.cardBody}>
-                This pass can register one account. Its bearer never enters JavaScript.
-              </Text>
-              <MetadataRow label="Origin" value={pending.canonicalOrigin} testID="access-pass-origin" />
-              <MetadataRow label="Reference" value={pending.tokenRef} mono testID="access-pass-reference" />
-              <MetadataRow label="Expires in" value={formatTtl(pending.expiresInSeconds)} testID="access-pass-ttl" />
+              <Text style={styles.cardTitle}>{runtimeCopy("Review invitation")}</Text>
+              <Text style={styles.cardBody}>{runtimeCopy("This pass can register one account. Its bearer never enters JavaScript.")}</Text>
+              <MetadataRow label={runtimeCopy("Origin")} value={pending.canonicalOrigin} testID="access-pass-origin" />
+              <MetadataRow label={runtimeCopy("Reference")} value={pending.tokenRef} mono testID="access-pass-reference" />
+              <MetadataRow label={runtimeCopy("Expires in")} value={formatTtl(pending.expiresInSeconds)} testID="access-pass-ttl" />
               <View style={styles.actionStack}>
                 <ActionButton
                   testID="use-access-pass"
-                  label={operation === "using_access_pass" ? "Opening securely..." : "Use access pass"}
+                  label={operation === "using_access_pass" ? runtimeCopy("Opening securely...") : runtimeCopy("Use access pass")}
                   onPress={() => onUsePendingAccessPass(pending.flowId)}
                   disabled={busy}
                   primary
                 />
                 <ActionButton
                   testID="discard-access-pass"
-                  label="Discard invitation"
+                  label={runtimeCopy("Discard invitation")}
                   onPress={() => onDiscardPendingAccessPass(pending.flowId)}
                   disabled={busy}
                 />
@@ -190,17 +192,15 @@ export function SecureRuntimeGate({
 
           {canImportPass ? (
             <View style={styles.card}>
-              <Text accessibilityRole="header" style={styles.cardTitle}>Have a Node invitation?</Text>
-              <Text style={styles.cardBody}>
-                Copy the HTTPS invitation link from your Node, then import it here to review the origin before registration.
-              </Text>
+              <Text accessibilityRole="header" style={styles.cardTitle}>{runtimeCopy("Have a Node invitation?")}</Text>
+              <Text style={styles.cardBody}>{runtimeCopy("Copy the HTTPS invitation link from your Node, then import it here to review the origin before registration.")}</Text>
               <ActionButton
                 testID="import-access-pass"
-                label={operation === "importing_access_pass" ? "Importing securely..." : "Import invitation from clipboard"}
+                label={operation === "importing_access_pass" ? runtimeCopy("Importing securely...") : runtimeCopy("Import invitation from clipboard")}
                 onPress={onImportAccessPass}
                 disabled={busy}
               />
-              <Text style={styles.cardBody}>The link stays in the clipboard until you replace or clear it.</Text>
+              <Text style={styles.cardBody}>{runtimeCopy("The link stays in the clipboard until you replace or clear it.")}</Text>
             </View>
           ) : null}
 
@@ -217,7 +217,7 @@ export function SecureRuntimeGate({
             {needsUnlock ? (
               <ActionButton
                 testID="unlock-account"
-                label={operation === "unlocking" ? "Unlocking..." : "Unlock local account"}
+                label={operation === "unlocking" ? runtimeCopy("Unlocking...") : runtimeCopy("Unlock local account")}
                 onPress={onUnlock}
                 disabled={busy || snapshot.sessionState === "opening" || snapshot.sessionState === "closing"}
                 primary
@@ -226,10 +226,10 @@ export function SecureRuntimeGate({
 
             {canEnterOrigin ? (
               <View style={styles.form}>
-                <Text style={styles.inputLabel}>Canonical Veil Node origin</Text>
+                <Text style={styles.inputLabel}>{runtimeCopy("Canonical Veil Node origin")}</Text>
                 <TextInput
                   testID="node-origin-input"
-                  accessibilityLabel="Canonical Veil Node origin"
+                  accessibilityLabel={runtimeCopy("Canonical Veil Node origin")}
                   value={origin}
                   onChangeText={setOrigin}
                   autoCapitalize="none"
@@ -238,12 +238,12 @@ export function SecureRuntimeGate({
                   keyboardType="url"
                   textContentType="URL"
                   placeholder="https://veil.example"
-                  placeholderTextColor={colors.textXLo}
+                  placeholderTextColor={c.muted}
                   style={styles.input}
                 />
                 <ActionButton
                   testID="connect-node"
-                  label={operation === "connecting" ? "Connecting..." : "Connect securely"}
+                  label={operation === "connecting" ? runtimeCopy("Connecting...") : runtimeCopy("Connect securely")}
                   onPress={() => onConnect(origin)}
                   disabled={busy || !origin.trim()}
                   primary
@@ -254,14 +254,14 @@ export function SecureRuntimeGate({
             {!needsUnlock && snapshot.connectionState === "connected" ? (
               <View style={styles.bindingBox}>
                 <Text style={styles.bindingState}>
-                  {bindingIsExact ? "Authenticated binding verified" : "Binding verification unavailable"}
+                  {bindingIsExact ? runtimeCopy("Authenticated binding verified") : runtimeCopy("Binding verification unavailable")}
                 </Text>
                 {snapshot.binding ? (
                   <Text style={styles.bindingOrigin}>{snapshot.binding.canonicalServerOrigin}</Text>
                 ) : null}
                 <ActionButton
                   testID="refresh-runtime"
-                  label={operation === "refreshing" ? "Refreshing..." : "Refresh secure state"}
+                  label={operation === "refreshing" ? runtimeCopy("Refreshing...") : runtimeCopy("Refresh secure state")}
                   onPress={onRefresh}
                   disabled={busy}
                 />
@@ -270,16 +270,14 @@ export function SecureRuntimeGate({
 
             {!reducedMotion && busy && operation !== "unlocking" && operation !== "connecting" ? (
               <ActivityIndicator
-                accessibilityLabel="Secure action in progress"
-                color={colors.primaryHi}
+                accessibilityLabel={runtimeCopy("Secure action in progress")}
+                color={c.accent}
                 style={styles.activity}
               />
             ) : null}
           </View>
 
-          <Text style={styles.footer}>
-            Messages stay hidden until the native session, exact account binding, and verified directory are all ready.
-          </Text>
+          <Text style={styles.footer}>{runtimeCopy("Messages stay hidden until the native session, exact account binding, and verified directory are all ready.")}</Text>
         </ScrollView>
       </KeyboardAvoidingView>
     </SafeAreaView>
@@ -297,6 +295,7 @@ function MetadataRow({
   mono?: boolean;
   testID?: string;
 }) {
+  const styles = useVeilStyles(createStyles);
   return (
     <View style={styles.metadataRow}>
       <Text style={styles.metadataLabel}>{label}</Text>
@@ -320,6 +319,7 @@ function ActionButton({
   primary?: boolean;
   testID?: string;
 }) {
+  const styles = useVeilStyles(createStyles);
   return (
     <Pressable
       testID={testID}
@@ -346,8 +346,8 @@ function formatTtl(seconds: number): string {
   return `${minutes}m ${String(remainder).padStart(2, "0")}s`;
 }
 
-const styles = StyleSheet.create({
-  root: { flex: 1, backgroundColor: colors.background },
+const createStyles = (c: Palette) => StyleSheet.create({
+  root: { flex: 1, backgroundColor: c.bg },
   flex: { flex: 1 },
   scrollContent: {
     flexGrow: 1,
@@ -361,76 +361,76 @@ const styles = StyleSheet.create({
   },
   brandBlock: { alignItems: "center", marginBottom: spacing.sm },
   brand: {
-    color: colors.textHi,
+    color: c.text,
     fontSize: 17,
     fontWeight: "800",
     letterSpacing: 5,
     marginTop: spacing.md,
   },
-  brandSub: { color: colors.textLo, fontSize: 13, marginTop: spacing.xs },
+  brandSub: { color: c.muted, fontSize: 13, marginTop: spacing.xs },
   card: {
-    backgroundColor: colors.surfaceSolid,
-    borderRadius: radii.xl,
+    backgroundColor: c.surface,
+    borderRadius: geometry.radius,
     borderWidth: StyleSheet.hairlineWidth,
-    borderColor: colors.border,
+    borderColor: c.line,
     padding: spacing.xl,
     gap: spacing.md,
   },
-  passCard: { borderColor: "rgba(155,138,251,0.32)" },
+  passCard: { borderColor: c.accent },
   cardHeader: { flexDirection: "row", alignItems: "center", gap: spacing.sm },
-  statusDot: { width: 8, height: 8, borderRadius: 4, backgroundColor: colors.primaryHi },
-  eyebrow: { color: colors.primaryHi, fontSize: 11, fontWeight: "800", letterSpacing: 1.4 },
-  cardTitle: { color: colors.textHi, fontSize: 21, lineHeight: 27, fontWeight: "800" },
-  cardBody: { color: colors.textMd, fontSize: 15, lineHeight: 22 },
+  statusDot: { width: 8, height: 8, borderRadius: 4, backgroundColor: c.accent },
+  eyebrow: { color: c.accent, fontSize: 11, fontWeight: "800", letterSpacing: 1.4 },
+  cardTitle: { color: c.text, fontSize: 21, lineHeight: 27, fontWeight: "800" },
+  cardBody: { color: c.text, fontSize: 15, lineHeight: 22 },
   metadataRow: {
     minHeight: 48,
     justifyContent: "center",
     borderTopWidth: StyleSheet.hairlineWidth,
-    borderTopColor: colors.border,
+    borderTopColor: c.line,
     paddingVertical: spacing.sm,
   },
-  metadataLabel: { color: colors.textLo, fontSize: 12, fontWeight: "700", marginBottom: 4 },
-  metadataValue: { color: colors.textHi, fontSize: 14, lineHeight: 20 },
-  mono: { fontFamily: typography.mono, letterSpacing: 1 },
+  metadataLabel: { color: c.muted, fontSize: 12, fontWeight: "700", marginBottom: 4 },
+  metadataValue: { color: c.text, fontSize: 14, lineHeight: 20 },
+  mono: { fontFamily: "monospace", letterSpacing: 1 },
   actionStack: { gap: spacing.sm, marginTop: spacing.xs },
   form: { gap: spacing.sm, marginTop: spacing.xs },
-  inputLabel: { color: colors.textMd, fontSize: 13, fontWeight: "700" },
+  inputLabel: { color: c.text, fontSize: 13, fontWeight: "700" },
   input: {
     minHeight: 52,
-    borderRadius: radii.md,
+    borderRadius: geometry.radius,
     borderWidth: StyleSheet.hairlineWidth,
-    borderColor: "rgba(255,255,255,0.12)",
-    backgroundColor: colors.surfaceLow,
-    color: colors.textHi,
+    borderColor: c.line,
+    backgroundColor: c.surface,
+    color: c.text,
     fontSize: 16,
     paddingHorizontal: spacing.lg,
   },
   button: {
     minHeight: 48,
-    borderRadius: radii.md,
+    borderRadius: geometry.radius,
     alignItems: "center",
     justifyContent: "center",
     paddingHorizontal: spacing.lg,
     paddingVertical: spacing.md,
   },
-  primaryButton: { backgroundColor: colors.primaryDeep },
+  primaryButton: { backgroundColor: c.accent },
   secondaryButton: {
-    backgroundColor: colors.surfaceLow,
+    backgroundColor: c.surface,
     borderWidth: StyleSheet.hairlineWidth,
-    borderColor: colors.border,
+    borderColor: c.line,
   },
   buttonPressed: { opacity: 0.78 },
   buttonDisabled: { opacity: 0.46 },
   buttonText: { color: "#fff", fontSize: 15, fontWeight: "800", textAlign: "center" },
-  secondaryButtonText: { color: colors.textMd },
+  secondaryButtonText: { color: c.text },
   bindingBox: {
     gap: spacing.sm,
     borderTopWidth: StyleSheet.hairlineWidth,
-    borderTopColor: colors.border,
+    borderTopColor: c.line,
     paddingTop: spacing.md,
   },
-  bindingState: { color: colors.success, fontSize: 13, fontWeight: "700" },
-  bindingOrigin: { color: colors.textLo, fontSize: 13, fontFamily: typography.mono },
+  bindingState: { color: c.accent, fontSize: 13, fontWeight: "700" },
+  bindingOrigin: { color: c.muted, fontSize: 13, fontFamily: "monospace" },
   activity: { marginVertical: spacing.sm },
-  footer: { color: colors.textLo, fontSize: 12, lineHeight: 18, textAlign: "center" },
+  footer: { color: c.muted, fontSize: 12, lineHeight: 18, textAlign: "center" },
 });

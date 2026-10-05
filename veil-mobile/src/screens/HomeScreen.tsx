@@ -8,5 +8,5 @@ export default function HomeScreen({ navigation }: NativeStackScreenProps<Authen
   const selected = useCallback((conversationId: string) => navigation.navigate('Direct', { conversationId }), [navigation]);
   const onOpen = useAccountNavigation(selected);
   return <AccountFrame testID="home-screen" onOpen={onOpen}
-    onContacts={() => navigation.navigate('Contacts')} onSettings={() => navigation.navigate('Settings')} />;
+    onContacts={() => navigation.navigate('Contacts')} />;
 }

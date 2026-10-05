@@ -1,5 +1,5 @@
-import React from 'react';
-import { Pressable, Text, View } from 'react-native';
+import React, { useEffect } from 'react';
+import { AccessibilityInfo, Pressable, Text, View } from 'react-native';
 import { ArrowLeft } from 'lucide-react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Palette } from './appearance';
@@ -13,7 +13,9 @@ export function ProfilePanelFrame({ open, onClose, c, reduceMotion, title, tab, 
   onTab: (tab: 'profile' | 'settings') => void; onBack?: () => void;
   returnFocus?: number; children: React.ReactNode }) {
   const focus = useModalAccessibility(open, returnFocus);
+  useEffect(() => { if (open && focus.heading.current) AccessibilityInfo.sendAccessibilityEvent(focus.heading.current, 'focus'); }, [open, title, focus.heading]);
   return <VeilSheet visible={open} c={c} reduceMotion={reduceMotion} onClose={onClose}
+    onBack={onBack}
     onShow={focus.onShow} closeLabel="Закрыть свой профиль" style={{ height: '86%' }}>
     <SafeAreaView edges={['bottom']} style={{ flex: 1, backgroundColor: c.bg }}>
       <View style={styles.panelHeading}>

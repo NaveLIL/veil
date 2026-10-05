@@ -39,3 +39,52 @@ test('a destroyed sheet cannot deliver its old animation callback', () => {
   act(() => completion?.({finished:true}));
   expect(close).not.toHaveBeenCalled();
 });
+
+test.each(['grip', 'back', 'outside', 'accessibility'] as const)('%s dismissal shares the animated exit and completes once', source => {
+  let completion: ((result: {finished:boolean}) => void) | undefined;
+  const timing = jest.spyOn(Animated, 'timing').mockReturnValue({start: jest.fn((cb?: (r:{finished:boolean})=>void) => {completion=cb;}), stop:jest.fn(), reset:jest.fn()});
+  const close=jest.fn();
+  const ui=render(<VeilSheet c={palettes.OLED} reduceMotion={false} onClose={close}><Text>Content</Text></VeilSheet>);
+  if(source==='back')fireEvent(ui.UNSAFE_getByType(Modal),'requestClose');
+  else if(source==='outside')fireEvent.press(ui.getByTestId('veil-sheet-outside', {includeHiddenElements:true}));
+  else if(source==='accessibility')fireEvent(ui.getByLabelText('Закрыть панель'),'accessibilityAction',{nativeEvent:{actionName:'dismiss'}});
+  else fireEvent.press(ui.getByLabelText('Закрыть панель'));
+  expect(timing).toHaveBeenCalledTimes(1);expect(close).not.toHaveBeenCalled();
+  act(()=>completion?.({finished:true}));
+  act(()=>completion?.({finished:true}));
+  expect(close).toHaveBeenCalledTimes(1);
+});
+test('Reduce Motion short gesture cancellation does not run a decorative spring', () => {
+  let pan: PanResponderCallbacks | undefined;
+  jest.spyOn(PanResponder,'create').mockImplementation(config=>{pan=config;return{panHandlers:{}};});
+  const spring=jest.spyOn(Animated,'spring'),close=jest.fn();
+  const ui=render(<VeilSheet c={palettes.OLED} reduceMotion onClose={close}><Text>Content</Text></VeilSheet>);
+  act(()=>pan?.onPanResponderRelease?.({} as never,{dy:20,vy:0} as never));
+  act(()=>pan?.onPanResponderTerminate?.({} as never,{} as never));
+  expect(spring).not.toHaveBeenCalled();expect(close).not.toHaveBeenCalled();
+  expect(ui.UNSAFE_getByType(Modal).props.visible).toBe(true);
+});
+test('a programmatic close stays mounted until its exit; reopening rejects its stale completion', () => {
+  const completions: ((r:{finished:boolean})=>void)[]=[];
+  jest.spyOn(Animated,'timing').mockReturnValue({start:jest.fn((cb?: (r:{finished:boolean})=>void)=>{if(cb)completions.push(cb);}),stop:jest.fn(),reset:jest.fn()});
+  const close=jest.fn(),content=(visible:boolean)=><VeilSheet visible={visible} c={palettes.OLED} reduceMotion={false} onClose={close}><Text>Content</Text></VeilSheet>;
+  const ui=render(content(true));ui.rerender(content(false));
+  expect(ui.UNSAFE_getByType(Modal).props.visible).toBe(true);
+  ui.rerender(content(true));
+  act(()=>completions[0]({finished:true}));
+  expect(ui.UNSAFE_getByType(Modal).props.visible).toBe(true);expect(close).not.toHaveBeenCalled();
+});
+test('nested Back returns one level without dismissing the parent modal', () => {
+  const back=jest.fn(),close=jest.fn();
+  const ui=render(<VeilSheet c={palettes.OLED} reduceMotion onBack={back} onClose={close}><Text>Child</Text></VeilSheet>);
+  fireEvent(ui.UNSAFE_getByType(Modal),'requestClose');
+  expect(back).toHaveBeenCalledTimes(1);expect(close).not.toHaveBeenCalled();
+});
+test('reversing a long drag upwards cancels rather than completing dismissal', () => {
+  let pan: PanResponderCallbacks | undefined;
+  jest.spyOn(PanResponder,'create').mockImplementation(config=>{pan=config;return{panHandlers:{}};});
+  const close=jest.fn(), spring=jest.spyOn(Animated,'spring');
+  render(<VeilSheet c={palettes.OLED} reduceMotion onClose={close}><Text>Content</Text></VeilSheet>);
+  act(()=>pan?.onPanResponderRelease?.({} as never,{dy:90,vy:-1} as never));
+  expect(close).not.toHaveBeenCalled(); expect(spring).not.toHaveBeenCalled();
+});

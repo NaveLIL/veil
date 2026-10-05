@@ -113,7 +113,7 @@ describe("native-only identity welcome", () => {
     expect(view.UNSAFE_queryAllByType(TextInput)).toHaveLength(0);
     expect(view.getByTestId("brand-phase-shift-mark")).toBeTruthy();
     expect(view.getByTestId("identity-setup-create")).toHaveStyle({ minHeight: 72 });
-    expect(view.getByText(/Development preview/)).toBeTruthy();
+    expect(view.getByText(/Тестовая сборка/)).toBeTruthy();
     timing.mockRestore();
   });
 
@@ -222,7 +222,7 @@ describe("native-only identity welcome", () => {
     fireEvent.press(view.getByTestId("identity-setup-create"));
 
     await waitFor(() => expect(view.getByTestId("identity-setup-error")).toBeTruthy());
-    expect(view.getByText("Secure setup did not start")).toBeTruthy();
+    expect(view.getByText("Защищённая настройка не началась")).toBeTruthy();
     expect(view.getByTestId("public-failure-code-v1").props.children).toBe("VEIL-SETUP-001");
     expect(onVerifyIdentity).not.toHaveBeenCalled();
   });

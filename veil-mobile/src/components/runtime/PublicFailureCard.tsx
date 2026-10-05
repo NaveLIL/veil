@@ -2,12 +2,11 @@ import React from "react";
 import { StyleSheet, Text, View } from "react-native";
 
 import {
-  publicFailurePresentationV1,
   type PublicFailureCodeV1,
 } from "../../contracts/publicFailureCodesV1";
-import { colors, radii, spacing } from "../../lib/theme";
-import { geometry } from '../../interfacePreview/appearance';
+import { geometry, typography } from '../../interfacePreview/appearance';
 import { usePresentation } from '../../interfacePreview/PresentationContext';
+import { publicFailureCopy } from '../../presentation/copy/publicFailures';
 
 export function PublicFailureCard({
   code,
@@ -18,7 +17,7 @@ export function PublicFailureCard({
   compact?: boolean;
   announce?: boolean;
 }) {
-  const failure = publicFailurePresentationV1(code);
+  const failure = publicFailureCopy(code);
   const { c } = usePresentation();
   return (
     <View
@@ -29,11 +28,11 @@ export function PublicFailureCard({
     >
       <Text accessibilityRole="header" style={[styles.title, {color:c.text}]}>{failure.title}</Text>
       <Text style={[styles.description, {color:c.muted}]}>{failure.description}</Text>
-      <Text style={[styles.actionLabel, {color:c.muted}]}>NEXT ACTION</Text>
+      <Text style={[styles.actionLabel, {color:c.muted}]}>Что делать</Text>
       <Text style={[styles.action, {color:c.text}]}>{failure.nextAction}</Text>
       <Text
         testID="public-failure-code-v1"
-        accessibilityLabel={`Public failure code ${failure.code}`}
+        accessibilityLabel={`Публичный код ошибки ${failure.code}`}
         selectable
         style={[styles.code, {color:c.danger}]}
       >
@@ -45,30 +44,26 @@ export function PublicFailureCard({
 
 const styles = StyleSheet.create({
   card: {
-    borderRadius: radii.lg,
+    borderRadius: geometry.radius,
     borderWidth: StyleSheet.hairlineWidth,
-    borderColor: colors.destructiveBorder,
-    backgroundColor: colors.destructiveBg,
-    padding: spacing.md,
+    padding: 12,
   },
-  compact: { marginTop: spacing.md },
-  title: { color: colors.textHi, fontSize: 15, fontWeight: "800" },
-  description: { color: colors.textMd, fontSize: 13, lineHeight: 19, marginTop: 5 },
+  compact: { marginTop: 12 },
+  title: { ...typography.body, fontWeight: '600' },
+  description: { ...typography.caption, marginTop: 5 },
   actionLabel: {
-    color: colors.textLo,
-    fontSize: 9,
+    ...typography.caption,
     fontWeight: "900",
     letterSpacing: 1.2,
-    marginTop: spacing.md,
+    marginTop: 12,
   },
-  action: { color: colors.textHi, fontSize: 13, lineHeight: 19, marginTop: 3 },
+  action: { ...typography.caption, marginTop: 3 },
   code: {
     alignSelf: "flex-start",
-    color: colors.destructive,
     fontFamily: "monospace",
     fontSize: 12,
     fontWeight: "800",
     letterSpacing: 0.5,
-    marginTop: spacing.md,
+    marginTop: 12,
   },
 });

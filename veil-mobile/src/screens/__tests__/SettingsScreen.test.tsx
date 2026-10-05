@@ -11,6 +11,11 @@ import {
 import SettingsScreen, { SettingsDetailScreen } from "../SettingsScreen";
 import { ROCKET_CHAT_MIT_NOTICE } from "../../presentation/rocketChat/notice";
 
+
+jest.mock('../../presentation/appearance/AccountAppearance', () => ({
+  useAccountAppearance: () => ({ready:true, showWallpaper:false, wallpaper:null, dim:20, blur:4}),
+}));
+
 const metrics = {
   frame: { x: 0, y: 0, width: 390, height: 844 },
   insets: { top: 47, right: 20, bottom: 34, left: 44 },
@@ -20,9 +25,9 @@ describe("SettingsScreen", () => {
   beforeEach(resetMobileSettingsStoreForTests);
 
   it("opens every root category as a real navigation action", () => {
-    const navigate = jest.fn();
+    const push = jest.fn();
     const props = {
-      navigation: { navigate, goBack: jest.fn() },
+      navigation: { push, goBack: jest.fn() },
       route: { key: "settings", name: "Settings" },
     } as unknown as React.ComponentProps<typeof SettingsScreen>;
     const view = render(
@@ -32,24 +37,24 @@ describe("SettingsScreen", () => {
     );
 
     const sections = [
-      ["Account & recovery. Local identity and recovery boundaries", "account"],
-      ["Devices. This phone, linking and revocation", "devices"],
-      ["Privacy & security. Lock, capture and identity trust", "privacy"],
-      ["Notifications. Push privacy, mentions and replies", "notifications"],
-      ["Appearance. Theme, motion and readable content", "appearance"],
-      ["Node & connection. Origin, transport and connection state", "node"],
-      ["Data & storage. Encrypted local data and future media", "storage"],
-      ["About & diagnostics. Build, safety status and support", "about"],
+      ["Аккаунт и восстановление. Идентичность и защищённое восстановление", "account"],
+      ["Устройства. Этот телефон и доступ других устройств", "devices"],
+      ["Конфиденциальность и безопасность. Блокировка, защита экрана и доверие", "privacy"],
+      ["Уведомления. Доступные настройки уведомлений", "notifications"],
+      ["Внешний вид. Тема, подложка и движение", "appearance"],
+      ["Node и соединение. Адрес сервера и состояние связи", "node"],
+      ["Хранилище. Локальные зашифрованные данные", "storage"],
+      ["О Veil и диагностика. Версия, лицензии и состояние клиента", "about"],
     ] as const;
 
     for (const [label, section] of sections) {
       fireEvent.press(view.getByLabelText(label));
-      expect(navigate).toHaveBeenCalledWith("SettingsDetail", { section });
+      expect(push).toHaveBeenCalledWith("SettingsDetail", { section });
     }
-    expect(navigate).toHaveBeenCalledTimes(sections.length);
+    expect(push).toHaveBeenCalledTimes(sections.length);
     expect(StyleSheet.flatten(
       view.getByTestId("settings-root-scroll").props.contentContainerStyle,
-    )).toMatchObject({ paddingBottom: 46, paddingLeft: 44, paddingRight: 20 });
+    )).toMatchObject({ paddingBottom: 24, padding: 12 });
   });
 
   it("toggles the debug visual-QA capture preference from the whole row", () => {
@@ -66,11 +71,11 @@ describe("SettingsScreen", () => {
         <SettingsDetailScreen {...props} />
       </SafeAreaProvider>,
     );
-    const captureRow = view.getByRole("switch", { name: "Screen capture for testing" });
+    const captureRow = view.getByRole("switch", { name: "Снимки экрана для тестирования" });
 
     expect(StyleSheet.flatten(
       view.getByTestId("settings-detail-scroll").props.contentContainerStyle,
-    )).toMatchObject({ paddingBottom: 46, paddingLeft: 44, paddingRight: 20 });
+    )).toMatchObject({ paddingBottom: 24, padding: 12 });
 
     expect(captureRow.props.accessibilityState).toEqual({
       checked: true,
@@ -96,7 +101,7 @@ describe("SettingsScreen", () => {
     );
 
     expect(view.getByText("0.1.0")).toBeTruthy();
-    expect(view.getByText("Development build")).toBeTruthy();
+    expect(view.getByText("Сборка для разработки")).toBeTruthy();
     expect(view.getByText("Rocket.Chat React Native")).toBeTruthy();
     expect(view.getByText("4.77.0 · MIT")).toBeTruthy();
     expect(view.getByText(ROCKET_CHAT_MIT_NOTICE)).toBeTruthy();

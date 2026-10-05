@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { ProfilePanelFrame } from './ProfilePanelFrame';
 import {
   Pressable,
@@ -79,9 +79,14 @@ export function ProfilePanel({
     'all' | 'appearance' | 'security' | 'notifications' | 'network'
   >('all');
   const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState<DemoProfile>(profile);
   const [quiet, setQuiet] = useState(false);
+  useEffect(() => {
+    if (!open) { setEditing(false); setDraft(profile); }
+  }, [open, profile]);
   function close() {
     setEditing(false);
+    setDraft(profile);
     onClose();
   }
   const labels = {
@@ -94,8 +99,9 @@ export function ProfilePanel({
   return (
     <ProfilePanelFrame open={open} onClose={close} c={c} reduceMotion={reduceMotion}
       title={tab === 'profile' ? 'Ваш профиль' : labels[section]} tab={tab}
-      onTab={(next) => {setTab(next);setSection('all');}}
-      onBack={tab === 'settings' && section !== 'all' ? () => setSection('all') : undefined}
+      onTab={(next) => {setTab(next);setSection('all');setEditing(false);setDraft(profile);}}
+      onBack={editing ? () => { setEditing(false); setDraft(profile); }
+        : tab === 'settings' ? () => { if (section !== 'all') setSection('all'); else setTab('profile'); } : undefined}
       returnFocus={returnFocus}>
           {tab === 'settings' && section === 'appearance' ? (
             <View style={styles.appearance}>{appearance}</View>
@@ -132,10 +138,10 @@ export function ProfilePanel({
                     <>
                       <TextInput
                         accessibilityLabel="Имя демо-профиля"
-                        value={profile.name}
+                        value={draft.name}
                         maxLength={48}
                         onChangeText={(name) =>
-                          onProfileChange({ ...profile, name })
+                          setDraft(value => ({ ...value, name }))
                         }
                         placeholder="Имя"
                         placeholderTextColor={c.muted}
@@ -146,11 +152,11 @@ export function ProfilePanel({
                       />
                       <TextInput
                         accessibilityLabel="Описание демо-профиля"
-                        value={profile.bio}
+                        value={draft.bio}
                         maxLength={300}
                         multiline
                         onChangeText={(bio) =>
-                          onProfileChange({ ...profile, bio })
+                          setDraft(value => ({ ...value, bio }))
                         }
                         placeholder="О себе"
                         placeholderTextColor={c.muted}
@@ -168,9 +174,14 @@ export function ProfilePanel({
                   <Row
                     label={editing ? 'Готово' : 'Редактировать демо-профиль'}
                     icon={Settings2}
-                    onPress={() => setEditing((v) => !v)}
+                    onPress={() => {
+                      if (editing) { onProfileChange(draft); setEditing(false); }
+                      else { setDraft(profile); setEditing(true); }
+                    }}
                     c={c}
                   />
+                  {editing && <Row label="Отмена" icon={Settings2} c={c}
+                    onPress={() => { setEditing(false); setDraft(profile); }} />}
                   <View style={[styles.note, { backgroundColor: c.surface }]}>
                     <Shield size={20} color={c.accent} />
                     <Text

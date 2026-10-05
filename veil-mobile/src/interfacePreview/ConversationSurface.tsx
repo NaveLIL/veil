@@ -117,7 +117,7 @@ export function ConversationSurface({
         )}
         {context}
         <Composer
-          key={chat.id}
+          key={`composer:${chat.id}`}
           value={draft}
           editing={editing}
           onChange={onDraft}

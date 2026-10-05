@@ -16,9 +16,9 @@ import { VeilState } from '../../interfacePreview/VeilState';
 
 /** Shared islands/deck/keyboard; account ownership stays in route/session controllers. */
 export function AccountFrame({ conversation, navigationOpen = true, onNavigationChange = () => {},
-  onOpen, onContacts, onSettings, modalOpen = false, testID }: {
+  onOpen, onContacts, modalOpen = false, testID }: {
   conversation?: React.ReactNode; navigationOpen?: boolean; onNavigationChange?: (open: boolean) => void;
-  onOpen: (id: string) => void; onContacts: () => void; onSettings: () => void;
+  onOpen: (id: string) => void; onContacts: () => void;
   modalOpen?: boolean; testID?: string;
 }) {
   const { c, reduceMotion } = usePresentation(), appearance = useAccountAppearance();
@@ -39,7 +39,7 @@ export function AccountFrame({ conversation, navigationOpen = true, onNavigation
           onOpen={handle => { returnFocus.current = handle; setProfileOpen(true); }} />}
         conversation={conversation} />
       <AccountProfile open={profileOpen && navigationOpen} onClose={() => setProfileOpen(false)}
-        onSettings={onSettings} returnFocus={returnFocus.current} />
+        returnFocus={returnFocus.current} />
     </SafeAreaView></KeyboardFrame>
   </View>;
 }

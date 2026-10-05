@@ -97,6 +97,7 @@ export function useContactsPresenter(onCreated: (conversationId: string) => void
       useChatStore.getState().selectDm(created.conversationId);
       if (useChatStore.getState().selectedDmId !== created.conversationId) throw new Error("Unavailable");
       flow.current = null;
+      setState((s) => ({ ...s, status: "idle" }));
       onCreated(created.conversationId);
     } catch {
       if (isCurrent(candidate)) {

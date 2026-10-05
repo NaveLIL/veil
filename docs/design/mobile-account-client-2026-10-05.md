@@ -4,6 +4,8 @@ This extends Design 10 without replacing the approved mobile visual language. Ve
 
 Final build/device limits and measurements are in the [Account 11 verification report](../reviews/mobile-account-11-verification-2026-10-05.md).
 
+The owner subsequently confirmed real text Direct in both directions on the preceding account client. Design 12's route migration and current validation limits are recorded in [Design 12](mobile-design12-2026-10-05.md). The earlier Account 11 report is historical evidence; its credential blocker must not be treated as a denial of the owner's later successful exchange.
+
 ## Actual boundaries
 
 `App.tsx` still owns the existing native bootstrap, identity/enrollment ceremony and runtime security gates. `AccountAppearanceProvider` owns only public, device-local presentation preferences. It does not own account identity, secrets or conversation plaintext.
@@ -90,8 +92,8 @@ by explicit reload and is cleaned up on result, privacy clearing or unmount.
 
 ## Verification boundaries
 
-Authenticated PC / phone Direct requires usable official test Access Passes, separate test identities and explicit existing trust establishment. A dedicated prior test-Pass file exists, but its remaining validity/use state and fresh test trust inputs have not been confirmed. No personal identity material was extracted. **E2E BLOCKED BY TEST CREDENTIALS**. A successful bundle, Kotlin compile, tester verifier or design fixture does not imply real Direct E2E.
+Authenticated PC / phone Direct requires usable official test Access Passes, separate test identities and explicit existing trust establishment. The owner has confirmed desktop -> mobile and mobile -> desktop exchange on the preceding account client. This is **USER-VERIFIED REAL TEXT DIRECT**, without a claim of agent-observed post-Design-12 regression. A dedicated prior test-Pass file exists; its remaining validity/use state is not inferred from the successful exchange. No personal identity material was extracted. A successful bundle, Kotlin compile, tester verifier or design fixture does not imply that the newly built APK passed authenticated E2E.
 
-The isolated design package allows fixture screenshots. The account tester retains its existing FLAG_SECURE/capture policy; account capture restrictions must not be bypassed for screenshots or profiling. Physical authenticated account history, send, reconnect and incoming switching remain blocked until the credential-dependent ceremony is completed.
+The isolated design package allows fixture screenshots. The account tester retains its existing FLAG_SECURE/capture policy; account capture restrictions must not be bypassed for screenshots or profiling. Post-migration authenticated account history, send, reconnect and incoming switching remain unverified while the migrated account APK cannot be installed in place on the currently connected phone. No new credential blocker is asserted without checking its actual state.
 
 The physical Samsung already contains an older account tester signed with certificate `a85ef3edcd837c3f71679ac50d02165fe4a60258e56b062057a278ba35fe792c`; the independent current tester certificate is `f5df868d3f517c0853225840e2c4f67f2d7b20d05b183bf1ab396e530fc3f250`. Android cannot update this installation across signing identities. Its data was neither read nor cleared. New-account physical startup/accessibility/E2E needs a clean test installation or an explicitly approved migration. Shared presentation checks use only the isolated fixture package.

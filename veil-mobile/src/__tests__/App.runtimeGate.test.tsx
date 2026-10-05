@@ -478,7 +478,7 @@ describe("App native runtime privacy gate", () => {
     await waitFor(() => expect(view.getByTestId("secure-runtime-gate")).toBeTruthy());
     expect(view.queryByTestId("privacy-curtain")).toBeNull();
     expect(view.queryByTestId("chat-runtime-ready")).toBeNull();
-    expect(view.getByText("Unlock required")).toBeTruthy();
+    expect(view.getByText("Нужно открыть аккаунт")).toBeTruthy();
     expect(mockRuntime.openSession).not.toHaveBeenCalled();
   });
 
@@ -518,7 +518,7 @@ describe("App native runtime privacy gate", () => {
     act(() => appStateListener?.("active"));
     await waitFor(() => expect(subscriptions).toHaveLength(2));
     await waitFor(() => expect(useRuntimeGateStore.getState().phase).toBe("ready"));
-    expect(view.getByText("Unlock required")).toBeTruthy();
+    expect(view.getByText("Нужно открыть аккаунт")).toBeTruthy();
 
     await act(async () => {
       staleConfirmation.reject(new Error("stale private handshake detail"));
@@ -700,7 +700,7 @@ describe("App native runtime privacy gate", () => {
 
     const view = render(<App />);
     await waitFor(() => expect(view.getByTestId("secure-runtime-gate")).toBeTruthy());
-    expect(view.getByText("Local account locked")).toBeTruthy();
+    expect(view.getByText("Локальный аккаунт заблокирован")).toBeTruthy();
     expect(view.queryByText("ONBOARDING")).toBeNull();
     expect(view.queryByTestId("chat-runtime-ready")).toBeNull();
   });
@@ -742,7 +742,7 @@ describe("App native runtime privacy gate", () => {
 
     await waitFor(() => expect(view.getByTestId("secure-runtime-gate")).toBeTruthy());
     expect(view.getByTestId("public-failure-code-v1").props.children).toBe("VEIL-SYNC-001");
-    expect(view.getByText("Secure Direct sync did not complete")).toBeTruthy();
+    expect(view.getByText("Синхронизация Direct не завершилась")).toBeTruthy();
     expect(view.queryByText("SECRET_SERVER_DIAGNOSTIC")).toBeNull();
     expect(view.queryByText("CHAT_PLAINTEXT")).toBeNull();
     expect(useChatStore.getState().messagesByChannel).toEqual({});
@@ -1001,7 +1001,7 @@ describe("App native runtime privacy gate", () => {
     act(() => appStateListener?.("inactive"));
     mockRuntime.getSnapshot.mockResolvedValue(reopened);
     act(() => appStateListener?.("active"));
-    await waitFor(() => expect(view.getByText("Unlock required")).toBeTruthy());
+    await waitFor(() => expect(view.getByText("Нужно открыть аккаунт")).toBeTruthy());
     fireEvent.press(view.getByTestId("unlock-account"));
     await waitFor(() => expect(view.getByTestId("chat-runtime-ready")).toBeTruthy());
     expect(mockRuntime.openSession).toHaveBeenCalledTimes(2);
@@ -1242,6 +1242,6 @@ describe("App native runtime privacy gate", () => {
 
     await waitFor(() => expect(view.getByTestId("secure-runtime-gate")).toBeTruthy());
     expect(view.queryByTestId("chat-runtime-ready")).toBeNull();
-    expect(view.getByText("Local account locked")).toBeTruthy();
+    expect(view.getByText("Локальный аккаунт заблокирован")).toBeTruthy();
   });
 });

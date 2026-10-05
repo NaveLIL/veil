@@ -336,7 +336,7 @@ describe("IdentityIslandSheet interaction and accessibility boundary", () => {
     const first = await renderSheet();
 
     expect(addBackHandler).toHaveBeenCalledWith("hardwareBackPress", expect.any(Function));
-    expect(backHandler?.()).toBe(true);
+    act(() => { expect(backHandler?.()).toBe(true); });
     expect(first.onClose).toHaveBeenCalledTimes(1);
     expect(timing).not.toHaveBeenCalled();
 
@@ -353,12 +353,17 @@ describe("IdentityIslandSheet interaction and accessibility boundary", () => {
 
   it("uses the shared native-driver entry and makes accessible Back idempotent", async () => {
     reduceMotion.mockResolvedValue(false);
-    const timing = jest.spyOn(Animated, 'timing').mockReturnValue({start:jest.fn(), stop:jest.fn(), reset:jest.fn()});
+    const completions: (((result: {finished: boolean}) => void) | undefined)[] = [];
+    const timing = jest.spyOn(Animated, 'timing').mockImplementation(() => ({
+      start: callback => { completions.push(callback); }, stop: jest.fn(), reset: jest.fn(),
+    }));
     const {onClose, root} = await renderSheet();
     act(() => root.findByType(Modal).props.onShow());
     expect(timing).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({toValue:0, duration:220, useNativeDriver:true}));
     act(() => root.findByType(Modal).props.onRequestClose());
     act(() => root.findByType(Modal).props.onRequestClose());
+    expect(onClose).not.toHaveBeenCalled();
+    act(() => completions[completions.length - 1]?.({finished: true}));
     expect(onClose).toHaveBeenCalledTimes(1);
   });
 

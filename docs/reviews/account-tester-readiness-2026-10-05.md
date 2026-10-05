@@ -1,5 +1,7 @@
 # Account tester: reproducible Direct check
 
+Update for Design 12: the owner has confirmed real desktop/mobile text Direct on the preceding account client. The read-only `account-tester-readiness.mjs` check now reports E2E as NOT RUN by that script; it cannot infer credential availability or negate a prior exchange. The [Design 12 verification report](mobile-design12-verification-2026-10-05.md) records current APKs and installation blockers. The Account 11 artifact/check details below remain historical evidence.
+
 The account package is `io.veil.mobile.tester`, not `io.veil.mobile.designpreview`. It retains the actual enrollment, identity, authentication, trust and capture gates. Use only test identities and synthetic messages.
 
 ## Build and readiness

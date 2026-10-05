@@ -41,8 +41,9 @@ export function AccountDirectory({ onOpen, onContacts }: { onOpen: (id: string) 
     <View style={[styles.island, { backgroundColor: c.bg, borderColor: c.line }]}>
       <View style={styles.header}>
         <Label color={c.text} style={[styles.heading, styles.flex]} numberOfLines={1}>Сообщения</Label>
-        <IconButton icon={Search} label="Поиск чатов" color={c.muted} onPress={() => setSearch(v => !v)} />
-        <IconButton icon={Plus} label="Find contacts" color={c.accent} onPress={onContacts} />
+        <IconButton icon={Search} label={search ? 'Закрыть поиск чатов' : 'Поиск чатов'} color={c.muted}
+          onPress={() => { if (search) setQuery(''); setSearch(v => !v); }} />
+        <IconButton icon={Plus} label="Найти контакт" color={c.accent} onPress={onContacts} />
       </View>
       {search && <View style={[styles.searchBox, { backgroundColor: c.surface }]}>
         <TextInput value={query} onChangeText={setQuery} accessibilityLabel="Найти чат по имени"
